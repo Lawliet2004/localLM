@@ -63,6 +63,7 @@ mod tests {
     use super::*;
     fn row(id: &str, role: &str, content: &str, status: &str) -> Message {
         Message {
+            error: None,
             id: id.into(),
             conversation_id: "chat".into(),
             role: role.into(),

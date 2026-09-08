@@ -30,3 +30,10 @@ describe('chat action reporting and submission', () => {
     expect(input).toHaveValue('Next draft');
   });
 });
+
+it('shows a saved generation error next to the partial response', () => {
+  const message: Message = { id: 'failed', conversationId: 'chat', role: 'assistant', content: 'Partial result', reasoning: '', status: 'error', createdAt: 0, error: 'Response token limit reached. Increase the response limit.' };
+  render(<Chat {...props} messages={[message]} />);
+  expect(screen.getByText('Partial result')).toBeInTheDocument();
+  expect(screen.getByText('Response token limit reached. Increase the response limit.')).toBeInTheDocument();
+});

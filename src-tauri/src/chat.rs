@@ -134,6 +134,7 @@ pub async fn send_message(
         let mut checkpoint = Instant::now();
         let mut calls = crate::tool_calls::ToolCalls::default();
         let mut round_answer = String::new();
+        let mut finish_reason = String::new();
         'stream: loop {
             let next = tokio::select! {
                 _ = cancellation.changed() => return Ok(false),
@@ -144,6 +145,7 @@ pub async fn send_message(
                 if event == "[DONE]" { break 'stream; }
                 let value: Value = serde_json::from_str(&event).map_err(|error| format!("Invalid model stream: {error}"))?;
                 if let Some(error) = value.get("error") { return Err(format!("Model error: {error}")); }
+                if let Some(reason) = value["choices"][0]["finish_reason"].as_str() { finish_reason = reason.to_string(); }
                 let delta = &value["choices"][0]["delta"];
                 calls.push(delta)?;
                 let text = delta["content"].as_str().unwrap_or("");
@@ -159,6 +161,7 @@ pub async fn send_message(
                 }
             }
         }
+        check_finish_reason(&finish_reason)?;
         let calls = calls.finish()?;
         if calls.is_empty() { return Ok(true); }
         if tool_use_denied { return Err("Tool use stopped after your denial. Send a new message to authorize further actions.".into()); }
@@ -208,8 +211,33 @@ pub async fn send_message(
         Ok(false) => "interrupted",
         Err(_) => "error",
     };
-    state
-        .database()?
-        .update_message(&assistant.id, &answer, &reasoning, status)?;
+    state.database()?.finish_message(
+        &assistant.id,
+        &answer,
+        &reasoning,
+        status,
+        result.as_ref().err().map(String::as_str),
+    )?;
     result.map(|_| ())
+}
+
+fn check_finish_reason(reason: &str) -> Result<(), String> {
+    match reason {
+        "length" => Err("Response token limit reached before the model finished. Increase Maximum response tokens in Models & runtime, or ask for a shorter response. Any partial output has been saved; unfinished tool calls were not executed.".into()),
+        "content_filter" => Err("The model runtime stopped this response because of its content filter.".into()),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    #[test]
+    fn token_exhaustion_is_not_treated_as_success_or_executable_tool_output() {
+        assert!(super::check_finish_reason("length")
+            .unwrap_err()
+            .contains("unfinished tool calls were not executed"));
+        assert!(super::check_finish_reason("stop").is_ok());
+        assert!(super::check_finish_reason("tool_calls").is_ok());
+        assert!(super::check_finish_reason("content_filter").is_err());
+    }
 }

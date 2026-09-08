@@ -21,6 +21,7 @@ export const defaultRuntimeConfig: RuntimeConfig = {
 
 export interface Conversation { id: string; title: string; updatedAt: number }
 export interface Message {
+  error?: string | null;
   id: string; conversationId: string; role: 'user' | 'assistant' | 'tool';
   content: string; reasoning: string; status: 'complete' | 'streaming' | 'interrupted' | 'error'; createdAt: number;
 }

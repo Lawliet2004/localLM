@@ -62,6 +62,9 @@ fn render(snapshot: &Snapshot, extension: &str) -> Result<Vec<u8>, String> {
                 message.role, message.status, message.created_at
             )
             .map_err(|error| error.to_string())?;
+            if let Some(error) = &message.error {
+                writeln!(output, "Response error: {error}\n").map_err(|error| error.to_string())?;
+            }
             if !message.reasoning.is_empty() {
                 writeln!(
                     output,
@@ -145,6 +148,7 @@ mod tests {
             tool_selection: ConversationTools::default(),
             messages: vec![
                 Message {
+                    error: None,
                     id: "assistant".into(),
                     conversation_id: "chat".into(),
                     role: "assistant".into(),
@@ -154,6 +158,7 @@ mod tests {
                     created_at: 110,
                 },
                 Message {
+                    error: None,
                     id: "tool".into(),
                     conversation_id: "chat".into(),
                     role: "tool".into(),

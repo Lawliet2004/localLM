@@ -25,6 +25,7 @@ pub struct Conversation {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
+    pub error: Option<String>,
     pub id: String,
     pub conversation_id: String,
     pub role: String,
@@ -139,7 +140,35 @@ impl Store {
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS conversation_tools(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, value TEXT NOT NULL);
             UPDATE messages SET status='interrupted' WHERE status='streaming';").map_err(db_error)?;
+        let has_error: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='error')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if !has_error {
+            connection
+                .execute("ALTER TABLE messages ADD COLUMN error TEXT", [])
+                .map_err(db_error)?;
+        }
         Ok(Self { connection })
+    }
+    pub fn finish_message(
+        &self,
+        id: &str,
+        content: &str,
+        reasoning: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE messages SET content=?1,reasoning=?2,status=?3,error=?4 WHERE id=?5",
+                params![content, reasoning, status, error, id],
+            )
+            .map_err(db_error)?;
+        Ok(())
     }
     pub fn conversation_tools(&self, id: &str) -> Result<ConversationTools> {
         let value: Option<Option<String>> = self.connection.query_row(
@@ -217,10 +246,11 @@ impl Store {
         Ok(())
     }
     pub fn messages(&self, id: &str) -> Result<Vec<Message>> {
-        let mut statement = self.connection.prepare("SELECT id,conversation_id,role,content,reasoning,status,created_at FROM messages WHERE conversation_id=?1 ORDER BY created_at,rowid").map_err(db_error)?;
+        let mut statement = self.connection.prepare("SELECT id,conversation_id,role,content,reasoning,status,created_at,error FROM messages WHERE conversation_id=?1 ORDER BY created_at,rowid").map_err(db_error)?;
         let rows = statement
             .query_map([id], |row| {
                 Ok(Message {
+                    error: row.get(7)?,
                     id: row.get(0)?,
                     conversation_id: row.get(1)?,
                     role: row.get(2)?,
@@ -245,6 +275,7 @@ impl Store {
             return Err("Message exceeds the 1 MiB limit.".into());
         }
         let message = Message {
+            error: None,
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: conversation_id.into(),
             role: role.into(),
@@ -335,6 +366,37 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generation_errors_survive_reopening_with_partial_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("errors.sqlite");
+        let id;
+        {
+            let store = Store::open(&path).unwrap();
+            id = store.create_conversation().unwrap().id;
+            let message = store
+                .append_message(&id, "assistant", "", "streaming")
+                .unwrap();
+            store
+                .finish_message(
+                    &message.id,
+                    "Partial answer",
+                    "Partial reasoning",
+                    "error",
+                    Some("Response token limit reached"),
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let messages = store.messages(&id).unwrap();
+        assert_eq!(
+            messages[0].error.as_deref(),
+            Some("Response token limit reached")
+        );
+        assert_eq!(messages[0].status, "error");
+        assert_eq!(messages[0].content, "Partial answer");
+        assert_eq!(messages[0].reasoning, "Partial reasoning");
+    }
     #[test]
     fn conversation_tools_are_isolated_durable_and_deleted_with_chat() {
         let dir = tempfile::tempdir().unwrap();

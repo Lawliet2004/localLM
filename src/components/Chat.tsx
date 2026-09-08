@@ -33,7 +33,7 @@ function MessageBody({ message }: { message: Message }) {
       img: ({ alt }) => <span className="image-reference">Image: {alt || 'external image'}</span>,
     }}>{message.content}</ReactMarkdown></div>
     {message.status === 'streaming' && !message.content && !message.reasoning && <span className="thinking" role="status">Thinking<span>···</span></span>}
-    {(message.status === 'interrupted' || message.status === 'error') && <p className="message-state">{message.status === 'interrupted' ? 'Response stopped' : 'Response interrupted by an error'}</p>}
+    {(message.status === 'interrupted' || message.status === 'error') && <p className="message-state">{message.error || (message.status === 'interrupted' ? 'Response stopped' : 'Response interrupted by an error')}</p>}
     {message.content && <button className="icon-button copy-message" aria-label="Copy message" title="Copy message" onClick={async () => {
       try { await navigator.clipboard.writeText(message.content); setCopied(true); clearTimeout(timer.current); timer.current = setTimeout(() => setCopied(false), 2000); }
       catch { setCopyError('Could not access the clipboard. Select the text to copy it.'); }
