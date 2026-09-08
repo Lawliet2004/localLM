@@ -3,6 +3,7 @@ mod chat;
 mod commands;
 mod connectors;
 mod context;
+pub mod daytona;
 mod execution;
 mod export;
 mod hardware;

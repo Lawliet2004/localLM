@@ -1,6 +1,6 @@
 # Daytona execution implementation contract
 
-Status: researched, not implemented. Local execution remains the only available provider. No cloud resources were created during this research.
+Status: the low-level Rust client is implemented and fixture-tested; the provider is not yet wired into chat. Local execution remains the only available provider. No cloud resources were created during this work.
 
 ## Sources inspected on 2026-09-08
 
@@ -8,9 +8,19 @@ Status: researched, not implemented. Local execution remains the only available 
 - [Platform OpenAPI](https://www.daytona.io/docs/openapi.json), SHA-256 `fb9d877c6bbedb818b257a5a9fa6837ac97f5ce3b24c00a4ba7effb6f195178c`.
 - [Toolbox OpenAPI](https://www.daytona.io/docs/toolbox-openapi.json), SHA-256 `3dbcb22f53b0205deedc9310dc2e87aa346cf28db9372508c28919b70a13b3f6`.
 
-The platform API creates sandboxes with POST `/sandbox`, inspects/deletes them at `/sandbox/{sandboxIdOrName}`, and provides a toolbox endpoint through GET `/sandbox/{sandboxId}/toolbox-proxy-url`. Bearer authentication applies to platform requests. Creation supports private previews, resource limits, auto-stop, auto-delete and a wall-clock TTL. The proxy authentication details and timeout units require verification against the upstream SDK before implementation.
+The platform API creates sandboxes with POST `/sandbox`, inspects/deletes them at `/sandbox/{sandboxIdOrName}`, and provides a toolbox endpoint through GET `/sandbox/{sandboxId}/toolbox-proxy-url`. Bearer authentication applies to platform requests. Creation supports private previews, resource limits, auto-stop, auto-delete and a wall-clock TTL.
 
 The toolbox POST `/process/code-run` request requires both `code` and `language`. Documented languages are Python, JavaScript and TypeScript. Optional fields include argv, envs and timeout; results include exitCode, result and artifacts. Do not infer separate stdout/stderr streams from this combined result.
+
+## Transport implementation
+
+`src-tauri/src/daytona.rs` implements create/inspect/delete/code-run requests. It limits responses to 1 MiB, disables redirects, bounds request durations and returns status-only errors instead of reflecting remote error bodies. Code accepts Python/JavaScript/TypeScript, 32 KiB maximum and 1–90 seconds. Creation requires a LocalLM operation name, requests private previews, and sets explicit resource/lifetime limits. No HTTP mutation is automatically retried by the application.
+
+The client accepts only the hosted `https://proxy.app.daytona.io/toolbox` origin/path before attaching credentials. Regional or self-hosted endpoints currently fail explicitly. Proxy fallback lookup, durable ownership, readiness polling, cleanup recovery, credentials UI and tool integration remain outstanding. The transport alone must not be exposed as an executable chat tool before those lifecycle pieces exist.
+
+SDK details were checked at [daytona/clients revision 246056df](https://github.com/daytona/clients/tree/246056df8886a020396cb46ad17c1d8b93653648/sdk-typescript/src): Process.ts uses seconds for execution timeout; Daytona.ts configures Bearer authorization; Sandbox.ts appends the sandbox ID to the proxy base URL. Real account compatibility still needs verification.
+
+Local TCP fixtures verify authentication, creation JSON, explicit ownership/lifetime settings, missing sandboxes, redirect rejection, oversized responses and exclusion of credentials/remote error text from returned errors. URL/key validation tests reject unsafe origins, paths and header injection.
 
 ## LocalLM design decisions to implement
 

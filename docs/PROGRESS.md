@@ -185,3 +185,10 @@ Audited remaining SPEC items and selected Daytona as the next missing execution 
 
 Corrected the Execution page's outdated claim that all runs require approval: it now accurately explains Ask/Auto-approve versus Full access. The production frontend build passed. This turn establishes the next implementation contract; it does not claim Daytona is available.
 
+
+### Daytona native transport
+
+Implemented a low-level Rust client for sandbox creation, inspection, deletion and code-run. Requests have bounded timeouts/responses, redirects disabled, validated identifiers and a strict hosted toolbox destination. Creation carries an operation ownership label and explicit private/resource/lifetime settings. Remote error bodies are omitted from errors. The client is not yet a selectable chat tool; durable ownership/cleanup, polling, vault/UI integration and account testing remain required.
+
+Verified current SDK source at daytona/clients revision 246056df8886a020396cb46ad17c1d8b93653648 for seconds-based execution timeout, Bearer configuration and toolbox URL construction. Three targeted Rust tests passed using local TCP fixtures for authentication, creation payloads, response bounds, 404, redirects and validation. Strict Clippy passed (57 tests now exist overall). No real Daytona resources were created and no account credentials were used.
+
