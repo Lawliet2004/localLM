@@ -29,6 +29,7 @@ mod skills;
 mod sse;
 mod store;
 mod tool_calls;
+mod tool_discovery;
 mod vault;
 mod workspace;
 

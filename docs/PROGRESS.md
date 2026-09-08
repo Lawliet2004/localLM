@@ -340,3 +340,9 @@ The smoke passed. This verifies new-turn retry for an interrupted response; tool
 Added a separate 60-second response-header deadline. Previously, a server that accepted the connection but never sent headers could hold the operation until the two-hour overall transfer timeout; body chunks already had a 60-second stall deadline. The new header timeout releases the temporary file and returns an actionable error.
 
 All six download-related filtered tests and strict Clippy passed. The new local TCP regression accepts and reads the request, deliberately withholds headers, and verifies timeout plus removal of the partial file using a shortened test deadline. No production download was repeated for this change.
+
+### Bounded MCP tool discovery
+
+While preparing custom local MCP support, replaced list_all_tools with incremental discovery. The connection keeps its 30-second outer deadline and now checks 512 tools and 2 MiB accumulated serialized tool data before retaining each page, rejects duplicate tool names/repeated or oversized cursors, and limits discovery to 64 pages. This bounds accumulation across pages; the transport still deserializes each individual page before these checks.
+
+Pagination regressions cover a valid two-page result, repeated cursors, duplicate names, excessive pages and excessive tool count. Tests and strict Clippy passed after using the pinned SDK's builder for its non-exhaustive request type. Live connector discovery acceptance and custom stdio configuration/lifecycle remain outstanding.

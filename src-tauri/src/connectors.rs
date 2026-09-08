@@ -362,7 +362,18 @@ impl McpHub {
                 .map_err(|_| "Connector handshake timed out.")?
                 .map_err(|error| redact(format!("Could not connect: {error}")))?
         };
-        let result = tokio::time::timeout(Duration::from_secs(30), service.list_all_tools()).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::tool_discovery::discover(|cursor| async {
+                service
+                    .list_tools(Some(
+                        rmcp::model::PaginatedRequestParams::default().with_cursor(cursor),
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())
+            }),
+        )
+        .await;
         let tools = match result {
             Ok(Ok(tools)) => tools,
             result => {
