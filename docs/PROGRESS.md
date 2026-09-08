@@ -148,3 +148,10 @@ Active skills now expose one shared skills_read_file tool with their pinned pack
 
 Verification: 51 Rust tests, 17 frontend tests, production frontend build and both browser checks pass. Native scripts/skill-reader-smoke.mjs passed all three modes against MiniCPM, reading the exact first three lines of the Jupyter notebook quality checklist and producing the expected answer. The Windows junction escape test passed. Active skills, preferences and temporary chats were restored/removed by the smoke fixture. Dedicated package script execution, dependencies, updates and other release acceptance remain open; see docs/SKILLS.md.
 
+
+### Desktop launch and window persistence
+
+Added the official Tauri single-instance and window-state plugins. Duplicate launches exit and restore/focus the existing main window. Size, position and maximized state persist; hidden/minimized state is not restored. No frontend permissions were added.
+
+The native debug build and scripts/window-smoke.ps1 passed: exact window bounds survived restart, maximized state survived another restart, a second process exited while the original PID remained, and a minimized window was restored. Original geometry was restored after testing. Physical disconnected-monitor behavior and installer acceptance remain unverified. See docs/DESKTOP.md.
+
