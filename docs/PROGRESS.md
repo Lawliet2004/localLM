@@ -86,3 +86,9 @@ Connector selections and local tool enablement now belong to each conversation i
 Verification: 34 Rust tests, strict Clippy, 9 frontend tests, production build and both browser tests pass. Database reopen tests prove independent settings survive, rejected writes preserve previous data and deletion cascades. `scripts/conversation-tools-smoke.mjs` exercised two different selections through native UI, switching, UI reload and new-chat reset. Real MiniCPM/DeepWiki allow/deny/cancel smoke passed again after persistence integration.
 
 Workspace folder and skill activation are still global settings; this slice persists tool enablement and connector/tool identities only. Full release acceptance remains open.
+
+### Native conversation export
+
+Replaced browser Blob downloads with the native Save dialog and a Rust snapshot/export command. Markdown preserves reasoning, statuses and complete literal tool audits; versioned JSON preserves message fields and tool selections. Writes stage and sync a temporary sibling file before replacement, reporting validation or filesystem errors. The UI handles cancellation, disables export during active operations and displays successful destination paths.
+
+Verification: 36 Rust tests pass; strict Clippy, 12 frontend tests, production build and both browser checks pass. Native `scripts/export-smoke.mjs` compared exported JSON exactly against three persisted messages including one real tool audit, checked Markdown content/reasoning, and verified replacing an existing export. UI tests mock the Save dialog to verify accepted paths, cancellation and write errors. The actual Windows Save-dialog interaction still needs manual acceptance; native file-writing IPC was tested directly. Usage and format details are in `docs/EXPORTS.md`.

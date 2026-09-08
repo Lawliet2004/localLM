@@ -24,6 +24,7 @@ export const api = {
   deleteConversation: (id: string) => invoke<void>('delete_conversation', { id }),
   conversationTools: (id: string) => invoke<ConversationTools>('get_conversation_tools', { id }),
   saveConversationTools: (id: string, tools: ConversationTools) => invoke<void>('save_conversation_tools', { id, tools }),
+  exportConversation: (id: string, path: string) => invoke<void>('export_conversation', { id, path }),
   messages: (id: string) => invoke<Message[]>('get_messages', { id }),
   saveConfig: (config: RuntimeConfig) => invoke<void>('save_runtime_config', { config }),
   savePreferences: (preferences: Preferences) => invoke<void>('save_preferences', { preferences }),

@@ -3,6 +3,7 @@ mod chat;
 mod commands;
 mod connectors;
 mod execution;
+mod export;
 mod hardware;
 mod oauth;
 mod runtime;
@@ -77,6 +78,7 @@ pub fn run() {
             commands::rename_conversation,
             commands::delete_conversation,
             commands::get_messages,
+            export::export_conversation,
             commands::get_conversation_tools,
             commands::save_conversation_tools,
             commands::save_runtime_config,

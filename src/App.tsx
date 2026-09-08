@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Check, ChevronDown, Download, PanelLeftOpen, Pencil, Trash2, X } from 'lucide-react';
-import { confirm } from '@tauri-apps/plugin-dialog';
+import { confirm, save } from '@tauri-apps/plugin-dialog';
 import { api, errorMessage, nativeAvailable } from './lib/api';
 import { defaultRuntimeConfig, type Bootstrap, type Message, type ToolApproval, type ToolSelection } from './lib/types';
 import { Sidebar, type Page } from './components/Sidebar';
@@ -30,6 +30,8 @@ export default function App() {
   const [generating, setGenerating] = useState(false);
   const [modelBusy, setModelBusy] = useState(false);
   const [savingTools, setSavingTools] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportedPath, setExportedPath] = useState('');
   const toolSave = useRef(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
@@ -39,7 +41,7 @@ export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('locallm-theme') || 'dark');
   const selection = useRef(0);
   const active = data.conversations.find(item => item.id === activeId);
-  const busy = generating || modelBusy || loading || savingTools;
+  const busy = generating || modelBusy || loading || savingTools || exporting;
   function newConversation() {
     selection.current++; setActiveId(null); setMessages([]); setPage('chat'); setError(''); setRenaming(false);
     setSelectedConnectors([]); setSelectedTools([]);
@@ -137,19 +139,26 @@ export default function App() {
     try { await api.renameConversation(activeId, title); setData(current => ({ ...current, conversations: current.conversations.map(item => item.id === activeId ? { ...item, title: title.trim() } : item) })); setRenaming(false); }
     catch (e) { setError(errorMessage(e)); }
   }
-  function exportChat() {
-    const text = `# ${active?.title || 'Conversation'}\n\n` + messages.map(message => `## ${message.role}\n\n${message.content}\n`).join('\n');
-    const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown' }));
-    const link = document.createElement('a'); link.href = url; link.download = 'conversation.md'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  async function exportChat() {
+    if (!activeId || busy) return;
+    setExporting(true); setError(''); setExportedPath('');
+    try {
+      const path = await save({ title: 'Export conversation', defaultPath: `conversation-${activeId.slice(0, 8)}.md`, filters: [
+        { name: 'Markdown', extensions: ['md'] }, { name: 'JSON (complete conversation data)', extensions: ['json'] },
+      ] });
+      if (path) { await api.exportConversation(activeId, path); setExportedPath(path); }
+    } catch (e) { setError(errorMessage(e)); }
+    finally { setExporting(false); }
   }
   return <div className={`app ${collapsed ? 'sidebar-collapsed' : ''}`}>
     {!collapsed && <Sidebar page={page} onPage={setPage} conversations={data.conversations} activeId={activeId} onSelect={id => void selectConversation(id)} onNew={newConversation} busy={busy} search={search} onSearch={setSearch} theme={theme} onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')} onCollapse={() => setCollapsed(true)} />}
     {approval && <ApprovalDialog key={approval.id} request={approval} onResolve={allow => api.resolveToolApproval(approval.id, allow)} />}
-    <main className="workspace"><header className="workspace-header"><div>{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{renaming && page === 'chat' ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{page === 'chat' ? active?.title || 'New conversation' : page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : 'Skills'}</span>}</div><div className="header-actions">{page === 'chat' && active && <><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length} onClick={exportChat}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></>}<button className="model-selector" onClick={() => setPage('models')}><span className={`status-dot ${data.runtime.phase === 'ready' ? 'ready' : ''}`} />{data.runtime.phase === 'ready' ? 'Model loaded' : 'Select model'}<ChevronDown size={13} /></button></div></header>
+    <main className="workspace"><header className="workspace-header"><div>{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{renaming && page === 'chat' ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{page === 'chat' ? active?.title || 'New conversation' : page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : 'Skills'}</span>}</div><div className="header-actions">{page === 'chat' && active && <><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></>}<button className="model-selector" onClick={() => setPage('models')}><span className={`status-dot ${data.runtime.phase === 'ready' ? 'ready' : ''}`} />{data.runtime.phase === 'ready' ? 'Model loaded' : 'Select model'}<ChevronDown size={13} /></button></div></header>
       {!nativeAvailable && <div className="preview-banner">Browser preview · Open the desktop application to load models and save conversations.</div>}
+      {exportedPath && <div className="preview-banner" role="status">Saved conversation to {exportedPath}<button className="icon-button" aria-label="Dismiss export confirmation" onClick={() => setExportedPath('')}><X size={16} /></button></div>}
       {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
       {page === 'chat' && <ToolPicker selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} busy={busy} />}
-      {page === 'chat' ? <Chat messages={messages} generating={generating} ready={nativeAvailable && data.runtime.phase === 'ready'} loading={loading} disabled={savingTools} onSend={send} onCancel={() => { void api.cancelGeneration().catch(e => setError(errorMessage(e))); }} onConfigure={() => setPage('models')} /> : page === 'models' ? <Models config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveConfig={async config => { try { await api.saveConfig(config); setData(current => ({ ...current, config })); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(current => ({ ...current, preferences })); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
+      {page === 'chat' ? <Chat messages={messages} generating={generating} ready={nativeAvailable && data.runtime.phase === 'ready'} loading={loading} disabled={savingTools || exporting} onSend={send} onCancel={() => { void api.cancelGeneration().catch(e => setError(errorMessage(e))); }} onConfigure={() => setPage('models')} /> : page === 'models' ? <Models config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveConfig={async config => { try { await api.saveConfig(config); setData(current => ({ ...current, config })); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(current => ({ ...current, preferences })); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
     </main>
   </div>;
 }
