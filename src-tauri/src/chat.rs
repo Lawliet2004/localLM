@@ -74,6 +74,10 @@ pub async fn send_message(
         )
     };
     let active_skills = state.database()?.active_skills()?;
+    let access_mode = state
+        .database()?
+        .conversation_tools(&conversation_id)?
+        .access_mode;
     let skill_instructions = state.skills.lock().await.instructions(&active_skills)?;
     let (preferences, history, assistant) = {
         let store = state.database()?;
@@ -107,6 +111,7 @@ pub async fn send_message(
     let result: Result<bool,String> = async {
         channel.send(ChatEvent { message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: None }).map_err(|error| error.to_string())?;
         let client = reqwest::Client::builder().no_proxy().connect_timeout(Duration::from_secs(5)).build().map_err(|error| error.to_string())?;
+        let mut tool_use_denied = false;
         for round in 0..9 {
         if *cancellation.borrow() { return Ok(false); }
         let mut payload = json!({
@@ -114,6 +119,7 @@ pub async fn send_message(
             "max_tokens":preferences.max_tokens,"stream":true,"cache_prompt":true,
         });
         if !tools.is_empty() { payload["tools"] = json!(tools.iter().map(|tool| tool.definition()).collect::<Vec<_>>()); }
+        if tool_use_denied { payload["tool_choice"] = json!("none"); }
         let request = client.post(format!("{endpoint}/v1/chat/completions")).bearer_auth(&api_key).json(&payload);
         let response = tokio::select! {
             _ = cancellation.changed() => return Ok(false),
@@ -155,10 +161,15 @@ pub async fn send_message(
         }
         let calls = calls.finish()?;
         if calls.is_empty() { return Ok(true); }
+        if tool_use_denied { return Err("Tool use stopped after your denial. Send a new message to authorize further actions.".into()); }
         if round >= 8 { return Err("Tool round limit reached. Review the results before continuing.".into()); }
         messages.push(json!({"role":"assistant","content":round_answer,"tool_calls":calls.iter().map(|call| call.model_value()).collect::<Vec<_>>() }));
         for call in calls {
             let tool = tools.iter().find(|tool| tool.alias == call.name).ok_or("The model requested a tool that was not selected.")?;
+            if *cancellation.borrow() { return Ok(false); }
+            let automatic_reason = access_mode.automatic_reason(tool.trusted_read());
+            let blocked_by_denial = tool_use_denied;
+            let allow = if blocked_by_denial { false } else if automatic_reason.is_some() { true } else {
             let (approval_id, decision) = state.approvals.request()?;
             let sent = channel.send(ChatEvent { message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: Some(json!({"id":approval_id,"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments})) });
             if sent.is_err() { state.approvals.remove(&approval_id); return Err("The approval interface disconnected.".into()); }
@@ -169,7 +180,11 @@ pub async fn send_message(
             state.approvals.remove(&approval_id);
             channel.send(ChatEvent { message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: Some(Value::Null) }).map_err(|error| error.to_string())?;
             let Some(allow) = allow else { return Ok(false); };
-            let audit = json!({"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"decision":if allow { "allowed" } else { "denied" }});
+            allow
+            };
+            if !allow { tool_use_denied = true; }
+            let authorization = if blocked_by_denial { "blocked by an earlier denial in this turn" } else { automatic_reason.unwrap_or("user approval decision") };
+            let audit = json!({"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"decision":if allow { "allowed" } else { "denied" },"accessMode":access_mode,"authorization":authorization});
             let row = state.database()?.append_message(&conversation_id,"tool",&audit.to_string(),if allow { "streaming" } else { "complete" })?;
             let result = if !allow { json!({"isError":true,"message":"The user denied this tool request. Do not repeat it without a new instruction."}) } else {
                 let outcome = tokio::select! {

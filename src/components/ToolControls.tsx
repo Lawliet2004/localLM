@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
-import type { ConnectorView, ToolApproval, ToolSelection } from '../lib/types';
+import type { AccessMode, ConnectorView, ToolApproval, ToolSelection } from '../lib/types';
 
-export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, busy }: { selected: string[]; onChange: (ids: string[]) => void; selectedTools: ToolSelection[]; onToolsChange: (tools: ToolSelection[]) => void; busy: boolean }) {
+export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, accessMode = 'ask', onAccessModeChange, busy }: { selected: string[]; onChange: (ids: string[]) => void; selectedTools: ToolSelection[]; onToolsChange: (tools: ToolSelection[]) => void; accessMode?: AccessMode; onAccessModeChange?: (mode: AccessMode) => void; busy: boolean }) {
   const [items, setItems] = useState<ConnectorView[]>([]);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [workspace, setWorkspace] = useState('');
@@ -32,11 +32,12 @@ export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, b
     catch (e) { setError(errorMessage(e)); }
     finally { setChoosing(false); }
   }
-  return <details className="tool-picker"><summary>Tools · {toolCount ? `${toolCount}/32 enabled` : 'Off'}{activeSkills.length > 0 && ` · ${activeSkills.length} active skills`}</summary>
+  return <><div className={`permission-bar permission-${accessMode}`}><label>Permissions<select aria-label="Permission mode" value={accessMode} disabled={!nativeAvailable || busy || !onAccessModeChange} onChange={event => onAccessModeChange?.(event.target.value as AccessMode)}><option value="ask">Ask for approval</option><option value="autoApprove">Auto-approve reads</option><option value="fullAccess">Full access</option></select></label><span>{accessMode === 'fullAccess' ? 'Selected tools run without prompts, including code and external changes.' : accessMode === 'autoApprove' ? 'Workspace reads run automatically. Other actions ask.' : 'Every tool action asks first.'}</span></div>
+  <details className="tool-picker"><summary>Tools · {toolCount ? `${toolCount}/32 enabled` : 'Off'}{activeSkills.length > 0 && ` · ${activeSkills.length} active skills`}</summary>
     {activeSkills.length > 0 && <p>Skill guidance: {activeSkills.join(', ')}</p>}
-    <p>Selected tools may send data to their services. Each action requires your approval.</p>
+    <p>Selected tools may send data to their services. Permissions apply to this conversation and are recorded with each action.</p>
     <div className="workspace-tools"><label><input type="checkbox" aria-label="Workspace files" checked={selected.includes('__workspace')} disabled={busy || !workspace || (!selected.includes('__workspace') && toolCount + 4 > 32)} onChange={event => onChange(event.target.checked ? [...selected, '__workspace'] : selected.filter(id => id !== '__workspace'))} />Workspace files</label><button className="secondary" disabled={!nativeAvailable || busy || choosing} onClick={() => void chooseWorkspace()}>{workspace ? 'Change folder' : 'Choose folder'}</button>{workspace && <code>{workspace}</code>}</div>
-    <label><input type="checkbox" aria-label="Local code" checked={selected.includes('__execution')} disabled={busy || !workspace || (!selected.includes('__execution') && toolCount >= 32)} onChange={event => onChange(event.target.checked ? [...selected, '__execution'] : selected.filter(id => id !== '__execution'))} />Local code <small>Not sandboxed · approval required</small></label>
+    <label><input type="checkbox" aria-label="Local code" checked={selected.includes('__execution')} disabled={busy || !workspace || (!selected.includes('__execution') && toolCount >= 32)} onChange={event => onChange(event.target.checked ? [...selected, '__execution'] : selected.filter(id => id !== '__execution'))} />Local code <small>Not sandboxed · {accessMode === 'fullAccess' ? 'runs without prompts' : 'approval required'}</small></label>
     {items.length > 0 && <input type="search" aria-label="Search available tools" placeholder="Find a tool or connector…" value={search} onChange={event => setSearch(event.target.value)} />}
     <div className="connector-tool-groups">{items.map(item => {
       const visible = item.tools.filter(tool => `${item.id} ${tool.name} ${tool.description}`.toLowerCase().includes(search.toLowerCase()));
@@ -50,7 +51,7 @@ export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, b
     {selectedTools.some(tool => !items.some(item => item.id === tool.connectorId && item.tools.some(available => available.name === tool.toolName))) && <p role="status">Some selected tools are unavailable. <button className="secondary" disabled={busy} onClick={() => onToolsChange(selectedTools.filter(tool => items.some(item => item.id === tool.connectorId && item.tools.some(available => available.name === tool.toolName))))}>Remove unavailable tools</button></p>}
     {!items.length && <p>Connect a service in Connectors to make its tools available here.</p>}
     {error && <p role="alert">{error}</p>}
-  </details>;
+  </details></>;
 }
 
 export function ApprovalDialog({ request, onResolve }: { request: ToolApproval; onResolve: (allow: boolean) => Promise<void> }) {

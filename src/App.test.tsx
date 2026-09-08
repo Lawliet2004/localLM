@@ -47,3 +47,19 @@ describe('desktop conversation export', () => {
     expect(screen.queryByText(/Saved conversation to/)).not.toBeInTheDocument();
   });
 });
+
+describe('conversation permission modes', () => {
+  it('shows full access clearly and resets a new conversation to asking', async () => {
+    render(<App />);
+    await screen.findByRole('button', { name: 'Saved chat' });
+    const mode = screen.getByRole('combobox', { name: 'Permission mode' });
+    expect(mode).toHaveValue('ask');
+    await userEvent.selectOptions(mode, 'fullAccess');
+    expect(mode).toHaveValue('fullAccess');
+    expect(screen.getByText('Selected tools run without prompts, including code and external changes.')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
+    expect(mode).toHaveValue('ask');
+    await userEvent.selectOptions(mode, 'autoApprove');
+    expect(screen.getByText('Workspace reads run automatically. Other actions ask.')).toBeInTheDocument();
+  });
+});

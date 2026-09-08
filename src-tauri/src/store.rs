@@ -77,6 +77,8 @@ pub struct Store {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationTools {
+    #[serde(default)]
+    pub access_mode: crate::permissions::AccessMode,
     pub sources: Vec<String>,
     pub tools: Vec<crate::connectors::ToolSelection>,
 }
@@ -340,6 +342,7 @@ mod tests {
         let first;
         let second;
         let settings = ConversationTools {
+            access_mode: crate::permissions::AccessMode::FullAccess,
             sources: vec!["__workspace".into()],
             tools: vec![crate::connectors::ToolSelection {
                 connector_id: "deepwiki".into(),
@@ -383,6 +386,7 @@ mod tests {
     #[test]
     fn conversation_tools_reject_duplicates_and_excessive_combined_tools() {
         let mut settings = ConversationTools {
+            access_mode: crate::permissions::AccessMode::Ask,
             sources: vec!["__workspace".into(), "__execution".into()],
             tools: (0..27)
                 .map(|index| crate::connectors::ToolSelection {

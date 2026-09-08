@@ -34,7 +34,8 @@ Use named types, explicit errors and small functions. Example: `async function l
 - [ ] Runtime download verification, model import/download progress, cancellation, disk-space checks, useful load errors, logs and memory/performance measurement.
 - [ ] All 14 presets: Linear, Notion, Sentry, DeepWiki, Exa, Parallel Web, GitHub, Tavily, Bright Data, Supabase, Stripe, Confluence, Jira, PostHog. Connection test, tool discovery, auth refresh/disconnect, per-chat selection and actual tool calls.
 - [ ] All 13 skills: algorithmic-art, skill-creator, mcp-builder, web-artifacts-builder, tavily-research, supabase, wiki-architect, wiki-qa, linear, gh-fix-ci, notion-knowledge-capture, sentry, jupyter-notebook. Install/remove/update, pinned provenance, inspect content, dependency status, activation and real execution workflows.
-- [ ] Local and Daytona execution with timeouts, cancellation, bounded output, workspace restrictions and explicit approvals; file and artifact previews.
+- [ ] Local and Daytona execution with timeouts, cancellation, bounded output, workspace restrictions and the selected permission policy; file and artifact previews.
+- [x] Per-conversation Ask for approval, Auto-approve reads and Full access modes, with visible scope, durable settings and audited authorization.
 - [ ] Credential protection, IPC input validation, CSP, hostile content handling, permission boundaries and no secrets in logs or prompts.
 - [ ] Polished light/dark interface, keyboard navigation, responsive layout, useful empty/loading/error states, readable Markdown/code/tables.
 - [ ] Automated unit/integration tests plus browser and native acceptance tests; GPU benchmark and release install/uninstall verification recorded.

@@ -100,6 +100,10 @@ enum ToolBackend {
     Workspace(Arc<crate::workspace::Workspace>),
 }
 impl AgentTool {
+    pub fn trusted_read(&self) -> bool {
+        matches!(&self.backend, ToolBackend::Workspace(_))
+            && matches!(self.tool.name.as_str(), "read_file" | "list_files")
+    }
     pub fn execution(execution: Arc<crate::execution::LocalExecution>, tool: ToolView) -> Self {
         Self {
             connector: "Local execution".into(),
@@ -447,6 +451,21 @@ pub fn cancel_connector_sign_in(state: tauri::State<'_, crate::AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_known_workspace_reads_qualify_for_automatic_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(
+            crate::workspace::Workspace::open(directory.path().to_str().unwrap()).unwrap(),
+        );
+        let tools = workspace.tools();
+        assert_eq!(tools.iter().filter(|tool| tool.trusted_read()).count(), 2);
+        for tool in tools {
+            assert_eq!(
+                tool.trusted_read(),
+                matches!(tool.tool.name.as_str(), "read_file" | "list_files")
+            );
+        }
+    }
     #[test]
     fn aliases_are_stable_bounded_and_distinguish_sanitization_collisions() {
         let alias = tool_alias("deepwiki", "read_wiki_structure");

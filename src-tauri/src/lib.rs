@@ -7,6 +7,7 @@ mod export;
 mod hardware;
 mod history;
 mod oauth;
+mod permissions;
 mod runtime;
 mod runtime_config;
 mod skills;

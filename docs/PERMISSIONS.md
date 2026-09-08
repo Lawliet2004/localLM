@@ -1,0 +1,19 @@
+# Tool permissions
+
+Each conversation has a **Permissions** selector above the chat:
+
+| Mode | Behavior |
+| --- | --- |
+| Ask for approval | Every selected tool action requires an Allow once or Deny decision. |
+| Auto-approve reads | Built-in workspace `read_file` and `list_files` run automatically. Writes, local code and all connector calls still ask. |
+| Full access | All selected tools run without approval prompts, including local code and connector actions that may change external data. |
+
+Denying a request blocks further tool use for the remainder of that turn, including other calls in the same batch. The model may still give a written response. A new message starts a fresh turn.
+
+New conversations start in Ask for approval. A saved conversation remembers its own mode. Older saved conversations also default to Ask. Changing modes during generation is disabled: stop the response before changing permissions.
+
+Full access changes approval behavior, not tool selection. It does not install tools, enable connectors, supply account credentials, or remove tool argument checks, workspace file boundaries, output limits, cancellation and timeouts. Local execution runs with your Windows account's filesystem and network permissions and is not sandboxed. In Full access it runs without a code-review prompt.
+
+Auto-approve reads uses an explicit native policy, not an AI reviewer. Tool descriptions and server-provided claims do not grant automatic approval. Skills and model messages cannot change the conversation's permission mode.
+
+Every tool audit records its permission mode, allow/deny decision, authorization source, arguments and result. An automatically approved operation can still fail; approval is not a success guarantee.

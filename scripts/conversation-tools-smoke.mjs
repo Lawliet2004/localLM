@@ -25,11 +25,11 @@ try {
   await page.getByRole('button', { name: `Tool settings A ${suffix}`, exact: true }).click();
   let group = await openTools();
   await group.getByRole('checkbox', { name: 'read_wiki_structure', exact: true }).click();
-  await expect.poll(() => invoke('get_conversation_tools', { id: chats[0].id })).toEqual({ sources: [], tools: [{ connectorId: 'deepwiki', toolName: 'read_wiki_structure' }] });
+  await expect.poll(() => invoke('get_conversation_tools', { id: chats[0].id })).toEqual({ accessMode: 'ask', sources: [], tools: [{ connectorId: 'deepwiki', toolName: 'read_wiki_structure' }] });
   await page.getByRole('button', { name: `Tool settings B ${suffix}`, exact: true }).click();
   await expect(group.getByRole('checkbox', { name: 'read_wiki_structure', exact: true })).not.toBeChecked();
   await group.getByRole('checkbox', { name: 'ask_question', exact: true }).click();
-  await expect.poll(() => invoke('get_conversation_tools', { id: chats[1].id })).toEqual({ sources: [], tools: [{ connectorId: 'deepwiki', toolName: 'ask_question' }] });
+  await expect.poll(() => invoke('get_conversation_tools', { id: chats[1].id })).toEqual({ accessMode: 'ask', sources: [], tools: [{ connectorId: 'deepwiki', toolName: 'ask_question' }] });
   await page.reload();
   await page.getByRole('button', { name: `Tool settings A ${suffix}`, exact: true }).click();
   group = await openTools();
@@ -46,4 +46,3 @@ try {
   await page.reload();
   await browser.close();
 }
-

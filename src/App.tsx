@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Check, ChevronDown, Download, PanelLeftOpen, Pencil, Trash2, X } from 'lucide-react';
 import { confirm, save } from '@tauri-apps/plugin-dialog';
 import { api, errorMessage, nativeAvailable } from './lib/api';
-import { defaultRuntimeConfig, type Bootstrap, type Message, type ToolApproval, type ToolSelection } from './lib/types';
+import { defaultRuntimeConfig, type Bootstrap, type Message, type ToolApproval, type ToolSelection, type AccessMode } from './lib/types';
 import { Sidebar, type Page } from './components/Sidebar';
 import { Chat } from './components/Chat';
 import { Models } from './components/Models';
@@ -20,6 +20,7 @@ const initialData: Bootstrap = {
 
 export default function App() {
   const [selectedConnectors, setSelectedConnectors] = useState<string[]>([]);
+  const [accessMode, setAccessMode] = useState<AccessMode>('ask');
   const [selectedTools, setSelectedTools] = useState<ToolSelection[]>([]);
   const [approval, setApproval] = useState<ToolApproval | null>(null);
   const [data, setData] = useState(initialData);
@@ -44,14 +45,14 @@ export default function App() {
   const busy = generating || modelBusy || loading || savingTools || exporting;
   function newConversation() {
     selection.current++; setActiveId(null); setMessages([]); setPage('chat'); setError(''); setRenaming(false);
-    setSelectedConnectors([]); setSelectedTools([]);
+    setSelectedConnectors([]); setSelectedTools([]); setAccessMode('ask');
   }
-  async function changeTools(sources: string[], tools: ToolSelection[]) {
+  async function changeTools(sources: string[], tools: ToolSelection[], mode: AccessMode = accessMode) {
     if (busy || toolSave.current) return;
     toolSave.current = true; setSavingTools(true); setError('');
     try {
-      if (activeId) await api.saveConversationTools(activeId, { sources, tools });
-      setSelectedConnectors(sources); setSelectedTools(tools);
+      if (activeId) await api.saveConversationTools(activeId, { sources, tools, accessMode: mode });
+      setSelectedConnectors(sources); setSelectedTools(tools); setAccessMode(mode);
     } catch (e) { setError(errorMessage(e)); }
     finally { toolSave.current = false; setSavingTools(false); }
   }
@@ -75,10 +76,10 @@ export default function App() {
     if (busy || toolSave.current) return;
     const version = ++selection.current;
     setPage('chat'); setActiveId(id); setLoading(true); setError(''); setRenaming(false);
-    setMessages([]); setSelectedConnectors([]); setSelectedTools([]);
+    setMessages([]); setSelectedConnectors([]); setSelectedTools([]); setAccessMode('ask');
     try {
       const [next, tools] = await Promise.all([api.messages(id), api.conversationTools(id)]);
-      if (version === selection.current) { setMessages(next); setSelectedConnectors(tools.sources); setSelectedTools(tools.tools); }
+      if (version === selection.current) { setMessages(next); setSelectedConnectors(tools.sources); setSelectedTools(tools.tools); setAccessMode(tools.accessMode || 'ask'); }
     }
     catch (e) { if (version === selection.current) { setError(errorMessage(e)); setActiveId(null); } }
     finally { if (version === selection.current) setLoading(false); }
@@ -93,7 +94,7 @@ export default function App() {
         const conversation = await api.createConversation(); id = conversation.id;
         setActiveId(id); setData(current => ({ ...current, conversations: [conversation, ...current.conversations] }));
       }
-      await api.saveConversationTools(id, { sources: selectedConnectors, tools: selectedTools });
+      await api.saveConversationTools(id, { sources: selectedConnectors, tools: selectedTools, accessMode });
       const conversationId = id;
       setMessages(current => [...current, { id: 'pending-user', conversationId, role: 'user', content, reasoning: '', status: 'complete', createdAt: Date.now() }]);
       await api.sendMessage(conversationId, content, event => { if ('approval' in event) setApproval(event.approval || null); setMessages(current => {
@@ -157,7 +158,7 @@ export default function App() {
       {!nativeAvailable && <div className="preview-banner">Browser preview · Open the desktop application to load models and save conversations.</div>}
       {exportedPath && <div className="preview-banner" role="status">Saved conversation to {exportedPath}<button className="icon-button" aria-label="Dismiss export confirmation" onClick={() => setExportedPath('')}><X size={16} /></button></div>}
       {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
-      {page === 'chat' && <ToolPicker selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} busy={busy} />}
+      {page === 'chat' && <ToolPicker accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} busy={busy} />}
       {page === 'chat' ? <Chat messages={messages} generating={generating} ready={nativeAvailable && data.runtime.phase === 'ready'} loading={loading} disabled={savingTools || exporting} onSend={send} onCancel={() => { void api.cancelGeneration().catch(e => setError(errorMessage(e))); }} onConfigure={() => setPage('models')} /> : page === 'models' ? <Models config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveConfig={async config => { try { await api.saveConfig(config); setData(current => ({ ...current, config })); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(current => ({ ...current, preferences })); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
     </main>
   </div>;
