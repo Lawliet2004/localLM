@@ -328,3 +328,9 @@ The native build and smoke passed. The indicator remains session-local and repor
 Added Retry last prompt after an errored or interrupted assistant response. The action sends the original prompt as a new turn through the existing permission-controlled send path, preserves previous messages/tool audits and leaves an unsent draft intact. Its copy explicitly states that enabled tool actions may run again. Active operations disable retry and the submission guard prevents duplicate calls.
 
 All 27 frontend tests and the production build passed. The new regression checks exact prompt reuse, draft preservation and retained partial output. Native retry acceptance remains outstanding. This is a new-turn retry; alternate response branches and history compaction remain separate unfinished work.
+
+### Native retry acceptance
+
+The native retry smoke sent a prompt, stopped it after context preflight, verified the stored assistant status was interrupted, then retried with an unrelated unsent draft present. The second attempt completed with 42. The entire original message prefix was unchanged, both user prompts were stored, and the draft remained intact. The test restored preferences/load state and removed its conversation/draft.
+
+The smoke passed. This verifies new-turn retry for an interrupted response; tool-side-effect retry behavior remains governed by the existing permission policy and is not newly proven by this arithmetic test.
