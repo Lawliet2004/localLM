@@ -41,3 +41,10 @@ The app now opens a separate daytona.sqlite journal in its data directory. Recor
 
 A read-only native command exposes pending records to the Execution page. Reopen tests verify unknown creation outcomes and failed cleanup remain, conflicting sandbox association fails, and mismatched scopes cannot clear ownership. UI tests verify pending errors and journal-read failures are visible. The native empty-journal/page check passed. The journal is infrastructure for the upcoming lifecycle manager: automated recovery and actual cloud execution are not yet wired.
 
+
+## Cleanup recovery engine
+
+The recovery engine validates the credential scope locally, inspects the saved sandbox ID (or operation name for an ambiguous creation), and requires the returned name/ownership label/known ID to match. It persists a discovered ID before DELETE. It then polls for absence, with a 60-second overall deadline. Failed or interrupted deletion retains the record; acceptance of DELETE does not acknowledge cleanup. An unknown creation that is not yet visible remains unresolved rather than being cleared prematurely.
+
+Tests cover successful deletion, ownership mismatch, API failure, unresolved creation and scope mismatch. A cancellation test interrupts deletion after association and reopens SQLite to verify identity survives. This engine is not yet called automatically or from a recovery button; credential integration and lifecycle wiring remain next.
+

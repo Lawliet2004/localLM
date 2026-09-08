@@ -17,6 +17,8 @@ pub struct Client {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sandbox {
+    #[serde(default)]
+    pub labels: std::collections::HashMap<String, String>,
     pub id: String,
     pub name: String,
     pub state: Option<String>,

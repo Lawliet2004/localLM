@@ -199,3 +199,10 @@ Added a SQLite journal independent of conversation storage, initialized by nativ
 
 Two journal tests pass (59 Rust tests now exist), all 19 frontend tests pass, strict Clippy, native build and frontend build pass. The rebuilt native app returned an empty journal and opened Execution without an alert. Lifecycle orchestration, credential settings, automatic cleanup recovery and the executable Daytona tool still remain.
 
+
+### Ownership-checked Daytona cleanup recovery
+
+Implemented the recovery engine over the native transport and durable journal. It validates credential scope, remote name/ownership label and known sandbox ID before deletion; associates discovered identity before mutation; and only removes ownership after confirmed absence. Unknown creation with no visible sandbox remains recorded. Cleanup has a 60-second deadline and retains errors for retry.
+
+All six Daytona tests passed before adding the cancellation test; both final cleanup tests and strict Clippy passed afterward (61 Rust tests now exist). Fixtures cover success, mismatched ownership, server failure, unresolved creation, wrong scope and cancellation during deletion followed by database reopening. No real cloud calls occurred. Credential UI, recovery-button/automatic startup wiring and the cloud execution lifecycle are still incomplete.
+
