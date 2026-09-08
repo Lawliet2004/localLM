@@ -370,3 +370,9 @@ Both process tests and strict Clippy passed. A real Node stdio fixture negotiate
 Added a Windows integration fixture that starts a persistent Node server and its child process, then opens process handles while both are alive. It verifies both handles signal termination after explicit session close, session drop, cancellation during handshake, and handshake timeout. The deadline is privately injectable for testing; production remains 30 seconds. This directly checks process termination rather than relying on missing marker files or process-ID lookup after exit.
 
 All three local MCP process tests and strict Clippy passed. The initial test compilation required replacing unwrap_err with a pattern assertion because sessions intentionally have no Debug implementation. Hub/UI integration, malformed protocol handling and non-Windows lifecycle acceptance remain outstanding; no full custom-connector completion claim is made.
+
+### Local MCP hub integration
+
+The connector hub now lists saved local servers, explicitly launches their owned sessions, discovers tools through the shared bounded pagination path, and exposes exact selections through the existing MCP agent backend. Local disconnect closes the session/process ownership. Editing, removal and reconnect require explicit disconnect while a session is retained, including a closed protocol whose process may still exist. Local discovery errors omit raw server error text. Local tools never qualify as trusted workspace reads based on their names.
+
+Seven connector tests and strict Clippy passed after fixing a test-only clone lint. The new real Node fixture verifies save/list/connect/discovery, exact selection, denial of editing/removal while connected, read-name permission isolation, disconnect and removal. Native UI configuration, human-readable local names throughout chat, tool-call acceptance and full local connector end-to-end verification remain outstanding.

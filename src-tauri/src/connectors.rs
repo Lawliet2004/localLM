@@ -57,8 +57,47 @@ pub struct ConnectorView {
     pub tools: Vec<ToolView>,
 }
 struct Connection {
-    service: RunningService<RoleClient, ()>,
+    service: ConnectorSession,
     tools: Vec<ToolView>,
+}
+enum ConnectorSession {
+    Remote(RunningService<RoleClient, ()>),
+    Local(crate::local_mcp_process::LocalSession),
+}
+impl std::ops::Deref for ConnectorSession {
+    type Target = RunningService<RoleClient, ()>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Remote(service) => service,
+            Self::Local(session) => &session.service,
+        }
+    }
+}
+impl ConnectorSession {
+    async fn cancel(self) -> Result<(), String> {
+        match self {
+            Self::Remote(service) => service
+                .cancel()
+                .await
+                .map(|_| ())
+                .map_err(|_| "Could not close the connector session cleanly.".into()),
+            Self::Local(session) => {
+                session.close().await;
+                Ok(())
+            }
+        }
+    }
+}
+fn local_view(server: &crate::local_mcp_config::LocalServer) -> ConnectorView {
+    ConnectorView {
+        id: server.id.clone(),
+        description: server.name.clone(),
+        url: String::new(),
+        auth_type: "local".into(),
+        connected: false,
+        has_credential: false,
+        tools: Vec::new(),
+    }
 }
 pub struct McpHub {
     connections: HashMap<String, Connection>,
@@ -299,8 +338,15 @@ impl McpHub {
     }
     pub fn list(&self) -> Result<Vec<ConnectorView>, String> {
         let mut items = presets();
+        items.extend(
+            crate::local_mcp_config::load(&self.vault)?
+                .iter()
+                .map(local_view),
+        );
         for item in &mut items {
-            item.has_credential = if item.auth_type == "oauth" {
+            item.has_credential = if item.auth_type == "local" {
+                false
+            } else if item.auth_type == "oauth" {
                 self.vault.load(&format!("oauth-{}", item.id))?.is_some()
             } else {
                 self.token(&item.id)?.is_some()
@@ -321,11 +367,7 @@ impl McpHub {
             .collect())
     }
     pub fn save_local(&self, server: crate::local_mcp_config::LocalServer) -> Result<(), String> {
-        if self
-            .connections
-            .get(&server.id)
-            .is_some_and(|connection| !connection.service.is_closed())
-        {
+        if self.connections.contains_key(&server.id) {
             return Err("Disconnect the local server before editing its configuration.".into());
         }
         server.validate()?;
@@ -338,11 +380,7 @@ impl McpHub {
         crate::local_mcp_config::save(&self.vault, &servers)
     }
     pub fn remove_local(&self, id: &str) -> Result<(), String> {
-        if self
-            .connections
-            .get(id)
-            .is_some_and(|connection| !connection.service.is_closed())
-        {
+        if self.connections.contains_key(id) {
             return Err("Disconnect the local server before removing its configuration.".into());
         }
         let mut servers = crate::local_mcp_config::load(&self.vault)?;
@@ -354,8 +392,21 @@ impl McpHub {
         crate::local_mcp_config::save(&self.vault, &servers)
     }
     pub async fn connect(&mut self, id: &str) -> Result<ConnectorView, String> {
-        let mut item = preset(id)?;
-        let secret = self.token(id)?;
+        let local = crate::local_mcp_config::load(&self.vault)?
+            .into_iter()
+            .find(|server| server.id == id);
+        let mut item = match &local {
+            Some(server) => local_view(server),
+            None => preset(id)?,
+        };
+        if local.is_some() && self.connections.contains_key(id) {
+            return Err("Disconnect the local server before reconnecting.".into());
+        }
+        let secret = if local.is_some() {
+            None
+        } else {
+            self.token(id)?
+        };
         if item.auth_type == "apiKey" && secret.is_none() {
             return Err("Add an API token before connecting.".into());
         }
@@ -371,12 +422,17 @@ impl McpHub {
             config = config.auth_header(secret);
         }
         let redact = |error: String| {
+            if local.is_some() {
+                return "Local connector discovery failed. Check its MCP tool catalog.".into();
+            }
             secret
                 .as_ref()
                 .map(|secret| error.replace(secret, "[redacted]"))
                 .unwrap_or(error)
         };
-        let service = if item.auth_type == "oauth" {
+        let service = if let Some(server) = &local {
+            ConnectorSession::Local(crate::local_mcp_process::connect(server).await?)
+        } else if item.auth_type == "oauth" {
             let mut manager = crate::oauth::manager(id, &item.url, self.vault.clone()).await?;
             if !manager
                 .initialize_from_store()
@@ -387,19 +443,23 @@ impl McpHub {
             }
             let client = rmcp::transport::auth::AuthClient::new(client, manager);
             let transport = StreamableHttpClientTransport::with_client(client, config);
-            tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
-                .await
-                .map_err(|_| "Connector handshake timed out.")?
-                .map_err(|_| {
-                    "Authorized connection failed. Check account access or sign in again."
-                        .to_string()
-                })?
+            ConnectorSession::Remote(
+                tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
+                    .await
+                    .map_err(|_| "Connector handshake timed out.")?
+                    .map_err(|_| {
+                        "Authorized connection failed. Check account access or sign in again."
+                            .to_string()
+                    })?,
+            )
         } else {
             let transport = StreamableHttpClientTransport::with_client(client, config);
-            tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
-                .await
-                .map_err(|_| "Connector handshake timed out.")?
-                .map_err(|error| redact(format!("Could not connect: {error}")))?
+            ConnectorSession::Remote(
+                tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
+                    .await
+                    .map_err(|_| "Connector handshake timed out.")?
+                    .map_err(|error| redact(format!("Could not connect: {error}")))?,
+            )
         };
         let result = tokio::time::timeout(
             Duration::from_secs(30),
@@ -463,7 +523,12 @@ impl McpHub {
         Ok(item)
     }
     pub async fn disconnect(&mut self, id: &str, forget: bool) -> Result<(), String> {
-        preset(id)?;
+        let local = crate::local_mcp_config::load(&self.vault)?
+            .iter()
+            .any(|server| server.id == id);
+        if !local {
+            preset(id)?;
+        }
         if let Some(connection) = self.connections.remove(id) {
             connection
                 .service
@@ -471,7 +536,7 @@ impl McpHub {
                 .await
                 .map_err(|_| "Could not close the connector session cleanly.")?;
         }
-        if forget {
+        if forget && !local {
             self.vault.clear(&format!("token-{id}"))?;
             self.vault.clear(&format!("oauth-{id}"))?;
         }
@@ -561,6 +626,73 @@ pub fn cancel_connector_sign_in(state: tauri::State<'_, crate::AppState>) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn local_server_discovery_selection_and_disconnect_use_the_hub() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fixture.cjs");
+        std::fs::write(&script, r#"
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+ const r = JSON.parse(line); if (r.id === undefined) return;
+ const result = r.method === 'initialize'
+ ? {protocolVersion:r.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}
+ : {tools:[{name:'read_file',description:'fixture',inputSchema:{type:'object'}}]};
+ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\n');
+});
+"#).unwrap();
+        let mut hub = super::McpHub::new(std::sync::Arc::new(crate::vault::Vault::new(
+            temp.path().join("vault"),
+        )));
+        let server = crate::local_mcp_config::LocalServer {
+            id: format!("local-{}", uuid::Uuid::new_v4()),
+            name: "Fixture".into(),
+            executable: crate::execution::ExecutionConfig::default().node_path,
+            arguments: vec![script.to_string_lossy().into_owned()],
+            working_directory: temp.path().to_string_lossy().into_owned(),
+            environment: Default::default(),
+        };
+        hub.save_local(server.clone()).unwrap();
+        assert!(
+            !hub.list()
+                .unwrap()
+                .iter()
+                .find(|item| item.id == server.id)
+                .unwrap()
+                .connected
+        );
+        let view = hub.connect(&server.id).await.unwrap();
+        assert!(view.connected);
+        assert_eq!(view.tools.len(), 1);
+        assert_eq!(view.auth_type, "local");
+        assert!(hub.save_local(server.clone()).is_err());
+        assert!(hub.remove_local(&server.id).is_err());
+        let tools = hub
+            .selected_tools(
+                &[],
+                &[super::ToolSelection {
+                    connector_id: server.id.clone(),
+                    tool_name: "read_file".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(
+            !tools[0].trusted_read(),
+            "server names must not grant read auto-approval"
+        );
+        hub.disconnect(&server.id, false).await.unwrap();
+        assert!(hub
+            .selected_tools(std::slice::from_ref(&server.id), &[])
+            .is_err());
+        assert!(
+            !hub.list()
+                .unwrap()
+                .iter()
+                .find(|item| item.id == server.id)
+                .unwrap()
+                .connected
+        );
+        hub.remove_local(&server.id).unwrap();
+    }
     #[test]
     fn local_configuration_crud_keeps_secrets_out_of_summaries() {
         let temp = tempfile::tempdir().unwrap();
