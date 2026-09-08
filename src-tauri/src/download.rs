@@ -4,6 +4,52 @@ use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 use tokio::{io::AsyncWriteExt, sync::watch};
 
+pub async fn verify_file(
+    path: &Path,
+    asset: &Asset<'_>,
+    mut cancel: watch::Receiver<bool>,
+    mut progress: impl FnMut(u64),
+) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    if *cancel.borrow() {
+        return Err("Download cancelled.".into());
+    }
+    let work = async {
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let metadata = file.metadata().await.map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.len() != asset.bytes {
+            return Err("Existing model has an unexpected size. It was not modified.".into());
+        }
+        let mut hash = Sha256::new();
+        let mut read = 0_u64;
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .await
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            read += count as u64;
+            if read > asset.bytes {
+                return Err("Model changed during verification.".into());
+            }
+            hash.update(&buffer[..count]);
+            progress(read);
+        }
+        if read != asset.bytes
+            || !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(asset.sha256)
+        {
+            return Err("Existing model failed SHA-256 verification. It was not modified.".into());
+        }
+        Ok(())
+    };
+    tokio::select! { biased; _ = cancel.changed() => Err("Download cancelled.".into()), result = work => result }
+}
+
 pub struct Asset<'a> {
     pub url: &'a str,
     pub bytes: u64,
@@ -156,6 +202,30 @@ pub async fn fetch(
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+    #[tokio::test]
+    async fn existing_file_verification_rejects_corruption_without_modifying_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("model");
+        tokio::fs::write(&path, b"fixture").await.unwrap();
+        let (_sender, receiver) = watch::channel(false);
+        let hash = format!("{:x}", Sha256::digest(b"fixture"));
+        let asset = Asset {
+            url: "unused",
+            bytes: 7,
+            sha256: &hash,
+        };
+        let mut progress = 0;
+        verify_file(&path, &asset, receiver.clone(), |bytes| progress = bytes)
+            .await
+            .unwrap();
+        assert_eq!(progress, 7);
+        tokio::fs::write(&path, b"corrupt").await.unwrap();
+        assert!(verify_file(&path, &asset, receiver, |_| {})
+            .await
+            .unwrap_err()
+            .contains("SHA-256"));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"corrupt");
+    }
     #[tokio::test]
     async fn storage_and_transport_preflight_fail_without_creating_files() {
         let temp = tempfile::tempdir().unwrap();

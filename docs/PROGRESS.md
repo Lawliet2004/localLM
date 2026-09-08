@@ -246,3 +246,9 @@ This core is not yet exposed through IPC or the model setup UI. Pinned asset cat
 Added destination-volume free-space checks via the Windows API, using bytes available to the current account and a 256 MiB reserve. The downloader refuses insufficient space before creating a temporary file or contacting the service. Added a production HTTPS-only client with bounded redirects, connection and total transfer time. The model catalog fixes the known MiniCPM5 Q6_K URL, byte length and hash; a native read-only metadata command reports its application-managed destination, existence (not verification), available space and requirements.
 
 All three download regression tests and strict Clippy pass. New coverage checks real Windows space queries, a missing directory, arithmetic overflow, insufficient-space refusal without file creation and HTTP rejection by the production client. No model transfer was started. Installation commands, progress UI, existing-file verification, runtime archive handling and native catalog acceptance remain open.
+
+### Native managed-model installer
+
+Added install/status/cancel IPC commands around the pinned model. Concurrent installation is refused; progress and outcomes remain queryable in application state across UI navigation. Existing managed files are verified by streaming size/hash checks and never overwritten on mismatch. A dropped installation future releases busy state with an interrupted outcome. Installation returns the verified path without silently changing model preferences.
+
+All 69 Rust tests and strict Clippy passed. New tests verify valid existing files, same-size corruption preservation, and interrupted-versus-completed state cleanup. The commands have not yet been exercised through the native UI; frontend controls, startup partial-file recovery, runtime archive installation and complete network download acceptance remain outstanding. No full model download was started.

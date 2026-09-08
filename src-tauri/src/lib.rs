@@ -14,6 +14,7 @@ mod export;
 mod hardware;
 mod history;
 mod model_catalog;
+mod model_install;
 mod oauth;
 mod permissions;
 mod runtime;
@@ -30,6 +31,7 @@ use std::sync::Mutex;
 use tauri::Manager;
 
 pub struct AppState {
+    model_installer: model_install::Installer,
     daytona_vault: std::sync::Arc<vault::Vault>,
     daytona_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
     daytona_journal: std::sync::Arc<Mutex<daytona_journal::Journal>>,
@@ -79,6 +81,7 @@ pub fn run() {
                 store::Store::open(&data.join("locallm.sqlite")).map_err(std::io::Error::other)?;
             let vault = std::sync::Arc::new(vault::Vault::new(data.join("credentials")));
             app.manage(AppState {
+                model_installer: model_install::Installer::default(),
                 daytona_vault: vault.clone(),
                 daytona_operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 daytona_journal: std::sync::Arc::new(Mutex::new(
@@ -134,6 +137,9 @@ pub fn run() {
             commands::runtime_status,
             runtime_log::read_runtime_log,
             model_catalog::model_download_info,
+            model_install::model_install_status,
+            model_install::install_model,
+            model_install::cancel_model_install,
             chat::send_message,
             chat::cancel_generation,
             approval::resolve_tool_approval,
