@@ -288,3 +288,9 @@ All 24 frontend tests, production frontend build, native debug build, the instal
 The native UI downloaded both pinned GitHub CUDA archives (645,512,786 bytes combined), verified them, extracted the complete bundle and published a new managed runtime. The initial smoke stopped after successful selection because its exact field-label matcher excluded the input help text. The corrected script resumed the already completed installation with --reuse-installed; no repeat download occurred.
 
 The installed executable loaded MiniCPM5-2B Q6_K and reported 43/43 layers offloaded with the saved 8192 context and q8_0 K/V settings. Original preferences and model load state were restored. The managed runtime remains installed at the path recorded in test-results/runtime-install-smoke.json. The README now describes in-app setup. Full model network-transfer acceptance, native cancellation, crash recovery and installation inventory remain open; this is runtime download-to-GPU-load evidence, not full product completion.
+
+### Installed runtime inventory after restart
+
+Added a bounded native inventory of published versioned runtime directories. It ignores staging/unrelated entries, checks each pinned filename and size through a capability directory, and marks incomplete installations unavailable for selection. The UI exposes existing installations separately from the current in-memory install status and explicitly states that this inventory does not recheck hashes.
+
+The inventory fixture, strict Clippy, all 24 frontend tests, frontend build and native build passed. After restarting the native app, runtime-inventory-smoke discovered the runtime installed in the previous acceptance test, selected it into the draft and verified saved preferences remained unchanged. Crash partial-file recovery, integrity revalidation and uninstall management remain open.

@@ -22,6 +22,7 @@ pub mod runtime_archive;
 mod runtime_config;
 pub mod runtime_install;
 mod runtime_install_commands;
+mod runtime_inventory;
 mod runtime_log;
 mod skills;
 mod sse;
@@ -145,6 +146,7 @@ pub fn run() {
             runtime_log::read_runtime_log,
             model_catalog::model_download_info,
             runtime_install_commands::runtime_download_info,
+            runtime_inventory::list_installed_runtimes,
             runtime_install_commands::runtime_install_status,
             runtime_install_commands::install_runtime,
             runtime_install_commands::cancel_runtime_install,

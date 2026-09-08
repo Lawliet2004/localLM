@@ -8,6 +8,13 @@ export function RuntimeDownload({ busy, onSelect }: { busy: boolean; onSelect: (
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [revision, setRevision] = useState(0);
+  const [installed, setInstalled] = useState<Awaited<ReturnType<typeof api.listInstalledRuntimes>>>([]);
+  useEffect(() => {
+    if (!nativeAvailable) return;
+    let disposed = false;
+    api.listInstalledRuntimes().then(value => { if (!disposed) setInstalled(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
+    return () => { disposed = true; };
+  }, [revision]);
   const version = useRef(0);
   useEffect(() => {
     if (!nativeAvailable) return;
@@ -42,5 +49,6 @@ export function RuntimeDownload({ busy, onSelect }: { busy: boolean; onSelect: (
       {active && <button type="button" className="secondary" disabled={cancelling} onClick={async () => { setCancelling(true); try { await api.cancelRuntimeInstall(); } catch (e) { setError(errorMessage(e)); } finally { setCancelling(false); } }}>Cancel runtime installation</button>}
       {!active && status?.phase === 'ready' && status.path && <button type="button" className="primary" disabled={busy} onClick={() => onSelect(status.path!)}>Use installed runtime</button>}</div>
     {!active && status?.phase === 'ready' && <p role="status">Runtime installed. Select it, then save settings to use it.</p>}
+    {installed.length > 0 && <details><summary>Installed runtimes ({installed.length})</summary><p>Checks file presence and sizes; does not recheck file hashes.</p>{installed.map(item => <div key={item.id}><p className="download-path">{item.id}</p>{item.problem && <p>{item.problem}</p>}<button type="button" className="secondary" disabled={busy || active || !item.complete} onClick={() => onSelect(item.path)}>Select {item.id.slice(-8)}</button></div>)}</details>}
   </section>;
 }
