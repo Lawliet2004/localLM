@@ -28,7 +28,7 @@ export interface Preferences {
   runtimePath: string; modelPath: string; temperature: number; topP: number; maxTokens: number;
   systemPrompt: string;
 }
-export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null }
+export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null }
 export interface Bootstrap { conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus }
 export interface ToolApproval { id: string; connector: string; name: string; arguments: Record<string, unknown> }
 export interface ChatEvent { messageId: string; content: string; reasoning: string; approval?: ToolApproval | null }
@@ -42,3 +42,8 @@ export interface SkillView {
   files: { path: string; size: number; sha256: string }[]; installed: boolean; active: boolean;
 }
 export interface ExecutionConfig { pythonPath: string; nodePath: string; powershellPath: string }
+export interface HardwareStatus {
+  logicalCpus: number; memoryTotalBytes: number | null; memoryAvailableBytes: number | null;
+  gpuStatus: string; sampledAt: number;
+  gpus: { name: string; uuid: string; memoryUsedMib: number | null; memoryTotalMib: number | null; utilizationPercent: number | null; driverVersion: string }[];
+}

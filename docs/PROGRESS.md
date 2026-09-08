@@ -57,3 +57,10 @@ Vite was started on 127.0.0.1:1420. A debug native app was launched with WebView
 - 29 Rust tests and strict lint passed. Existing frontend and browser checks passed.
 - `node scripts/execution-smoke.mjs`: real MiniCPM/native approval -> Python -> data file sum 54, confirmed from persisted stdout/exit status. Denied code made no file. Cancellation after a started marker prevented the script's delayed write and persisted an interrupted tool record.
 - Remaining execution work: Daytona, configurable dependencies and skill script workflows, live output/progress, artifacts and previews, per-chat permissions, longer-running jobs, and fuller recovery tests. CPU/memory limits beyond time/output are not implemented for local processes.
+## Verified hardware telemetry and loaded settings
+- Models page displays NVIDIA device name, driver, device-wide VRAM/utilization, logical CPU count and available physical RAM. Native queries have timeout/output bounds. Missing readings remain unavailable rather than zero. Polling runs only on the visible Models page.
+- Runtime status retains the configuration used for the current model load, separately from saved settings. UI describes GPU layers as requested settings, not a fabricated measured layer count.
+- 31 Rust tests passed, including multi-device telemetry, unsupported fields and inconsistent driver data. Frontend tests, browser checks, build and strict Rust lint passed.
+- `node scripts/hardware-smoke.mjs`: actual RTX 2050 utilization sampled at 21–97% during generation, with 2047 MiB used of 4096 MiB. A second run sampled 69–97%. UI and progress bar inspected in native WebView2. Readings are device-wide, not process-specific attribution.
+- Saved CPU-only configuration while GPU model remained loaded, verified loadedConfig still reported -1 GPU layers, then restored saved configuration. No false implication that settings apply without reloading.
+- Remaining runtime work includes actual per-layer placement, model-specific memory/timing metrics, download management, context budgeting and broader backend/fallback checks.

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Cpu, Play, Square } from 'lucide-react';
 import type { Preferences, RuntimeConfig, RuntimeStatus } from '../lib/types';
 import { RuntimeForm } from './RuntimeForm';
+import { HardwareStatus } from './HardwareStatus';
 import { open } from '@tauri-apps/plugin-dialog';
 
 interface Props {
@@ -18,6 +19,7 @@ export function Models({ config, preferences, runtime, busy, onSaveConfig, onSav
   return <div className="settings-page">
     <div className="page-heading"><p className="eyebrow">ON YOUR MACHINE</p><h1>Models & runtime</h1><p>Make the most of your hardware. Keep control of every response.</p></div>
     <div className="model-status"><div className="model-icon"><Cpu size={24} /></div><div><strong>{runtime.modelPath?.split(/[\\/]/).pop() || 'Your local model'}</strong><p><span className={`status-dot ${runtime.phase === 'ready' ? 'ready' : ''}`} />{runtime.message}</p></div>{runtime.phase === 'ready' ? <button className="secondary" disabled={busy} onClick={onUnload}><Square size={14} />Unload</button> : <button className="primary" disabled={busy || !preferences.modelPath || !preferences.runtimePath} onClick={onLoad}><Play size={14} />{busy ? 'Loading…' : 'Load model'}</button>}</div>
+    <HardwareStatus runtime={runtime} />
     <div className="tabs" role="tablist" aria-label="Model settings">{(['model','runtime','generation'] as const).map(value => <button role="tab" aria-selected={tab === value} key={value} onClick={() => { setTab(value); setNotice(''); }}>{value === 'model' ? 'Model files' : value === 'runtime' ? 'Runtime' : 'Generation'}</button>)}</div>
     {notice && <p className="success" role="status">{notice}</p>}
     {error && <p className="error" role="alert">{error}</p>}

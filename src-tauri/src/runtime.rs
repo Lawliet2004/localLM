@@ -14,6 +14,7 @@ pub struct RuntimeStatus {
     pub phase: String,
     pub message: String,
     pub model_path: Option<String>,
+    pub loaded_config: Option<RuntimeConfig>,
 }
 impl Default for RuntimeStatus {
     fn default() -> Self {
@@ -21,6 +22,7 @@ impl Default for RuntimeStatus {
             phase: "stopped".into(),
             message: "No model loaded".into(),
             model_path: None,
+            loaded_config: None,
         }
     }
 }
@@ -56,6 +58,7 @@ impl Runtime {
                             self.log_path.display()
                         ),
                         model_path: None,
+                        loaded_config: None,
                     };
                 }
                 Err(error) => {
@@ -140,6 +143,7 @@ impl Runtime {
             phase: "loading".into(),
             message: "Loading model into memory".into(),
             model_path: Some(model.to_string_lossy().into_owned()),
+            loaded_config: None,
         };
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -162,6 +166,7 @@ impl Runtime {
                     {
                         if health.status().is_success() {
                             self.context_length = config.context_length;
+                            self.status.loaded_config = Some(config.clone());
                             self.status.phase = "ready".into();
                             self.status.message = "Model ready".into();
                             return Ok(self.status.clone());
