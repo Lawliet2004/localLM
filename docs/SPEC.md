@@ -27,7 +27,7 @@ Ship a polished Windows desktop agent harness using Rust, TypeScript, React and 
 Use named types, explicit errors and small functions. Example: `async function loadModel(config: RuntimeConfig): Promise<RuntimeStatus>`. No fake connection success, fabricated metrics or silent failures.
 
 ## Acceptance checklist
-- [ ] Native application starts, closes cleanly, remembers window state, and packages into a Windows installer.
+- [x] Native application starts, closes cleanly, remembers window state, and packages into a Windows installer. Evidence: docs/DESKTOP.md and docs/RELEASE.md; broader release verification remains below.
 - [ ] Persistent conversations: create, rename, delete, search, stream, cancel, retry, copy and export; recover interrupted turns.
 - [ ] Verified MiniCPM5 Q6_K chat template, reasoning separation, XML/structured tool-call parsing, tool result continuation and bounded agent loops.
 - [ ] GPU detection and actual offload reporting; load/unload/reload; CPU fallback; context, GPU layers, CPU threads, K/V cache precision/placement, Flash Attention, batch sizes and generation parameters.

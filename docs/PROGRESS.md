@@ -155,3 +155,12 @@ Added the official Tauri single-instance and window-state plugins. Duplicate lau
 
 The native debug build and scripts/window-smoke.ps1 passed: exact window bounds survived restart, maximized state survived another restart, a second process exited while the original PID remained, and a minimized window was restored. Original geometry was restored after testing. Physical disconnected-monitor behavior and installer acceptance remain unverified. See docs/DESKTOP.md.
 
+
+### First optimized Windows installer verification
+
+The NSIS release build completed in 6m18s. Installer size is 3,412,952 bytes; the application executable is 10,120,704 bytes. The artifact is unsigned and excludes the separately prepared runtime/model. docs/RELEASE.md records its source commit, SHA-256 and verification limits.
+
+Silent current-user installation into a temporary folder succeeded. The installed bundled frontend loaded the actual model, answered 17 + 25 with 42, persisted a complete response and showed no JavaScript errors. Silent uninstall removed the installation and registry entry while leaving the database hash unchanged. The fixture now waits for NSIS's temporary uninstaller to finish cleanup. The debug app was reopened afterward. Production npm dependencies reported zero known vulnerabilities. The starter README was replaced with setup, privacy, troubleshooting and remaining-scope documentation.
+
+This proves the packaging/desktop checklist item, not production readiness. Clean-profile setup, signing, updates, account-specific connectors, downloads, execution providers and other full acceptance requirements remain open.
+
