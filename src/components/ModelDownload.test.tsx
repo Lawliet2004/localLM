@@ -8,6 +8,14 @@ vi.mock('../lib/api', () => ({ nativeAvailable: true, errorMessage: String, api:
   modelInstallStatus: fixtures.status,
 } }));
 const info = { filename: 'model.gguf', bytes: 100, requiredBytes: 200, availableBytes: 300, destinationExists: false, destination: 'C:/models/model.gguf', sha256: 'abc' };
+it('presents cancellation as a normal outcome and allows retry', async () => {
+  fixtures.info.mockResolvedValue(info);
+  fixtures.status.mockResolvedValue({ busy: false, phase: 'cancelled', received: 10, total: 100, path: null, error: 'Download cancelled.' });
+  render(<ModelDownload busy={false} onSelect={vi.fn()} />);
+  expect(await screen.findByRole('status')).toHaveTextContent('Installation cancelled');
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Download model' })).toBeEnabled();
+});
 it('requires an explicit selection after successful verification', async () => {
   fixtures.info.mockResolvedValue({ ...info, destinationExists: true });
   fixtures.status.mockResolvedValue({ busy: false, phase: '', received: 0, total: 0, path: null, error: null });

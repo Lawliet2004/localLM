@@ -104,8 +104,7 @@ pub async fn install_runtime(
             inner.0.path = Some(path.to_string_lossy().into_owned());
         }
         Err(error) => {
-            inner.0.phase = "failed".into();
-            inner.0.error = Some(error);
+            inner.0.fail(error);
         }
     }
     Ok(inner.0.clone())

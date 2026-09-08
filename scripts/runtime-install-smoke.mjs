@@ -22,7 +22,7 @@ try {
   await expect.poll(async () => {
     installed = await invoke('runtime_install_status');
     if (Date.now() - lastLog > 30000) { console.log(JSON.stringify(installed)); lastLog = Date.now(); }
-    return !installed.busy && ['ready', 'failed', 'interrupted'].includes(installed.phase);
+    return !installed.busy && ['ready', 'failed', 'interrupted', 'cancelled'].includes(installed.phase);
   }, { timeout: 7500000, intervals: [1000] }).toBe(true);
   if (installed.phase !== 'ready') throw new Error(installed.error || installed.phase);
   await panel.getByRole('button', { name: 'Use installed runtime' }).click();

@@ -38,7 +38,7 @@ export function ModelDownload({ busy, onSelect }: { busy: boolean; onSelect: (pa
     <p>Download the pinned GGUF from Hugging Face, or verify an existing managed copy. The file is checked against its SHA-256 before use.</p>
     {info && <><p>{gib(info.bytes)} download · {gib(info.availableBytes)} free · {gib(info.requiredBytes)} required including reserve</p><details><summary>File details</summary><p className="download-path">{info.destination}</p><code className="download-path">SHA-256: {info.sha256}</code></details></>}
     {insufficient && <p role="alert">Not enough disk space for this download.</p>}
-    {error && <p role="alert">{error}</p>}{status?.error && <p role="alert">{status.error}</p>}
+    {error && <p role="alert">{error}</p>}{status?.error && <p role={status.phase === 'cancelled' ? 'status' : 'alert'}>{status.phase === 'cancelled' ? 'Installation cancelled. You can try again when ready.' : status.error}</p>}
     {active && <div role="status"><p>{status?.phase === 'verifying' ? 'Verifying existing model' : 'Downloading model'} · {gib(status?.received ?? 0)} / {gib(status?.total || info?.bytes || 0)}</p><progress aria-label="Model installation progress" max={status?.total || info?.bytes || 1} value={status?.received ?? 0} /></div>}
     {status?.phase === 'ready' && <p role="status">Model verified. Select it below, then save your model settings.</p>}
     <div className="connector-actions"><button type="button" className="secondary" disabled={!nativeAvailable || !info || active || Boolean(insufficient)} onClick={() => void install()}>{info?.destinationExists ? 'Verify managed model' : 'Download model'}</button>

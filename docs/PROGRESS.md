@@ -304,3 +304,9 @@ Both recovery tests passed, including a real Windows bundle junction with preser
 ### Native model verification cancellation
 
 The native UI started verification of the managed 2.07 GB model, observed nonzero verification progress, cancelled it and returned to an available Verify action. The status recorded cancellation, the existing model size and modification time were unchanged, saved preferences were preserved and no managed partial-download files remained. The reproducible model-cancel-smoke script passed. This proves cancellation during existing-file verification; network-transfer cancellation and forced-crash acceptance remain separate checks.
+
+### Cancellation outcome presentation
+
+Model and runtime status now distinguish explicit cancellation from failures. Both setup cards present cancellation as a normal status message while preserving actionable failures as alerts. Regression coverage checks cancellation classification, failure classification and the retryable UI state.
+
+Both targeted Rust tests, strict Clippy, all 25 frontend tests, production frontend build and native build passed. Native model cancellation passed with the new cancelled phase; the first invocation raced initial WebView navigation, so the script now waits for the target page before testing. This does not extend cancellation evidence to a real network transfer.

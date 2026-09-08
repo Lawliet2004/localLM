@@ -13,6 +13,21 @@ pub struct Status {
     pub path: Option<String>,
     pub error: Option<String>,
 }
+impl Status {
+    pub(crate) fn fail(&mut self, error: String) {
+        self.busy = false;
+        self.phase = if matches!(
+            error.as_str(),
+            "Download cancelled." | "Runtime installation cancelled."
+        ) {
+            "cancelled"
+        } else {
+            "failed"
+        }
+        .into();
+        self.error = Some(error);
+    }
+}
 #[derive(Default)]
 pub struct Installer {
     pub(crate) inner: Mutex<(Status, Option<watch::Sender<bool>>)>,
@@ -21,6 +36,17 @@ pub(crate) struct RunGuard<'a>(pub(crate) &'a Installer);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_is_distinct_from_installation_failure() {
+        let mut status = Status::default();
+        for error in ["Download cancelled.", "Runtime installation cancelled."] {
+            status.fail(error.into());
+            assert_eq!(status.phase, "cancelled");
+            assert!(!status.busy);
+        }
+        status.fail("Download SHA-256 verification failed.".into());
+        assert_eq!(status.phase, "failed");
+    }
     #[test]
     fn interrupted_run_releases_busy_state_but_preserves_finished_result() {
         let installer = Installer::default();
@@ -155,8 +181,7 @@ pub async fn install_model(
             inner.0.path = Some(path);
         }
         Err(error) => {
-            inner.0.phase = "failed".into();
-            inner.0.error = Some(error);
+            inner.0.fail(error);
         }
     }
     Ok(inner.0.clone())

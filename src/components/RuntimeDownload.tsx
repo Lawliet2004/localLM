@@ -43,7 +43,7 @@ export function RuntimeDownload({ busy, onSelect }: { busy: boolean; onSelect: (
     <h2>llama.cpp · CUDA 12.4</h2><p>Install the pinned b10855 Windows runtime and CUDA libraries. Each installation uses a new directory; existing runtimes are preserved.</p>
     {info && <p>{gib(info.bytes)} download · {gib(info.requiredBytes)} required for download, extraction and reserve · {gib(info.availableBytes)} free</p>}
     {insufficient && !active && <p role="alert">Not enough disk space to install the runtime.</p>}
-    {error && <p role="alert">{error}</p>}{status?.error && <p role="alert">{status.error}</p>}
+    {error && <p role="alert">{error}</p>}{status?.error && <p role={status.phase === 'cancelled' ? 'status' : 'alert'}>{status.phase === 'cancelled' ? 'Installation cancelled. You can try again when ready.' : status.error}</p>}
     {active && <div role="status"><p>{status?.phase === 'extracting' ? 'Verifying and extracting runtime files…' : 'Downloading runtime archive…'}</p>{status?.phase !== 'extracting' && <progress aria-label="Runtime archive download progress" max={status?.total || 1} value={status?.received || 0} />}</div>}
     <div className="connector-actions"><button type="button" className="secondary" disabled={!nativeAvailable || !info || active || Boolean(insufficient)} onClick={() => void install()}>Install CUDA runtime</button>
       {active && <button type="button" className="secondary" disabled={cancelling} onClick={async () => { setCancelling(true); try { await api.cancelRuntimeInstall(); } catch (e) { setError(errorMessage(e)); } finally { setCancelling(false); } }}>Cancel runtime installation</button>}
