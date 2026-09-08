@@ -120,6 +120,32 @@ pub fn extract(
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires the pinned archives in .local/downloads and space for the expanded runtime"]
+    fn extracts_cached_pinned_cuda_archives() {
+        let assets = catalog().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let needed = crate::runtime_install::required_bytes(&assets).unwrap();
+        assert!(crate::download::available_space(directory.path()).unwrap() >= needed);
+        let staging =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .unwrap();
+        let (_sender, cancel) = tokio::sync::watch::channel(false);
+        let archive_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".local/downloads");
+        for asset in &assets {
+            extract(&archive_root.join(&asset.name), &staging, asset, &cancel).unwrap();
+            for file in &asset.files {
+                assert_eq!(staging.metadata(&file.name).unwrap().len(), file.bytes);
+            }
+        }
+        assert_eq!(
+            staging.entries().unwrap().count(),
+            assets.iter().map(|asset| asset.files.len()).sum::<usize>()
+        );
+    }
+    #[test]
     fn extraction_checks_hash_manifest_and_existing_files() {
         for case in ["valid", "hash", "unexpected", "size", "existing", "cancel"] {
             let temp = tempfile::tempdir().unwrap();

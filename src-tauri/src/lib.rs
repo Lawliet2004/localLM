@@ -20,6 +20,7 @@ mod permissions;
 mod runtime;
 pub mod runtime_archive;
 mod runtime_config;
+pub mod runtime_install;
 mod runtime_log;
 mod skills;
 mod sse;
