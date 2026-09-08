@@ -346,3 +346,9 @@ All six download-related filtered tests and strict Clippy passed. The new local 
 While preparing custom local MCP support, replaced list_all_tools with incremental discovery. The connection keeps its 30-second outer deadline and now checks 512 tools and 2 MiB accumulated serialized tool data before retaining each page, rejects duplicate tool names/repeated or oversized cursors, and limits discovery to 64 pages. This bounds accumulation across pages; the transport still deserializes each individual page before these checks.
 
 Pagination regressions cover a valid two-page result, repeated cursors, duplicate names, excessive pages and excessive tool count. Tests and strict Clippy passed after using the pinned SDK's builder for its non-exhaustive request type. Live connector discovery acceptance and custom stdio configuration/lifecycle remain outstanding.
+
+### Local MCP configuration model
+
+Added bounded local-server configuration for stable local IDs, display names, absolute executable/working-directory paths, argument arrays and environment variables. Environment keys reject case-insensitive duplicates and invalid identifiers. Separate launch validation checks file/directory existence without launching anything. The complete configuration collection, including arguments and environment values, is stored in the encrypted vault with a 128 KiB ceiling rather than plaintext settings.
+
+The configuration regression and strict Clippy passed. Tests cover encrypted round-trip, preserved argument boundaries, duplicate IDs/environment keys, NUL arguments and relative paths. This module is not yet exposed through IPC/UI or connected to subprocess transport. Explicit process-launch UI, environment handling, descendant cleanup, MCP negotiation and tool integration remain required.
