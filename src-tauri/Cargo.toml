@@ -27,6 +27,11 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "s
 tokio = { version = "1.53.1", features = ["process", "io-util", "time", "sync", "macros", "net"] }
 uuid = { version = "1.26.0", features = ["v4"] }
 futures-util = "0.3.34"
+tauri-plugin-dialog = "2.7.3"
+rmcp = { version = "3.2.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-native-tls", "transport-child-process", "auth"] }
+keyring = { version = "3", features = ["windows-native"] }
+aes-gcm = "0.10"
+async-trait = "0.1.92"
 
 [profile.dev]
 debug = 0

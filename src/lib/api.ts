@@ -1,8 +1,13 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Bootstrap, ChatEvent, Conversation, Message, Preferences, RuntimeConfig, RuntimeStatus } from './types';
+import type { Bootstrap, ChatEvent, ConnectorView, Conversation, Message, Preferences, RuntimeConfig, RuntimeStatus } from './types';
 
 export const nativeAvailable = isTauri();
 export const api = {
+  listConnectors: () => invoke<ConnectorView[]>('list_connectors'),
+  connectConnector: (id: string, apiToken?: string) => invoke<ConnectorView>('connect_connector', { id, apiToken }),
+  disconnectConnector: (id: string, forget = false) => invoke<void>('disconnect_connector', { id, forget }),
+  signInConnector: (id: string) => invoke<ConnectorView>('sign_in_connector', { id }),
+  cancelConnectorSignIn: () => invoke<void>('cancel_connector_sign_in'),
   bootstrap: () => invoke<Bootstrap>('bootstrap'),
   createConversation: () => invoke<Conversation>('create_conversation'),
   renameConversation: (id: string, title: string) => invoke<void>('rename_conversation', { id, title }),

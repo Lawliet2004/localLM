@@ -31,3 +31,8 @@ export interface Preferences {
 export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null }
 export interface Bootstrap { conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus }
 export interface ChatEvent { messageId: string; content: string; reasoning: string }
+export interface ToolView { name: string; description: string; inputSchema: Record<string, unknown> }
+export interface ConnectorView {
+  id: string; description: string; url: string; authType: 'none' | 'apiKey' | 'oauth';
+  connected: boolean; hasCredential: boolean; tools: ToolView[];
+}
