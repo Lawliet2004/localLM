@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Check, ChevronDown, Download, PanelLeftOpen, Pencil, Trash2, X } from 'lucide-react';
 import { confirm, save } from '@tauri-apps/plugin-dialog';
 import { api, errorMessage, nativeAvailable } from './lib/api';
-import { defaultRuntimeConfig, type Bootstrap, type Message, type ToolApproval, type ToolSelection, type AccessMode } from './lib/types';
+import { defaultRuntimeConfig, type Bootstrap, type Message, type ToolApproval, type ToolSelection, type AccessMode, type ContextUsage } from './lib/types';
 import { Sidebar, type Page } from './components/Sidebar';
 import { Chat } from './components/Chat';
 import { Models } from './components/Models';
@@ -39,6 +39,7 @@ export default function App() {
   const [page, setPage] = useState<Page>('chat');
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [contextUsage, setContextUsage] = useState<{ conversationId: string; usage: ContextUsage } | null>(null);
   const [loading, setLoading] = useState(nativeAvailable);
   const [generating, setGenerating] = useState(false);
   const [modelBusy, setModelBusy] = useState(false);
@@ -113,7 +114,7 @@ export default function App() {
       await api.saveConversationTools(id, { sources: selectedConnectors, tools: selectedTools, accessMode });
       const conversationId = id;
       setMessages(current => [...current, { id: 'pending-user', conversationId, role: 'user', content, reasoning: '', status: 'complete', createdAt: Date.now() }]);
-      await api.sendMessage(conversationId, content, event => { if ('approval' in event) setApproval(event.approval || null); setMessages(current => {
+      await api.sendMessage(conversationId, content, event => { if (event.context) setContextUsage({ conversationId, usage: event.context }); if ('approval' in event) setApproval(event.approval || null); setMessages(current => {
         const existing = current.find(message => message.id === event.messageId);
         if (existing) return current.map(message => message.id === event.messageId ? { ...message, content: message.content + event.content, reasoning: message.reasoning + event.reasoning } : message);
         return [...current, { id: event.messageId, conversationId, role: 'assistant', content: event.content, reasoning: event.reasoning, status: 'streaming', createdAt: Date.now() }];
@@ -175,7 +176,7 @@ export default function App() {
       {exportedPath && <div className="preview-banner" role="status">Saved conversation to {exportedPath}<button className="icon-button" aria-label="Dismiss export confirmation" onClick={() => setExportedPath('')}><X size={16} /></button></div>}
       {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
       {page === 'chat' && <ToolPicker accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} busy={busy} />}
-      {page === 'chat' ? <Chat draft={draft} onDraftChange={changeDraft} messages={messages} generating={generating} ready={nativeAvailable && data.runtime.phase === 'ready'} loading={loading} disabled={savingTools || exporting} onSend={send} onCancel={() => { void api.cancelGeneration().catch(e => setError(errorMessage(e))); }} onConfigure={() => setPage('models')} /> : page === 'models' ? <Models config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveConfig={async config => { try { await api.saveConfig(config); setData(current => ({ ...current, config })); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(current => ({ ...current, preferences })); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
+      {page === 'chat' ? <Chat contextUsage={contextUsage?.conversationId === activeId ? contextUsage.usage : undefined} draft={draft} onDraftChange={changeDraft} messages={messages} generating={generating} ready={nativeAvailable && data.runtime.phase === 'ready'} loading={loading} disabled={savingTools || exporting} onSend={send} onCancel={() => { void api.cancelGeneration().catch(e => setError(errorMessage(e))); }} onConfigure={() => setPage('models')} /> : page === 'models' ? <Models config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveConfig={async config => { try { await api.saveConfig(config); setData(current => ({ ...current, config })); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(current => ({ ...current, preferences })); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
     </main>
   </div>;
 }

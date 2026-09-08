@@ -5,6 +5,14 @@ import type { Message } from '../lib/types';
 
 const props = { generating: false, ready: true, loading: false, onSend: vi.fn(), onCancel: vi.fn(), onConfigure: vi.fn() };
 describe('chat action reporting and submission', () => {
+  it('labels measured context separately from draft changes', () => {
+    render(<Chat {...props} messages={[]} contextUsage={{ inputTokens: 123, responseReserve: 512, contextLength: 8192 }} />);
+    const usage = screen.getByLabelText('Last request context');
+    expect(usage).toHaveTextContent('123 input + 512 response reserve');
+    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'A new draft that has not been counted' } });
+    expect(usage).toHaveTextContent('123 input');
+    expect(usage).toHaveTextContent('Draft changes are not included');
+  });
   it.each([
     ['complete', { isError: true, message: 'Process failed' }, 'allowed', 'Failed'],
     ['complete', { isError: true }, 'denied', 'Denied'],

@@ -310,3 +310,9 @@ The native UI started verification of the managed 2.07 GB model, observed nonzer
 Model and runtime status now distinguish explicit cancellation from failures. Both setup cards present cancellation as a normal status message while preserving actionable failures as alerts. Regression coverage checks cancellation classification, failure classification and the retryable UI state.
 
 Both targeted Rust tests, strict Clippy, all 25 frontend tests, production frontend build and native build passed. Native model cancellation passed with the new cancelled phase; the first invocation raced initial WebView navigation, so the script now waits for the target page before testing. This does not extend cancellation evidence to a real network transfer.
+
+### Measured context indicator in chat
+
+The backend now forwards its successful exact-token preflight count before each model request, including subsequent tool rounds. Chat shows the latest input count, reserved response budget and loaded context size, explicitly excluding unsent draft changes. Counts are associated with the active conversation in UI state; they are not persisted or presented as a current draft estimate.
+
+Strict Clippy, frontend production build, all 26 frontend tests and the targeted native context tests passed. The new UI test confirms editing a draft does not silently change the measured count. Native channel-to-render acceptance for the indicator remains outstanding, as do persistent usage history, draft preflight and context compaction.

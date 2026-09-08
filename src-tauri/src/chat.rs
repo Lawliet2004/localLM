@@ -8,6 +8,8 @@ use tauri::{ipc::Channel, State};
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<Value>,
     message_id: String,
     content: String,
     reasoning: String,
@@ -127,25 +129,26 @@ pub async fn send_message(
         .build()
         .map_err(|error| error.to_string())?;
     let initial_payload = request_payload(&messages, &tools, &preferences, false);
-    tokio::select! {
+    let mut input_tokens = tokio::select! {
         _ = cancellation.changed() => return Err("Message cancelled before generation; it was not saved.".into()),
-        result = crate::context::check(&client, &endpoint, &api_key, &initial_payload, preferences.max_tokens, context_length) => { result?; },
-    }
+        result = crate::context::check(&client, &endpoint, &api_key, &initial_payload, preferences.max_tokens, context_length) => result?,
+    };
     let assistant = state.database()?.begin_turn(&conversation_id, &content)?;
     let mut answer = String::new();
     let mut reasoning = String::new();
     let result: Result<bool,String> = async {
-        channel.send(ChatEvent { message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: None }).map_err(|error| error.to_string())?;
+        channel.send(ChatEvent { context: None, message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: None }).map_err(|error| error.to_string())?;
         let mut tool_use_denied = false;
         for round in 0..9 {
         if *cancellation.borrow() { return Ok(false); }
         let payload = request_payload(&messages, &tools, &preferences, tool_use_denied);
         if round > 0 {
-            tokio::select! {
+            input_tokens = tokio::select! {
                 _ = cancellation.changed() => return Ok(false),
-                result = crate::context::check(&client, &endpoint, &api_key, &payload, preferences.max_tokens, context_length) => { result?; },
-            }
+                result = crate::context::check(&client, &endpoint, &api_key, &payload, preferences.max_tokens, context_length) => result?,
+            };
         }
+        channel.send(ChatEvent { context: Some(json!({"inputTokens":input_tokens,"responseReserve":preferences.max_tokens,"contextLength":context_length})), message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: None }).map_err(|error| error.to_string())?;
         let request = client.post(format!("{endpoint}/v1/chat/completions")).bearer_auth(&api_key).json(&payload);
         let response = tokio::select! {
             _ = cancellation.changed() => return Ok(false),
@@ -179,7 +182,7 @@ pub async fn send_message(
                 answer.push_str(text); round_answer.push_str(text); reasoning.push_str(thought);
                 if answer.len() + reasoning.len() > 4_194_304 { return Err("Model output exceeded 4 MiB.".into()); }
                 if !text.is_empty() || !thought.is_empty() {
-                    channel.send(ChatEvent { message_id: assistant.id.clone(), content: text.into(), reasoning: thought.into(), approval: None }).map_err(|error| error.to_string())?;
+                    channel.send(ChatEvent { context: None, message_id: assistant.id.clone(), content: text.into(), reasoning: thought.into(), approval: None }).map_err(|error| error.to_string())?;
                 }
                 if checkpoint.elapsed() > Duration::from_millis(500) {
                     state.database()?.update_message(&assistant.id,&answer,&reasoning,"streaming")?;
@@ -200,14 +203,14 @@ pub async fn send_message(
             let blocked_by_denial = tool_use_denied;
             let allow = if blocked_by_denial { false } else if automatic_reason.is_some() { true } else {
             let (approval_id, decision) = state.approvals.request()?;
-            let sent = channel.send(ChatEvent { message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: Some(json!({"id":approval_id,"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments})) });
+            let sent = channel.send(ChatEvent { context: None, message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: Some(json!({"id":approval_id,"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments})) });
             if sent.is_err() { state.approvals.remove(&approval_id); return Err("The approval interface disconnected.".into()); }
             let allow = tokio::select! {
                 _ = cancellation.changed() => None,
                 result = tokio::time::timeout(Duration::from_secs(600),decision) => Some(result.ok().and_then(Result::ok).unwrap_or(false)),
             };
             state.approvals.remove(&approval_id);
-            channel.send(ChatEvent { message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: Some(Value::Null) }).map_err(|error| error.to_string())?;
+            channel.send(ChatEvent { context: None, message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: Some(Value::Null) }).map_err(|error| error.to_string())?;
             let Some(allow) = allow else { return Ok(false); };
             allow
             };

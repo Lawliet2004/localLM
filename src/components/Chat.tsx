@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import { ArrowUp, Check, Copy, Cpu, MessageSquare, Square, Terminal, WandSparkles } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { Message } from '../lib/types';
+import type { Message, ContextUsage } from '../lib/types';
 
 interface Props {
+  contextUsage?: ContextUsage;
   draft?: string; onDraftChange?: (value: string | ((previous: string) => string)) => void;
   messages: Message[]; generating: boolean; ready: boolean; loading: boolean;
   disabled?: boolean;
@@ -43,7 +44,7 @@ function MessageBody({ message }: { message: Message }) {
   </article>;
 }
 
-export function Chat({ messages, generating, ready, loading, disabled = false, onSend, onCancel, onConfigure, draft: controlledDraft, onDraftChange }: Props) {
+export function Chat({ contextUsage, messages, generating, ready, loading, disabled = false, onSend, onCancel, onConfigure, draft: controlledDraft, onDraftChange }: Props) {
   const [localDraft, setLocalDraft] = useState('');
   const draft = controlledDraft ?? localDraft;
   const setDraft = onDraftChange ?? setLocalDraft;
@@ -84,6 +85,7 @@ export function Chat({ messages, generating, ready, loading, disabled = false, o
         <div className="composer-bottom"><span><span className={`status-dot ${ready ? 'ready' : ''}`} />{ready ? 'Local model' : 'No model loaded'}</span><div><small>Shift + Enter for a new line</small>{generating ? <button type="button" className="send-button" aria-label="Stop response" onClick={onCancel}><Square size={15} fill="currentColor" /></button> : <button className="send-button" type="submit" aria-label="Send message" disabled={!draft.trim() || !ready || loading || disabled}><ArrowUp size={20} /></button>}</div></div>
       </form>
       <p className="composer-note">Local inference. A space to make things happen.</p>
+      {contextUsage && <p className="composer-note" aria-label="Last request context">Last request: {contextUsage.inputTokens.toLocaleString()} input + {contextUsage.responseReserve.toLocaleString()} response reserve / {contextUsage.contextLength.toLocaleString()} context tokens. Draft changes are not included.</p>}
     </div>
   </div>;
 }
