@@ -125,7 +125,11 @@ pub async fn fetch(
     if available_space(parent)? < needed {
         return Err(format!("Not enough disk space. Download requires {needed} free bytes, including a 256 MiB reserve."));
     }
-    let temporary = tempfile::NamedTempFile::new_in(parent)
+    let temporary = tempfile::Builder::new()
+        .prefix(".locallm-download-")
+        .rand_bytes(32)
+        .suffix(".part")
+        .tempfile_in(parent)
         .map_err(|error| format!("Cannot create download file: {error}"))?;
     // Keep the tempfile owner alive until the asynchronous file handle is closed.
     let mut file =

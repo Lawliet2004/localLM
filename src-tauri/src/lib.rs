@@ -13,6 +13,7 @@ mod execution;
 mod export;
 mod hardware;
 mod history;
+mod install_recovery;
 mod model_catalog;
 mod model_install;
 mod oauth;
@@ -107,6 +108,13 @@ pub fn run() {
                 oauth_cancel: tokio::sync::watch::channel(false).0,
             });
             let handle = app.handle().clone();
+            for (folder, runtime) in [("models", false), ("runtimes", true)] {
+                if let Err(error) = install_recovery::clean(&data.join(folder), runtime) {
+                    let state = app.state::<AppState>();
+                    let installer = if runtime { &state.runtime_installer } else { &state.model_installer };
+                    if let Ok(mut inner) = installer.inner.lock() { inner.0.error = Some(format!("Interrupted installation cleanup needs attention: {error}")); };
+                }
+            }
             tauri::async_runtime::spawn(async move {
                 if daytona_settings::recover_at_startup(&handle.state::<AppState>()).await.is_err() {
                     eprintln!("Startup cloud cleanup could not access its journal; pending ownership is retained.");

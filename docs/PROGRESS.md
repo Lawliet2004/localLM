@@ -294,3 +294,9 @@ The installed executable loaded MiniCPM5-2B Q6_K and reported 43/43 layers offlo
 Added a bounded native inventory of published versioned runtime directories. It ignores staging/unrelated entries, checks each pinned filename and size through a capability directory, and marks incomplete installations unavailable for selection. The UI exposes existing installations separately from the current in-memory install status and explicitly states that this inventory does not recheck hashes.
 
 The inventory fixture, strict Clippy, all 24 frontend tests, frontend build and native build passed. After restarting the native app, runtime-inventory-smoke discovered the runtime installed in the previous acceptance test, selected it into the draft and verified saved preferences remained unchanged. Crash partial-file recovery, integrity revalidation and uninstall management remain open.
+
+### Startup recovery for interrupted installation staging
+
+New model partial files and runtime staging directories use distinct 32-character randomized names. Startup cleanup recognizes only these layouts, validates runtime contents against the pinned manifest before removing files, never recursively follows links and preserves unexpected content with a visible installer error. Completed model/runtime paths are outside this cleanup scope. Older anonymous temporary files from pre-recovery builds are deliberately not claimed or removed.
+
+Both recovery tests passed, including a real Windows bundle junction with preserved external content. Strict Clippy and the native build passed after correcting a compile-time temporary-borrow lifetime in setup. Native startup acceptance removed staged partial model/runtime fixtures and retained the completed installed runtime. This tests the startup hook with crash-equivalent leftovers; an actual forced-process-termination test remains outstanding.

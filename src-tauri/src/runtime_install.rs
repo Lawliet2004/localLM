@@ -46,6 +46,7 @@ pub async fn install(
     let staging = Arc::new(
         tempfile::Builder::new()
             .prefix(".locallm-runtime-")
+            .rand_bytes(32)
             .tempdir_in(root)
             .map_err(|error| error.to_string())?,
     );
