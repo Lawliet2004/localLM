@@ -1,12 +1,13 @@
 import { useRef, useState } from 'react';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
+import type { LocalServerConfig } from '../lib/api';
 
-export function LocalConnectorForm({ onSaved }: { onSaved: () => Promise<void> }) {
-  const [name, setName] = useState('');
-  const [executable, setExecutable] = useState('');
-  const [directory, setDirectory] = useState('');
-  const [args, setArgs] = useState('[]');
-  const [environment, setEnvironment] = useState('{}');
+export function LocalConnectorForm({ onSaved, initial, onCancel }: { onSaved: () => Promise<void>; initial?: LocalServerConfig; onCancel?: () => void }) {
+  const [name, setName] = useState(initial?.name ?? '');
+  const [executable, setExecutable] = useState(initial?.executable ?? '');
+  const [directory, setDirectory] = useState(initial?.workingDirectory ?? '');
+  const [args, setArgs] = useState(JSON.stringify(initial?.arguments ?? []));
+  const [environment, setEnvironment] = useState(JSON.stringify(initial?.environment ?? {}));
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState(false);
@@ -20,13 +21,13 @@ export function LocalConnectorForm({ onSaved }: { onSaved: () => Promise<void> }
       catch { throw new Error('Arguments and environment must contain valid JSON.'); }
       if (!Array.isArray(argumentsValue) || !argumentsValue.every(value => typeof value === 'string')) throw new Error('Arguments must be a JSON array of strings.');
       if (!environmentValue || Array.isArray(environmentValue) || typeof environmentValue !== 'object' || !Object.values(environmentValue).every(value => typeof value === 'string')) throw new Error('Environment must be a JSON object with string values.');
-      await api.saveLocalConnector({ id: `local-${crypto.randomUUID()}`, name: name.trim(), executable, workingDirectory: directory, arguments: argumentsValue, environment: environmentValue as Record<string, string> });
+      await api.saveLocalConnector({ id: initial?.id ?? `local-${crypto.randomUUID()}`, name: name.trim(), executable, workingDirectory: directory, arguments: argumentsValue, environment: environmentValue as Record<string, string> });
       setName(''); setExecutable(''); setDirectory(''); setArgs('[]'); setEnvironment('{}'); setSaved(true);
       await onSaved();
     } catch (e) { setError(errorMessage(e)); }
     finally { submitting.current = false; setPending(false); }
   }
-  return <details className="catalog-item"><summary>Add a local MCP server</summary><div className="catalog-detail">
+  return <details className="catalog-item" open={initial ? true : undefined}><summary>{initial ? `Edit ${initial.name}` : 'Add a local MCP server'}</summary><div className="catalog-detail">
     <p>Configure an installed MCP server. Save stores its configuration encrypted on this device. Connect launches it with your operating-system permissions, including file and network access.</p>
     <form onSubmit={event => { event.preventDefault(); void save(); }}>
       <fieldset disabled={!nativeAvailable || pending}>
@@ -37,6 +38,7 @@ export function LocalConnectorForm({ onSaved }: { onSaved: () => Promise<void> }
         <label>Environment variables (JSON object)<textarea aria-label="Environment variables (JSON object)" spellCheck={false} autoComplete="off" value={environment} onChange={event => setEnvironment(event.target.value)} /></label>
         <p>Use one JSON string per argument, for example ["C:\\servers\\index.js"]. Environment values may contain credentials; they are visible while editing this form.</p>
         <button className="primary">{pending ? 'Saving…' : 'Save local server'}</button>
+        {onCancel && <button type="button" className="secondary" onClick={onCancel}>Cancel editing</button>}
       </fieldset>
     </form>
     {error && <p role="alert" className="error-banner">{error}</p>}

@@ -366,6 +366,15 @@ impl McpHub {
             .map(Into::into)
             .collect())
     }
+    pub fn read_local(&self, id: &str) -> Result<crate::local_mcp_config::LocalServer, String> {
+        if self.connections.contains_key(id) {
+            return Err("Disconnect the local server before editing its configuration.".into());
+        }
+        crate::local_mcp_config::load(&self.vault)?
+            .into_iter()
+            .find(|server| server.id == id)
+            .ok_or("Unknown local connector.".into())
+    }
     pub fn save_local(&self, server: crate::local_mcp_config::LocalServer) -> Result<(), String> {
         if self.connections.contains_key(&server.id) {
             return Err("Disconnect the local server before editing its configuration.".into());
@@ -558,6 +567,13 @@ pub async fn list_local_connectors(
     state.connectors.lock().await.list_local()
 }
 #[tauri::command]
+pub async fn read_local_connector(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+) -> Result<crate::local_mcp_config::LocalServer, String> {
+    state.connectors.lock().await.read_local(&id)
+}
+#[tauri::command]
 pub async fn save_local_connector(
     state: tauri::State<'_, crate::AppState>,
     server: crate::local_mcp_config::LocalServer,
@@ -666,6 +682,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         assert_eq!(view.tools.len(), 1);
         assert_eq!(view.auth_type, "local");
         assert!(hub.save_local(server.clone()).is_err());
+        assert!(hub.read_local(&server.id).is_err());
         assert!(hub.remove_local(&server.id).is_err());
         let tools = hub
             .selected_tools(
@@ -739,6 +756,10 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         };
         hub.save_local(server.clone()).unwrap();
         let summaries = hub.list_local().unwrap();
+        let editable = hub.read_local(&server.id).unwrap();
+        assert_eq!(editable.arguments, server.arguments);
+        assert_eq!(editable.environment, server.environment);
+        assert!(hub.read_local("unknown").is_err());
         assert_eq!(summaries.len(), 1);
         let text = serde_json::to_string(&summaries).unwrap();
         assert!(!text.contains("private-argument-fixture"));

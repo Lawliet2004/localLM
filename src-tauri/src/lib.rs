@@ -169,6 +169,7 @@ pub fn run() {
             approval::resolve_tool_approval,
             connectors::list_connectors,
             connectors::list_local_connectors,
+            connectors::read_local_connector,
             connectors::save_local_connector,
             connectors::remove_local_connector,
             connectors::connect_connector,

@@ -4,6 +4,7 @@ import { api, errorMessage, nativeAvailable } from '../lib/api';
 import catalog from '../lib/catalog.json';
 import type { ConnectorView } from '../lib/types';
 import { LocalConnectorForm } from './LocalConnectorForm';
+import type { LocalServerConfig } from '../lib/api';
 
 const presets: ConnectorView[] = catalog.connectors.map(item => ({
   id: item.name, description: item.description, url: item.url,
@@ -18,6 +19,13 @@ export function Connectors() {
   const [signingIn, setSigningIn] = useState(false);
   const [tokens, setTokens] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
+  const [editing, setEditing] = useState<LocalServerConfig>();
+  async function editLocal(item: ConnectorView) {
+    setPending(item.id); setError('');
+    try { setEditing(await api.readLocalConnector(item.id)); }
+    catch (e) { setError(errorMessage(e)); }
+    finally { setPending(''); }
+  }
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
@@ -51,7 +59,7 @@ export function Connectors() {
     <div className="page-heading"><p className="eyebrow">EXTEND YOUR WORKSPACE</p><h1>Connectors</h1><p>Connect your accounts and discover the tools they provide.</p></div>
     <div className="catalog-toolbar"><label className="search-field"><Search size={16} /><input type="search" aria-label="Search connectors" placeholder="Search connectors…" value={query} onChange={e => setQuery(e.target.value)} /></label><span>{filtered.length} connectors</span></div>
     <p className="catalog-notice">Credentials are encrypted on this device. Select connected services under Tools in your conversation. Actions follow your conversation’s permission mode.</p>
-    <LocalConnectorForm onSaved={async () => setItems(await api.listConnectors())} />
+    <LocalConnectorForm key={editing?.id ?? 'new'} initial={editing} onCancel={editing ? () => setEditing(undefined) : undefined} onSaved={async () => { setEditing(undefined); setItems(await api.listConnectors()); }} />
     {error && <p role="alert" className="error-banner">{error}</p>}
     <div className="catalog-list">{filtered.map(item => <details className="catalog-item" key={item.id}>
       <summary><span className="catalog-icon"><Plug size={18} /></span><span><strong>{item.authType === 'local' ? item.description : item.id.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')}</strong><small>{item.authType === 'local' ? 'Local MCP server' : item.description}</small></span><small>{item.connected ? `${item.tools.length} tools` : 'Not connected'}</small></summary>
@@ -59,6 +67,7 @@ export function Connectors() {
         <form onSubmit={event => { event.preventDefault(); void connect(item, item.authType === 'oauth' && !item.hasCredential); }}>
           {item.authType === 'apiKey' && !item.connected && <label>API token<input type="password" aria-label={`${item.id} API token`} autoComplete="off" value={tokens[item.id] || ''} placeholder={item.hasCredential ? 'Saved token · enter to replace' : 'Enter your API token'} onChange={event => setTokens(current => ({ ...current, [item.id]: event.target.value }))} /></label>}
           <div className="connector-actions">
+            {item.authType === 'local' && !item.connected && <button type="button" className="secondary" disabled={!nativeAvailable || !!pending} onClick={() => void editLocal(item)}>Edit configuration</button>}
             {!item.connected && <button className="primary" disabled={!nativeAvailable || !!pending || (item.authType === 'apiKey' && !item.hasCredential && !tokens[item.id])}>{pending === item.id ? signingIn ? 'Waiting for sign-in…' : 'Connecting…' : item.authType === 'oauth' && !item.hasCredential ? 'Sign in' : 'Connect'}</button>}
             {item.connected && <button type="button" className="secondary" disabled={!!pending} onClick={() => void disconnect(item, false)}>Disconnect</button>}
             {item.authType === 'local' && !item.connected && <><button type="button" className="secondary" disabled={!nativeAvailable || !!pending} onClick={() => void disconnect(item, false)}>Stop session</button><button type="button" className="secondary" disabled={!nativeAvailable || !!pending} onClick={() => void removeLocal(item)}>Remove server</button></>}

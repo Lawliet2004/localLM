@@ -4,6 +4,16 @@ import { LocalConnectorForm } from './LocalConnectorForm';
 import { api } from '../lib/api';
 vi.mock('../lib/api', () => ({ nativeAvailable: true, api: { saveLocalConnector: vi.fn() }, errorMessage: (error: Error) => error.message }));
 describe('local connector configuration', () => {
+  it('edits the same server and preserves configured arguments and credentials', async () => {
+    vi.mocked(api.saveLocalConnector).mockClear().mockResolvedValue();
+    const initial = { id: 'local-fixture', name: 'Original', executable: 'C:\\node.exe', workingDirectory: 'C:\\work', arguments: ['a b', ''], environment: { TOKEN: 'saved-secret' } };
+    const onSaved = vi.fn().mockResolvedValue(undefined);
+    render(<LocalConnectorForm initial={initial} onSaved={onSaved} onCancel={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText('Name'), {target:{value:'Renamed'}});
+    fireEvent.click(screen.getByText('Save local server'));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledOnce());
+    expect(api.saveLocalConnector).toHaveBeenCalledWith({...initial, name:'Renamed'});
+  });
   it('saves exact argument boundaries and clears credentials without launching', async () => {
     vi.mocked(api.saveLocalConnector).mockResolvedValue();
     const onSaved = vi.fn().mockResolvedValue(undefined);
