@@ -106,8 +106,27 @@ pub async fn fetch(
     client: &reqwest::Client,
     asset: &Asset<'_>,
     destination: &Path,
+    cancel: watch::Receiver<bool>,
+    progress: impl FnMut(u64),
+) -> Result<(), String> {
+    fetch_with_header_timeout(
+        client,
+        asset,
+        destination,
+        cancel,
+        progress,
+        Duration::from_secs(60),
+    )
+    .await
+}
+
+async fn fetch_with_header_timeout(
+    client: &reqwest::Client,
+    asset: &Asset<'_>,
+    destination: &Path,
     mut cancel: watch::Receiver<bool>,
     mut progress: impl FnMut(u64),
+    header_timeout: Duration,
 ) -> Result<(), String> {
     if asset.bytes == 0
         || asset.sha256.len() != 64
@@ -135,11 +154,13 @@ pub async fn fetch(
     let mut file =
         tokio::fs::File::from_std(temporary.reopen().map_err(|error| error.to_string())?);
     let work = async {
-        let response = client
+        let request = client
             .get(asset.url)
             .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .send()
+            .send();
+        let response = tokio::time::timeout(header_timeout, request)
             .await
+            .map_err(|_| "Download service did not send response headers within 60 seconds.")?
             .map_err(|_| "Could not connect to the download service.")?;
         if response.status() != reqwest::StatusCode::OK {
             return Err(format!(
@@ -206,6 +227,40 @@ pub async fn fetch(
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+    #[tokio::test]
+    async fn stalled_headers_release_the_partial_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("model.gguf");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/asset", listener.local_addr().unwrap());
+        let (accepted, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            accepted.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let asset = Asset {
+            url: &url,
+            bytes: 7,
+            sha256: &"0".repeat(64),
+        };
+        let (_sender, cancel) = watch::channel(false);
+        let result = fetch_with_header_timeout(
+            &reqwest::Client::new(),
+            &asset,
+            &destination,
+            cancel,
+            |_| panic!("No response body received"),
+            Duration::from_secs(1),
+        )
+        .await;
+        received.await.unwrap();
+        assert!(result.unwrap_err().contains("response headers"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        server.abort();
+    }
     #[tokio::test]
     async fn existing_file_verification_rejects_corruption_without_modifying_it() {
         let temp = tempfile::tempdir().unwrap();

@@ -334,3 +334,9 @@ All 27 frontend tests and the production build passed. The new regression checks
 The native retry smoke sent a prompt, stopped it after context preflight, verified the stored assistant status was interrupted, then retried with an unrelated unsent draft present. The second attempt completed with 42. The entire original message prefix was unchanged, both user prompts were stored, and the draft remained intact. The test restored preferences/load state and removed its conversation/draft.
 
 The smoke passed. This verifies new-turn retry for an interrupted response; tool-side-effect retry behavior remains governed by the existing permission policy and is not newly proven by this arithmetic test.
+
+### Download response-header deadline
+
+Added a separate 60-second response-header deadline. Previously, a server that accepted the connection but never sent headers could hold the operation until the two-hour overall transfer timeout; body chunks already had a 60-second stall deadline. The new header timeout releases the temporary file and returns an actionable error.
+
+All six download-related filtered tests and strict Clippy passed. The new local TCP regression accepts and reads the request, deliberately withholds headers, and verifies timeout plus removal of the partial file using a shortened test deadline. No production download was repeated for this change.
