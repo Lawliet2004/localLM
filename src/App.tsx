@@ -63,6 +63,7 @@ export default function App() {
   async function send(content: string) {
     setGenerating(true); setError('');
     let id = activeId;
+    const previousIds = new Set(messages.map(message => message.id));
     try {
       if (!id) {
         const conversation = await api.createConversation(); id = conversation.id;
@@ -75,7 +76,20 @@ export default function App() {
         if (existing) return current.map(message => message.id === event.messageId ? { ...message, content: message.content + event.content, reasoning: message.reasoning + event.reasoning } : message);
         return [...current, { id: event.messageId, conversationId, role: 'assistant', content: event.content, reasoning: event.reasoning, status: 'streaming', createdAt: Date.now() }];
       }); }, selectedConnectors);
-    } catch (e) { setError(errorMessage(e)); throw e; }
+    } catch (e) {
+      setError(errorMessage(e));
+      // Restore the draft only when persistence confirms the message was not accepted.
+      // An inference failure can happen after the user message has already been saved.
+      if (!id) throw e;
+      let saved: Message[];
+      try { saved = await api.messages(id); }
+      catch {
+        setError(`${errorMessage(e)} Could not verify whether your message was saved. Reopen the conversation before sending it again.`);
+        return;
+      }
+      setMessages(saved);
+      if (!saved.some(message => message.role === 'user' && !previousIds.has(message.id) && message.content === content.trim())) throw e;
+    }
     finally {
       try { if (id) setMessages(await api.messages(id)); setData(await api.bootstrap()); }
       catch (e) { setError(errorMessage(e)); }

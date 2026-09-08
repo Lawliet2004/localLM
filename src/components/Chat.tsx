@@ -14,7 +14,10 @@ function ToolMessage({ message }: { message: Message }) {
   const request = record.request && typeof record.request === 'object' ? record.request as Record<string, unknown> : record;
   const name = typeof request.name === 'string' ? request.name : 'Tool';
   const connector = typeof request.connector === 'string' ? request.connector : 'Connector';
-  return <article className="message message-tool" aria-label="tool message"><details className="tool-record"><summary><Terminal size={14} /><strong>{connector} · {name}</strong><span>{message.status === 'interrupted' ? 'Stopped · outcome unknown' : request.decision === 'denied' ? 'Denied' : message.status === 'streaming' ? 'Running…' : 'Finished'}</span></summary><h4>Arguments</h4><pre>{JSON.stringify(request.arguments ?? {}, null, 2)}</pre><h4>Result</h4><pre>{JSON.stringify(record.result ?? message.content, null, 2)}</pre></details></article>;
+  const result = record.result;
+  const failed = message.status === 'error' || (result !== null && typeof result === 'object' && 'isError' in result && result.isError === true);
+  const status = message.status === 'interrupted' ? 'Stopped · outcome unknown' : request.decision === 'denied' ? 'Denied' : message.status === 'streaming' ? 'Running…' : failed ? 'Failed' : 'Finished';
+  return <article className="message message-tool" aria-label="tool message"><details className="tool-record"><summary><Terminal size={14} /><strong>{connector} · {name}</strong><span>{status}</span></summary><h4>Arguments</h4><pre>{JSON.stringify(request.arguments ?? {}, null, 2)}</pre><h4>Result</h4><pre>{JSON.stringify(record.result ?? message.content, null, 2)}</pre></details></article>;
 }
 function MessageBody({ message }: { message: Message }) {
   const [copied, setCopied] = useState(false);
@@ -43,12 +46,15 @@ export function Chat({ messages, generating, ready, loading, onSend, onCancel, o
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
   const input = useRef<HTMLTextAreaElement>(null);
+  const submitting = useRef(false);
   useEffect(() => { if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [messages]);
   async function submit() {
-    if (!draft.trim() || !ready || generating) return;
+    if (!draft.trim() || !ready || generating || loading || submitting.current) return;
+    submitting.current = true;
     const content = draft;
     setDraft('');
-    try { await onSend(content); } catch { setDraft(content); }
+    try { await onSend(content); } catch { setDraft(current => current || content); }
+    finally { submitting.current = false; }
     input.current?.focus();
   }
   return <div className="chat-layout">
@@ -77,3 +83,4 @@ export function Chat({ messages, generating, ready, loading, onSend, onCancel, o
     </div>
   </div>;
 }
+

@@ -64,3 +64,9 @@ Vite was started on 127.0.0.1:1420. A debug native app was launched with WebView
 - `node scripts/hardware-smoke.mjs`: actual RTX 2050 utilization sampled at 21–97% during generation, with 2047 MiB used of 4096 MiB. A second run sampled 69–97%. UI and progress bar inspected in native WebView2. Readings are device-wide, not process-specific attribution.
 - Saved CPU-only configuration while GPU model remained loaded, verified loadedConfig still reported -1 GPU layers, then restored saved configuration. No false implication that settings apply without reloading.
 - Remaining runtime work includes actual per-layer placement, model-specific memory/timing metrics, download management, context budgeting and broader backend/fallback checks.
+
+### Chat submission and tool outcome correction
+
+Tool audit cards now distinguish `isError: true` results from successful transport completion, while keeping denial and interruption labels. Submission has an immediate in-flight guard and respects conversation loading. Failed sends query persisted messages before restoring the original draft, avoiding duplicate user messages after inference failures; unverifiable persistence prompts reopening the conversation. A newly typed draft is preserved if an earlier submission fails.
+
+Verification: 8 frontend tests pass, including four tool outcomes and duplicate-submit/new-draft regression coverage; TypeScript/production build and both browser tests pass. The persistence reconciliation branch still needs native failure-injection coverage; durable structured generation errors and explicit retry workflows remain unfinished.
