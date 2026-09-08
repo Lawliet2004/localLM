@@ -5,6 +5,7 @@ const fixtures=vi.hoisted(()=>({pending:vi.fn()}));
 vi.mock('../lib/api',()=>({nativeAvailable:true,errorMessage:String,api:{
   getExecutionConfig:async()=>({pythonPath:'',nodePath:'',powershellPath:''}),
   pendingDaytonaOperations:fixtures.pending,
+  hasDaytonaKey:async()=>false,
 }}));
 describe('cloud recovery visibility',()=>{
   it('shows unknown creation outcomes and retained cleanup failures',async()=>{

@@ -3,6 +3,10 @@ import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ConversationToo
 
 export const nativeAvailable = isTauri();
 export const api = {
+  hasDaytonaKey: () => invoke<boolean>('has_daytona_key'),
+  saveDaytonaKey: (key: string) => invoke<void>('save_daytona_key', { key }),
+  forgetDaytonaKey: () => invoke<void>('forget_daytona_key'),
+  retryDaytonaCleanup: (name: string) => invoke<void>('retry_daytona_cleanup', { name }),
   pendingDaytonaOperations: () => invoke<{ name: string; sandboxId: string | null; createdAt: number; cleanupError: string | null }[]>('pending_daytona_operations'),
   hardwareStatus: () => invoke<HardwareStatus>('hardware_status'),
   getExecutionConfig: () => invoke<ExecutionConfig>('get_execution_config'),

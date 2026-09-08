@@ -48,3 +48,12 @@ The recovery engine validates the credential scope locally, inspects the saved s
 
 Tests cover successful deletion, ownership mismatch, API failure, unresolved creation and scope mismatch. A cancellation test interrupts deletion after association and reopens SQLite to verify identity survives. This engine is not yet called automatically or from a recovery button; credential integration and lifecycle wiring remain next.
 
+
+## Credentials and manual cleanup UI
+
+Execution now saves/forgets a Daytona API key through the shared encrypted vault and exposes only a presence flag. Saving validates format locally but does not verify the account or allocate resources. Pending records prevent replacing the associated key with a different key or forgetting it. Credential scope currently hashes the key; rotation of an expired key while cleanup remains is not yet supported and needs verified account-identity handling before release.
+
+Retry cleanup invokes the ownership-checked recovery engine for the selected record. It serializes cloud operations and refuses to run during a model operation. The UI refreshes pending records after success or error. Automatic startup recovery and the executable cloud tool remain incomplete.
+
+The native daytona-settings smoke test refuses to replace an existing key. Using a generated fixture, it verifies encrypted-file contents do not contain the key, input clearing, persisted presence across reload and forgetting, without cloud calls. The test restores the no-key state.
+

@@ -206,3 +206,10 @@ Implemented the recovery engine over the native transport and durable journal. I
 
 All six Daytona tests passed before adding the cancellation test; both final cleanup tests and strict Clippy passed afterward (61 Rust tests now exist). Fixtures cover success, mismatched ownership, server failure, unresolved creation, wrong scope and cancellation during deletion followed by database reopening. No real cloud calls occurred. Credential UI, recovery-button/automatic startup wiring and the cloud execution lifecycle are still incomplete.
 
+
+### Daytona credential settings and manual recovery
+
+Added native encrypted-key save/presence/forget commands and a manual retry-cleanup command. Execution now provides password input, explicit saved-versus-verified status, forgetting and per-record cleanup buttons. Pending ownership blocks credential replacement/removal. Daytona and MCP share the same vault instance to serialize key operations. Cloud cleanup is serialized and excluded during model operations.
+
+All 19 frontend tests, strict Clippy and production frontend build pass. The final native build passed; scripts/daytona-settings-smoke.mjs verified save, ciphertext absence of the fixture key, input clearing, presence after reload and forget twice, including after the shared-vault change. No account/cloud requests were made. An initial native attempt launched the old executable during compilation; it was closed, the build completed, and the test reran successfully. Key rotation with pending operations, automatic recovery and the cloud execution tool remain open.
+

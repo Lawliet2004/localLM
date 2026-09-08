@@ -8,10 +8,14 @@ export function Execution() {
   const [busy, setBusy] = useState(nativeAvailable);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [cloudKey, setCloudKey] = useState('');
+  const [hasCloudKey, setHasCloudKey] = useState(false);
+  const [cloudBusy, setCloudBusy] = useState(false);
   const [pendingCloud, setPendingCloud] = useState<Awaited<ReturnType<typeof api.pendingDaytonaOperations>>>([]);
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
+    api.hasDaytonaKey().then(value => { if (!disposed) setHasCloudKey(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
     api.pendingDaytonaOperations().then(value => { if (!disposed) setPendingCloud(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
     api.getExecutionConfig().then(value => { if (!disposed) setConfig(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); }).finally(() => { if (!disposed) setBusy(false); });
     return () => { disposed = true; };
@@ -19,6 +23,15 @@ export function Execution() {
   async function browse(key: keyof ExecutionConfig) {
     try { const path = await open({ multiple: false, filters: [{ name: 'Executable', extensions: ['exe'] }] }); if (typeof path === 'string') setConfig(current => ({ ...current, [key]: path })); }
     catch (e) { setError(errorMessage(e)); }
+  }
+  async function cloudAction(action: 'save' | 'forget' | 'cleanup', name?: string) {
+    setCloudBusy(true); setError(''); setNotice('');
+    try {
+      if (action === 'save') { await api.saveDaytonaKey(cloudKey); setCloudKey(''); setHasCloudKey(true); setNotice('Daytona key saved securely. Account access has not been verified.'); }
+      if (action === 'forget') { await api.forgetDaytonaKey(); setCloudKey(''); setHasCloudKey(false); setNotice('Daytona key removed.'); }
+      if (action === 'cleanup' && name) { await api.retryDaytonaCleanup(name); setNotice('Cloud resource removal confirmed.'); }
+    } catch (e) { setError(errorMessage(e)); }
+    finally { try { setPendingCloud(await api.pendingDaytonaOperations()); } catch (e) { setError(errorMessage(e)); } setCloudBusy(false); }
   }
   async function save() {
     setBusy(true); setError(''); setNotice('');
@@ -35,6 +48,7 @@ export function Execution() {
     {error && <p role="alert" className="error-banner">{error}</p>}{notice && <p role="status">{notice}</p>}
     <p className="catalog-notice">To use local execution, choose a workspace folder under Tools in chat and enable Local code. Runs have a 90-second maximum and capture up to 64 KiB from each output stream.</p>
     <p className="catalog-notice">Daytona cloud execution is still being integrated.</p>
-    {pendingCloud.length > 0 && <section aria-label="Pending cloud cleanup"><h2>Cloud cleanup needs attention</h2><p>These operations may still have cloud resources. Their records are retained until removal is verified.</p>{pendingCloud.map(item => <div className="catalog-notice" key={item.name}><strong>{item.name}</strong><p>{item.sandboxId ? `Sandbox: ${item.sandboxId}` : 'Creation outcome unknown; look up this operation name before retrying.'}</p>{item.cleanupError && <p>{item.cleanupError}</p>}</div>)}</section>}
+    <form className="runtime-form" onSubmit={event => { event.preventDefault(); void cloudAction('save'); }}><h2>Daytona credentials</h2><p>{hasCloudKey ? 'An encrypted API key is saved.' : 'No Daytona key saved.'} Saving a key does not create a sandbox or verify account access.</p><label>Daytona API key<input type="password" autoComplete="off" spellCheck={false} value={cloudKey} disabled={!nativeAvailable || cloudBusy} onChange={event => setCloudKey(event.target.value)} /></label><div className="connector-actions"><button className="primary" disabled={!nativeAvailable || cloudBusy || !cloudKey}>Save Daytona key</button>{hasCloudKey && <button type="button" className="secondary" disabled={cloudBusy || pendingCloud.length > 0} onClick={() => void cloudAction('forget')}>Forget Daytona key</button>}</div></form>
+    {pendingCloud.length > 0 && <section aria-label="Pending cloud cleanup"><h2>Cloud cleanup needs attention</h2><p>These operations may still have cloud resources. Their records are retained until removal is verified.</p>{pendingCloud.map(item => <div className="catalog-notice" key={item.name}><strong>{item.name}</strong><p>{item.sandboxId ? `Sandbox: ${item.sandboxId}` : 'Creation outcome unknown; look up this operation name before retrying.'}</p>{item.cleanupError && <p>{item.cleanupError}</p>}<button className="secondary" disabled={!hasCloudKey || cloudBusy} onClick={() => void cloudAction('cleanup', item.name)}>Retry cleanup</button></div>)}</section>}
   </div>;
 }

@@ -6,6 +6,7 @@ mod context;
 pub mod daytona;
 pub mod daytona_cleanup;
 pub mod daytona_journal;
+mod daytona_settings;
 mod execution;
 mod export;
 mod hardware;
@@ -26,6 +27,8 @@ use std::sync::Mutex;
 use tauri::Manager;
 
 pub struct AppState {
+    daytona_vault: std::sync::Arc<vault::Vault>,
+    daytona_operation: tokio::sync::Mutex<()>,
     daytona_journal: Mutex<daytona_journal::Journal>,
     skills: tokio::sync::Mutex<skills::Skills>,
     approvals: approval::Approvals,
@@ -71,7 +74,10 @@ pub fn run() {
             std::fs::create_dir_all(&data)?;
             let store =
                 store::Store::open(&data.join("locallm.sqlite")).map_err(std::io::Error::other)?;
+            let vault = std::sync::Arc::new(vault::Vault::new(data.join("credentials")));
             app.manage(AppState {
+                daytona_vault: vault.clone(),
+                daytona_operation: tokio::sync::Mutex::new(()),
                 daytona_journal: Mutex::new(
                     daytona_journal::Journal::open(&data.join("daytona.sqlite"))
                         .map_err(std::io::Error::other)?,
@@ -82,15 +88,17 @@ pub fn run() {
                 runtime: tokio::sync::Mutex::new(runtime::Runtime::new(data.join("runtime.log"))),
                 operation: tokio::sync::Mutex::new(()),
                 cancel: tokio::sync::watch::channel(false).0,
-                connectors: tokio::sync::Mutex::new(connectors::McpHub::new(std::sync::Arc::new(
-                    vault::Vault::new(data.join("credentials")),
-                ))),
+                connectors: tokio::sync::Mutex::new(connectors::McpHub::new(vault)),
                 oauth_operation: tokio::sync::Mutex::new(()),
                 oauth_cancel: tokio::sync::watch::channel(false).0,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            daytona_settings::has_daytona_key,
+            daytona_settings::save_daytona_key,
+            daytona_settings::forget_daytona_key,
+            daytona_settings::retry_daytona_cleanup,
             daytona_journal::pending_daytona_operations,
             commands::bootstrap,
             hardware::hardware_status,
