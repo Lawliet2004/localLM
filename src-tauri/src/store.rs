@@ -244,6 +244,12 @@ impl Store {
     pub fn preferences(&self) -> Result<Preferences> {
         self.setting("preferences")
     }
+    pub fn active_skills(&self) -> Result<Vec<String>> {
+        self.setting("active_skills")
+    }
+    pub fn save_active_skills(&self, ids: &[String]) -> Result<()> {
+        self.save_setting("active_skills", &ids)
+    }
     pub fn save_preferences(&self, preferences: &Preferences) -> Result<()> {
         preferences.validate()?;
         self.save_setting("preferences", preferences)

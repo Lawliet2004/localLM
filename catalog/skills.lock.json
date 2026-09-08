@@ -1,0 +1,686 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "id": "algorithmic-art",
+      "description": "Creating algorithmic art using p5.js with seeded randomness and interactive parameter exploration.",
+      "repo": "anthropics/skills",
+      "revision": "41bbe19d1a1a7eaab5e7bb9050a417e5c6cffc8f",
+      "sourcePath": "skills/algorithmic-art",
+      "files": [
+        {
+          "path": "LICENSE.txt",
+          "sourcePath": "skills/algorithmic-art/LICENSE.txt",
+          "size": 11345,
+          "sha256": "bc6b3af2f331cbc7fb0da1344efb2cbe5877a31498b4d70dbc7000f3405a1362"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/algorithmic-art/SKILL.md",
+          "size": 19769,
+          "sha256": "3bc4092c09804853186524c826bc0621b940bb6122c05b84496dff95388e6eef"
+        },
+        {
+          "path": "templates/generator_template.js",
+          "sourcePath": "skills/algorithmic-art/templates/generator_template.js",
+          "size": 7826,
+          "sha256": "9ee0f1da52ef8f7bbfde1917123654880890d43f2d388642d71eab6dd78f94c4"
+        },
+        {
+          "path": "templates/viewer.html",
+          "sourcePath": "skills/algorithmic-art/templates/viewer.html",
+          "size": 20844,
+          "sha256": "86c79d7ce97d2599ebe4bd9b97fdeb7295c9d3ed61ceeb513cbe1b2bb5d1ce29"
+        }
+      ]
+    },
+    {
+      "id": "skill-creator",
+      "description": "Scaffold, refine, and package new Agent Skills, including SKILL.md structure and evaluation.",
+      "repo": "anthropics/skills",
+      "revision": "41bbe19d1a1a7eaab5e7bb9050a417e5c6cffc8f",
+      "sourcePath": "skills/skill-creator",
+      "files": [
+        {
+          "path": "agents/analyzer.md",
+          "sourcePath": "skills/skill-creator/agents/analyzer.md",
+          "size": 10376,
+          "sha256": "bf68f4cac5a56c673a928c2e6d619586c5b93ea364026ab37547772cb45a663a"
+        },
+        {
+          "path": "agents/comparator.md",
+          "sourcePath": "skills/skill-creator/agents/comparator.md",
+          "size": 7287,
+          "sha256": "fe1fc9787c495d864c5d6eada47396478572325fde1b33a96d78bf4b849b7a3e"
+        },
+        {
+          "path": "agents/grader.md",
+          "sourcePath": "skills/skill-creator/agents/grader.md",
+          "size": 9049,
+          "sha256": "57134da0c1a4eea33fbd74a1c9c44aa814f07d6bc64de303edb586f941e5d21a"
+        },
+        {
+          "path": "assets/eval_review.html",
+          "sourcePath": "skills/skill-creator/assets/eval_review.html",
+          "size": 7058,
+          "sha256": "ce477dcc74dc1c0d1d3352646a79167b5a63634e936b1019160025065974e452"
+        },
+        {
+          "path": "eval-viewer/generate_review.py",
+          "sourcePath": "skills/skill-creator/eval-viewer/generate_review.py",
+          "size": 16365,
+          "sha256": "fc9d1b9243fe5ab6012ebd579bd76d0035de1b79fd3b969de114defab26478fb"
+        },
+        {
+          "path": "eval-viewer/viewer.html",
+          "sourcePath": "skills/skill-creator/eval-viewer/viewer.html",
+          "size": 44998,
+          "sha256": "a53213426ee1100441d701a3a0d49cda7a842f992d2c36463f4d3cc0258575fa"
+        },
+        {
+          "path": "LICENSE.txt",
+          "sourcePath": "skills/skill-creator/LICENSE.txt",
+          "size": 11345,
+          "sha256": "bc6b3af2f331cbc7fb0da1344efb2cbe5877a31498b4d70dbc7000f3405a1362"
+        },
+        {
+          "path": "references/schemas.md",
+          "sourcePath": "skills/skill-creator/references/schemas.md",
+          "size": 12061,
+          "sha256": "8e8876180a8989b406a4d3edddf875b04cdfd5805cc8616686d552b11ce4455f"
+        },
+        {
+          "path": "scripts/__init__.py",
+          "sourcePath": "skills/skill-creator/scripts/__init__.py",
+          "size": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "scripts/aggregate_benchmark.py",
+          "sourcePath": "skills/skill-creator/scripts/aggregate_benchmark.py",
+          "size": 14386,
+          "sha256": "123ef128ea5ccc01a4b1ac212ef5567f21e9c13d3d240609780beeb3200c49aa"
+        },
+        {
+          "path": "scripts/generate_report.py",
+          "sourcePath": "skills/skill-creator/scripts/generate_report.py",
+          "size": 12847,
+          "sha256": "13df7118a3c50c83c4c3250a606d5f2b20b25a3d44cbc392b3d669ec75281453"
+        },
+        {
+          "path": "scripts/improve_description.py",
+          "sourcePath": "skills/skill-creator/scripts/improve_description.py",
+          "size": 11116,
+          "sha256": "87d864570220b699fac52da309d2d6efdb060647bfebc74f768128e646accf80"
+        },
+        {
+          "path": "scripts/package_skill.py",
+          "sourcePath": "skills/skill-creator/scripts/package_skill.py",
+          "size": 4234,
+          "sha256": "1a33059b0db1ef73375d46d513e5ea81369d2e8838c970597b0d52ddef8d1c0f"
+        },
+        {
+          "path": "scripts/quick_validate.py",
+          "sourcePath": "skills/skill-creator/scripts/quick_validate.py",
+          "size": 3972,
+          "sha256": "67cf5703402013936c8fb75ad6a1afecd8841d45cc5e606b634eb05825fde365"
+        },
+        {
+          "path": "scripts/run_eval.py",
+          "sourcePath": "skills/skill-creator/scripts/run_eval.py",
+          "size": 11464,
+          "sha256": "43e3b8f80dbf69c343967ba77e268fae991d9fa3ed68b32a0ff02532cd48657f"
+        },
+        {
+          "path": "scripts/run_loop.py",
+          "sourcePath": "skills/skill-creator/scripts/run_loop.py",
+          "size": 13605,
+          "sha256": "7bd6f674203168520517eec94c55f493c0d154339b061b4d7c0f0dad187d0f21"
+        },
+        {
+          "path": "scripts/utils.py",
+          "sourcePath": "skills/skill-creator/scripts/utils.py",
+          "size": 1661,
+          "sha256": "3af8ae62c40c73ab712207436a0d9a981e845f25c5a7040229eb189cc8e45bb1"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/skill-creator/SKILL.md",
+          "size": 33168,
+          "sha256": "dcd4803e61e913e6fc27294184cd3a71f09f5e924ff20c8a9a20173e7b3c2bcf"
+        }
+      ]
+    },
+    {
+      "id": "mcp-builder",
+      "description": "Build Model Context Protocol (MCP) servers — tool definitions, transports, and packaging.",
+      "repo": "anthropics/skills",
+      "revision": "41bbe19d1a1a7eaab5e7bb9050a417e5c6cffc8f",
+      "sourcePath": "skills/mcp-builder",
+      "files": [
+        {
+          "path": "LICENSE.txt",
+          "sourcePath": "skills/mcp-builder/LICENSE.txt",
+          "size": 11345,
+          "sha256": "bc6b3af2f331cbc7fb0da1344efb2cbe5877a31498b4d70dbc7000f3405a1362"
+        },
+        {
+          "path": "reference/evaluation.md",
+          "sourcePath": "skills/mcp-builder/reference/evaluation.md",
+          "size": 21663,
+          "sha256": "8c99479f8a2d22a636c38e274537aac3610879e26f34e0709825077c4576f427"
+        },
+        {
+          "path": "reference/mcp_best_practices.md",
+          "sourcePath": "skills/mcp-builder/reference/mcp_best_practices.md",
+          "size": 7330,
+          "sha256": "80fb4369a349447cf18ecdd7494fe7938b6065377e9f08c077cec411093a3007"
+        },
+        {
+          "path": "reference/node_mcp_server.md",
+          "sourcePath": "skills/mcp-builder/reference/node_mcp_server.md",
+          "size": 28550,
+          "sha256": "c3ba35a4f599dd53be9c6555ae72c19a7bf412cd5426576c2c08d42755482c66"
+        },
+        {
+          "path": "reference/python_mcp_server.md",
+          "sourcePath": "skills/mcp-builder/reference/python_mcp_server.md",
+          "size": 25099,
+          "sha256": "2da52f77e675191014ca2e146a4b95aa04d0ca7dd7e2b100322df15ade685e80"
+        },
+        {
+          "path": "scripts/connections.py",
+          "sourcePath": "skills/mcp-builder/scripts/connections.py",
+          "size": 4875,
+          "sha256": "9403668a2041568772082a8b334122c1f88daf0541fb393af4522d0094a47a6e"
+        },
+        {
+          "path": "scripts/evaluation.py",
+          "sourcePath": "skills/mcp-builder/scripts/evaluation.py",
+          "size": 12579,
+          "sha256": "49ed1d17cdce5da101b210197740713f49b935c29d4f339542a14b132658e6f7"
+        },
+        {
+          "path": "scripts/example_evaluation.xml",
+          "sourcePath": "skills/mcp-builder/scripts/example_evaluation.xml",
+          "size": 1194,
+          "sha256": "9272b348ddcc4b06ba562367ccd0770e018158c0068ac5116d5e34aaeff8777a"
+        },
+        {
+          "path": "scripts/requirements.txt",
+          "sourcePath": "skills/mcp-builder/scripts/requirements.txt",
+          "size": 29,
+          "sha256": "d5d7558b2368ecea9dfeed7d1fbc71ee9e0750bebd1282faa527d528a344c3c7"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/mcp-builder/SKILL.md",
+          "size": 9092,
+          "sha256": "0f4592dcb53cf2b5d6b7febee6b4152018b565551a1c29e3c612f57b218ab295"
+        }
+      ]
+    },
+    {
+      "id": "web-artifacts-builder",
+      "description": "Build self-contained web artifacts (HTML/JS/CSS) that render as interactive standalone pages.",
+      "repo": "anthropics/skills",
+      "revision": "41bbe19d1a1a7eaab5e7bb9050a417e5c6cffc8f",
+      "sourcePath": "skills/web-artifacts-builder",
+      "files": [
+        {
+          "path": "LICENSE.txt",
+          "sourcePath": "skills/web-artifacts-builder/LICENSE.txt",
+          "size": 11345,
+          "sha256": "bc6b3af2f331cbc7fb0da1344efb2cbe5877a31498b4d70dbc7000f3405a1362"
+        },
+        {
+          "path": "scripts/bundle-artifact.sh",
+          "sourcePath": "skills/web-artifacts-builder/scripts/bundle-artifact.sh",
+          "size": 1517,
+          "sha256": "abf0e480bf6585b56fab8526a407dfb7dc740812bddd70c636e1e8f3df5f9618"
+        },
+        {
+          "path": "scripts/init-artifact.sh",
+          "sourcePath": "skills/web-artifacts-builder/scripts/init-artifact.sh",
+          "size": 9924,
+          "sha256": "355e5dd4382aaaee91f01f1627eaeab30b2676ffa8d9b3ec328a1ae450ebccaa"
+        },
+        {
+          "path": "scripts/shadcn-components.tar.gz",
+          "sourcePath": "skills/web-artifacts-builder/scripts/shadcn-components.tar.gz",
+          "size": 19967,
+          "sha256": "1296f069e825de7933de7e8ac63672495cacce3f88f2dc45554dbcddbcbca60f"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/web-artifacts-builder/SKILL.md",
+          "size": 3087,
+          "sha256": "81c5002c6643b0de7b8710b00e7a9038daa6fb9b68d59870ee6adb12da8d10f8"
+        }
+      ]
+    },
+    {
+      "id": "tavily-research",
+      "description": "Run structured web research with the Tavily MCP — search, extract, and synthesize sources.",
+      "repo": "tavily-ai/skills",
+      "revision": "778122e5f9c680f541eeceda5a5b36405eb7980c",
+      "sourcePath": "skills/tavily-research",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/tavily-research/SKILL.md",
+          "size": 4076,
+          "sha256": "d62b2b1ba9804ec077c2e79f6433a3e60deb02a845d6481ac4b47d3961452970"
+        },
+        {
+          "path": "UPSTREAM-LICENSE",
+          "sourcePath": "LICENSE",
+          "size": 1093,
+          "sha256": "3a6f01d3dc3c51e09a15c9fd63fa965688c8b549bf2dce183116d9c5528c596e"
+        }
+      ]
+    },
+    {
+      "id": "supabase",
+      "description": "Query and manage a Supabase Postgres database via SQL through the Supabase MCP.",
+      "repo": "supabase/agent-skills",
+      "revision": "8331f910845103c08d51f6ca1d86ebb7d1f745e3",
+      "sourcePath": "skills/supabase",
+      "files": [
+        {
+          "path": "assets/feedback-issue-template.md",
+          "sourcePath": "skills/supabase/assets/feedback-issue-template.md",
+          "size": 459,
+          "sha256": "ea211aa174c5a096fe76461f25143b8bc23f3bde3adc9e727cda38218cc8c282"
+        },
+        {
+          "path": "CHANGELOG.md",
+          "sourcePath": "skills/supabase/CHANGELOG.md",
+          "size": 7355,
+          "sha256": "f4c9c7750ea2c9212a05c3f38bc04d66cb2fe037f6b9a3fb6279d53bef152f8e"
+        },
+        {
+          "path": "references/skill-feedback.md",
+          "sourcePath": "skills/supabase/references/skill-feedback.md",
+          "size": 1035,
+          "sha256": "09ad94c0291735dfc04c92557c8734fa259ec39e1d56bf2bd5c6a6529d838717"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/supabase/SKILL.md",
+          "size": 12830,
+          "sha256": "16817870f69bb9db58343cfa41c6fb864713c01f3680a64e0fb869605a5d81c3"
+        },
+        {
+          "path": "UPSTREAM-LICENSE",
+          "sourcePath": "LICENSE",
+          "size": 1065,
+          "sha256": "b65e575eb4f04a13c187d64e958321298e2ab84d67aa8428819f362056ba292c"
+        }
+      ]
+    },
+    {
+      "id": "wiki-architect",
+      "description": "Plan and structure a repository wiki / brief from a codebase (DeepWiki).",
+      "repo": "microsoft/skills",
+      "revision": "02e0b2f852b39ea00c43283f999b83fc12079273",
+      "sourcePath": ".github/plugins/deep-wiki/skills/wiki-architect",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sourcePath": ".github/plugins/deep-wiki/skills/wiki-architect/SKILL.md",
+          "size": 4068,
+          "sha256": "e439354d8a650cf147ef008222b80e28414c1e295381616639890f901a653226"
+        },
+        {
+          "path": "UPSTREAM-LICENSE",
+          "sourcePath": "LICENSE",
+          "size": 1140,
+          "sha256": "d9a1b1e30d633d5732ea18e3cba9538d293ebc53e1a9e4e96ab739e0c5c4f1cb"
+        }
+      ]
+    },
+    {
+      "id": "wiki-qa",
+      "description": "Answer questions about a repository from its generated wiki (DeepWiki); companion to wiki-architect.",
+      "repo": "microsoft/skills",
+      "revision": "02e0b2f852b39ea00c43283f999b83fc12079273",
+      "sourcePath": ".github/plugins/deep-wiki/skills/wiki-qa",
+      "files": [
+        {
+          "path": "SKILL.md",
+          "sourcePath": ".github/plugins/deep-wiki/skills/wiki-qa/SKILL.md",
+          "size": 2358,
+          "sha256": "e509864c9561b98dc3f6e9d8bf80824f07a1fe78978dea9ed849959c34b6f7b4"
+        },
+        {
+          "path": "UPSTREAM-LICENSE",
+          "sourcePath": "LICENSE",
+          "size": 1140,
+          "sha256": "d9a1b1e30d633d5732ea18e3cba9538d293ebc53e1a9e4e96ab739e0c5c4f1cb"
+        }
+      ]
+    },
+    {
+      "id": "linear",
+      "description": "Triage and manage Linear issues (create, update, search) via the Linear MCP.",
+      "repo": "openai/skills",
+      "revision": "49f948faa9258a0c61caceaf225e179651397431",
+      "sourcePath": "skills/.curated/linear",
+      "files": [
+        {
+          "path": "agents/openai.yaml",
+          "sourcePath": "skills/.curated/linear/agents/openai.yaml",
+          "size": 460,
+          "sha256": "9e6f164960e3dd0bc56456538abdf196d9e4fd8b4273be06fe1ef0110fbab9cb"
+        },
+        {
+          "path": "assets/linear-small.svg",
+          "sourcePath": "skills/.curated/linear/assets/linear-small.svg",
+          "size": 1065,
+          "sha256": "6af9dbc5e58a51e80fcbcee47e5f9bd196a997cc5985c2147a89c908831d327f"
+        },
+        {
+          "path": "assets/linear.png",
+          "sourcePath": "skills/.curated/linear/assets/linear.png",
+          "size": 6969,
+          "sha256": "be13bf3f97e4437e67cda80979759998fb4f4dcace3cdd6a220ba6a75e1c2a82"
+        },
+        {
+          "path": "LICENSE.txt",
+          "sourcePath": "skills/.curated/linear/LICENSE.txt",
+          "size": 11357,
+          "sha256": "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/.curated/linear/SKILL.md",
+          "size": 4952,
+          "sha256": "ce0f39c95b6c9190f8ea33614393cdb556b2684dd8388ded394e9cb915f42601"
+        }
+      ]
+    },
+    {
+      "id": "gh-fix-ci",
+      "description": "Diagnose and fix failing GitHub CI checks on a pull request via the GitHub MCP.",
+      "repo": "openai/skills",
+      "revision": "49f948faa9258a0c61caceaf225e179651397431",
+      "sourcePath": "skills/.curated/gh-fix-ci",
+      "files": [
+        {
+          "path": "agents/openai.yaml",
+          "sourcePath": "skills/.curated/gh-fix-ci/agents/openai.yaml",
+          "size": 302,
+          "sha256": "36f73b9450504983d1647c960689596f59bf9147c14b1b43162912ed7ada9af6"
+        },
+        {
+          "path": "assets/github-small.svg",
+          "sourcePath": "skills/.curated/gh-fix-ci/assets/github-small.svg",
+          "size": 853,
+          "sha256": "ee05e92d373d4d84f4612af3c1090ef67698d421bbe30896a4ed5a00cb86a069"
+        },
+        {
+          "path": "assets/github.png",
+          "sourcePath": "skills/.curated/gh-fix-ci/assets/github.png",
+          "size": 1838,
+          "sha256": "d55a9baa41798d8b5108e3058df3a5bda09914ea9fd73b49929cc38a8832424f"
+        },
+        {
+          "path": "LICENSE.txt",
+          "sourcePath": "skills/.curated/gh-fix-ci/LICENSE.txt",
+          "size": 10776,
+          "sha256": "4dd13869245e356246a5b770723247bbb80a8f07a181d1d3d873a1734297cdb9"
+        },
+        {
+          "path": "scripts/inspect_pr_checks.py",
+          "sourcePath": "skills/.curated/gh-fix-ci/scripts/inspect_pr_checks.py",
+          "size": 15222,
+          "sha256": "9459e5b03f86785d184a83e5cd8d621b832e918ec04158a2962d867785812c6c"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/.curated/gh-fix-ci/SKILL.md",
+          "size": 3651,
+          "sha256": "7b326b4a2f0f5f85122144628ec02077e48841e0e0e82efce88b3415bcfb7c26"
+        }
+      ]
+    },
+    {
+      "id": "notion-knowledge-capture",
+      "description": "Capture and organize knowledge into Notion pages and databases via the Notion MCP.",
+      "repo": "openai/skills",
+      "revision": "49f948faa9258a0c61caceaf225e179651397431",
+      "sourcePath": "skills/.curated/notion-knowledge-capture",
+      "files": [
+        {
+          "path": "agents/openai.yaml",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/agents/openai.yaml",
+          "size": 512,
+          "sha256": "549a8c26475f190cb1518c960312bab5c5cf43cc3b0693cd67268e82c5f42b3a"
+        },
+        {
+          "path": "assets/notion-small.svg",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/assets/notion-small.svg",
+          "size": 15777,
+          "sha256": "00f5e4b758cc5c3e36e783dca2fabfafd05169c2f2175063e56d2e1fb6a55f81"
+        },
+        {
+          "path": "assets/notion.png",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/assets/notion.png",
+          "size": 8526,
+          "sha256": "5eef1e62d96a3d09bc9d18e4140486c22799145b017033bd0924c2c49d741cd4"
+        },
+        {
+          "path": "evaluations/conversation-to-wiki.json",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/evaluations/conversation-to-wiki.json",
+          "size": 2035,
+          "sha256": "ff08f8d2b7c0634314b70e96cc2f7fa8aa757683dd0652d99d665c678c6c53ba"
+        },
+        {
+          "path": "evaluations/decision-record.json",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/evaluations/decision-record.json",
+          "size": 2220,
+          "sha256": "9f7c3de9390cb57dde8278fa0537bd3f779b4e7066b9a17ec72ec7a108e7ba32"
+        },
+        {
+          "path": "evaluations/README.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/evaluations/README.md",
+          "size": 3487,
+          "sha256": "2d965e000d73b013a0a0ab50802fa53e81efb8a657dba49a3d79ec6562ab3d23"
+        },
+        {
+          "path": "examples/conversation-to-faq.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/examples/conversation-to-faq.md",
+          "size": 16242,
+          "sha256": "2c78414d86d3d854ba51ff6c88ea5f1315268742816e2d3b13ee6848f1158a73"
+        },
+        {
+          "path": "examples/decision-capture.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/examples/decision-capture.md",
+          "size": 3568,
+          "sha256": "c6fc42d095d842ac55ab1a95322bab7d0146669089e0b0d470f791ad8477b586"
+        },
+        {
+          "path": "examples/how-to-guide.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/examples/how-to-guide.md",
+          "size": 2838,
+          "sha256": "5c13ac240bf07a0575b1295a6c5d7f95d0112702652d92870a9858e3c74033e7"
+        },
+        {
+          "path": "LICENSE.txt",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/LICENSE.txt",
+          "size": 1057,
+          "sha256": "0f377d9b2a1db642e4b0531ffa126e96d9bc6c085f8d9441f220fb25f723c6f8"
+        },
+        {
+          "path": "reference/database-best-practices.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/reference/database-best-practices.md",
+          "size": 2876,
+          "sha256": "72190afe54894b8ef2566d6f6d60fdcfe39822f5a1db02e75c2186c6952ad83c"
+        },
+        {
+          "path": "reference/decision-log-database.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/reference/decision-log-database.md",
+          "size": 2033,
+          "sha256": "77d23a69b94cecaad520cb84f18b214994fa2c7873b88928f8d13da8b301c773"
+        },
+        {
+          "path": "reference/documentation-database.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/reference/documentation-database.md",
+          "size": 2745,
+          "sha256": "727f6bb7a341e871ba8afe155f9b261fe6f5ecf7f5ca7a43db3ad646fee7244d"
+        },
+        {
+          "path": "reference/faq-database.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/reference/faq-database.md",
+          "size": 2037,
+          "sha256": "2fedbd91f02df20541fa14372661d82d19e04cb96d261a184a74aff5b90089be"
+        },
+        {
+          "path": "reference/how-to-guide-database.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/reference/how-to-guide-database.md",
+          "size": 1237,
+          "sha256": "a6002d032b0563e0234a4c225226ea6a207b120e69b0c839315c8402813b30e5"
+        },
+        {
+          "path": "reference/learning-database.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/reference/learning-database.md",
+          "size": 1322,
+          "sha256": "8ceaa72bc7ab944ce1084df6233001c05b65d06ee5913a23caf760f248236e83"
+        },
+        {
+          "path": "reference/team-wiki-database.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/reference/team-wiki-database.md",
+          "size": 927,
+          "sha256": "b08cfd417d2d61cda223c1d44c199b0a588e35c177f75328681c1b820b6450f8"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/.curated/notion-knowledge-capture/SKILL.md",
+          "size": 3316,
+          "sha256": "b49383b229bc766190ea22bb58502cfcf7e08449f5fce55a104eef1e54e27f00"
+        }
+      ]
+    },
+    {
+      "id": "sentry",
+      "description": "Investigate and triage Sentry errors and issues via the Sentry MCP.",
+      "repo": "openai/skills",
+      "revision": "49f948faa9258a0c61caceaf225e179651397431",
+      "sourcePath": "skills/.curated/sentry",
+      "files": [
+        {
+          "path": "agents/openai.yaml",
+          "sourcePath": "skills/.curated/sentry/agents/openai.yaml",
+          "size": 316,
+          "sha256": "c7ed57441b9a1e3f4caa19da4d90d432a65cd398c4f361b47dbf9408be0e065f"
+        },
+        {
+          "path": "assets/sentry-small.svg",
+          "sourcePath": "skills/.curated/sentry/assets/sentry-small.svg",
+          "size": 661,
+          "sha256": "f1de8efc906c03b583b4d74560b003175c8a3d9ea5950d891ce3142fec11ca99"
+        },
+        {
+          "path": "assets/sentry.png",
+          "sourcePath": "skills/.curated/sentry/assets/sentry.png",
+          "size": 1998,
+          "sha256": "b61e0534635a275cf56f7dad26ac7cc36504b7bd9a60c95791d6e72634129fb1"
+        },
+        {
+          "path": "LICENSE.txt",
+          "sourcePath": "skills/.curated/sentry/LICENSE.txt",
+          "size": 10776,
+          "sha256": "4dd13869245e356246a5b770723247bbb80a8f07a181d1d3d873a1734297cdb9"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/.curated/sentry/SKILL.md",
+          "size": 3810,
+          "sha256": "508c6f5c100586c81a34397d30f00f4b8771b66d698a7ac1836998df925dd007"
+        }
+      ]
+    },
+    {
+      "id": "jupyter-notebook",
+      "description": "Perform data analysis in Jupyter notebooks — load data, compute, and visualize results.",
+      "repo": "openai/skills",
+      "revision": "49f948faa9258a0c61caceaf225e179651397431",
+      "sourcePath": "skills/.curated/jupyter-notebook",
+      "files": [
+        {
+          "path": "agents/openai.yaml",
+          "sourcePath": "skills/.curated/jupyter-notebook/agents/openai.yaml",
+          "size": 325,
+          "sha256": "3a2d6a8f9ed10e18f6caa66aeb26a02305bc61f36fc4b333c904e02f9988fb9c"
+        },
+        {
+          "path": "assets/experiment-template.ipynb",
+          "sourcePath": "skills/.curated/jupyter-notebook/assets/experiment-template.ipynb",
+          "size": 2570,
+          "sha256": "25f85914103cd84244e20ef378f59097479c72481cd18d3a931354d107c3f300"
+        },
+        {
+          "path": "assets/jupyter-small.svg",
+          "sourcePath": "skills/.curated/jupyter-notebook/assets/jupyter-small.svg",
+          "size": 1043,
+          "sha256": "a36bd27bef3775f111309241754b386db81e7d356f07672190e2fcb24478a250"
+        },
+        {
+          "path": "assets/jupyter.png",
+          "sourcePath": "skills/.curated/jupyter-notebook/assets/jupyter.png",
+          "size": 2713,
+          "sha256": "852fd5468885bb176d266d547e61684792332e44a88cfbc8cd07323937040ccb"
+        },
+        {
+          "path": "assets/tutorial-template.ipynb",
+          "sourcePath": "skills/.curated/jupyter-notebook/assets/tutorial-template.ipynb",
+          "size": 2490,
+          "sha256": "704a809c09c7c9e6e5c437860df95524412b50c58571a14204610d73e0744765"
+        },
+        {
+          "path": "LICENSE.txt",
+          "sourcePath": "skills/.curated/jupyter-notebook/LICENSE.txt",
+          "size": 10776,
+          "sha256": "4dd13869245e356246a5b770723247bbb80a8f07a181d1d3d873a1734297cdb9"
+        },
+        {
+          "path": "references/experiment-patterns.md",
+          "sourcePath": "skills/.curated/jupyter-notebook/references/experiment-patterns.md",
+          "size": 699,
+          "sha256": "1ff9c04281c01e8e2209bde9f1fd910b8e4b620dd1f1f040e2101f1d88513a91"
+        },
+        {
+          "path": "references/notebook-structure.md",
+          "sourcePath": "skills/.curated/jupyter-notebook/references/notebook-structure.md",
+          "size": 751,
+          "sha256": "a85051a2e88fd3424bbed2636e952ec5f858e7efa4e076c28d62a8cc2cc9dc06"
+        },
+        {
+          "path": "references/quality-checklist.md",
+          "sourcePath": "skills/.curated/jupyter-notebook/references/quality-checklist.md",
+          "size": 572,
+          "sha256": "ed01afe6ff47714d85935d11053b64c414772f02250fdc604e3fca65e5139136"
+        },
+        {
+          "path": "references/tutorial-patterns.md",
+          "sourcePath": "skills/.curated/jupyter-notebook/references/tutorial-patterns.md",
+          "size": 685,
+          "sha256": "8c194bb640de2fb7747e3db87006ecec5219252d301f53670975dbb5310ff659"
+        },
+        {
+          "path": "scripts/new_notebook.py",
+          "sourcePath": "skills/.curated/jupyter-notebook/scripts/new_notebook.py",
+          "size": 4086,
+          "sha256": "a004e2ea3115edb24313928be0be6d1dc07e571d7ca6c1b24375f0569c616d2f"
+        },
+        {
+          "path": "SKILL.md",
+          "sourcePath": "skills/.curated/jupyter-notebook/SKILL.md",
+          "size": 4154,
+          "sha256": "62f102e8554b25716dccef0ffab4572d4e3eaf05ccc76562d33a065bc9c521fb"
+        }
+      ]
+    }
+  ]
+}

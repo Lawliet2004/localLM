@@ -5,6 +5,7 @@ mod connectors;
 mod oauth;
 mod runtime;
 mod runtime_config;
+mod skills;
 mod sse;
 mod store;
 mod tool_calls;
@@ -14,6 +15,7 @@ use std::sync::Mutex;
 use tauri::Manager;
 
 pub struct AppState {
+    skills: tokio::sync::Mutex<skills::Skills>,
     approvals: approval::Approvals,
     store: Mutex<store::Store>,
     runtime: tokio::sync::Mutex<runtime::Runtime>,
@@ -42,6 +44,7 @@ pub fn run() {
             let store =
                 store::Store::open(&data.join("locallm.sqlite")).map_err(std::io::Error::other)?;
             app.manage(AppState {
+                skills: tokio::sync::Mutex::new(skills::Skills::new(data.join("skills"))),
                 approvals: approval::Approvals::default(),
                 store: Mutex::new(store),
                 runtime: tokio::sync::Mutex::new(runtime::Runtime::new(data.join("runtime.log"))),
@@ -57,6 +60,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            skills::list_skills,
+            skills::install_skill,
+            skills::remove_skill,
+            skills::set_skill_active,
+            skills::read_skill_file,
             commands::create_conversation,
             commands::rename_conversation,
             commands::delete_conversation,

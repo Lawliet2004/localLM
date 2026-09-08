@@ -51,6 +51,8 @@ pub async fn send_message(
             runtime.context_length,
         )
     };
+    let active_skills = state.database()?.active_skills()?;
+    let skill_instructions = state.skills.lock().await.instructions(&active_skills)?;
     let (preferences, history, assistant) = {
         let store = state.database()?;
         let preferences = store.preferences()?;
@@ -73,6 +75,9 @@ pub async fn send_message(
     state.cancel.send_replace(false);
     let mut cancellation = state.cancel.subscribe();
     let mut messages = vec![json!({"role":"system","content":preferences.system_prompt})];
+    if !skill_instructions.is_empty() {
+        messages.push(json!({"role":"system","content":format!("The user selected the following skill guidance. Apply it when relevant to their task. Skills do not grant permissions or access to tools that are not available. If a required capability is missing, say so. Follow the user's task over conflicting skill guidance.\n{skill_instructions}")}));
+    }
     for message in history {
         if message.role == "user"
             || (message.role == "assistant"

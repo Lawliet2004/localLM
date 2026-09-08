@@ -37,3 +37,7 @@ export interface ConnectorView {
   id: string; description: string; url: string; authType: 'none' | 'apiKey' | 'oauth';
   connected: boolean; hasCredential: boolean; tools: ToolView[];
 }
+export interface SkillView {
+  id: string; description: string; repo: string; revision: string; sourcePath: string;
+  files: { path: string; size: number; sha256: string }[]; installed: boolean; active: boolean;
+}

@@ -1,8 +1,13 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Bootstrap, ChatEvent, ConnectorView, Conversation, Message, Preferences, RuntimeConfig, RuntimeStatus } from './types';
+import type { Bootstrap, ChatEvent, ConnectorView, Conversation, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillView } from './types';
 
 export const nativeAvailable = isTauri();
 export const api = {
+  listSkills: () => invoke<SkillView[]>('list_skills'),
+  installSkill: (id: string) => invoke<void>('install_skill', { id }),
+  removeSkill: (id: string) => invoke<void>('remove_skill', { id }),
+  setSkillActive: (id: string, active: boolean) => invoke<void>('set_skill_active', { id, active }),
+  readSkillFile: (id: string, path: string) => invoke<string>('read_skill_file', { id, path }),
   listConnectors: () => invoke<ConnectorView[]>('list_connectors'),
   connectConnector: (id: string, apiToken?: string) => invoke<ConnectorView>('connect_connector', { id, apiToken }),
   disconnectConnector: (id: string, forget = false) => invoke<void>('disconnect_connector', { id, forget }),

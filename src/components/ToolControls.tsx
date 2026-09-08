@@ -4,14 +4,17 @@ import type { ConnectorView, ToolApproval } from '../lib/types';
 
 export function ToolPicker({ selected, onChange, busy }: { selected: string[]; onChange: (ids: string[]) => void; busy: boolean }) {
   const [items, setItems] = useState<ConnectorView[]>([]);
+  const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [error, setError] = useState('');
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
     api.listConnectors().then(value => { if (!disposed) setItems(value.filter(item => item.connected)); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
+    api.listSkills().then(value => { if (!disposed) setActiveSkills(value.filter(item => item.active).map(item => item.id)); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
     return () => { disposed = true; };
   }, []);
-  return <details className="tool-picker"><summary>Tools · {selected.length ? `${selected.length} connectors selected` : 'Off'}</summary>
+  return <details className="tool-picker"><summary>Tools · {selected.length ? `${selected.length} connectors selected` : 'Off'}{activeSkills.length > 0 && ` · ${activeSkills.length} active skills`}</summary>
+    {activeSkills.length > 0 && <p>Skill guidance: {activeSkills.join(', ')}</p>}
     <p>Selected tools may send data to their services. Each action requires your approval.</p>
     {items.map(item => <label key={item.id}><input type="checkbox" checked={selected.includes(item.id)} disabled={busy} onChange={event => onChange(event.target.checked ? [...selected, item.id] : selected.filter(id => id !== item.id))} />{item.id}<small>{item.tools.length} tools</small></label>)}
     {!items.length && <p>Connect a service in Connectors to make its tools available here.</p>}
