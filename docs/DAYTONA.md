@@ -57,3 +57,12 @@ Retry cleanup invokes the ownership-checked recovery engine for the selected rec
 
 The native daytona-settings smoke test refuses to replace an existing key. Using a generated fixture, it verifies encrypted-file contents do not contain the key, input clearing, persisted presence across reload and forgetting, without cloud calls. The test restores the no-key state.
 
+
+## Execution lifecycle coordinator
+
+The native coordinator now validates code arguments, serializes a cloud run, journals ownership before creation, records returned identity, waits for started state, submits code once and attempts cleanup. It returns execution output/errors and cleanup errors separately, with an overall isError flag. Nonzero exit codes are retained as failed execution results rather than transport failures.
+
+The caller owns a cancellation sender; dropping it signals a separately spawned worker. Creation is allowed to return within its transport timeout so identity can be captured. After creation, cancellation skips or interrupts code submission and proceeds to cleanup. Cleanup is not tied to the dropped chat future. Interrupted/failed cleanup leaves its durable record. A process crash can still interrupt the worker, which is why startup recovery remains necessary.
+
+A fake remote verifies ownership exists before creation, one code submission, success/nonzero results, and cleanup after caller cancellation. Real Daytona execution and chat-tool wiring are still unverified/incomplete; the coordinator is not yet exposed to the model.
+

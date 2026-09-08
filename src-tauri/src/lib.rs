@@ -5,6 +5,7 @@ mod connectors;
 mod context;
 pub mod daytona;
 pub mod daytona_cleanup;
+pub mod daytona_execution;
 pub mod daytona_journal;
 mod daytona_settings;
 mod execution;

@@ -213,3 +213,10 @@ Added native encrypted-key save/presence/forget commands and a manual retry-clea
 
 All 19 frontend tests, strict Clippy and production frontend build pass. The final native build passed; scripts/daytona-settings-smoke.mjs verified save, ciphertext absence of the fixture key, input clearing, presence after reload and forget twice, including after the shared-vault change. No account/cloud requests were made. An initial native attempt launched the old executable during compilation; it was closed, the build completed, and the test reran successfully. Key rotation with pending operations, automatic recovery and the cloud execution tool remain open.
 
+
+### Daytona execution lifecycle
+
+Implemented the coordinator for journal-before-create, identity capture, bounded readiness, single code submission and ownership-checked cleanup. A cancellation sender lets a detached worker finish identity capture and cleanup after the caller disappears. Execution and cleanup errors are returned separately, and nonzero code exits are represented as failures with retained output.
+
+The targeted async lifecycle test passed for normal completion, nonzero exit and caller cancellation, verifying one submission and eventual journal clearance after deletion. Strict Clippy passed (62 Rust tests now exist). This is a fake-remote lifecycle test, not live account evidence. The coordinator remains to be wired to model tool selection/approval, and automatic startup recovery is still outstanding.
+
