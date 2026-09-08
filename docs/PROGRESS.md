@@ -141,3 +141,10 @@ The accepted user prompt, streaming assistant record and initial conversation ti
 
 Verification: 48 Rust tests, strict Clippy and the native debug build pass. The rebuilt desktop application passed the response-limit smoke test against the real model, persisting both message records and the terminal error, then showing the same error after reload.
 
+
+### Active skill reference access
+
+Active skills now expose one shared skills_read_file tool with their pinned package inventories. The model can inspect supporting references and script source through bounded, numbered pages, with hash verification and capability-scoped file access. The active set is fixed for the turn. The reader occupies one visible tool slot and follows permission policy: Ask and Auto-approve both prompt; Full access does not. Reading does not execute scripts.
+
+Verification: 51 Rust tests, 17 frontend tests, production frontend build and both browser checks pass. Native scripts/skill-reader-smoke.mjs passed all three modes against MiniCPM, reading the exact first three lines of the Jupyter notebook quality checklist and producing the expected answer. The Windows junction escape test passed. Active skills, preferences and temporary chats were restored/removed by the smoke fixture. Dedicated package script execution, dependencies, updates and other release acceptance remain open; see docs/SKILLS.md.
+

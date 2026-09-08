@@ -59,6 +59,15 @@ pub async fn send_message(
             std::sync::Arc::new(crate::execution::LocalExecution::new(config, &path)?).tool(),
         );
     }
+    let active_skills = state.database()?.active_skills()?;
+    let skill_instructions = {
+        let skills = state.skills.lock().await;
+        let instructions = skills.instructions(&active_skills)?;
+        if let Some(reader) = skills.reader(&active_skills)? {
+            tools.push(reader);
+        }
+        instructions
+    };
     if tools.len() > 32 {
         return Err("Select fewer tool sources: at most 32 tools can be offered in a turn.".into());
     }
@@ -73,12 +82,10 @@ pub async fn send_message(
             runtime.context_length,
         )
     };
-    let active_skills = state.database()?.active_skills()?;
     let access_mode = state
         .database()?
         .conversation_tools(&conversation_id)?
         .access_mode;
-    let skill_instructions = state.skills.lock().await.instructions(&active_skills)?;
     let (preferences, history) = {
         let store = state.database()?;
         let preferences = store.preferences()?;

@@ -72,6 +72,9 @@ pub struct AgentTool {
     backend: ToolBackend,
 }
 pub fn tool_alias(connector: &str, name: &str) -> String {
+    if connector == "Skills" && name == "read_file" {
+        return "skills_read_file".into();
+    }
     if connector == "Workspace" {
         return format!("workspace_{name}");
     }
@@ -95,11 +98,20 @@ pub fn tool_alias(connector: &str, name: &str) -> String {
     format!("{readable}_{}", &digest[..16])
 }
 enum ToolBackend {
+    Skills(Arc<crate::skills::SkillReader>),
     Execution(Arc<crate::execution::LocalExecution>),
     Mcp(rmcp::Peer<RoleClient>),
     Workspace(Arc<crate::workspace::Workspace>),
 }
 impl AgentTool {
+    pub fn skills(reader: Arc<crate::skills::SkillReader>, tool: ToolView) -> Self {
+        Self {
+            connector: "Skills".into(),
+            alias: "skills_read_file".into(),
+            tool,
+            backend: ToolBackend::Skills(reader),
+        }
+    }
     pub fn trusted_read(&self) -> bool {
         matches!(&self.backend, ToolBackend::Workspace(_))
             && matches!(self.tool.name.as_str(), "read_file" | "list_files")
@@ -125,6 +137,12 @@ impl AgentTool {
     }
     pub async fn call(&self, arguments: Value) -> Result<Value, String> {
         let peer = match &self.backend {
+            ToolBackend::Skills(reader) => {
+                let reader = reader.clone();
+                return tokio::task::spawn_blocking(move || reader.call(arguments))
+                    .await
+                    .map_err(|_| "Skill read failed unexpectedly.")?;
+            }
             ToolBackend::Execution(execution) => return execution.run(arguments).await,
             ToolBackend::Mcp(peer) => peer,
             ToolBackend::Workspace(workspace) => {

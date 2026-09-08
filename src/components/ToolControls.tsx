@@ -10,12 +10,12 @@ export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, a
   const [choosing, setChoosing] = useState(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
-  const toolCount = selectedTools.length + (selected.includes('__workspace') ? 4 : 0) + (selected.includes('__execution') ? 1 : 0);
+  const toolCount = selectedTools.length + (selected.includes('__workspace') ? 4 : 0) + (selected.includes('__execution') ? 1 : 0) + (activeSkills.length ? 1 : 0);
   const isSelected = (connectorId: string, toolName: string) => selectedTools.some(tool => tool.connectorId === connectorId && tool.toolName === toolName);
   function toggleTools(item: ConnectorView, names: string[], enabled: boolean) {
     const remaining = selectedTools.filter(tool => tool.connectorId !== item.id || !names.includes(tool.toolName));
     const next = enabled ? [...remaining, ...names.map(toolName => ({ connectorId: item.id, toolName }))] : remaining;
-    if (toolCount - selectedTools.length + next.length > 32) { setError('Choose at most 32 tools, including workspace and execution tools.'); return; }
+    if (toolCount - selectedTools.length + next.length > 32) { setError('Choose at most 32 tools, including workspace, execution and skill reading tools.'); return; }
     setError(''); onToolsChange(next);
   }
   useEffect(() => {
@@ -34,7 +34,7 @@ export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, a
   }
   return <><div className={`permission-bar permission-${accessMode}`}><label>Permissions<select aria-label="Permission mode" value={accessMode} disabled={!nativeAvailable || busy || !onAccessModeChange} onChange={event => onAccessModeChange?.(event.target.value as AccessMode)}><option value="ask">Ask for approval</option><option value="autoApprove">Auto-approve reads</option><option value="fullAccess">Full access</option></select></label><span>{accessMode === 'fullAccess' ? 'Selected tools run without prompts, including code and external changes.' : accessMode === 'autoApprove' ? 'Workspace reads run automatically. Other actions ask.' : 'Every tool action asks first.'}</span></div>
   <details className="tool-picker"><summary>Tools · {toolCount ? `${toolCount}/32 enabled` : 'Off'}{activeSkills.length > 0 && ` · ${activeSkills.length} active skills`}</summary>
-    {activeSkills.length > 0 && <p>Skill guidance: {activeSkills.join(', ')}</p>}
+    {activeSkills.length > 0 && <p>Active skills: {activeSkills.join(', ')}. One tool enables reading their package files. Deactivate skills in Skills to remove it.</p>}
     <p>Selected tools may send data to their services. Permissions apply to this conversation and are recorded with each action.</p>
     <div className="workspace-tools"><label><input type="checkbox" aria-label="Workspace files" checked={selected.includes('__workspace')} disabled={busy || !workspace || (!selected.includes('__workspace') && toolCount + 4 > 32)} onChange={event => onChange(event.target.checked ? [...selected, '__workspace'] : selected.filter(id => id !== '__workspace'))} />Workspace files</label><button className="secondary" disabled={!nativeAvailable || busy || choosing} onClick={() => void chooseWorkspace()}>{workspace ? 'Change folder' : 'Choose folder'}</button>{workspace && <code>{workspace}</code>}</div>
     <label><input type="checkbox" aria-label="Local code" checked={selected.includes('__execution')} disabled={busy || !workspace || (!selected.includes('__execution') && toolCount >= 32)} onChange={event => onChange(event.target.checked ? [...selected, '__execution'] : selected.filter(id => id !== '__execution'))} />Local code <small>Not sandboxed · {accessMode === 'fullAccess' ? 'runs without prompts' : 'approval required'}</small></label>
@@ -66,7 +66,7 @@ export function ApprovalDialog({ request, onResolve }: { request: ToolApproval; 
   }
   return <dialog ref={dialog} className="tool-approval" aria-labelledby="approval-title" onCancel={event => { event.preventDefault(); if (!busy) void resolve(false); }}>
     <p className="eyebrow">ACTION REQUEST</p><h2 id="approval-title">{request.connector === 'Local execution' ? 'Run this code on your computer?' : `Allow ${request.connector} to run this tool?`}</h2>
-    <p><strong>{request.name}</strong></p><p>{request.connector === 'Local execution' ? 'This code runs with your Windows account’s permissions. It can access files outside the workspace and the network. It is not sandboxed. Review the complete code before allowing it.' : request.connector === 'Workspace' ? 'This action will access the workspace folder on your computer using the arguments below.' : 'The arguments below will be sent to this service. The action may read or change external data.'}</p>
+    <p><strong>{request.name}</strong></p><p>{request.connector === 'Local execution' ? 'This code runs with your Windows account’s permissions. It can access files outside the workspace and the network. It is not sandboxed. Review the complete code before allowing it.' : request.connector === 'Workspace' ? 'This action will access the workspace folder on your computer using the arguments below.' : request.connector === 'Skills' ? 'Read a verified file from an active skill’s local package. This does not execute scripts or contact a service.' : 'The arguments below will be sent to this service. The action may read or change external data.'}</p>
     {request.connector === 'Local execution' && typeof request.arguments.code === 'string' ? <><p>Language: {String(request.arguments.language)} · Timeout: {String(request.arguments.timeout_seconds ?? 60)} seconds</p><pre className="approval-code">{request.arguments.code}</pre><details><summary>Full request</summary><pre className="approval-arguments">{JSON.stringify(request.arguments, null, 2)}</pre></details></> : <pre className="approval-arguments">{JSON.stringify(request.arguments, null, 2)}</pre>}
     {error && <p role="alert">{error}</p>}
     <div className="connector-actions"><button autoFocus className="secondary" disabled={busy} onClick={() => void resolve(false)}>Deny</button><button className="primary" disabled={busy} onClick={() => void resolve(true)}>Allow once</button></div>
