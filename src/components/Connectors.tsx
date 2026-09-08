@@ -3,6 +3,7 @@ import { Plug, Search } from 'lucide-react';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import catalog from '../lib/catalog.json';
 import type { ConnectorView } from '../lib/types';
+import { LocalConnectorForm } from './LocalConnectorForm';
 
 const presets: ConnectorView[] = catalog.connectors.map(item => ({
   id: item.name, description: item.description, url: item.url,
@@ -39,20 +40,28 @@ export function Connectors() {
     catch (e) { setError(errorMessage(e)); }
     finally { setPending(''); }
   }
+  async function removeLocal(item: ConnectorView) {
+    setPending(item.id); setError('');
+    try { await api.disconnectConnector(item.id, false); await api.removeLocalConnector(item.id); setItems(await api.listConnectors()); }
+    catch (e) { setError(errorMessage(e)); }
+    finally { setPending(''); }
+  }
   const filtered = items.filter(item => `${item.id} ${item.description}`.toLowerCase().includes(query.toLowerCase()));
   return <div className="settings-page catalog-page">
     <div className="page-heading"><p className="eyebrow">EXTEND YOUR WORKSPACE</p><h1>Connectors</h1><p>Connect your accounts and discover the tools they provide.</p></div>
-    <div className="catalog-toolbar"><label className="search-field"><Search size={16} /><input type="search" aria-label="Search connectors" placeholder="Search connectors…" value={query} onChange={e => setQuery(e.target.value)} /></label><span>{filtered.length} available presets</span></div>
-    <p className="catalog-notice">Credentials are encrypted on this device. Select connected services under Tools in your conversation. Each action requires approval.</p>
+    <div className="catalog-toolbar"><label className="search-field"><Search size={16} /><input type="search" aria-label="Search connectors" placeholder="Search connectors…" value={query} onChange={e => setQuery(e.target.value)} /></label><span>{filtered.length} connectors</span></div>
+    <p className="catalog-notice">Credentials are encrypted on this device. Select connected services under Tools in your conversation. Actions follow your conversation’s permission mode.</p>
+    <LocalConnectorForm onSaved={async () => setItems(await api.listConnectors())} />
     {error && <p role="alert" className="error-banner">{error}</p>}
     <div className="catalog-list">{filtered.map(item => <details className="catalog-item" key={item.id}>
-      <summary><span className="catalog-icon"><Plug size={18} /></span><span><strong>{item.id.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')}</strong><small>{item.description}</small></span><small>{item.connected ? `${item.tools.length} tools` : 'Not connected'}</small></summary>
-      <div className="catalog-detail"><span>MCP service</span><code>{item.url}</code>
+      <summary><span className="catalog-icon"><Plug size={18} /></span><span><strong>{item.authType === 'local' ? item.description : item.id.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')}</strong><small>{item.authType === 'local' ? 'Local MCP server' : item.description}</small></span><small>{item.connected ? `${item.tools.length} tools` : 'Not connected'}</small></summary>
+      <div className="catalog-detail">{item.authType === 'local' ? <p>Connect launches this program with your account’s file and network permissions. Disconnect stops its process tree.</p> : <><span>MCP service</span><code>{item.url}</code></>}
         <form onSubmit={event => { event.preventDefault(); void connect(item, item.authType === 'oauth' && !item.hasCredential); }}>
           {item.authType === 'apiKey' && !item.connected && <label>API token<input type="password" aria-label={`${item.id} API token`} autoComplete="off" value={tokens[item.id] || ''} placeholder={item.hasCredential ? 'Saved token · enter to replace' : 'Enter your API token'} onChange={event => setTokens(current => ({ ...current, [item.id]: event.target.value }))} /></label>}
           <div className="connector-actions">
             {!item.connected && <button className="primary" disabled={!nativeAvailable || !!pending || (item.authType === 'apiKey' && !item.hasCredential && !tokens[item.id])}>{pending === item.id ? signingIn ? 'Waiting for sign-in…' : 'Connecting…' : item.authType === 'oauth' && !item.hasCredential ? 'Sign in' : 'Connect'}</button>}
             {item.connected && <button type="button" className="secondary" disabled={!!pending} onClick={() => void disconnect(item, false)}>Disconnect</button>}
+            {item.authType === 'local' && !item.connected && <><button type="button" className="secondary" disabled={!nativeAvailable || !!pending} onClick={() => void disconnect(item, false)}>Stop session</button><button type="button" className="secondary" disabled={!nativeAvailable || !!pending} onClick={() => void removeLocal(item)}>Remove server</button></>}
             {item.hasCredential && <button type="button" className="secondary" disabled={!!pending} onClick={() => void disconnect(item, true)}>Forget credentials</button>}
             {item.authType === 'oauth' && item.hasCredential && <button type="button" className="secondary" disabled={!!pending} onClick={() => void connect(item, true)}>Sign in again</button>}
             {pending === item.id && signingIn && <button type="button" className="secondary" onClick={() => void api.cancelConnectorSignIn().catch(e => setError(errorMessage(e)))}>Cancel sign-in</button>}

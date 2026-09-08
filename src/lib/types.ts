@@ -37,7 +37,7 @@ export interface ChatEvent { messageId: string; content: string; reasoning: stri
 export interface ToolView { name: string; description: string; inputSchema: Record<string, unknown> }
 export interface ToolSelection { connectorId: string; toolName: string }
 export interface ConnectorView {
-  id: string; description: string; url: string; authType: 'none' | 'apiKey' | 'oauth';
+  id: string; description: string; url: string; authType: 'none' | 'apiKey' | 'oauth' | 'local';
   connected: boolean; hasCredential: boolean; tools: ToolView[];
 }
 export interface SkillView {

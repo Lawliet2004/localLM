@@ -5,6 +5,8 @@ export const nativeAvailable = isTauri();
 export interface ModelInstallStatus { busy: boolean; phase: string; received: number; total: number; path: string | null; error: string | null }
 export interface ModelDownloadInfo { filename: string; bytes: number; sha256: string; destination: string; availableBytes: number; requiredBytes: number; destinationExists: boolean }
 export const api = {
+  saveLocalConnector: (server: { id: string; name: string; executable: string; arguments: string[]; workingDirectory: string; environment: Record<string, string> }) => invoke<void>('save_local_connector', { server }),
+  removeLocalConnector: (id: string) => invoke<void>('remove_local_connector', { id }),
   listInstalledRuntimes: () => invoke<{ id: string; path: string; complete: boolean; problem: string | null }[]>('list_installed_runtimes'),
   runtimeDownloadInfo: () => invoke<{ bytes: number; requiredBytes: number; availableBytes: number; destination: string }>('runtime_download_info'),
   runtimeInstallStatus: () => invoke<ModelInstallStatus>('runtime_install_status'),
