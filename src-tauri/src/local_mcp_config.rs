@@ -15,6 +15,28 @@ pub struct LocalServer {
     pub working_directory: String,
     pub environment: BTreeMap<String, String>,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalServerSummary {
+    pub id: String,
+    pub name: String,
+    pub executable: String,
+    pub working_directory: String,
+    pub argument_count: usize,
+    pub environment_names: Vec<String>,
+}
+impl From<&LocalServer> for LocalServerSummary {
+    fn from(server: &LocalServer) -> Self {
+        Self {
+            id: server.id.clone(),
+            name: server.name.clone(),
+            executable: server.executable.clone(),
+            working_directory: server.working_directory.clone(),
+            argument_count: server.arguments.len(),
+            environment_names: server.environment.keys().cloned().collect(),
+        }
+    }
+}
 impl LocalServer {
     pub fn validate(&self) -> Result<(), String> {
         if self

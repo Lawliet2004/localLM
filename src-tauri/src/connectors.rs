@@ -314,6 +314,45 @@ impl McpHub {
         }
         Ok(items)
     }
+    pub fn list_local(&self) -> Result<Vec<crate::local_mcp_config::LocalServerSummary>, String> {
+        Ok(crate::local_mcp_config::load(&self.vault)?
+            .iter()
+            .map(Into::into)
+            .collect())
+    }
+    pub fn save_local(&self, server: crate::local_mcp_config::LocalServer) -> Result<(), String> {
+        if self
+            .connections
+            .get(&server.id)
+            .is_some_and(|connection| !connection.service.is_closed())
+        {
+            return Err("Disconnect the local server before editing its configuration.".into());
+        }
+        server.validate()?;
+        let mut servers = crate::local_mcp_config::load(&self.vault)?;
+        if let Some(previous) = servers.iter_mut().find(|previous| previous.id == server.id) {
+            *previous = server;
+        } else {
+            servers.push(server);
+        }
+        crate::local_mcp_config::save(&self.vault, &servers)
+    }
+    pub fn remove_local(&self, id: &str) -> Result<(), String> {
+        if self
+            .connections
+            .get(id)
+            .is_some_and(|connection| !connection.service.is_closed())
+        {
+            return Err("Disconnect the local server before removing its configuration.".into());
+        }
+        let mut servers = crate::local_mcp_config::load(&self.vault)?;
+        let index = servers
+            .iter()
+            .position(|server| server.id == id)
+            .ok_or("Unknown local connector.")?;
+        servers.remove(index);
+        crate::local_mcp_config::save(&self.vault, &servers)
+    }
     pub async fn connect(&mut self, id: &str) -> Result<ConnectorView, String> {
         let mut item = preset(id)?;
         let secret = self.token(id)?;
@@ -446,6 +485,35 @@ pub async fn list_connectors(
 ) -> Result<Vec<ConnectorView>, String> {
     state.connectors.lock().await.list()
 }
+
+#[tauri::command]
+pub async fn list_local_connectors(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<crate::local_mcp_config::LocalServerSummary>, String> {
+    state.connectors.lock().await.list_local()
+}
+#[tauri::command]
+pub async fn save_local_connector(
+    state: tauri::State<'_, crate::AppState>,
+    server: crate::local_mcp_config::LocalServer,
+) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the current model operation before editing connectors.")?;
+    state.connectors.lock().await.save_local(server)
+}
+#[tauri::command]
+pub async fn remove_local_connector(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the current model operation before editing connectors.")?;
+    state.connectors.lock().await.remove_local(&id)
+}
 #[tauri::command]
 pub async fn connect_connector(
     state: tauri::State<'_, crate::AppState>,
@@ -493,6 +561,41 @@ pub fn cancel_connector_sign_in(state: tauri::State<'_, crate::AppState>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_configuration_crud_keeps_secrets_out_of_summaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = std::sync::Arc::new(crate::vault::Vault::new(temp.path().join("credentials")));
+        let hub = super::McpHub::new(vault.clone());
+        let mut server = crate::local_mcp_config::LocalServer {
+            id: format!("local-{}", uuid::Uuid::new_v4()),
+            name: "Local fixture".into(),
+            executable: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            arguments: vec!["private-argument-fixture".into()],
+            working_directory: temp.path().to_string_lossy().into_owned(),
+            environment: [("API_KEY".into(), "secret-value-fixture".into())].into(),
+        };
+        hub.save_local(server.clone()).unwrap();
+        let summaries = hub.list_local().unwrap();
+        assert_eq!(summaries.len(), 1);
+        let text = serde_json::to_string(&summaries).unwrap();
+        assert!(!text.contains("private-argument-fixture"));
+        assert!(!text.contains("secret-value-fixture"));
+        assert!(text.contains("API_KEY"));
+        server.name = "Renamed".into();
+        hub.save_local(server.clone()).unwrap();
+        let reopened = super::McpHub::new(vault);
+        assert_eq!(reopened.list_local().unwrap()[0].name, "Renamed");
+        let mut invalid = server.clone();
+        invalid.executable = "relative.exe".into();
+        assert!(hub.save_local(invalid).is_err());
+        assert_eq!(hub.list_local().unwrap().len(), 1);
+        hub.remove_local(&server.id).unwrap();
+        assert!(hub.list_local().unwrap().is_empty());
+        assert!(hub.remove_local(&server.id).is_err());
+    }
     use super::*;
     #[test]
     fn only_known_workspace_reads_qualify_for_automatic_approval() {

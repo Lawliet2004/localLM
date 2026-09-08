@@ -352,3 +352,9 @@ Pagination regressions cover a valid two-page result, repeated cursors, duplicat
 Added bounded local-server configuration for stable local IDs, display names, absolute executable/working-directory paths, argument arrays and environment variables. Environment keys reject case-insensitive duplicates and invalid identifiers. Separate launch validation checks file/directory existence without launching anything. The complete configuration collection, including arguments and environment values, is stored in the encrypted vault with a 128 KiB ceiling rather than plaintext settings.
 
 The configuration regression and strict Clippy passed. Tests cover encrypted round-trip, preserved argument boundaries, duplicate IDs/environment keys, NUL arguments and relative paths. This module is not yet exposed through IPC/UI or connected to subprocess transport. Explicit process-launch UI, environment handling, descendant cleanup, MCP negotiation and tool integration remain required.
+
+### Local MCP configuration commands
+
+Added serialized save/list/remove desktop commands for encrypted local-server configurations. Summaries expose display/path metadata, argument count and environment names while omitting argument contents and environment values. Invalid updates preserve the prior configuration; connected servers must be disconnected before changes, and model operations exclude configuration mutations. Saving does not launch a process.
+
+The CRUD regression and strict Clippy passed. Coverage verifies persistence through a fresh hub instance, rename, invalid-update preservation, removal and absence of argument/environment secrets in serialized summaries. These commands still need a native settings UI and end-to-end IPC acceptance; stdio process transport and integration remain unfinished.
