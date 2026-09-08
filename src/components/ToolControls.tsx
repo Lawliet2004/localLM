@@ -43,11 +43,12 @@ export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, a
     <label><input type="checkbox" aria-label="Daytona cloud code" checked={selected.includes('__daytona')} disabled={busy || (!selected.includes('__daytona') && (!hasDaytona || toolCount >= 32))} onChange={event => onChange(event.target.checked ? [...selected, '__daytona'] : selected.filter(id => id !== '__daytona'))} />Daytona cloud code <small>{hasDaytona ? 'Remote sandbox · usage may incur charges' : 'Save a Daytona key in Execution'}</small></label>
     {items.length > 0 && <input type="search" aria-label="Search available tools" placeholder="Find a tool or connector…" value={search} onChange={event => setSearch(event.target.value)} />}
     <div className="connector-tool-groups">{items.map(item => {
-      const visible = item.tools.filter(tool => `${item.id} ${tool.name} ${tool.description}`.toLowerCase().includes(search.toLowerCase()));
+      const displayName = item.authType === 'local' ? item.description : item.id;
+      const visible = item.tools.filter(tool => `${item.id} ${displayName} ${tool.name} ${tool.description}`.toLowerCase().includes(search.toLowerCase()));
       if (!visible.length) return null;
       const count = item.tools.filter(tool => isSelected(item.id, tool.name)).length;
-      return <details key={item.id} className="connector-tool-group"><summary>{item.id} <small>{count}/{item.tools.length} selected</small></summary>
-        <label><input type="checkbox" aria-label={item.id} checked={count === item.tools.length && count > 0} disabled={busy} onChange={event => toggleTools(item, item.tools.map(tool => tool.name), event.target.checked)} />All {item.id} tools</label>
+      return <details key={item.id} className="connector-tool-group"><summary>{displayName} <small>{count}/{item.tools.length} selected</small></summary>
+        <label><input type="checkbox" aria-label={displayName} checked={count === item.tools.length && count > 0} disabled={busy} onChange={event => toggleTools(item, item.tools.map(tool => tool.name), event.target.checked)} />All {displayName} tools</label>
         {visible.map(tool => <label key={tool.name} className="connector-tool-choice"><input type="checkbox" aria-label={tool.name} checked={isSelected(item.id, tool.name)} disabled={busy || (!isSelected(item.id, tool.name) && toolCount >= 32)} onChange={event => toggleTools(item, [tool.name], event.target.checked)} /><span><strong>{tool.name}</strong><small>{tool.description || 'No description provided.'}</small></span></label>)}
       </details>;
     })}</div>

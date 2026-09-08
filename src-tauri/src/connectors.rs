@@ -635,6 +635,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
  const r = JSON.parse(line); if (r.id === undefined) return;
  const result = r.method === 'initialize'
  ? {protocolVersion:r.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}
+ : r.method === 'tools/call'
+ ? {content:[{type:'text',text:JSON.stringify({name:r.params.name,arguments:r.params.arguments})}],isError:false}
  : {tools:[{name:'read_file',description:'fixture',inputSchema:{type:'object'}}]};
  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\n');
 });
@@ -679,7 +681,33 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             !tools[0].trusted_read(),
             "server names must not grant read auto-approval"
         );
+        let arguments = serde_json::json!({"path":"folder with spaces/日本語.txt", "nested":{"enabled":true}, "items":[1,"two"]});
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tools[0].call(arguments.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let returned: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            returned,
+            serde_json::json!({"name":"read_file", "arguments":arguments})
+        );
+        assert_eq!(response["isError"], false);
+        assert!(tools[0]
+            .call(serde_json::json!(["invalid argument shape"]))
+            .await
+            .is_err());
         hub.disconnect(&server.id, false).await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tools[0].call(serde_json::json!({}))
+        )
+        .await
+        .unwrap()
+        .is_err());
         assert!(hub
             .selected_tools(std::slice::from_ref(&server.id), &[])
             .is_err());

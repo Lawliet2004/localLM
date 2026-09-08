@@ -388,3 +388,9 @@ All 28 frontend tests and the production build passed. The form regression check
 Rebuilt the native executable and exercised the creation form against a temporary Node MCP server through WebView2. Save returned a disconnected entry and cleared environment values; Connect discovered fixture_echo; Disconnect and Remove left no saved fixture. The smoke cleans up only its uniquely named configuration and temporary directory. Recorded JSON evidence and inspected a connected-card screenshot. This tests discovery, not an actual chat tool invocation.
 
 The first attempt found the Vite server stopped; restarted it and reloaded the existing native page. The next attempt exposed exact textarea labels including default text in WebView2. Added explicit accessible labels and reran successfully. The form test and production build also passed. Existing-configuration editing, structured fields, broader visual polish and chat tool-call acceptance remain outstanding.
+
+### Local tool invocation and picker names
+
+Extended the real local MCP hub fixture to answer tools/call. The agent backend delivers the requested tool name and exact Unicode/nested/array arguments and decodes the returned MCP content. Tests also reject non-object arguments and verify a retained tool handle fails after disconnect. This is backend invocation acceptance; model-driven chat approval/result reconstruction is not covered by this fixture.
+
+Local connector groups in the conversation tool picker now display and search their configured names while selections retain stable IDs. The local invocation test, strict Clippy, existing tool-picker regressions and production build passed. Local names in approval/audit views, configuration editing and full chat acceptance remain outstanding.
