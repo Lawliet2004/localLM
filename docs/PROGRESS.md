@@ -43,3 +43,10 @@ Vite was started on 127.0.0.1:1420. A debug native app was launched with WebView
 - The same native test loaded MiniCPM and asked about the active skill's response format without placing that format in the question. It correctly described the Key Files table, Mermaid diagrams and citation formats, proving guidance reaches the model.
 - Native tests: 23 passed. Strict Rust lint and frontend/browser checks passed before the last active-skill indicator UI change.
 - Remaining: per-conversation activation, dependency detection/setup, approved script execution, reference-file tools, update/repair UX, install cancellation/progress, crash/disk-full recovery tests, and complete workflows for each skill. Installed guidance is not equivalent to completed execution support.
+## Verified workspace file tools
+- Added folder selection/persistence and an explicit Workspace files toggle. Workspace tools share the existing single-use approval and audit flow.
+- list_files, read_file with line ranges/SHA-256, create_file without overwriting, and create_directory operate through cap-std directory handles. Added strict relative-path/argument validation and bounded data.
+- 26 Rust tests passed, including a real Windows junction pointing outside the root: read and create both rejected, outside content unchanged. Strict lint and existing frontend/browser checks passed.
+- `node scripts/workspace-smoke.mjs`: real MiniCPM read a fresh random code from a workspace file; denied creation left no file; approved creation wrote exactly the content shown for approval. Verified actual disk bytes, not only the assistant's claim.
+- Earlier native attempts exposed model transcription variability (added punctuation and shortened code); the final prompts explicitly requested exact strings and the full prefix. This test does not establish universal model editing accuracy.
+- Remaining: existing-file edits with conflict detection/diffs, file browsing/artifact previews, search, per-conversation workspace permissions, execution providers, and further failure/recovery tests. Local process execution is not implemented by these file tools.

@@ -33,6 +33,7 @@ keyring = { version = "3", features = ["windows-native"] }
 aes-gcm = "0.10"
 async-trait = "0.1.92"
 sha2 = "0.10"
+cap-std = "4"
 
 [profile.dev]
 debug = 0

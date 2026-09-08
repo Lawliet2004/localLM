@@ -10,6 +10,7 @@ mod sse;
 mod store;
 mod tool_calls;
 mod vault;
+mod workspace;
 
 use std::sync::Mutex;
 use tauri::Manager;
@@ -60,6 +61,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            workspace::get_workspace,
+            workspace::set_workspace,
             skills::list_skills,
             skills::install_skill,
             skills::remove_skill,

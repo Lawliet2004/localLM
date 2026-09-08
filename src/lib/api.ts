@@ -3,6 +3,8 @@ import type { Bootstrap, ChatEvent, ConnectorView, Conversation, Message, Prefer
 
 export const nativeAvailable = isTauri();
 export const api = {
+  getWorkspace: () => invoke<{ path: string }>('get_workspace'),
+  setWorkspace: (path: string) => invoke<void>('set_workspace', { path }),
   listSkills: () => invoke<SkillView[]>('list_skills'),
   installSkill: (id: string) => invoke<void>('install_skill', { id }),
   removeSkill: (id: string) => invoke<void>('remove_skill', { id }),

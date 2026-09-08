@@ -10,3 +10,5 @@ Connector design: Rust MCP SDK handles protocol negotiation and sessions. HTTPS 
 
 Abuse cases to test: script/HTML in model output; malformed SSE; credentials in endpoint URLs; mismatched OAuth state; expired/revoked credentials; redirects leaking headers; unbounded tool catalogs/results; model selecting unavailable tools; cancellation while awaiting approval; hostile skill archives/symlinks; workspace traversal; process escape and orphan subprocesses. These are release requirements, not claims of tests already completed.
 
+
+Workspace file operations use cap-std directory capabilities. Only the explicitly selected root is opened with ambient authority; relative operations stay within that capability. Native tests exercise Windows junction escape attempts for both reading and creating files. Absolute paths, parent traversal, alternate data streams, device names, malformed arguments, binary text and oversized reads are rejected. Creation uses create_new so existing content is preserved. This filesystem boundary does not imply that future local process execution is sandboxed.

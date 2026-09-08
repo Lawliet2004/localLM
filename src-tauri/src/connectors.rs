@@ -40,18 +40,40 @@ pub struct AgentTool {
     pub connector: String,
     pub tool: ToolView,
     pub alias: String,
-    peer: rmcp::Peer<RoleClient>,
+    backend: ToolBackend,
+}
+enum ToolBackend {
+    Mcp(rmcp::Peer<RoleClient>),
+    Workspace(Arc<crate::workspace::Workspace>),
 }
 impl AgentTool {
+    pub fn workspace(workspace: Arc<crate::workspace::Workspace>, tool: ToolView) -> Self {
+        Self {
+            connector: "Workspace".into(),
+            alias: format!("workspace_{}", tool.name),
+            tool,
+            backend: ToolBackend::Workspace(workspace),
+        }
+    }
     pub fn definition(&self) -> Value {
         serde_json::json!({"type":"function","function":{"name":self.alias,"description":format!("{}: {} — {}", self.connector,self.tool.name,self.tool.description),"parameters":self.tool.input_schema}})
     }
     pub async fn call(&self, arguments: Value) -> Result<Value, String> {
+        let peer = match &self.backend {
+            ToolBackend::Mcp(peer) => peer,
+            ToolBackend::Workspace(workspace) => {
+                let workspace = workspace.clone();
+                let name = self.tool.name.clone();
+                return tokio::task::spawn_blocking(move || workspace.call(&name, arguments))
+                    .await
+                    .map_err(|_| "Workspace operation failed unexpectedly.")?;
+            }
+        };
         let arguments = arguments
             .as_object()
             .ok_or("Tool arguments must be an object.")?
             .clone();
-        let response = self.peer.call_tool_once(rmcp::model::CallToolRequestParams::new(self.tool.name.clone()).with_arguments(arguments)).await.map_err(|_| "Connector tool request failed. Its remote outcome may be unknown; do not automatically retry.".to_string())?;
+        let response = peer.call_tool_once(rmcp::model::CallToolRequestParams::new(self.tool.name.clone()).with_arguments(arguments)).await.map_err(|_| "Connector tool request failed. Its remote outcome may be unknown; do not automatically retry.".to_string())?;
         match response {
             rmcp::model::CallToolResponse::Complete(result) => {
                 let value =
@@ -149,7 +171,7 @@ impl McpHub {
                             .take(48)
                             .collect::<String>()
                     ),
-                    peer: connection.service.peer().clone(),
+                    backend: ToolBackend::Mcp(connection.service.peer().clone()),
                 });
             }
         }

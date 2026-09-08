@@ -175,3 +175,4 @@ h1 { font-weight: 450; font-size: 38px; line-height: 1.22; letter-spacing: -1.3p
 .tool-record summary span { margin-left: auto; color: var(--muted); }
 .tool-record pre { max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .skill-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 500px; overflow: auto; padding: 16px; background: var(--input); border: 1px solid var(--border); border-radius: 6px; line-height: 1.6; } .catalog-detail select { display: block; width: 100%; margin-top: 8px; }
+.workspace-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 8px 0; } .workspace-tools code { overflow-wrap: anywhere; font-size: 10px; }

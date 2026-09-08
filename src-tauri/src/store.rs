@@ -247,6 +247,12 @@ impl Store {
     pub fn active_skills(&self) -> Result<Vec<String>> {
         self.setting("active_skills")
     }
+    pub fn workspace_path(&self) -> Result<String> {
+        self.setting("workspace_path")
+    }
+    pub fn save_workspace_path(&self, path: &str) -> Result<()> {
+        self.save_setting("workspace_path", &path)
+    }
     pub fn save_active_skills(&self, ids: &[String]) -> Result<()> {
         self.save_setting("active_skills", &ids)
     }

@@ -35,11 +35,21 @@ pub async fn send_message(
     if content.trim().is_empty() || content.len() > 1_048_576 {
         return Err("Enter a message no larger than 1 MiB.".into());
     }
-    let tools = state
+    let mut connector_ids = connector_ids.unwrap_or_default();
+    let use_workspace = connector_ids.iter().any(|id| id == "__workspace");
+    connector_ids.retain(|id| id != "__workspace");
+    let mut tools = state
         .connectors
         .lock()
         .await
-        .selected_tools(&connector_ids.unwrap_or_default())?;
+        .selected_tools(&connector_ids)?;
+    if use_workspace {
+        let path = state.database()?.workspace_path()?;
+        tools.extend(std::sync::Arc::new(crate::workspace::Workspace::open(&path)?).tools());
+    }
+    if tools.len() > 32 {
+        return Err("Select fewer tool sources: at most 32 tools can be offered in a turn.".into());
+    }
     let (endpoint, api_key, context_length) = {
         let mut runtime = state.runtime.lock().await;
         if runtime.inspect().phase != "ready" {
