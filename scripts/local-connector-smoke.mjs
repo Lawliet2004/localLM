@@ -42,10 +42,34 @@ try {
   await page.screenshot({path:'test-results/local-connector-smoke.png',fullPage:true});
   await card.getByRole('button', {name:'Disconnect',exact:true}).click();
   await expect(card.getByText('Not connected', {exact:true})).toBeVisible();
-  await card.getByRole('button', {name:'Remove server',exact:true}).click();
-  await expect(card).toHaveCount(0);
+  await card.getByRole('button', {name:'Edit configuration',exact:true}).click();
+  await expect(page.getByLabel('Name', {exact:true})).toHaveValue(name);
+  await expect(page.getByLabel('Arguments (JSON array)', {exact:true})).toHaveValue(JSON.stringify([script]));
+  await expect(page.getByLabel('Environment variables (JSON object)', {exact:true})).toHaveValue(JSON.stringify({FIXTURE_KEY:'test-value'}));
+  await page.getByLabel('Name', {exact:true}).fill('Unsaved change');
+  await page.getByLabel('Environment variables (JSON object)', {exact:true}).fill('{}');
+  await page.getByRole('button', {name:'Cancel editing',exact:true}).click();
+  const afterCancel = await invoke('read_local_connector', {id});
+  expect(afterCancel.name).toBe(name);
+  expect(afterCancel.environment).toEqual({FIXTURE_KEY:'test-value'});
+  await card.getByRole('button', {name:'Edit configuration',exact:true}).click();
+  await page.getByLabel('Name', {exact:true}).fill(`${name} renamed`);
+  await page.getByRole('button', {name:'Save local server',exact:true}).click();
+  await expect.poll(async () => (await invoke('list_connectors')).find(item => item.id === id)?.description).toBe(`${name} renamed`);
+  const edited = await invoke('read_local_connector', {id});
+  expect(edited.arguments).toEqual([script]);
+  expect(edited.environment).toEqual({FIXTURE_KEY:'test-value'});
+  expect(edited.executable).toBe(process.execPath);
+  expect(edited.workingDirectory).toBe(directory);
+  await expect(page.getByLabel('Environment variables (JSON object)', {exact:true})).toHaveValue('{}');
+  const renamed = page.locator('details.catalog-item').filter({has:page.locator('strong', {hasText:`${name} renamed`})});
+  await renamed.getByRole('button', {name:'Connect',exact:true}).click();
+  await expect(renamed.getByText('1 tools', {exact:true})).toBeVisible();
+  await renamed.getByRole('button', {name:'Disconnect',exact:true}).click();
+  await renamed.getByRole('button', {name:'Remove server',exact:true}).click();
+  await expect(renamed).toHaveCount(0);
   expect((await invoke('list_local_connectors')).some(item => item.id === id)).toBe(false);
-  writeFileSync('test-results/local-connector-smoke.json', JSON.stringify({testedAt:new Date().toISOString(),savedWithoutLaunching:true,discoveredTool:'fixture_echo',disconnectedAndRemoved:true},null,2));
+  writeFileSync('test-results/local-connector-smoke.json', JSON.stringify({testedAt:new Date().toISOString(),savedWithoutLaunching:true,discoveredTool:'fixture_echo',cancelPreservedConfiguration:true,editedSameId:true,connectionSettingsPreserved:true,reconnectedAfterEdit:true,disconnectedAndRemoved:true},null,2));
 } finally {
   if (page) {
     // Recover only this fixture if an assertion failed before its ID was read.

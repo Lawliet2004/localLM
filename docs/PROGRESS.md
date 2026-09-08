@@ -400,3 +400,9 @@ Local connector groups in the conversation tool picker now display and search th
 Added an explicit read_local_connector command for the configuration editor; routine list responses still omit arguments and environment values. The hub rejects editor reads while a session is retained. The UI loads configuration only after Edit configuration, supports cancelling edits, and updates the existing stable ID. Successful save clears the form and releases the parent's loaded configuration.
 
 Seven connector tests, two form tests, strict Clippy and the production build passed. Coverage checks full editor values, unknown IDs, connected-session rejection, and rename preserving ID/arguments/environment. Native edit IPC acceptance, focus/scroll polish, structured argument/environment controls and full chat acceptance remain outstanding. The currently running executable predates this new command and needs rebuilding before native editing verification.
+
+### Native local connector editing acceptance
+
+Rebuilt and launched the current native executable. Extended the local connector smoke to load the editor, cancel modified name/environment values and verify persisted configuration remained unchanged, then rename and save under the same ID. Readback verifies executable, working directory, arguments and environment remained intact; cleared form values and successful reconnect were also checked. The fixture disconnected and was removed at the end.
+
+The extended native smoke passed, including cancellation. This proves the settings IPC/UI edit flow against a real temporary MCP process; it does not prove model-driven chat approval or tool-result reconstruction. Structured fields, editor focus/scroll polish and full local chat acceptance remain outstanding.
