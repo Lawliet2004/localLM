@@ -134,3 +134,10 @@ Unsent text now belongs to its conversation rather than the mounted chat compone
 Verification: 16 frontend tests, production build and both browser checks pass. Native `scripts/drafts-smoke.mjs` verified two independent unsent drafts, a separate new-chat draft, reload recovery and navigation away/back. Fixtures restored the prior new-chat draft and removed their temporary conversations. Rust was unchanged in this slice.
 
 Drafts are local WebView data, separate from SQLite conversation exports. Crash recovery during the interval between submitting a draft and backend acceptance remains to be hardened; this slice verifies unsent draft persistence, not transactional draft-to-message handoff.
+
+### Atomic turn acceptance
+
+The accepted user prompt, streaming assistant record and initial conversation title now commit in one SQLite transaction. An injected assistant-insert failure verifies that no user row or title change remains; unknown conversations cannot create orphan rows. This does not yet make the WebView draft-to-backend handoff crash-safe.
+
+Verification: 48 Rust tests, strict Clippy and the native debug build pass. The rebuilt desktop application passed the response-limit smoke test against the real model, persisting both message records and the terminal error, then showing the same error after reload.
+

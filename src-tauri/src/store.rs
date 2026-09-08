@@ -295,6 +295,53 @@ impl Store {
         transaction.commit().map_err(db_error)?;
         Ok(message)
     }
+    pub fn begin_turn(&self, conversation_id: &str, content: &str) -> Result<Message> {
+        let content = content.trim();
+        if content.is_empty() || content.len() > 1_048_576 {
+            return Err("Enter a message no larger than 1 MiB.".into());
+        }
+        let assistant = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conversation_id.into(),
+            role: "assistant".into(),
+            content: String::new(),
+            reasoning: String::new(),
+            status: "streaming".into(),
+            created_at: now(),
+            error: None,
+        };
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        let existing: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id=?1)",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        transaction.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'user',?3,'complete',?4)", params![uuid::Uuid::new_v4().to_string(), conversation_id, content, assistant.created_at]).map_err(db_error)?;
+        transaction.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'assistant','','streaming',?3)", params![assistant.id, conversation_id, assistant.created_at]).map_err(db_error)?;
+        if existing {
+            transaction
+                .execute(
+                    "UPDATE conversations SET updated_at=?1 WHERE id=?2",
+                    params![assistant.created_at, conversation_id],
+                )
+                .map_err(db_error)?;
+        } else {
+            transaction
+                .execute(
+                    "UPDATE conversations SET title=?1,updated_at=?2 WHERE id=?3",
+                    params![
+                        content.chars().take(64).collect::<String>(),
+                        assistant.created_at,
+                        conversation_id
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(assistant)
+    }
     pub fn update_message(
         &self,
         id: &str,
@@ -366,6 +413,33 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepting_a_turn_is_atomic_even_when_the_assistant_insert_fails() {
+        let store = Store::open_memory().unwrap();
+        let id = store.create_conversation().unwrap().id;
+        store.rename_conversation(&id, "Original title").unwrap();
+        let before = store.list_conversations().unwrap().remove(0);
+        store.connection.execute_batch("CREATE TRIGGER fail_assistant BEFORE INSERT ON messages WHEN NEW.role='assistant' BEGIN SELECT RAISE(ABORT,'injected write failure'); END;").unwrap();
+        assert!(store.begin_turn(&id, "New prompt").is_err());
+        assert!(store.messages(&id).unwrap().is_empty());
+        let after = store.list_conversations().unwrap().remove(0);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.updated_at, before.updated_at);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_assistant;")
+            .unwrap();
+        let assistant = store.begin_turn(&id, " New prompt ").unwrap();
+        let messages = store.messages(&id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "New prompt");
+        assert_eq!(messages[1].id, assistant.id);
+        assert_eq!(messages[1].status, "streaming");
+        assert_eq!(store.list_conversations().unwrap()[0].title, "New prompt");
+        assert!(store.begin_turn("missing", "No orphan records").is_err());
+        assert_eq!(store.messages(&id).unwrap().len(), 2);
+    }
     #[test]
     fn generation_errors_survive_reopening_with_partial_output() {
         let directory = tempfile::tempdir().unwrap();

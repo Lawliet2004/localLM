@@ -79,7 +79,7 @@ pub async fn send_message(
         .conversation_tools(&conversation_id)?
         .access_mode;
     let skill_instructions = state.skills.lock().await.instructions(&active_skills)?;
-    let (preferences, history, first_message) = {
+    let (preferences, history) = {
         let store = state.database()?;
         let preferences = store.preferences()?;
         preferences.validate()?;
@@ -89,7 +89,7 @@ pub async fn send_message(
         let previous = store.messages(&conversation_id)?;
         let mut history = crate::history::model_history(&previous)?;
         history.push(json!({"role":"user","content":content.trim()}));
-        (preferences, history, previous.is_empty())
+        (preferences, history)
     };
     state.cancel.send_replace(false);
     let mut cancellation = state.cancel.subscribe();
@@ -108,17 +108,7 @@ pub async fn send_message(
         _ = cancellation.changed() => return Err("Message cancelled before generation; it was not saved.".into()),
         result = crate::context::check(&client, &endpoint, &api_key, &initial_payload, preferences.max_tokens, context_length) => { result?; },
     }
-    let assistant = {
-        let store = state.database()?;
-        store.append_message(&conversation_id, "user", content.trim(), "complete")?;
-        if first_message {
-            store.rename_conversation(
-                &conversation_id,
-                &content.trim().chars().take(64).collect::<String>(),
-            )?;
-        }
-        store.append_message(&conversation_id, "assistant", "", "streaming")?
-    };
+    let assistant = state.database()?.begin_turn(&conversation_id, &content)?;
     let mut answer = String::new();
     let mut reasoning = String::new();
     let result: Result<bool,String> = async {
