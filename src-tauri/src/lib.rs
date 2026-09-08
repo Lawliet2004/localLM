@@ -11,6 +11,7 @@ mod oauth;
 mod permissions;
 mod runtime;
 mod runtime_config;
+mod runtime_log;
 mod skills;
 mod sse;
 mod store;

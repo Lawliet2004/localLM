@@ -68,6 +68,7 @@ pub struct Runtime {
     pub api_key: String,
     pub context_length: u32,
     log_path: PathBuf,
+    log_tasks: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 impl Runtime {
     pub fn new(log_path: PathBuf) -> Self {
@@ -78,6 +79,7 @@ impl Runtime {
             api_key: String::new(),
             context_length: 0,
             log_path,
+            log_tasks: Vec::new(),
         }
     }
     pub fn inspect(&mut self) -> RuntimeStatus {
@@ -111,6 +113,15 @@ impl Runtime {
                 .await
                 .map_err(|error| format!("Could not stop model: {error}"))?;
         }
+        for mut task in self.log_tasks.drain(..) {
+            if tokio::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
         self.status = RuntimeStatus::default();
         self.api_key.clear();
         self.endpoint.clear();
@@ -136,7 +147,8 @@ impl Runtime {
             .port();
         self.api_key = uuid::Uuid::new_v4().to_string();
         self.endpoint = format!("http://127.0.0.1:{port}");
-        let log = std::fs::File::create(&self.log_path)
+        let log = crate::runtime_log::RuntimeLog::create(&self.log_path)
+            .await
             .map_err(|error| format!("Cannot create runtime log: {error}"))?;
         let mut command = Command::new(executable);
         // Inherited llama options could expose tools or change the selected model.
@@ -166,16 +178,27 @@ impl Runtime {
             ])
             .env("LLAMA_API_KEY", &self.api_key)
             .stdin(Stdio::null())
-            .stdout(log.try_clone().map_err(|error| error.to_string())?)
-            .stderr(log)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(0x08000000);
-        self.child = Some(
-            command
-                .spawn()
-                .map_err(|error| format!("Cannot start llama-server: {error}"))?,
-        );
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("Cannot start llama-server: {error}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Runtime stdout pipe unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or("Runtime stderr pipe unavailable")?;
+        self.log_tasks
+            .push(tokio::spawn(crate::runtime_log::drain(stdout, log.clone())));
+        self.log_tasks
+            .push(tokio::spawn(crate::runtime_log::drain(stderr, log)));
+        self.child = Some(child);
         self.status = RuntimeStatus {
             phase: "loading".into(),
             message: "Loading model into memory".into(),

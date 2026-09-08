@@ -171,3 +171,10 @@ Models now shows actual layer counts from the runtime startup summary alongside 
 
 Verification: 52 Rust tests, 17 frontend tests and the frontend production build passed. Strict Clippy passed after replacing a forward full scan with reverse lookup. Native scripts/offload-smoke.mjs verified 43/43, 5/43 and 0/43 for all-layer, five-layer and zero-layer requests, including visible UI checks. Saved configuration and loaded/stopped state were restored. The screenshot was inspected. This reports layer placement; per-device allocation and KV placement reporting still remain. The existing installer predates this change.
 
+
+### Bounded runtime diagnostics
+
+The runtime no longer writes directly to an unbounded file. Shared stdout/stderr draining caps each load's log at 8 MiB including a truncation marker, then discards further output while keeping pipes flowing. Write failures likewise do not stop draining. Shutdown waits a bounded interval for drain tasks after terminating the child. Startup diagnostics are retained; later diagnostics after the cap are intentionally unavailable.
+
+Verification: the full 53-test Rust suite passed after implementation, then both logging tests passed after adding a write-failure fixture (54 total tests now). Tests stream 200,000 bytes through tiny pipes into a small cap, verify a single marker and exact size, verify reset on new load, and verify read-only-file failure cannot deadlock a producer. Strict Clippy and native build passed. Rebuilt-app offload checks again reported 43/43, 5/43 and 0/43; the real response-limit generation/reload check also passed. Frontend code was unchanged. Full release scope remains active.
+
