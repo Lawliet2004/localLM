@@ -33,6 +33,7 @@ export interface Bootstrap { conversations: Conversation[]; config: RuntimeConfi
 export interface ToolApproval { id: string; connector: string; name: string; arguments: Record<string, unknown> }
 export interface ChatEvent { messageId: string; content: string; reasoning: string; approval?: ToolApproval | null }
 export interface ToolView { name: string; description: string; inputSchema: Record<string, unknown> }
+export interface ToolSelection { connectorId: string; toolName: string }
 export interface ConnectorView {
   id: string; description: string; url: string; authType: 'none' | 'apiKey' | 'oauth';
   connected: boolean; hasCredential: boolean; tools: ToolView[];

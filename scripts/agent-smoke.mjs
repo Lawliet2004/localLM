@@ -22,8 +22,11 @@ try {
   for (const decision of ['allow', 'deny', 'cancel']) {
     await page.getByRole('button', { name: 'New conversation', exact: false }).click();
     const picker = page.locator('.tool-picker');
-    if (await picker.getAttribute('open') === null) await picker.locator('summary').click();
-    await page.getByRole('checkbox', { name: 'deepwiki', exact: false }).check();
+    if (await picker.getAttribute('open') === null) await picker.locator('summary').first().click();
+    const group = picker.locator('.connector-tool-group').filter({ hasText: 'deepwiki' });
+    if (await group.getAttribute('open') === null) await group.locator('summary').click();
+    await group.getByRole('checkbox', { name: 'read_wiki_structure', exact: true }).check();
+    await expect(picker.locator('summary').first()).toContainText('1/32 enabled');
     await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Use the read_wiki_structure tool for the public repository tauri-apps/tauri. Call it exactly once, then briefly name one section from its result. If permission is denied, stop and say it was denied.');
     await page.getByRole('button', { name: 'Send message', exact: true }).click();
     const dialog = page.getByRole('dialog');

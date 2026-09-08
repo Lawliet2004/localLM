@@ -83,4 +83,3 @@ export function Chat({ messages, generating, ready, loading, onSend, onCancel, o
     </div>
   </div>;
 }
-

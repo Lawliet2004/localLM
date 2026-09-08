@@ -187,3 +187,11 @@ h1 { font-weight: 450; font-size: 38px; line-height: 1.22; letter-spacing: -1.3p
 .hardware-note { display: block; line-height: 1.6; }
 .loaded-settings { border-top: 1px solid var(--border); padding-top: 12px; line-height: 1.7; }
 @media (max-width: 760px) { .gpu-reading { grid-template-columns: 1fr; gap: 10px; } }
+.connector-tool-groups { max-height: 280px; overflow-y: auto; margin-top: 8px; }
+.connector-tool-group { border-top: 1px solid var(--border); padding: 6px 0; }
+.connector-tool-group summary small { margin-left: 8px; }
+.tool-picker .connector-tool-choice { display: flex; align-items: flex-start; margin: 8px 0; }
+.connector-tool-choice span { min-width: 0; }
+.connector-tool-choice strong { display: block; overflow-wrap: anywhere; }
+.connector-tool-choice small { display: block; margin-top: 3px; max-width: 800px; overflow-wrap: anywhere; }
+.tool-picker input[type=search] { width: min(100%, 420px); margin-top: 8px; }

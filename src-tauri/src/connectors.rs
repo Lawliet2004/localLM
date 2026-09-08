@@ -5,7 +5,7 @@ use rmcp::{
     },
     RoleClient, ServiceExt,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -15,6 +15,35 @@ pub struct ToolView {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+}
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolSelection {
+    pub connector_id: String,
+    pub tool_name: String,
+}
+
+fn select_views<'a>(
+    available: &'a [ToolView],
+    names: impl Iterator<Item = &'a str>,
+    all: bool,
+) -> Result<Vec<&'a ToolView>, String> {
+    let mut selected = Vec::new();
+    for name in names {
+        let tool = available
+            .iter()
+            .find(|tool| tool.name == name)
+            .ok_or_else(|| {
+                format!("Selected tool {name} is no longer available. Review your tool selection.")
+            })?;
+        if !selected.iter().any(|item: &&ToolView| item.name == name) {
+            selected.push(tool);
+        }
+    }
+    if all {
+        return Ok(available.iter().collect());
+    }
+    Ok(selected)
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -144,10 +173,20 @@ fn validate_token(value: &str) -> Result<(), String> {
 }
 
 impl McpHub {
-    pub fn selected_tools(&self, ids: &[String]) -> Result<Vec<AgentTool>, String> {
+    pub fn selected_tools(
+        &self,
+        ids: &[String],
+        selections: &[ToolSelection],
+    ) -> Result<Vec<AgentTool>, String> {
+        if ids.len() > 32 || selections.len() > 32 {
+            return Err("At most 32 tools can be offered in a turn.".into());
+        }
         let mut tools = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for id in ids {
+        for id in ids
+            .iter()
+            .chain(selections.iter().map(|selection| &selection.connector_id))
+        {
             if !seen.insert(id) {
                 continue;
             }
@@ -156,11 +195,18 @@ impl McpHub {
                 .get(id)
                 .filter(|value| !value.service.is_closed())
                 .ok_or_else(|| format!("Connector {id} is not connected."))?;
-            for tool in &connection.tools {
+            let selected = select_views(
+                &connection.tools,
+                selections
+                    .iter()
+                    .filter(|selection| &selection.connector_id == id)
+                    .map(|selection| selection.tool_name.as_str()),
+                ids.contains(id),
+            )?;
+            for tool in selected {
                 if tools.len() >= 32 {
                     return Err(
-                        "Select fewer connectors: at most 32 tools can be offered in a turn."
-                            .into(),
+                        "Select fewer tools: at most 32 tools can be offered in a turn.".into(),
                     );
                 }
                 tools.push(AgentTool {
@@ -392,6 +438,36 @@ pub fn cancel_connector_sign_in(state: tauri::State<'_, crate::AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selects_exact_tools_from_large_catalog_and_rejects_stale_names() {
+        let tools: Vec<ToolView> = (0..100)
+            .map(|index| ToolView {
+                name: format!("tool_{index}"),
+                description: String::new(),
+                input_schema: serde_json::json!({"type":"object"}),
+            })
+            .collect();
+        let selected =
+            select_views(&tools, ["tool_92", "tool_3", "tool_92"].into_iter(), false).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["tool_92", "tool_3"]
+        );
+        assert!(select_views(&tools, ["removed_tool"].into_iter(), false).is_err());
+        assert!(select_views(&tools, ["removed_tool"].into_iter(), true).is_err());
+        assert_eq!(
+            select_views(&tools, std::iter::empty(), true)
+                .unwrap()
+                .len(),
+            100
+        );
+        assert!(select_views(&tools, std::iter::empty(), false)
+            .unwrap()
+            .is_empty());
+    }
     #[test]
     fn rejects_arbitrary_connector_ids_and_header_injection() {
         assert!(preset("https://attacker.example").is_err());

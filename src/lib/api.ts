@@ -1,5 +1,5 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ExecutionConfig, HardwareStatus, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillView } from './types';
+import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ExecutionConfig, HardwareStatus, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillView, ToolSelection } from './types';
 
 export const nativeAvailable = isTauri();
 export const api = {
@@ -28,10 +28,10 @@ export const api = {
   loadModel: () => invoke<RuntimeStatus>('load_model'),
   unloadModel: () => invoke<RuntimeStatus>('unload_model'),
   runtimeStatus: () => invoke<RuntimeStatus>('runtime_status'),
-  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = []) => {
+  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = [], connectorTools: ToolSelection[] = []) => {
     const channel = new Channel<ChatEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>('send_message', { conversationId, content, channel, connectorIds });
+    return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools });
   },
   cancelGeneration: () => invoke<void>('cancel_generation'),
   resolveToolApproval: (id: string, allow: boolean) => invoke<void>('resolve_tool_approval', { id, allow }),

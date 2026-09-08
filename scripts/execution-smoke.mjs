@@ -22,7 +22,7 @@ try {
   const scenarios=[];
   for(const mode of ['allow','deny','cancel']) {
     await page.getByRole('button',{name:'New conversation',exact:false}).click();
-    const picker=page.locator('.tool-picker'); if(await picker.getAttribute('open')===null) await picker.locator('summary').click();
+    const picker=page.locator('.tool-picker'); if(await picker.getAttribute('open')===null) await picker.locator('summary').first().click();
     await page.getByRole('checkbox',{name:'Local code',exact:true}).check();
     const code=mode==='allow' ? "from pathlib import Path\nprint(sum(map(int, Path('numbers.txt').read_text().split())))" : mode==='deny' ? "from pathlib import Path\nPath('denied.txt').write_text('should not exist')" : "from pathlib import Path\nimport time\nPath('started.txt').write_text('started')\ntime.sleep(4)\nPath('after-cancel.txt').write_text('should not exist')";
     await page.getByRole('textbox',{name:'Message',exact:true}).fill(`Use run_code with language python to run exactly the following code. Do not modify the code. If denied, stop.\n\n\`\`\`python\n${code}\n\`\`\``);

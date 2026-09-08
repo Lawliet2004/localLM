@@ -70,3 +70,11 @@ Vite was started on 127.0.0.1:1420. A debug native app was launched with WebView
 Tool audit cards now distinguish `isError: true` results from successful transport completion, while keeping denial and interruption labels. Submission has an immediate in-flight guard and respects conversation loading. Failed sends query persisted messages before restoring the original draft, avoiding duplicate user messages after inference failures; unverifiable persistence prompts reopening the conversation. A newly typed draft is preserved if an earlier submission fails.
 
 Verification: 8 frontend tests pass, including four tool outcomes and duplicate-submit/new-draft regression coverage; TypeScript/production build and both browser tests pass. The persistence reconciliation branch still needs native failure-injection coverage; durable structured generation errors and explicit retry workflows remain unfinished.
+
+### Individual connector tool selection
+
+The chat picker supports individual discovered tools, searchable by connector/name/description, with explicit structured IPC selections (`connectorId`, `toolName`). The model receives only selected tool definitions. Workspace tools count as four and local execution as one toward the 32-tool turn limit. Whole-connector requests remain supported for existing IPC clients, but the UI sends exact selections. Rust rejects stale tool names, deduplicates selections, checks connection health and enforces the limit before message persistence.
+
+Verification: 32 Rust tests and strict Clippy pass; 9 frontend tests, production build and 2 browser tests pass. Regression fixtures cover selecting two exact tools from a 100-tool catalog, unknown tool rejection, and selecting/searching a tool from a 40-tool UI catalog. Native MiniCPM/DeepWiki smoke tests enabled only `read_wiki_structure` and passed real allowed-result continuation, denied-call handling and cancellation. Native stale-selection smoke verified an error and zero persisted messages. Native screenshot inspected at `test-results/native-agent.png` (ignored).
+
+Remaining: selections are currently session state, not persisted per conversation. Account-specific provider compatibility, larger-context management, Daytona, runtime installation and release acceptance remain open.

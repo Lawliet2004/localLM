@@ -22,7 +22,7 @@ try {
   for (const mode of ['read', 'deny-write', 'write']) {
     await page.getByRole('button', { name: 'New conversation', exact: false }).click();
     const picker=page.locator('.tool-picker');
-    if (await picker.getAttribute('open') === null) await picker.locator('summary').click();
+    if (await picker.getAttribute('open') === null) await picker.locator('summary').first().click();
     await page.getByRole('checkbox', { name: 'Workspace files', exact: true }).check();
     const prompt = mode === 'read' ? 'Use read_file to read fixture.txt in the workspace. Quote the ENTIRE verification code verbatim, including its prefix. Do not shorten or reformat it.' : 'Use create_file to create output.txt in the workspace. Its entire content must be the JSON string value "workspace write verified" (without the quotes, with no added punctuation). If permission is denied, stop.';
     await page.getByRole('textbox', { name: 'Message', exact: true }).fill(prompt);

@@ -26,6 +26,7 @@ pub async fn send_message(
     conversation_id: String,
     content: String,
     connector_ids: Option<Vec<String>>,
+    connector_tools: Option<Vec<crate::connectors::ToolSelection>>,
     channel: Channel<ChatEvent>,
 ) -> Result<(), String> {
     let _operation = state
@@ -44,7 +45,7 @@ pub async fn send_message(
         .connectors
         .lock()
         .await
-        .selected_tools(&connector_ids)?;
+        .selected_tools(&connector_ids, &connector_tools.unwrap_or_default())?;
     if use_workspace {
         let path = state.database()?.workspace_path()?;
         tools.extend(std::sync::Arc::new(crate::workspace::Workspace::open(&path)?).tools());
