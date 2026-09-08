@@ -220,3 +220,11 @@ Implemented the coordinator for journal-before-create, identity capture, bounded
 
 The targeted async lifecycle test passed for normal completion, nonzero exit and caller cancellation, verifying one submission and eventual journal clearance after deletion. Strict Clippy passed (62 Rust tests now exist). This is a fake-remote lifecycle test, not live account evidence. The coordinator remains to be wired to model tool selection/approval, and automatic startup recovery is still outstanding.
 
+
+### Daytona chat permissions and startup recovery
+
+Connected the cloud execution coordinator to a separately selected chat tool. Ask and Auto-approve reads show code and cost scope before creation; Full access follows the existing native policy. Credential mutations are excluded during model operations. The native denial smoke passed in both prompting modes with zero resource journal records. Production frontend build, 19 frontend tests, 62 Rust tests and strict Clippy passed for chat wiring.
+
+Added one launch-time cleanup pass over pending ownership, serialized with other cloud operations. Missing/mismatched credentials retain actionable errors; one remote failure does not prevent later cleanup. No code or creation is replayed. The new mixed-scope recovery regression and strict Clippy passed. Live cloud execution and native restart recovery remain unverified; no paid cloud calls were made.
+
+The Execution page now refreshes the pending journal every five seconds while mounted, without overlapping polls, and refreshes after credential/cleanup actions. Journal errors have their own visible state and clear after a successful refresh. A fake-timer regression verifies completed cleanup disappears and unmount stops polling. All 20 frontend tests and the production frontend build pass. Native debug rebuild succeeded; the credential UI smoke passed after relaunch with encrypted save, reload persistence, clearing and forget, with zero cloud calls. This confirms startup with an empty journal, not live pending-resource recovery.

@@ -37,6 +37,8 @@ pub async fn send_message(
         return Err("Enter a message no larger than 1 MiB.".into());
     }
     let mut connector_ids = connector_ids.unwrap_or_default();
+    let use_daytona = connector_ids.iter().any(|id| id == "__daytona");
+    connector_ids.retain(|id| id != "__daytona");
     let use_workspace = connector_ids.iter().any(|id| id == "__workspace");
     let use_execution = connector_ids.iter().any(|id| id == "__execution");
     connector_ids.retain(|id| id != "__execution");
@@ -49,6 +51,20 @@ pub async fn send_message(
     if use_workspace {
         let path = state.database()?.workspace_path()?;
         tools.extend(std::sync::Arc::new(crate::workspace::Workspace::open(&path)?).tools());
+    }
+    if use_daytona {
+        let bytes = state
+            .daytona_vault
+            .load("daytona")?
+            .ok_or("Save a Daytona API key in Execution first.")?;
+        let key = String::from_utf8(bytes).map_err(|_| "Saved Daytona key is invalid.")?;
+        tools.push(crate::connectors::AgentTool::daytona(
+            crate::daytona_execution::Executor::new(
+                &key,
+                state.daytona_journal.clone(),
+                state.daytona_operation.clone(),
+            )?,
+        ));
     }
     if use_execution {
         let (config, path) = {
@@ -202,7 +218,7 @@ pub async fn send_message(
             let result = if !allow { json!({"isError":true,"message":"The user denied this tool request. Do not repeat it without a new instruction."}) } else {
                 let outcome = tokio::select! {
                     _ = cancellation.changed() => None,
-                    result = tokio::time::timeout(Duration::from_secs(120),tool.call(call.arguments.clone())) => Some(result.unwrap_or_else(|_| Err("Tool request timed out. Its remote outcome may be unknown; do not automatically retry.".into()))),
+                    result = tokio::time::timeout(tool.timeout(),tool.call(call.arguments.clone())) => Some(result.unwrap_or_else(|_| Err("Tool request timed out. Its remote outcome may be unknown; do not automatically retry.".into()))),
                 };
                 match outcome {
                     None => { state.database()?.update_message(&row.id,&json!({"request":audit,"result":"Cancelled; the action may already have changed data."}).to_string(),"","interrupted")?; return Ok(false); },

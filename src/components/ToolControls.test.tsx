@@ -6,6 +6,7 @@ import { ToolPicker } from './ToolControls';
 import type { ToolSelection } from '../lib/types';
 const fixtures = vi.hoisted(() => ({ skills: [] as { id: string; active: boolean }[] }));
 vi.mock('../lib/api', () => ({ nativeAvailable: true, errorMessage: String, api: {
+  hasDaytonaKey: async () => false,
   listConnectors: async () => [{ id: 'example', connected: true, tools: Array.from({ length: 40 }, (_, index) => ({ name: `tool_${index}`, description: `Action ${index}`, inputSchema: {} })) }],
   listSkills: async () => fixtures.skills, getWorkspace: async () => ({ path: 'C:/workspace' }),
 } }));

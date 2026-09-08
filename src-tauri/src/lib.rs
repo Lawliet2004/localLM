@@ -29,8 +29,8 @@ use tauri::Manager;
 
 pub struct AppState {
     daytona_vault: std::sync::Arc<vault::Vault>,
-    daytona_operation: tokio::sync::Mutex<()>,
-    daytona_journal: Mutex<daytona_journal::Journal>,
+    daytona_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
+    daytona_journal: std::sync::Arc<Mutex<daytona_journal::Journal>>,
     skills: tokio::sync::Mutex<skills::Skills>,
     approvals: approval::Approvals,
     store: Mutex<store::Store>,
@@ -78,11 +78,11 @@ pub fn run() {
             let vault = std::sync::Arc::new(vault::Vault::new(data.join("credentials")));
             app.manage(AppState {
                 daytona_vault: vault.clone(),
-                daytona_operation: tokio::sync::Mutex::new(()),
-                daytona_journal: Mutex::new(
+                daytona_operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                daytona_journal: std::sync::Arc::new(Mutex::new(
                     daytona_journal::Journal::open(&data.join("daytona.sqlite"))
                         .map_err(std::io::Error::other)?,
-                ),
+                )),
                 skills: tokio::sync::Mutex::new(skills::Skills::new(data.join("skills"))),
                 approvals: approval::Approvals::default(),
                 store: Mutex::new(store),
@@ -92,6 +92,12 @@ pub fn run() {
                 connectors: tokio::sync::Mutex::new(connectors::McpHub::new(vault)),
                 oauth_operation: tokio::sync::Mutex::new(()),
                 oauth_cancel: tokio::sync::watch::channel(false).0,
+            });
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if daytona_settings::recover_at_startup(&handle.state::<AppState>()).await.is_err() {
+                    eprintln!("Startup cloud cleanup could not access its journal; pending ownership is retained.");
+                }
             });
             Ok(())
         })

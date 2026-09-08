@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({ save: vi.fn(), exportConversation: vi.fn(), bo
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: mocks.save, open: vi.fn(), confirm: vi.fn() }));
 vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) => e instanceof Error ? e.message : String(e), api: {
   bootstrap: mocks.bootstrap, exportConversation: mocks.exportConversation,
-  listConnectors: async () => [], listSkills: async () => [], getWorkspace: async () => ({ path: '' }),
+  listConnectors: async () => [], listSkills: async () => [], getWorkspace: async () => ({ path: '' }), hasDaytonaKey: async () => false,
   conversationTools: async () => ({ sources: [], tools: [] }),
   messages: async () => [{ id: 'message', conversationId: 'chat', role: 'user', content: 'Export this message', reasoning: '', status: 'complete', createdAt: 0 }],
 } }));

@@ -9,6 +9,38 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{watch, Mutex as AsyncMutex};
+pub struct Executor {
+    client: Arc<Client>,
+    store: Arc<Mutex<Journal>>,
+    operation: Arc<AsyncMutex<()>>,
+    scope: String,
+}
+impl Executor {
+    pub fn new(
+        key: &str,
+        store: Arc<Mutex<Journal>>,
+        operation: Arc<AsyncMutex<()>>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            client: Arc::new(Client::new(key)?),
+            store,
+            operation,
+            scope: crate::daytona_settings::credential_scope(key),
+        })
+    }
+    pub async fn call(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let request = serde_json::from_value(args).map_err(|_| "Invalid cloud code arguments.")?;
+        let outcome = run(
+            self.client.clone(),
+            self.store.clone(),
+            self.operation.clone(),
+            self.scope.clone(),
+            request,
+        )
+        .await?;
+        serde_json::to_value(outcome).map_err(|_| "Could not encode cloud execution result.".into())
+    }
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

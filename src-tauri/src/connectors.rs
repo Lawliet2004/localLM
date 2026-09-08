@@ -98,12 +98,25 @@ pub fn tool_alias(connector: &str, name: &str) -> String {
     format!("{readable}_{}", &digest[..16])
 }
 enum ToolBackend {
+    Daytona(Arc<crate::daytona_execution::Executor>),
     Skills(Arc<crate::skills::SkillReader>),
     Execution(Arc<crate::execution::LocalExecution>),
     Mcp(rmcp::Peer<RoleClient>),
     Workspace(Arc<crate::workspace::Workspace>),
 }
 impl AgentTool {
+    pub fn daytona(executor: crate::daytona_execution::Executor) -> Self {
+        Self {connector:"Daytona".into(),alias:tool_alias("Daytona","run_code"),backend:ToolBackend::Daytona(Arc::new(executor)),tool:ToolView{
+            name:"run_code".into(),description:"Execute code in a temporary Daytona cloud sandbox, then delete it. Code and results leave this device. No local workspace files are uploaded. Cloud usage may incur charges.".into(),
+            input_schema:serde_json::json!({"type":"object","properties":{"language":{"type":"string","enum":["python","javascript","typescript"]},"code":{"type":"string","maxLength":32768},"timeout_seconds":{"type":"integer","minimum":1,"maximum":90}},"required":["language","code","timeout_seconds"],"additionalProperties":false})}}
+    }
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(if matches!(self.backend, ToolBackend::Daytona(_)) {
+            300
+        } else {
+            120
+        })
+    }
     pub fn skills(reader: Arc<crate::skills::SkillReader>, tool: ToolView) -> Self {
         Self {
             connector: "Skills".into(),
@@ -137,6 +150,7 @@ impl AgentTool {
     }
     pub async fn call(&self, arguments: Value) -> Result<Value, String> {
         let peer = match &self.backend {
+            ToolBackend::Daytona(executor) => return executor.call(arguments).await,
             ToolBackend::Skills(reader) => {
                 let reader = reader.clone();
                 return tokio::task::spawn_blocking(move || reader.call(arguments))

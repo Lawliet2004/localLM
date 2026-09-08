@@ -7,10 +7,11 @@ export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, a
   const [items, setItems] = useState<ConnectorView[]>([]);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [workspace, setWorkspace] = useState('');
+  const [hasDaytona, setHasDaytona] = useState(false);
   const [choosing, setChoosing] = useState(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
-  const toolCount = selectedTools.length + (selected.includes('__workspace') ? 4 : 0) + (selected.includes('__execution') ? 1 : 0) + (activeSkills.length ? 1 : 0);
+  const toolCount = selectedTools.length + (selected.includes('__workspace') ? 4 : 0) + (selected.includes('__execution') ? 1 : 0) + (selected.includes('__daytona') ? 1 : 0) + (activeSkills.length ? 1 : 0);
   const isSelected = (connectorId: string, toolName: string) => selectedTools.some(tool => tool.connectorId === connectorId && tool.toolName === toolName);
   function toggleTools(item: ConnectorView, names: string[], enabled: boolean) {
     const remaining = selectedTools.filter(tool => tool.connectorId !== item.id || !names.includes(tool.toolName));
@@ -21,6 +22,7 @@ export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, a
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
+    api.hasDaytonaKey().then(value => { if (!disposed) setHasDaytona(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
     api.listConnectors().then(value => { if (!disposed) setItems(value.filter(item => item.connected)); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
     api.listSkills().then(value => { if (!disposed) setActiveSkills(value.filter(item => item.active).map(item => item.id)); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
     api.getWorkspace().then(value => { if (!disposed) setWorkspace(value.path); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
@@ -38,6 +40,7 @@ export function ToolPicker({ selected, onChange, selectedTools, onToolsChange, a
     <p>Selected tools may send data to their services. Permissions apply to this conversation and are recorded with each action.</p>
     <div className="workspace-tools"><label><input type="checkbox" aria-label="Workspace files" checked={selected.includes('__workspace')} disabled={busy || !workspace || (!selected.includes('__workspace') && toolCount + 4 > 32)} onChange={event => onChange(event.target.checked ? [...selected, '__workspace'] : selected.filter(id => id !== '__workspace'))} />Workspace files</label><button className="secondary" disabled={!nativeAvailable || busy || choosing} onClick={() => void chooseWorkspace()}>{workspace ? 'Change folder' : 'Choose folder'}</button>{workspace && <code>{workspace}</code>}</div>
     <label><input type="checkbox" aria-label="Local code" checked={selected.includes('__execution')} disabled={busy || !workspace || (!selected.includes('__execution') && toolCount >= 32)} onChange={event => onChange(event.target.checked ? [...selected, '__execution'] : selected.filter(id => id !== '__execution'))} />Local code <small>Not sandboxed · {accessMode === 'fullAccess' ? 'runs without prompts' : 'approval required'}</small></label>
+    <label><input type="checkbox" aria-label="Daytona cloud code" checked={selected.includes('__daytona')} disabled={busy || (!selected.includes('__daytona') && (!hasDaytona || toolCount >= 32))} onChange={event => onChange(event.target.checked ? [...selected, '__daytona'] : selected.filter(id => id !== '__daytona'))} />Daytona cloud code <small>{hasDaytona ? 'Remote sandbox · usage may incur charges' : 'Save a Daytona key in Execution'}</small></label>
     {items.length > 0 && <input type="search" aria-label="Search available tools" placeholder="Find a tool or connector…" value={search} onChange={event => setSearch(event.target.value)} />}
     <div className="connector-tool-groups">{items.map(item => {
       const visible = item.tools.filter(tool => `${item.id} ${tool.name} ${tool.description}`.toLowerCase().includes(search.toLowerCase()));
@@ -66,8 +69,8 @@ export function ApprovalDialog({ request, onResolve }: { request: ToolApproval; 
   }
   return <dialog ref={dialog} className="tool-approval" aria-labelledby="approval-title" onCancel={event => { event.preventDefault(); if (!busy) void resolve(false); }}>
     <p className="eyebrow">ACTION REQUEST</p><h2 id="approval-title">{request.connector === 'Local execution' ? 'Run this code on your computer?' : `Allow ${request.connector} to run this tool?`}</h2>
-    <p><strong>{request.name}</strong></p><p>{request.connector === 'Local execution' ? 'This code runs with your Windows account’s permissions. It can access files outside the workspace and the network. It is not sandboxed. Review the complete code before allowing it.' : request.connector === 'Workspace' ? 'This action will access the workspace folder on your computer using the arguments below.' : request.connector === 'Skills' ? 'Read a verified file from an active skill’s local package. This does not execute scripts or contact a service.' : 'The arguments below will be sent to this service. The action may read or change external data.'}</p>
-    {request.connector === 'Local execution' && typeof request.arguments.code === 'string' ? <><p>Language: {String(request.arguments.language)} · Timeout: {String(request.arguments.timeout_seconds ?? 60)} seconds</p><pre className="approval-code">{request.arguments.code}</pre><details><summary>Full request</summary><pre className="approval-arguments">{JSON.stringify(request.arguments, null, 2)}</pre></details></> : <pre className="approval-arguments">{JSON.stringify(request.arguments, null, 2)}</pre>}
+    <p><strong>{request.name}</strong></p><p>{request.connector === 'Local execution' ? 'This code runs with your Windows account’s permissions. It can access files outside the workspace and the network. It is not sandboxed. Review the complete code before allowing it.' : request.connector === 'Daytona' ? 'This code will be sent to a temporary Daytona cloud sandbox and may incur usage charges. No local files are uploaded automatically. Cleanup is attempted after execution.' : request.connector === 'Workspace' ? 'This action will access the workspace folder on your computer using the arguments below.' : request.connector === 'Skills' ? 'Read a verified file from an active skill’s local package. This does not execute scripts or contact a service.' : 'The arguments below will be sent to this service. The action may read or change external data.'}</p>
+    {(request.connector === 'Local execution' || request.connector === 'Daytona') && typeof request.arguments.code === 'string' ? <><p>Language: {String(request.arguments.language)} · Timeout: {String(request.arguments.timeout_seconds ?? 60)} seconds</p><pre className="approval-code">{request.arguments.code}</pre><details><summary>Full request</summary><pre className="approval-arguments">{JSON.stringify(request.arguments, null, 2)}</pre></details></> : <pre className="approval-arguments">{JSON.stringify(request.arguments, null, 2)}</pre>}
     {error && <p role="alert">{error}</p>}
     <div className="connector-actions"><button autoFocus className="secondary" disabled={busy} onClick={() => void resolve(false)}>Deny</button><button className="primary" disabled={busy} onClick={() => void resolve(true)}>Allow once</button></div>
   </dialog>;

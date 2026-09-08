@@ -11,15 +11,33 @@ export function Execution() {
   const [cloudKey, setCloudKey] = useState('');
   const [hasCloudKey, setHasCloudKey] = useState(false);
   const [cloudBusy, setCloudBusy] = useState(false);
+  const [cloudRevision, setCloudRevision] = useState(0);
+  const [cloudError, setCloudError] = useState('');
   const [pendingCloud, setPendingCloud] = useState<Awaited<ReturnType<typeof api.pendingDaytonaOperations>>>([]);
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
     api.hasDaytonaKey().then(value => { if (!disposed) setHasCloudKey(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
-    api.pendingDaytonaOperations().then(value => { if (!disposed) setPendingCloud(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
     api.getExecutionConfig().then(value => { if (!disposed) setConfig(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); }).finally(() => { if (!disposed) setBusy(false); });
     return () => { disposed = true; };
   }, []);
+  useEffect(() => {
+    if (!nativeAvailable) return;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function refresh() {
+      try {
+        const value = await api.pendingDaytonaOperations();
+        if (!disposed) { setPendingCloud(value); setCloudError(''); }
+      } catch (e) {
+        if (!disposed) setCloudError(errorMessage(e));
+      } finally {
+        if (!disposed) timer = setTimeout(() => void refresh(), 5000);
+      }
+    }
+    void refresh();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [cloudRevision]);
   async function browse(key: keyof ExecutionConfig) {
     try { const path = await open({ multiple: false, filters: [{ name: 'Executable', extensions: ['exe'] }] }); if (typeof path === 'string') setConfig(current => ({ ...current, [key]: path })); }
     catch (e) { setError(errorMessage(e)); }
@@ -31,7 +49,7 @@ export function Execution() {
       if (action === 'forget') { await api.forgetDaytonaKey(); setCloudKey(''); setHasCloudKey(false); setNotice('Daytona key removed.'); }
       if (action === 'cleanup' && name) { await api.retryDaytonaCleanup(name); setNotice('Cloud resource removal confirmed.'); }
     } catch (e) { setError(errorMessage(e)); }
-    finally { try { setPendingCloud(await api.pendingDaytonaOperations()); } catch (e) { setError(errorMessage(e)); } setCloudBusy(false); }
+    finally { setCloudRevision(value => value + 1); setCloudBusy(false); }
   }
   async function save() {
     setBusy(true); setError(''); setNotice('');
@@ -45,9 +63,9 @@ export function Execution() {
       {([['pythonPath', 'Python executable'], ['nodePath', 'Node.js executable'], ['powershellPath', 'PowerShell executable']] as const).map(([key, label]) => <label key={key}>{label}<div className="execution-path"><input aria-label={label} value={config[key]} placeholder="Not configured" disabled={busy} onChange={event => { setNotice(''); setConfig(current => ({ ...current, [key]: event.target.value })); }} /><button type="button" className="secondary" disabled={!nativeAvailable || busy} onClick={() => void browse(key)}>Browse</button></div></label>)}
       <button className="primary" disabled={!nativeAvailable || busy}>{busy ? 'Saving…' : 'Save interpreters'}</button>
     </form>
-    {error && <p role="alert" className="error-banner">{error}</p>}{notice && <p role="status">{notice}</p>}
+    {error && <p role="alert" className="error-banner">{error}</p>}{cloudError && <p role="alert" className="error-banner">Cloud cleanup status could not be refreshed: {cloudError}</p>}{notice && <p role="status">{notice}</p>}
     <p className="catalog-notice">To use local execution, choose a workspace folder under Tools in chat and enable Local code. Runs have a 90-second maximum and capture up to 64 KiB from each output stream.</p>
-    <p className="catalog-notice">Daytona cloud execution is still being integrated.</p>
+    <p className="catalog-notice">Enable Daytona cloud code under Tools in chat to run Python, JavaScript or TypeScript in a temporary remote sandbox. Code leaves this device and cloud usage may incur charges. Local workspace files are not uploaded automatically. Cleanup is attempted after every run; unresolved resources appear below.</p>
     <form className="runtime-form" onSubmit={event => { event.preventDefault(); void cloudAction('save'); }}><h2>Daytona credentials</h2><p>{hasCloudKey ? 'An encrypted API key is saved.' : 'No Daytona key saved.'} Saving a key does not create a sandbox or verify account access.</p><label>Daytona API key<input type="password" autoComplete="off" spellCheck={false} value={cloudKey} disabled={!nativeAvailable || cloudBusy} onChange={event => setCloudKey(event.target.value)} /></label><div className="connector-actions"><button className="primary" disabled={!nativeAvailable || cloudBusy || !cloudKey}>Save Daytona key</button>{hasCloudKey && <button type="button" className="secondary" disabled={cloudBusy || pendingCloud.length > 0} onClick={() => void cloudAction('forget')}>Forget Daytona key</button>}</div></form>
     {pendingCloud.length > 0 && <section aria-label="Pending cloud cleanup"><h2>Cloud cleanup needs attention</h2><p>These operations may still have cloud resources. Their records are retained until removal is verified.</p>{pendingCloud.map(item => <div className="catalog-notice" key={item.name}><strong>{item.name}</strong><p>{item.sandboxId ? `Sandbox: ${item.sandboxId}` : 'Creation outcome unknown; look up this operation name before retrying.'}</p>{item.cleanupError && <p>{item.cleanupError}</p>}<button className="secondary" disabled={!hasCloudKey || cloudBusy} onClick={() => void cloudAction('cleanup', item.name)}>Retry cleanup</button></div>)}</section>}
   </div>;

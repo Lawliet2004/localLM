@@ -94,6 +94,7 @@ impl ConversationTools {
             count += match source.as_str() {
                 "__workspace" => 4,
                 "__execution" => 1,
+                "__daytona" => 1,
                 _ => return Err("Unknown local tool source.".into()),
             };
         }

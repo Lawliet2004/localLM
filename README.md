@@ -64,4 +64,4 @@ The configured Windows target is NSIS under `src-tauri/target/release/bundle/nsi
 - **Tool denied:** denial prevents further tool calls for that turn. Change permissions before sending a new message if needed.
 - **Skill integrity failure:** remove and reinstall the affected package.
 
-Outstanding work includes in-app verified downloads, Daytona, custom stdio connectors, skill execution workflows, existing-file editing/artifact previews, retry/compaction, third-party notices and full release verification. [Progress](docs/PROGRESS.md) records evidence and limitations; [desktop lifecycle](docs/DESKTOP.md) describes launch behavior.
+Outstanding work includes in-app verified downloads, live Daytona verification and credential rotation, custom stdio connectors, skill execution workflows, existing-file editing/artifact previews, retry/compaction, third-party notices and full release verification. [Progress](docs/PROGRESS.md) records evidence and limitations; [desktop lifecycle](docs/DESKTOP.md) describes launch behavior.
