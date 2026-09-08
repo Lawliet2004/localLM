@@ -2,7 +2,13 @@ import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ConversationTools, ExecutionConfig, HardwareStatus, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillView, ToolSelection } from './types';
 
 export const nativeAvailable = isTauri();
+export interface ModelInstallStatus { busy: boolean; phase: string; received: number; total: number; path: string | null; error: string | null }
+export interface ModelDownloadInfo { filename: string; bytes: number; sha256: string; destination: string; availableBytes: number; requiredBytes: number; destinationExists: boolean }
 export const api = {
+  modelDownloadInfo: () => invoke<ModelDownloadInfo>('model_download_info'),
+  modelInstallStatus: () => invoke<ModelInstallStatus>('model_install_status'),
+  installModel: () => invoke<ModelInstallStatus>('install_model'),
+  cancelModelInstall: () => invoke<void>('cancel_model_install'),
   readRuntimeLog: () => invoke<{ content: string; truncated: boolean }>('read_runtime_log'),
   hasDaytonaKey: () => invoke<boolean>('has_daytona_key'),
   saveDaytonaKey: (key: string) => invoke<void>('save_daytona_key', { key }),

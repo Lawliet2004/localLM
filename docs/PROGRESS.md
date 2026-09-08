@@ -252,3 +252,9 @@ All three download regression tests and strict Clippy pass. New coverage checks 
 Added install/status/cancel IPC commands around the pinned model. Concurrent installation is refused; progress and outcomes remain queryable in application state across UI navigation. Existing managed files are verified by streaming size/hash checks and never overwritten on mismatch. A dropped installation future releases busy state with an interrupted outcome. Installation returns the verified path without silently changing model preferences.
 
 All 69 Rust tests and strict Clippy passed. New tests verify valid existing files, same-size corruption preservation, and interrupted-versus-completed state cleanup. The commands have not yet been exercised through the native UI; frontend controls, startup partial-file recovery, runtime archive installation and complete network download acceptance remain outstanding. No full model download was started.
+
+### Managed model setup UI
+
+Added the recommended model card to Model files, with pinned size/hash/destination details, destination free space, download or existing-copy verification, polled progress, cancellation and explicit selection of a verified path into the settings draft. Selection does not save preferences or load the model automatically. Native installation status survives navigation; the UI resumes polling on mount.
+
+All 23 frontend tests and production frontend build passed. A test initially returned stale idle status after a mocked successful installation; the fixture was corrected to retain the result like the backend. Native debug rebuild and read-only model-download-info smoke passed, including exact pinned size, reserve and available-space checks; the screenshot was inspected. No full download was started. Full transfer/cancellation acceptance, stale status races, crash partial-file cleanup and runtime installation remain to verify or implement.
