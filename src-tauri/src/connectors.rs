@@ -36,6 +36,38 @@ pub struct McpHub {
     vault: Arc<crate::vault::Vault>,
 }
 
+pub struct AgentTool {
+    pub connector: String,
+    pub tool: ToolView,
+    pub alias: String,
+    peer: rmcp::Peer<RoleClient>,
+}
+impl AgentTool {
+    pub fn definition(&self) -> Value {
+        serde_json::json!({"type":"function","function":{"name":self.alias,"description":format!("{}: {} — {}", self.connector,self.tool.name,self.tool.description),"parameters":self.tool.input_schema}})
+    }
+    pub async fn call(&self, arguments: Value) -> Result<Value, String> {
+        let arguments = arguments
+            .as_object()
+            .ok_or("Tool arguments must be an object.")?
+            .clone();
+        let response = self.peer.call_tool_once(rmcp::model::CallToolRequestParams::new(self.tool.name.clone()).with_arguments(arguments)).await.map_err(|_| "Connector tool request failed. Its remote outcome may be unknown; do not automatically retry.".to_string())?;
+        match response {
+            rmcp::model::CallToolResponse::Complete(result) => {
+                let value =
+                    serde_json::to_value(result).map_err(|_| "Could not decode tool result.")?;
+                if value.to_string().len() > 262_144 {
+                    return Err("Tool result exceeds 256 KiB. Request a narrower result.".into());
+                }
+                Ok(value)
+            }
+            _ => Err(
+                "This tool requires additional server input, which is not supported yet.".into(),
+            ),
+        }
+    }
+}
+
 fn presets() -> Vec<ConnectorView> {
     let catalog: Value = serde_json::from_str(include_str!("../../src/lib/catalog.json"))
         .expect("Bundled connector catalog is valid JSON");
@@ -80,6 +112,49 @@ fn validate_token(value: &str) -> Result<(), String> {
 }
 
 impl McpHub {
+    pub fn selected_tools(&self, ids: &[String]) -> Result<Vec<AgentTool>, String> {
+        let mut tools = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            let connection = self
+                .connections
+                .get(id)
+                .filter(|value| !value.service.is_closed())
+                .ok_or_else(|| format!("Connector {id} is not connected."))?;
+            for tool in &connection.tools {
+                if tools.len() >= 32 {
+                    return Err(
+                        "Select fewer connectors: at most 32 tools can be offered in a turn."
+                            .into(),
+                    );
+                }
+                tools.push(AgentTool {
+                    connector: id.clone(),
+                    tool: tool.clone(),
+                    alias: format!(
+                        "t{}_{}",
+                        tools.len(),
+                        tool.name
+                            .chars()
+                            .map(|character| {
+                                if character.is_ascii_alphanumeric() || character == '_' {
+                                    character
+                                } else {
+                                    '_'
+                                }
+                            })
+                            .take(48)
+                            .collect::<String>()
+                    ),
+                    peer: connection.service.peer().clone(),
+                });
+            }
+        }
+        Ok(tools)
+    }
     pub fn new(vault: Arc<crate::vault::Vault>) -> Self {
         Self {
             connections: HashMap::new(),

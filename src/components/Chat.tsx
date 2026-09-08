@@ -8,6 +8,14 @@ interface Props {
   messages: Message[]; generating: boolean; ready: boolean; loading: boolean;
   onSend: (content: string) => Promise<void>; onCancel: () => void; onConfigure: () => void;
 }
+function ToolMessage({ message }: { message: Message }) {
+  let record: Record<string, unknown> = {};
+  try { const value: unknown = JSON.parse(message.content); if (value && typeof value === 'object' && !Array.isArray(value)) record = value as Record<string, unknown>; } catch { /* Preserve legacy tool content below. */ }
+  const request = record.request && typeof record.request === 'object' ? record.request as Record<string, unknown> : record;
+  const name = typeof request.name === 'string' ? request.name : 'Tool';
+  const connector = typeof request.connector === 'string' ? request.connector : 'Connector';
+  return <article className="message message-tool" aria-label="tool message"><details className="tool-record"><summary><Terminal size={14} /><strong>{connector} · {name}</strong><span>{message.status === 'interrupted' ? 'Stopped · outcome unknown' : request.decision === 'denied' ? 'Denied' : message.status === 'streaming' ? 'Running…' : 'Finished'}</span></summary><h4>Arguments</h4><pre>{JSON.stringify(request.arguments ?? {}, null, 2)}</pre><h4>Result</h4><pre>{JSON.stringify(record.result ?? message.content, null, 2)}</pre></details></article>;
+}
 function MessageBody({ message }: { message: Message }) {
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState('');
@@ -48,7 +56,7 @@ export function Chat({ messages, generating, ready, loading, onSend, onCancel, o
       const element = scroll.current;
       if (element) follow.current = element.scrollHeight - element.scrollTop - element.clientHeight < 120;
     }}>
-      {loading ? <p className="loading-state" role="status">Opening conversation…</p> : messages.length ? <div className="messages">{messages.map(message => <MessageBody key={message.id} message={message} />)}</div> :
+      {loading ? <p className="loading-state" role="status">Opening conversation…</p> : messages.length ? <div className="messages">{messages.map(message => message.role === 'tool' ? <ToolMessage key={message.id} message={message} /> : <MessageBody key={message.id} message={message} />)}</div> :
         <div className="welcome"><div className="welcome-mark"><span /> <span /> <span /></div><p className="eyebrow">YOUR LOCAL WORKSPACE</p><h1>A little model.<br />Room for big ideas.</h1><p className="welcome-description">Think out loud, work through a problem, or start something new.<br className="wide-only" /> Your model runs right here, on your computer.</p>
           <div className="suggestions">{[
             { icon: MessageSquare, title: 'Think it through', prompt: 'Help me think through an idea. Start by asking me what I want to achieve.' },

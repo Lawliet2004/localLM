@@ -18,12 +18,13 @@ export const api = {
   loadModel: () => invoke<RuntimeStatus>('load_model'),
   unloadModel: () => invoke<RuntimeStatus>('unload_model'),
   runtimeStatus: () => invoke<RuntimeStatus>('runtime_status'),
-  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void) => {
+  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = []) => {
     const channel = new Channel<ChatEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>('send_message', { conversationId, content, channel });
+    return invoke<void>('send_message', { conversationId, content, channel, connectorIds });
   },
   cancelGeneration: () => invoke<void>('cancel_generation'),
+  resolveToolApproval: (id: string, allow: boolean) => invoke<void>('resolve_tool_approval', { id, allow }),
 };
 
 export function errorMessage(error: unknown): string {

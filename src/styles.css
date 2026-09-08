@@ -160,3 +160,17 @@ h1 { font-weight: 450; font-size: 38px; line-height: 1.22; letter-spacing: -1.3p
 @media (max-width: 480px) { h1 { font-size: 30px; } .suggestions { flex-direction: column; } .suggestions button { flex: auto; } .composer-bottom small, .wide-only { display: none; } .setup-hint { flex-wrap: wrap; } .setup-hint button { margin-left: 22px; } .field-pair { grid-template-columns: 1fr; gap: 0; } .catalog-toolbar { align-items: stretch; flex-direction: column; } .catalog-toolbar .search-field { width: 100%; } .model-status { flex-wrap: wrap; } .header-actions > .icon-button { display: none; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }
 .connector-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; } .connector-tools { display: grid; gap: 8px; margin-top: 20px; } .connector-tools pre { overflow: auto; max-height: 260px; font-size: 12px; } .connector-tools summary { cursor: pointer; } .catalog-detail form input { display: block; width: 100%; margin-top: 8px; }
+.tool-picker { margin: 8px 24px; font-size: 11px; color: var(--secondary); }
+.tool-picker summary { cursor: pointer; padding: 5px 0; }
+.tool-picker label { display: inline-flex; gap: 8px; align-items: center; margin: 8px 18px 8px 0; }
+.tool-picker input { width: auto; }
+.tool-approval { width: min(580px, calc(100vw - 32px)); padding: 28px; border: 1px solid var(--border-strong); border-radius: 12px; color: var(--text); background: var(--surface); }
+.tool-approval::backdrop { background: #0009; }
+.tool-approval h2 { font-size: 20px; margin: 12px 0; }
+.tool-approval p { font-size: 12px; line-height: 1.7; }
+.tool-approval pre { max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 14px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+
+.tool-record { border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 11px; }
+.tool-record summary { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.tool-record summary span { margin-left: auto; color: var(--muted); }
+.tool-record pre { max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -43,7 +43,7 @@ export function Connectors() {
   return <div className="settings-page catalog-page">
     <div className="page-heading"><p className="eyebrow">EXTEND YOUR WORKSPACE</p><h1>Connectors</h1><p>Connect your accounts and discover the tools they provide.</p></div>
     <div className="catalog-toolbar"><label className="search-field"><Search size={16} /><input type="search" aria-label="Search connectors" placeholder="Search connectors…" value={query} onChange={e => setQuery(e.target.value)} /></label><span>{filtered.length} available presets</span></div>
-    <p className="catalog-notice">Credentials are encrypted on this device. Connecting discovers available tools; chat tool execution is still being integrated.</p>
+    <p className="catalog-notice">Credentials are encrypted on this device. Select connected services under Tools in your conversation. Each action requires approval.</p>
     {error && <p role="alert" className="error-banner">{error}</p>}
     <div className="catalog-list">{filtered.map(item => <details className="catalog-item" key={item.id}>
       <summary><span className="catalog-icon"><Plug size={18} /></span><span><strong>{item.id.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')}</strong><small>{item.description}</small></span><small>{item.connected ? `${item.tools.length} tools` : 'Not connected'}</small></summary>

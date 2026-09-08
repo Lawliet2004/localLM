@@ -30,7 +30,8 @@ export interface Preferences {
 }
 export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null }
 export interface Bootstrap { conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus }
-export interface ChatEvent { messageId: string; content: string; reasoning: string }
+export interface ToolApproval { id: string; connector: string; name: string; arguments: Record<string, unknown> }
+export interface ChatEvent { messageId: string; content: string; reasoning: string; approval?: ToolApproval | null }
 export interface ToolView { name: string; description: string; inputSchema: Record<string, unknown> }
 export interface ConnectorView {
   id: string; description: string; url: string; authType: 'none' | 'apiKey' | 'oauth';

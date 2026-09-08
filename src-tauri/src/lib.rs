@@ -1,3 +1,4 @@
+mod approval;
 mod chat;
 mod commands;
 mod connectors;
@@ -6,12 +7,14 @@ mod runtime;
 mod runtime_config;
 mod sse;
 mod store;
+mod tool_calls;
 mod vault;
 
 use std::sync::Mutex;
 use tauri::Manager;
 
 pub struct AppState {
+    approvals: approval::Approvals,
     store: Mutex<store::Store>,
     runtime: tokio::sync::Mutex<runtime::Runtime>,
     operation: tokio::sync::Mutex<()>,
@@ -39,6 +42,7 @@ pub fn run() {
             let store =
                 store::Store::open(&data.join("locallm.sqlite")).map_err(std::io::Error::other)?;
             app.manage(AppState {
+                approvals: approval::Approvals::default(),
                 store: Mutex::new(store),
                 runtime: tokio::sync::Mutex::new(runtime::Runtime::new(data.join("runtime.log"))),
                 operation: tokio::sync::Mutex::new(()),
@@ -64,6 +68,7 @@ pub fn run() {
             commands::runtime_status,
             chat::send_message,
             chat::cancel_generation,
+            approval::resolve_tool_approval,
             connectors::list_connectors,
             connectors::connect_connector,
             connectors::disconnect_connector,

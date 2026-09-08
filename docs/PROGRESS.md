@@ -29,3 +29,10 @@ Vite was started on 127.0.0.1:1420. A debug native app was launched with WebView
 - `node scripts/connector-smoke.mjs`: real native application connected to public DeepWiki MCP, discovered ask_question/read_wiki_contents/read_wiki_structure, and disconnected. Native screenshot inspected.
 - Credentials use AES-256-GCM encrypted files with a Windows Credential Manager master key; cryptographic tampering and large-secret tests passed. Actual account sign-in, refresh/revocation, and OS vault restart tests remain required.
 - This verifies discovery only, not chat tool execution or all external services.
+## Verified first agent tool loop
+- Streamed tool calls assemble across chunks, with up to 8 calls per round, 8 execution rounds, bounded arguments and results, and a maximum of 32 offered tools.
+- Connected services can be selected in chat. Each proposed call opens a modal showing the service, real tool name and exact arguments, with single-use Allow once/Deny decisions. Escape denies. Cancellation removes pending approval without executing it.
+- Requests/results are persisted as tool messages and rendered in expandable cards. Remote timeout/cancellation reports an unknown outcome and does not automatically retry.
+- `node scripts/agent-smoke.mjs`: real MiniCPM Q6_K + native Rust MCP + DeepWiki read_wiki_structure for tauri-apps/tauri. Allowed call returned repository sections (verified in stored JSON); denied call produced a denied record and explanation; cancellation during approval ended with no executed tool record. Three scenarios passed twice after replacing opaque aliases with descriptive tool names.
+- `cargo test`: 21 tests passed, including interleaved/malformed tool fragments and single-use approval identity. Frontend production build passed.
+- Remaining agent work: individual tool selection for large catalogs, schema validation, context/token budgeting, durable pending-approval recovery, live tool progress, richer error states, full tool history replay, and broader transport failure/hostile-output tests. This slice is not production readiness.
