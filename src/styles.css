@@ -200,3 +200,4 @@ h1 { font-weight: 450; font-size: 38px; line-height: 1.22; letter-spacing: -1.3p
 .permission-bar select { width: auto; padding: 6px 28px 6px 10px; font-size: 12px; }
 .permission-bar > span { flex: 1; min-width: 180px; }
 .permission-fullAccess { color: #c99049; }
+.runtime-diagnostics-log { max-height: 32rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; line-height: 1.6; }

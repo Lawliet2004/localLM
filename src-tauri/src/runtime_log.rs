@@ -1,10 +1,53 @@
 use std::{io, path::Path, sync::Arc};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::Mutex,
 };
 
 const LIMIT: usize = 8 * 1024 * 1024;
+const VIEW_LIMIT: u64 = 65_536;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogView {
+    content: String,
+    truncated: bool,
+}
+
+#[tauri::command]
+pub async fn read_runtime_log(app: tauri::AppHandle) -> Result<LogView, String> {
+    use tauri::Manager;
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("runtime.log");
+    read_tail(&path)
+        .await
+        .map_err(|error| format!("Could not read runtime log: {error}"))
+}
+
+async fn read_tail(path: &Path) -> io::Result<LogView> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(LogView {
+                content: String::new(),
+                truncated: false,
+            })
+        }
+        Err(error) => return Err(error),
+    };
+    let length = file.metadata().await?.len();
+    let start = length.saturating_sub(VIEW_LIMIT);
+    file.seek(io::SeekFrom::Start(start)).await?;
+    let mut bytes = Vec::new();
+    file.take(VIEW_LIMIT).read_to_end(&mut bytes).await?;
+    Ok(LogView {
+        content: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated: start > 0,
+    })
+}
 const TRUNCATED: &[u8] = b"\n[LocalLM: runtime log limit reached; further output is discarded until the next model load.]\n";
 
 pub struct RuntimeLog {
@@ -56,6 +99,23 @@ pub async fn drain(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn diagnostics_bounds_output_handles_missing_and_keeps_invalid_utf8_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime.log");
+        assert!(super::read_tail(&path).await.unwrap().content.is_empty());
+        let mut bytes = vec![b'a'; 100_000];
+        bytes.extend_from_slice(b"\nlast line\xff");
+        tokio::fs::write(&path, bytes).await.unwrap();
+        let view = super::read_tail(&path).await.unwrap();
+        assert!(view.truncated);
+        assert!(view.content.ends_with("last line\u{fffd}"));
+        assert_eq!(view.content.chars().count(), super::VIEW_LIMIT as usize);
+        tokio::fs::write(&path, b"new load").await.unwrap();
+        let view = super::read_tail(&path).await.unwrap();
+        assert!(!view.truncated);
+        assert_eq!(view.content, "new load");
+    }
     use super::*;
     #[tokio::test]
     async fn write_failure_does_not_stop_pipe_drain() {

@@ -130,6 +130,7 @@ pub fn run() {
             commands::load_model,
             commands::unload_model,
             commands::runtime_status,
+            runtime_log::read_runtime_log,
             chat::send_message,
             chat::cancel_generation,
             approval::resolve_tool_approval,

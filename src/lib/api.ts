@@ -3,6 +3,7 @@ import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ConversationToo
 
 export const nativeAvailable = isTauri();
 export const api = {
+  readRuntimeLog: () => invoke<{ content: string; truncated: boolean }>('read_runtime_log'),
   hasDaytonaKey: () => invoke<boolean>('has_daytona_key'),
   saveDaytonaKey: (key: string) => invoke<void>('save_daytona_key', { key }),
   forgetDaytonaKey: () => invoke<void>('forget_daytona_key'),
