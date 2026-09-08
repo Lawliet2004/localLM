@@ -382,3 +382,9 @@ Seven connector tests and strict Clippy passed after fixing a test-only clone li
 Added a local MCP creation form for name, absolute executable/directory paths, JSON argument arrays and environment objects. Save invokes encrypted configuration storage only, clears successful form values and refreshes the connector list. Local entries display their names and explain process-launch permissions; Connect remains separate. Disconnected entries offer Stop session for retained process ownership and Remove server. Corrected the general approval notice to reflect conversation permission modes.
 
 All 28 frontend tests and the production build passed. The form regression checks preserved argument boundaries, credential clearing and the separate Connect instruction. Editing existing configurations, better structured argument/environment entry, local names in chat tool controls, visual/native acceptance and full tool-call verification remain outstanding. The native executable must be rebuilt before testing the new IPC workflow.
+
+### Native local connector creation acceptance
+
+Rebuilt the native executable and exercised the creation form against a temporary Node MCP server through WebView2. Save returned a disconnected entry and cleared environment values; Connect discovered fixture_echo; Disconnect and Remove left no saved fixture. The smoke cleans up only its uniquely named configuration and temporary directory. Recorded JSON evidence and inspected a connected-card screenshot. This tests discovery, not an actual chat tool invocation.
+
+The first attempt found the Vite server stopped; restarted it and reloaded the existing native page. The next attempt exposed exact textarea labels including default text in WebView2. Added explicit accessible labels and reran successfully. The form test and production build also passed. Existing-configuration editing, structured fields, broader visual polish and chat tool-call acceptance remain outstanding.

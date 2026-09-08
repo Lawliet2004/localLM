@@ -33,8 +33,8 @@ export function LocalConnectorForm({ onSaved }: { onSaved: () => Promise<void> }
         <label>Name<input required maxLength={160} value={name} onChange={event => setName(event.target.value)} /></label>
         <label>Executable path<input required value={executable} onChange={event => setExecutable(event.target.value)} placeholder="Absolute path to node.exe, python.exe, or a server executable" /></label>
         <label>Working directory<input required value={directory} onChange={event => setDirectory(event.target.value)} placeholder="Absolute directory path" /></label>
-        <label>Arguments (JSON array)<textarea spellCheck={false} autoComplete="off" value={args} onChange={event => setArgs(event.target.value)} /></label>
-        <label>Environment variables (JSON object)<textarea spellCheck={false} autoComplete="off" value={environment} onChange={event => setEnvironment(event.target.value)} /></label>
+        <label>Arguments (JSON array)<textarea aria-label="Arguments (JSON array)" spellCheck={false} autoComplete="off" value={args} onChange={event => setArgs(event.target.value)} /></label>
+        <label>Environment variables (JSON object)<textarea aria-label="Environment variables (JSON object)" spellCheck={false} autoComplete="off" value={environment} onChange={event => setEnvironment(event.target.value)} /></label>
         <p>Use one JSON string per argument, for example ["C:\\servers\\index.js"]. Environment values may contain credentials; they are visible while editing this form.</p>
         <button className="primary">{pending ? 'Saving…' : 'Save local server'}</button>
       </fieldset>
