@@ -5,6 +5,7 @@ mod connectors;
 mod execution;
 mod export;
 mod hardware;
+mod history;
 mod oauth;
 mod runtime;
 mod runtime_config;

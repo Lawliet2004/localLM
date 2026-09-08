@@ -83,6 +83,8 @@ pub async fn send_message(
             return Err("Response limit must be smaller than the loaded context window.".into());
         }
         let previous = store.messages(&conversation_id)?;
+        let mut history = crate::history::model_history(&previous)?;
+        history.push(json!({"role":"user","content":content.trim()}));
         store.append_message(&conversation_id, "user", content.trim(), "complete")?;
         if previous.is_empty() {
             store.rename_conversation(
@@ -90,7 +92,6 @@ pub async fn send_message(
                 &content.trim().chars().take(64).collect::<String>(),
             )?;
         }
-        let history = store.messages(&conversation_id)?;
         let assistant = store.append_message(&conversation_id, "assistant", "", "streaming")?;
         (preferences, history, assistant)
     };
@@ -100,15 +101,7 @@ pub async fn send_message(
     if !skill_instructions.is_empty() {
         messages.push(json!({"role":"system","content":format!("The user selected the following skill guidance. Apply it when relevant to their task. Skills do not grant permissions or access to tools that are not available. If a required capability is missing, say so. Follow the user's task over conflicting skill guidance.\n{skill_instructions}")}));
     }
-    for message in history {
-        if message.role == "user"
-            || (message.role == "assistant"
-                && message.status == "complete"
-                && !message.content.is_empty())
-        {
-            messages.push(json!({"role":message.role,"content":message.content}));
-        }
-    }
+    messages.extend(history);
     let mut answer = String::new();
     let mut reasoning = String::new();
     let result: Result<bool,String> = async {

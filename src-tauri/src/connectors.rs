@@ -71,6 +71,29 @@ pub struct AgentTool {
     pub alias: String,
     backend: ToolBackend,
 }
+pub fn tool_alias(connector: &str, name: &str) -> String {
+    if connector == "Workspace" {
+        return format!("workspace_{name}");
+    }
+    if connector == "Local execution" && name == "run_code" {
+        return "local_run_code".into();
+    }
+    use sha2::{Digest, Sha256};
+    let identity = format!("{connector}\0{name}");
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    let readable = format!("{connector}_{name}")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(47)
+        .collect::<String>();
+    format!("{readable}_{}", &digest[..16])
+}
 enum ToolBackend {
     Execution(Arc<crate::execution::LocalExecution>),
     Mcp(rmcp::Peer<RoleClient>),
@@ -212,21 +235,7 @@ impl McpHub {
                 tools.push(AgentTool {
                     connector: id.clone(),
                     tool: tool.clone(),
-                    alias: format!(
-                        "t{}_{}",
-                        tools.len(),
-                        tool.name
-                            .chars()
-                            .map(|character| {
-                                if character.is_ascii_alphanumeric() || character == '_' {
-                                    character
-                                } else {
-                                    '_'
-                                }
-                            })
-                            .take(48)
-                            .collect::<String>()
-                    ),
+                    alias: tool_alias(id, &tool.name),
                     backend: ToolBackend::Mcp(connection.service.peer().clone()),
                 });
             }
@@ -438,6 +447,21 @@ pub fn cancel_connector_sign_in(state: tauri::State<'_, crate::AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aliases_are_stable_bounded_and_distinguish_sanitization_collisions() {
+        let alias = tool_alias("deepwiki", "read_wiki_structure");
+        assert_eq!(alias, tool_alias("deepwiki", "read_wiki_structure"));
+        assert!(alias.starts_with("deepwiki_read_wiki_structure_"));
+        assert_ne!(tool_alias("x", "a-b"), tool_alias("x", "a_b"));
+        assert_ne!(tool_alias("x", "read"), tool_alias("y", "read"));
+        let long = tool_alias("connector", &"long-tool".repeat(50));
+        assert_eq!(long.len(), 64);
+        assert!(long
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
+        assert_eq!(tool_alias("Workspace", "read_file"), "workspace_read_file");
+        assert_eq!(tool_alias("Local execution", "run_code"), "local_run_code");
+    }
     #[test]
     fn selects_exact_tools_from_large_catalog_and_rejects_stale_names() {
         let tools: Vec<ToolView> = (0..100)
