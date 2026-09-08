@@ -20,6 +20,13 @@ impl LocalSession {
 }
 
 pub async fn connect(config: &LocalServer) -> Result<LocalSession, String> {
+    connect_with_timeout(config, Duration::from_secs(30)).await
+}
+
+async fn connect_with_timeout(
+    config: &LocalServer,
+    handshake_timeout: Duration,
+) -> Result<LocalSession, String> {
     config.validate_launch()?;
     let mut command = tokio::process::Command::new(&config.executable);
     command
@@ -78,7 +85,7 @@ pub async fn connect(config: &LocalServer) -> Result<LocalSession, String> {
         .stdout()
         .take()
         .ok_or("Local connector output pipe unavailable.")?;
-    let service = tokio::time::timeout(Duration::from_secs(30), ().serve((output, input)))
+    let service = tokio::time::timeout(handshake_timeout, ().serve((output, input)))
         .await
         .map_err(|_| "Local connector handshake timed out.")?
         .map_err(|_| {
@@ -90,6 +97,94 @@ pub async fn connect(config: &LocalServer) -> Result<LocalSession, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn process_tree_exits_after_close_drop_and_handshake_cancellation() {
+        use windows::Win32::{
+            Foundation::{CloseHandle, WAIT_OBJECT_0},
+            System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+        };
+        for scenario in ["close", "drop", "cancel", "timeout"] {
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("tree.cjs");
+            std::fs::write(
+                &script,
+                r#"
+const fs = require('node:fs');
+const child = require('node:child_process').spawn(process.execPath,
+ ['-e', 'setInterval(()=>{},1000)'], {stdio:'ignore'});
+fs.writeFileSync('pids.json', JSON.stringify([process.pid,child.pid]));
+setInterval(()=>{},1000);
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+ if (process.argv[2] === 'silent') return;
+ const r = JSON.parse(line);
+ if (r.method === 'initialize') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,
+ result:{protocolVersion:r.params.protocolVersion,capabilities:{tools:{}},
+ serverInfo:{name:'tree',version:'1'}}})+'\n');
+});
+"#,
+            )
+            .unwrap();
+            let config = LocalServer {
+                id: format!("local-{}", uuid::Uuid::new_v4()),
+                name: "tree".into(),
+                executable: crate::execution::ExecutionConfig::default().node_path,
+                arguments: vec![
+                    script.to_string_lossy().into_owned(),
+                    if matches!(scenario, "cancel" | "timeout") {
+                        "silent"
+                    } else {
+                        "respond"
+                    }
+                    .into(),
+                ],
+                working_directory: directory.path().to_string_lossy().into_owned(),
+                environment: Default::default(),
+            };
+            let task =
+                tokio::spawn(
+                    async move { connect_with_timeout(&config, Duration::from_secs(3)).await },
+                );
+            let pids: Vec<u32> = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(bytes) = std::fs::read(directory.path().join("pids.json")) {
+                        if let Ok(pids) = serde_json::from_slice(&bytes) {
+                            break pids;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fixture did not publish process IDs");
+            // Open handles while both processes are alive so PID reuse cannot
+            // produce a false success when checking termination below.
+            let handles: Vec<_> = pids
+                .into_iter()
+                .map(|pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid).unwrap() })
+                .collect();
+            match scenario {
+                "cancel" => {
+                    task.abort();
+                    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+                }
+                "timeout" => {
+                    assert!(
+                        matches!(task.await.unwrap(), Err(error) if error.contains("timed out"))
+                    );
+                }
+                "close" => task.await.unwrap().unwrap().close().await,
+                _ => drop(task.await.unwrap().unwrap()),
+            }
+            for handle in handles {
+                let status = unsafe { WaitForSingleObject(handle, 5000) };
+                unsafe {
+                    CloseHandle(handle).unwrap();
+                }
+                assert_eq!(status, WAIT_OBJECT_0, "process survived {scenario}");
+            }
+        }
+    }
     #[tokio::test]
     async fn negotiates_with_a_real_stdio_server_and_closes() {
         let directory = tempfile::tempdir().unwrap();
