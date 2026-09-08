@@ -15,6 +15,7 @@ mod hardware;
 mod history;
 mod install_recovery;
 pub mod local_mcp_config;
+pub mod local_mcp_process;
 mod model_catalog;
 mod model_install;
 mod oauth;

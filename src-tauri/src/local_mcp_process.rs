@@ -1,0 +1,149 @@
+//! Local MCP process ownership. Explicit connection is the only launch operation.
+use crate::local_mcp_config::LocalServer;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
+use rmcp::{service::RunningService, RoleClient, ServiceExt};
+use std::{process::Stdio, time::Duration};
+
+pub struct LocalSession {
+    pub service: RunningService<RoleClient, ()>,
+    // KillOnDrop and the Windows job own the entire process tree, including when
+    // handshake cancellation drops the future before a session is returned.
+    child: Box<dyn ChildWrapper>,
+}
+
+impl LocalSession {
+    pub async fn close(mut self) {
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.service.cancel()).await;
+        let _ = self.child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await;
+    }
+}
+
+pub async fn connect(config: &LocalServer) -> Result<LocalSession, String> {
+    config.validate_launch()?;
+    let mut command = tokio::process::Command::new(&config.executable);
+    command
+        .args(&config.arguments)
+        .current_dir(&config.working_directory)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // Server stderr can contain credentials. Discard it without an unread
+        // pipe that could block negotiation; protocol errors remain actionable.
+        .stderr(Stdio::null());
+    for name in [
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "PATH",
+        "PATHEXT",
+        "COMSPEC",
+        "USERPROFILE",
+        "HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .env("NO_COLOR", "1")
+        .envs(&config.environment);
+    let mut command = CommandWrap::from(command);
+    command.wrap(KillOnDrop);
+    #[cfg(windows)]
+    {
+        command.wrap(process_wrap::tokio::CreationFlags(
+            windows::Win32::System::Threading::CREATE_NO_WINDOW,
+        ));
+        command.wrap(process_wrap::tokio::JobObject);
+    }
+    #[cfg(unix)]
+    command.wrap(process_wrap::tokio::ProcessGroup::leader());
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "Local connector launch failed ({:?}). Check its executable and working directory.",
+            error.kind()
+        )
+    })?;
+    let input = child
+        .stdin()
+        .take()
+        .ok_or("Local connector input pipe unavailable.")?;
+    let output = child
+        .stdout()
+        .take()
+        .ok_or("Local connector output pipe unavailable.")?;
+    let service = tokio::time::timeout(Duration::from_secs(30), ().serve((output, input)))
+        .await
+        .map_err(|_| "Local connector handshake timed out.")?
+        .map_err(|_| {
+            "Local connector handshake failed. Check its arguments and MCP stdio support."
+        })?;
+    Ok(LocalSession { service, child })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn negotiates_with_a_real_stdio_server_and_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("server.cjs");
+        std::fs::write(&script, r#"
+const readline = require('node:readline');
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const request = JSON.parse(line);
+ if (request.id === undefined) return;
+ const result = request.method === 'initialize'
+ ? {protocolVersion:request.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}
+ : {tools:[]};
+ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\n');
+}).on('close', () => process.exit(0));
+"#).unwrap();
+        let config = LocalServer {
+            id: format!("local-{}", uuid::Uuid::new_v4()),
+            name: "fixture".into(),
+            executable: crate::execution::ExecutionConfig::default().node_path,
+            arguments: vec![script.to_string_lossy().into_owned()],
+            working_directory: directory.path().to_string_lossy().into_owned(),
+            environment: Default::default(),
+        };
+        assert!(
+            !config.executable.is_empty(),
+            "Node is required for this process integration test"
+        );
+        let session = connect(&config).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), session.service.list_tools(None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.tools.is_empty());
+        session.close().await;
+    }
+    #[tokio::test]
+    async fn invalid_executable_returns_no_configuration_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("invalid.exe");
+        std::fs::write(&executable, b"not an executable").unwrap();
+        let config = LocalServer {
+            id: format!("local-{}", uuid::Uuid::new_v4()),
+            name: "fixture".into(),
+            executable: executable.to_string_lossy().into_owned(),
+            arguments: vec!["secret-argument".into()],
+            working_directory: directory.path().to_string_lossy().into_owned(),
+            environment: [("PRIVATE_TOKEN".into(), "secret-value".into())].into(),
+        };
+        let error = match connect(&config).await {
+            Ok(_) => panic!("unexpected launch"),
+            Err(error) => error,
+        };
+        assert!(error.contains("launch failed"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("PRIVATE_TOKEN"));
+    }
+}

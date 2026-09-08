@@ -28,7 +28,7 @@ tokio = { version = "1.53.1", features = ["process", "io-util", "time", "sync", 
 uuid = { version = "1.26.0", features = ["v4"] }
 futures-util = "0.3.34"
 tauri-plugin-dialog = "2.7.3"
-rmcp = { version = "3.2.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-native-tls", "auth"] }
+rmcp = { version = "3.2.0", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest-native-tls", "auth"] }
 keyring = { version = "3", features = ["windows-native"] }
 aes-gcm = "0.10"
 async-trait = "0.1.92"
