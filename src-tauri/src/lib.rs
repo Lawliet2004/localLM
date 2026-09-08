@@ -8,6 +8,7 @@ pub mod daytona_cleanup;
 pub mod daytona_execution;
 pub mod daytona_journal;
 mod daytona_settings;
+pub mod download;
 mod execution;
 mod export;
 mod hardware;
