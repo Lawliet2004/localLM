@@ -322,3 +322,9 @@ Strict Clippy, frontend production build, all 26 frontend tests and the targeted
 After rebuilding and restarting the native app, the context-indicator smoke loaded the model, sent an arithmetic prompt, observed the measured input count and 512-token response reserve, and verified a completed answer containing 42. Editing an unsent draft did not change the measured count; starting a new conversation removed the previous conversation's indicator. The test restored preferences/load state and deleted its temporary conversation and draft.
 
 The native build and smoke passed. The indicator remains session-local and reports the latest accepted model request, not a draft estimate or persistent token-usage ledger. Tool-round count rendering, compaction and the broader acceptance checklist remain open.
+
+### Retry failed or stopped prompts
+
+Added Retry last prompt after an errored or interrupted assistant response. The action sends the original prompt as a new turn through the existing permission-controlled send path, preserves previous messages/tool audits and leaves an unsent draft intact. Its copy explicitly states that enabled tool actions may run again. Active operations disable retry and the submission guard prevents duplicate calls.
+
+All 27 frontend tests and the production build passed. The new regression checks exact prompt reuse, draft preservation and retained partial output. Native retry acceptance remains outstanding. This is a new-turn retry; alternate response branches and history compaction remain separate unfinished work.

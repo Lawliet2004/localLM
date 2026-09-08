@@ -5,6 +5,19 @@ import type { Message } from '../lib/types';
 
 const props = { generating: false, ready: true, loading: false, onSend: vi.fn(), onCancel: vi.fn(), onConfigure: vi.fn() };
 describe('chat action reporting and submission', () => {
+  it('retries the failed prompt as a new send without changing the draft', async () => {
+    const onSend = vi.fn(async () => {});
+    const messages: Message[] = [
+      { id: 'u', conversationId: 'c', role: 'user', content: 'Original prompt', reasoning: '', status: 'complete', createdAt: 1 },
+      { id: 'a', conversationId: 'c', role: 'assistant', content: 'Partial answer', reasoning: '', status: 'error', createdAt: 2 },
+    ];
+    render(<Chat {...props} messages={messages} onSend={onSend} />);
+    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'Unsent draft' } });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry last prompt' })); });
+    expect(onSend).toHaveBeenCalledWith('Original prompt');
+    expect(screen.getByLabelText('Message')).toHaveValue('Unsent draft');
+    expect(screen.getByText('Partial answer')).toBeInTheDocument();
+  });
   it('labels measured context separately from draft changes', () => {
     render(<Chat {...props} messages={[]} contextUsage={{ inputTokens: 123, responseReserve: 512, contextLength: 8192 }} />);
     const usage = screen.getByLabelText('Last request context');

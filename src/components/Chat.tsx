@@ -52,6 +52,15 @@ export function Chat({ contextUsage, messages, generating, ready, loading, disab
   const follow = useRef(true);
   const input = useRef<HTMLTextAreaElement>(null);
   const submitting = useRef(false);
+  const lastPrompt = [...messages].reverse().find(message => message.role === 'user');
+  const lastResponse = [...messages].reverse().find(message => message.role === 'assistant');
+  const canRetry = lastPrompt && lastResponse && ['error', 'interrupted'].includes(lastResponse.status);
+  async function retry() {
+    if (!lastPrompt || !ready || generating || loading || disabled || submitting.current) return;
+    submitting.current = true;
+    try { await onSend(lastPrompt.content); } catch { /* App retains and displays the send error. */ }
+    finally { submitting.current = false; }
+  }
   useEffect(() => { if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [messages]);
   async function submit() {
     if (!draft.trim() || !ready || generating || loading || disabled || submitting.current) return;
@@ -77,6 +86,7 @@ export function Chat({ contextUsage, messages, generating, ready, loading, disab
         </div>}
     </div>
     <div className="composer-region">
+      {canRetry && !generating && <div className="setup-hint"><span>Retry sends the last prompt as a new message. Enabled tool actions may run again.</span><button disabled={!ready || loading || disabled} onClick={() => void retry()}>Retry last prompt</button></div>}
       {!ready && <div className="setup-hint"><Cpu size={15} /><span>Load a local model to start a conversation.</span><button onClick={onConfigure}>Open Models <span>↗</span></button></div>}
       <form className="composer" onSubmit={event => { event.preventDefault(); void submit(); }}>
         <textarea ref={input} aria-label="Message" placeholder="Ask anything, or work on an idea…" value={draft} rows={2} maxLength={100000} onChange={e => setDraft(e.target.value)} onKeyDown={e => {
