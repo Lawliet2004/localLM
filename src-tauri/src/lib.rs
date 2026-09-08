@@ -13,6 +13,7 @@ mod execution;
 mod export;
 mod hardware;
 mod history;
+mod model_catalog;
 mod oauth;
 mod permissions;
 mod runtime;
@@ -132,6 +133,7 @@ pub fn run() {
             commands::unload_model,
             commands::runtime_status,
             runtime_log::read_runtime_log,
+            model_catalog::model_download_info,
             chat::send_message,
             chat::cancel_generation,
             approval::resolve_tool_approval,

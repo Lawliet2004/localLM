@@ -10,6 +10,50 @@ pub struct Asset<'a> {
     pub sha256: &'a str,
 }
 
+/// Production downloads use HTTPS across every redirect and bounded connection/transfer time.
+pub fn client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(7200))
+        .build()
+        .map_err(|_| "Could not initialize the download client.".into())
+}
+
+pub fn required_space(bytes: u64) -> Result<u64, String> {
+    bytes
+        .checked_add(256 * 1024 * 1024)
+        .ok_or_else(|| "Download size exceeds supported storage limits.".into())
+}
+
+#[cfg(windows)]
+pub fn available_space(directory: &Path) -> Result<u64, String> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = directory.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err("Invalid download directory.".into());
+    }
+    wide.push(0);
+    let mut available = 0;
+    // The NUL-terminated directory and output storage outlive this synchronous call.
+    unsafe {
+        windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            Some(&mut available),
+            None,
+            None,
+        )
+    }
+    .map_err(|error| format!("Could not check available disk space: {error}"))?;
+    Ok(available)
+}
+
+#[cfg(not(windows))]
+pub fn available_space(_: &Path) -> Result<u64, String> {
+    Err("Managed downloads currently support Windows only.".into())
+}
+
 /// The caller supplies a pinned asset and an application-owned destination.
 /// Dropping this future or cancellation removes the unpublished temporary file.
 pub async fn fetch(
@@ -31,6 +75,10 @@ pub async fn fetch(
     let parent = destination
         .parent()
         .ok_or("Download destination has no parent directory.")?;
+    let needed = required_space(asset.bytes)?;
+    if available_space(parent)? < needed {
+        return Err(format!("Not enough disk space. Download requires {needed} free bytes, including a 256 MiB reserve."));
+    }
     let temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("Cannot create download file: {error}"))?;
     // Keep the tempfile owner alive until the asynchronous file handle is closed.
@@ -108,6 +156,36 @@ pub async fn fetch(
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+    #[tokio::test]
+    async fn storage_and_transport_preflight_fail_without_creating_files() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(available_space(temp.path()).unwrap() > 0);
+        assert!(available_space(&temp.path().join("missing")).is_err());
+        assert!(required_space(u64::MAX).is_err());
+        let (_sender, receiver) = watch::channel(false);
+        let asset = Asset {
+            url: "https://example.invalid/never-requested",
+            bytes: u64::MAX / 2,
+            sha256: &"0".repeat(64),
+        };
+        let error = fetch(
+            &client().unwrap(),
+            &asset,
+            &temp.path().join("model"),
+            receiver,
+            |_| panic!("no download should start"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("Not enough disk space"));
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert!(client()
+            .unwrap()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .is_err());
+    }
     #[tokio::test]
     async fn cancellation_during_transfer_removes_partial_file() {
         let temp = tempfile::tempdir().unwrap();
