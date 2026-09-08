@@ -412,3 +412,9 @@ The extended native smoke passed, including cancellation. This proves the settin
 Local MCP connection ownership now retains the configured display name separately from the stable connector ID. Approval events and persisted tool audit requests include optional localServerName metadata; IDs and tool aliases remain unchanged. The approval dialog names the local server and shows its ID and OS file/network permission context. The backend, rather than server tool naming, supplies this metadata.
 
 Connector tests, strict Clippy and the production build passed; the fixture additionally checks the local display name and preserved stable ID. A shell text replacement initially malformed the TS heading and was corrected before the successful build. Native approval rendering and full model-driven chat acceptance remain outstanding, as does displaying this additional metadata in historical audit UI.
+
+### Recorded local server identity and approval UI checks
+
+Historical tool activity now renders the recorded local server name and exposes its stable ID in expanded details. It uses the saved request rather than current connector settings, preserving the identity shown when the action occurred. Older records without local metadata keep their previous connector label.
+
+Nine chat tests, four tool-control tests and the production build passed. New coverage checks historical names/IDs and legacy records, plus local approval identity, permission text and both decision callbacks. The dialog test initially encountered jsdom's missing showModal method; a scoped test implementation resolves that environment limitation. This is component verification, not native modal or model-driven approval acceptance; those remain outstanding.

@@ -17,10 +17,11 @@ function ToolMessage({ message }: { message: Message }) {
   const request = record.request && typeof record.request === 'object' ? record.request as Record<string, unknown> : record;
   const name = typeof request.name === 'string' ? request.name : 'Tool';
   const connector = typeof request.connector === 'string' ? request.connector : 'Connector';
+  const localName = typeof request.localServerName === 'string' && request.localServerName ? request.localServerName : undefined;
   const result = record.result;
   const failed = message.status === 'error' || (result !== null && typeof result === 'object' && 'isError' in result && result.isError === true);
   const status = message.status === 'interrupted' ? 'Stopped · outcome unknown' : request.decision === 'denied' ? 'Denied' : message.status === 'streaming' ? 'Running…' : failed ? 'Failed' : 'Finished';
-  return <article className="message message-tool" aria-label="tool message"><details className="tool-record"><summary><Terminal size={14} /><strong>{connector} · {name}</strong><span>{status}</span></summary>{typeof request.authorization === 'string' && <p>Authorization: {request.authorization}</p>}<h4>Arguments</h4><pre>{JSON.stringify(request.arguments ?? {}, null, 2)}</pre><h4>Result</h4><pre>{JSON.stringify(record.result ?? message.content, null, 2)}</pre></details></article>;
+  return <article className="message message-tool" aria-label="tool message"><details className="tool-record"><summary><Terminal size={14} /><strong>{localName ?? connector} · {name}</strong><span>{status}</span></summary>{localName && <p>Local server ID: <code>{connector}</code></p>}{typeof request.authorization === 'string' && <p>Authorization: {request.authorization}</p>}<h4>Arguments</h4><pre>{JSON.stringify(request.arguments ?? {}, null, 2)}</pre><h4>Result</h4><pre>{JSON.stringify(record.result ?? message.content, null, 2)}</pre></details></article>;
 }
 function MessageBody({ message }: { message: Message }) {
   const [copied, setCopied] = useState(false);

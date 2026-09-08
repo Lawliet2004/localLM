@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import { ToolPicker } from './ToolControls';
+import { ApprovalDialog, ToolPicker } from './ToolControls';
 import type { ToolSelection } from '../lib/types';
 const fixtures = vi.hoisted(() => ({ skills: [] as { id: string; active: boolean }[] }));
 vi.mock('../lib/api', () => ({ nativeAvailable: true, errorMessage: String, api: {
@@ -16,6 +16,19 @@ function Picker() {
   return <><ToolPicker selected={selected} onChange={setSelected} selectedTools={tools} onToolsChange={setTools} busy={false} /><output data-testid="selection">{JSON.stringify(tools)}</output></>;
 }
 describe('individual connector tools', () => {
+  it.each([['Allow once', true], ['Deny', false]] as const)('identifies a local server before %s', async (button, decision) => {
+    const original = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'showModal');
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable:true, value:function(this: HTMLDialogElement) { this.open = true; } });
+    try {
+      const onResolve = vi.fn().mockResolvedValue(undefined);
+      render(<ApprovalDialog request={{id:'approval',connector:'local-stable-id',localServerName:'Research server',name:'lookup',arguments:{query:'private query'}}} onResolve={onResolve} />);
+      expect(screen.getByRole('heading', {name:'Allow local server Research server to run this tool?'})).toBeVisible();
+      expect(screen.getByText('local-stable-id')).toBeVisible();
+      expect(screen.getByText(/account’s file and network permissions/)).toBeVisible();
+      await userEvent.click(screen.getByRole('button', {name:button}));
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith(decision);
+    } finally { if (original) Object.defineProperty(HTMLDialogElement.prototype, 'showModal', original); else Reflect.deleteProperty(HTMLDialogElement.prototype, 'showModal'); }
+  });
   it('reserves a visible tool slot for active skill references', async () => {
     fixtures.skills = [{ id: 'jupyter-notebook', active: true }];
     try {

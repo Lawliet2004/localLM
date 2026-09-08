@@ -5,6 +5,17 @@ import type { Message } from '../lib/types';
 
 const props = { generating: false, ready: true, loading: false, onSend: vi.fn(), onCancel: vi.fn(), onConfigure: vi.fn() };
 describe('chat action reporting and submission', () => {
+  it('renders the recorded local server name with its stable identity', () => {
+    const message: Message = { id:'tool', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'local-stable-id',localServerName:'Research server',name:'lookup',arguments:{query:'example'},authorization:'user approval decision'},result:{isError:false}}) };
+    const { rerender } = render(<Chat {...props} messages={[message]} />);
+    expect(screen.getByText('Research server · lookup')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Research server · lookup'));
+    expect(screen.getByText('local-stable-id')).toBeVisible();
+    expect(screen.getByText('Authorization: user approval decision')).toBeVisible();
+    // Older audit rows retain their existing label without needing live settings.
+    rerender(<Chat {...props} messages={[{...message,content:JSON.stringify({request:{connector:'Legacy',name:'lookup'},result:{}})}]} />);
+    expect(screen.getByText('Legacy · lookup')).toBeInTheDocument();
+  });
   it('retries the failed prompt as a new send without changing the draft', async () => {
     const onSend = vi.fn(async () => {});
     const messages: Message[] = [
