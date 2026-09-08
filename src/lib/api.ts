@@ -5,6 +5,10 @@ export const nativeAvailable = isTauri();
 export interface ModelInstallStatus { busy: boolean; phase: string; received: number; total: number; path: string | null; error: string | null }
 export interface ModelDownloadInfo { filename: string; bytes: number; sha256: string; destination: string; availableBytes: number; requiredBytes: number; destinationExists: boolean }
 export const api = {
+  runtimeDownloadInfo: () => invoke<{ bytes: number; requiredBytes: number; availableBytes: number; destination: string }>('runtime_download_info'),
+  runtimeInstallStatus: () => invoke<ModelInstallStatus>('runtime_install_status'),
+  installRuntime: () => invoke<ModelInstallStatus>('install_runtime'),
+  cancelRuntimeInstall: () => invoke<void>('cancel_runtime_install'),
   modelDownloadInfo: () => invoke<ModelDownloadInfo>('model_download_info'),
   modelInstallStatus: () => invoke<ModelInstallStatus>('model_install_status'),
   installModel: () => invoke<ModelInstallStatus>('install_model'),

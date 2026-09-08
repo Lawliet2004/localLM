@@ -21,6 +21,7 @@ mod runtime;
 pub mod runtime_archive;
 mod runtime_config;
 pub mod runtime_install;
+mod runtime_install_commands;
 mod runtime_log;
 mod skills;
 mod sse;
@@ -33,6 +34,8 @@ use std::sync::Mutex;
 use tauri::Manager;
 
 pub struct AppState {
+    installation_operation: tokio::sync::Mutex<()>,
+    runtime_installer: model_install::Installer,
     model_installer: model_install::Installer,
     daytona_vault: std::sync::Arc<vault::Vault>,
     daytona_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -83,6 +86,8 @@ pub fn run() {
                 store::Store::open(&data.join("locallm.sqlite")).map_err(std::io::Error::other)?;
             let vault = std::sync::Arc::new(vault::Vault::new(data.join("credentials")));
             app.manage(AppState {
+                installation_operation: tokio::sync::Mutex::new(()),
+                runtime_installer: model_install::Installer::default(),
                 model_installer: model_install::Installer::default(),
                 daytona_vault: vault.clone(),
                 daytona_operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -139,6 +144,10 @@ pub fn run() {
             commands::runtime_status,
             runtime_log::read_runtime_log,
             model_catalog::model_download_info,
+            runtime_install_commands::runtime_download_info,
+            runtime_install_commands::runtime_install_status,
+            runtime_install_commands::install_runtime,
+            runtime_install_commands::cancel_runtime_install,
             model_install::model_install_status,
             model_install::install_model,
             model_install::cancel_model_install,

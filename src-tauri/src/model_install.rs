@@ -15,9 +15,9 @@ pub struct Status {
 }
 #[derive(Default)]
 pub struct Installer {
-    inner: Mutex<(Status, Option<watch::Sender<bool>>)>,
+    pub(crate) inner: Mutex<(Status, Option<watch::Sender<bool>>)>,
 }
-struct RunGuard<'a>(&'a Installer);
+pub(crate) struct RunGuard<'a>(pub(crate) &'a Installer);
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,8 +47,7 @@ impl Drop for RunGuard<'_> {
                 inner.0.busy = false;
                 inner.0.phase = "interrupted".into();
                 inner.0.error = Some(
-                    "Model installation was interrupted. Retry to verify or download the model."
-                        .into(),
+                    "Installation was interrupted. Retry to verify or download the files.".into(),
                 );
             }
         }
@@ -81,6 +80,10 @@ pub async fn install_model(
     app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Status, String> {
+    let _installation = state
+        .installation_operation
+        .try_lock()
+        .map_err(|_| "Another model or runtime installation is running.")?;
     let installer = &state.model_installer;
     let receiver = {
         let mut inner = installer

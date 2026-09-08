@@ -276,3 +276,9 @@ The extraction regression passes for valid output, hash mismatch, unexpected ent
 Added space accounting for both compressed archives, all expanded files and reserve. The coordinator downloads pinned archives into private same-volume staging, extracts off the async worker, checks cancellation and publishes the completed bundle into a fresh versioned directory. Existing runtime installations are not reused or overwritten. Staging ownership stays alive during blocking extraction even if the caller disappears, preventing cleanup from racing its writes.
 
 The real cached CUDA archive extraction acceptance test passed in 43.53 seconds, verifying every output size and total file count; its temporary bundle was removed by the test. The cancellation-before-download regression and strict Clippy passed. Full coordinator network/publication acceptance, installer IPC/UI, crash recovery and installation inventory remain open. No runtime was installed in the application profile by this change.
+
+### Runtime installation desktop controls
+
+Added runtime metadata/install/status/cancel IPC and a CUDA runtime card in Model files. Progress distinguishes downloads from extraction, completed installation requires explicit selection into the settings draft, and saved preferences remain unchanged until Save. Model and runtime installations share an execution lock to prevent competing storage preflights; their status and cancellation remain separate.
+
+All 24 frontend tests, production frontend build, native debug build, the installer guard regression and strict Clippy passed. The native read-only setup smoke verified both model and runtime metadata, including the exact combined archive download size, and the resulting screen was inspected. No runtime transfer was started. Full download/install/launch acceptance, crash recovery, installed-runtime inventory and remaining project scope are still open.

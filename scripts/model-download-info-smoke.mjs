@@ -14,6 +14,11 @@ try {
   expect(metadata.requiredBytes).toBe(metadata.bytes + 268435456);
   expect(metadata.availableBytes).toBeGreaterThan(0);
   expect(metadata.destination).toContain('MiniCPM5-2B.Q6_K.gguf');
+  const runtime = page.getByRole('region', { name: 'CUDA runtime download' });
+  await expect(runtime.getByText(/required for download/)).toBeVisible();
+  const runtimeMetadata = await page.evaluate(async () => { const { invoke } = await import('/node_modules/@tauri-apps/api/core.js'); return invoke('runtime_download_info'); });
+  expect(runtimeMetadata.bytes).toBe(645512786);
+  expect(runtimeMetadata.requiredBytes).toBeGreaterThan(runtimeMetadata.bytes);
   await page.screenshot({ path: 'test-results/model-download-info.png' });
-  writeFileSync('test-results/model-download-info.json', JSON.stringify({ ...metadata, downloadStarted: false }, null, 2));
+  writeFileSync('test-results/model-download-info.json', JSON.stringify({ ...metadata, runtime: runtimeMetadata, downloadStarted: false }, null, 2));
 } finally { await browser.close(); }
