@@ -1,0 +1,1 @@
+Catalogs copied from truefoundry/trueforge commit e9569151cf92d8ef7f39f511bf7870dd54245ce6 on 2026-09-08. Upstream license: MIT. Presets require independent service authentication and skill dependency verification.
