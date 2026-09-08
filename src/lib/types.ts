@@ -31,7 +31,7 @@ export interface Preferences {
 }
 export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null; gpuOffload?: { layers: number; totalLayers: number } | null }
 export interface Bootstrap { conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus }
-export interface ToolApproval { id: string; connector: string; name: string; arguments: Record<string, unknown> }
+export interface ToolApproval { id: string; connector: string; localServerName?: string | null; name: string; arguments: Record<string, unknown> }
 export interface ContextUsage { inputTokens: number; responseReserve: number; contextLength: number }
 export interface ChatEvent { messageId: string; content: string; reasoning: string; approval?: ToolApproval | null; context?: ContextUsage }
 export interface ToolView { name: string; description: string; inputSchema: Record<string, unknown> }

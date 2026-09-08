@@ -406,3 +406,9 @@ Seven connector tests, two form tests, strict Clippy and the production build pa
 Rebuilt and launched the current native executable. Extended the local connector smoke to load the editor, cancel modified name/environment values and verify persisted configuration remained unchanged, then rename and save under the same ID. Readback verifies executable, working directory, arguments and environment remained intact; cleared form values and successful reconnect were also checked. The fixture disconnected and was removed at the end.
 
 The extended native smoke passed, including cancellation. This proves the settings IPC/UI edit flow against a real temporary MCP process; it does not prove model-driven chat approval or tool-result reconstruction. Structured fields, editor focus/scroll polish and full local chat acceptance remain outstanding.
+
+### Local server identity in approval requests
+
+Local MCP connection ownership now retains the configured display name separately from the stable connector ID. Approval events and persisted tool audit requests include optional localServerName metadata; IDs and tool aliases remain unchanged. The approval dialog names the local server and shows its ID and OS file/network permission context. The backend, rather than server tool naming, supplies this metadata.
+
+Connector tests, strict Clippy and the production build passed; the fixture additionally checks the local display name and preserved stable ID. A shell text replacement initially malformed the TS heading and was corrected before the successful build. Native approval rendering and full model-driven chat acceptance remain outstanding, as does displaying this additional metadata in historical audit UI.

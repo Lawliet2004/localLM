@@ -59,6 +59,7 @@ pub struct ConnectorView {
 struct Connection {
     service: ConnectorSession,
     tools: Vec<ToolView>,
+    local_name: Option<String>,
 }
 enum ConnectorSession {
     Remote(RunningService<RoleClient, ()>),
@@ -140,10 +141,19 @@ enum ToolBackend {
     Daytona(Arc<crate::daytona_execution::Executor>),
     Skills(Arc<crate::skills::SkillReader>),
     Execution(Arc<crate::execution::LocalExecution>),
-    Mcp(rmcp::Peer<RoleClient>),
+    Mcp {
+        peer: rmcp::Peer<RoleClient>,
+        local_name: Option<String>,
+    },
     Workspace(Arc<crate::workspace::Workspace>),
 }
 impl AgentTool {
+    pub fn local_server_name(&self) -> Option<&str> {
+        match &self.backend {
+            ToolBackend::Mcp { local_name, .. } => local_name.as_deref(),
+            _ => None,
+        }
+    }
     pub fn daytona(executor: crate::daytona_execution::Executor) -> Self {
         Self {connector:"Daytona".into(),alias:tool_alias("Daytona","run_code"),backend:ToolBackend::Daytona(Arc::new(executor)),tool:ToolView{
             name:"run_code".into(),description:"Execute code in a temporary Daytona cloud sandbox, then delete it. Code and results leave this device. No local workspace files are uploaded. Cloud usage may incur charges.".into(),
@@ -197,7 +207,7 @@ impl AgentTool {
                     .map_err(|_| "Skill read failed unexpectedly.")?;
             }
             ToolBackend::Execution(execution) => return execution.run(arguments).await,
-            ToolBackend::Mcp(peer) => peer,
+            ToolBackend::Mcp { peer, .. } => peer,
             ToolBackend::Workspace(workspace) => {
                 let workspace = workspace.clone();
                 let name = self.tool.name.clone();
@@ -311,7 +321,10 @@ impl McpHub {
                     connector: id.clone(),
                     tool: tool.clone(),
                     alias: tool_alias(id, &tool.name),
-                    backend: ToolBackend::Mcp(connection.service.peer().clone()),
+                    backend: ToolBackend::Mcp {
+                        peer: connection.service.peer().clone(),
+                        local_name: connection.local_name.clone(),
+                    },
                 });
             }
         }
@@ -524,6 +537,7 @@ impl McpHub {
             Connection {
                 service,
                 tools: views.clone(),
+                local_name: local.as_ref().map(|server| server.name.clone()),
             },
         );
         item.connected = true;
@@ -694,6 +708,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             )
             .unwrap();
         assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].local_server_name(), Some("Fixture"));
+        assert_eq!(tools[0].connector, server.id);
         assert!(
             !tools[0].trusted_read(),
             "server names must not grant read auto-approval"

@@ -203,7 +203,7 @@ pub async fn send_message(
             let blocked_by_denial = tool_use_denied;
             let allow = if blocked_by_denial { false } else if automatic_reason.is_some() { true } else {
             let (approval_id, decision) = state.approvals.request()?;
-            let sent = channel.send(ChatEvent { context: None, message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: Some(json!({"id":approval_id,"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments})) });
+            let sent = channel.send(ChatEvent { context: None, message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: Some(json!({"id":approval_id,"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments})) });
             if sent.is_err() { state.approvals.remove(&approval_id); return Err("The approval interface disconnected.".into()); }
             let allow = tokio::select! {
                 _ = cancellation.changed() => None,
@@ -216,7 +216,7 @@ pub async fn send_message(
             };
             if !allow { tool_use_denied = true; }
             let authorization = if blocked_by_denial { "blocked by an earlier denial in this turn" } else { automatic_reason.unwrap_or("user approval decision") };
-            let audit = json!({"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"decision":if allow { "allowed" } else { "denied" },"accessMode":access_mode,"authorization":authorization});
+            let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":if allow { "allowed" } else { "denied" },"accessMode":access_mode,"authorization":authorization});
             let row = state.database()?.append_message(&conversation_id,"tool",&audit.to_string(),if allow { "streaming" } else { "complete" })?;
             let result = if !allow { json!({"isError":true,"message":"The user denied this tool request. Do not repeat it without a new instruction."}) } else {
                 let outcome = tokio::select! {
