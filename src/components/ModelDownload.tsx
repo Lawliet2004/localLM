@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, errorMessage, nativeAvailable, type ModelDownloadInfo, type ModelInstallStatus } from '../lib/api';
 const gib = (bytes: number) => `${(bytes / 1073741824).toFixed(2)} GiB`;
 export function ModelDownload({ busy, onSelect }: { busy: boolean; onSelect: (path: string) => void }) {
@@ -8,25 +8,28 @@ export function ModelDownload({ busy, onSelect }: { busy: boolean; onSelect: (pa
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [revision, setRevision] = useState(0);
+  const actionVersion = useRef(0);
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     async function refresh() {
+      const version = actionVersion.current;
       try {
         const [nextInfo, nextStatus] = await Promise.all([api.modelDownloadInfo(), api.modelInstallStatus()]);
-        if (!disposed) { setInfo(nextInfo); setStatus(nextStatus); }
-      } catch (e) { if (!disposed) setError(errorMessage(e)); }
+        if (!disposed && version === actionVersion.current) { setInfo(nextInfo); setStatus(nextStatus); }
+      } catch (e) { if (!disposed && version === actionVersion.current) setError(errorMessage(e)); }
       finally { if (!disposed) timer = setTimeout(() => void refresh(), 1000); }
     }
     void refresh();
     return () => { disposed = true; clearTimeout(timer); };
   }, [revision]);
   async function install() {
+    actionVersion.current += 1;
     setStarting(true); setError('');
     try { setStatus(await api.installModel()); }
     catch (e) { setError(errorMessage(e)); }
-    finally { setStarting(false); setRevision(value => value + 1); }
+    finally { actionVersion.current += 1; setStarting(false); setRevision(value => value + 1); }
   }
   const active = starting || status?.busy;
   const insufficient = info && !info.destinationExists && info.availableBytes < info.requiredBytes;
