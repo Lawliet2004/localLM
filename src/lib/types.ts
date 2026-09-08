@@ -48,3 +48,4 @@ export interface HardwareStatus {
   gpuStatus: string; sampledAt: number;
   gpus: { name: string; uuid: string; memoryUsedMib: number | null; memoryTotalMib: number | null; utilizationPercent: number | null; driverVersion: string }[];
 }
+export interface ConversationTools { sources: string[]; tools: ToolSelection[] }

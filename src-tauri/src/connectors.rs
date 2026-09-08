@@ -16,7 +16,7 @@ pub struct ToolView {
     pub description: String,
     pub input_schema: Value,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolSelection {
     pub connector_id: String,

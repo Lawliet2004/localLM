@@ -1,5 +1,5 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ExecutionConfig, HardwareStatus, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillView, ToolSelection } from './types';
+import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ConversationTools, ExecutionConfig, HardwareStatus, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillView, ToolSelection } from './types';
 
 export const nativeAvailable = isTauri();
 export const api = {
@@ -22,6 +22,8 @@ export const api = {
   createConversation: () => invoke<Conversation>('create_conversation'),
   renameConversation: (id: string, title: string) => invoke<void>('rename_conversation', { id, title }),
   deleteConversation: (id: string) => invoke<void>('delete_conversation', { id }),
+  conversationTools: (id: string) => invoke<ConversationTools>('get_conversation_tools', { id }),
+  saveConversationTools: (id: string, tools: ConversationTools) => invoke<void>('save_conversation_tools', { id, tools }),
   messages: (id: string) => invoke<Message[]>('get_messages', { id }),
   saveConfig: (config: RuntimeConfig) => invoke<void>('save_runtime_config', { config }),
   savePreferences: (preferences: Preferences) => invoke<void>('save_preferences', { preferences }),

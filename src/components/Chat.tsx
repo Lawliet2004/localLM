@@ -6,6 +6,7 @@ import type { Message } from '../lib/types';
 
 interface Props {
   messages: Message[]; generating: boolean; ready: boolean; loading: boolean;
+  disabled?: boolean;
   onSend: (content: string) => Promise<void>; onCancel: () => void; onConfigure: () => void;
 }
 function ToolMessage({ message }: { message: Message }) {
@@ -41,7 +42,7 @@ function MessageBody({ message }: { message: Message }) {
   </article>;
 }
 
-export function Chat({ messages, generating, ready, loading, onSend, onCancel, onConfigure }: Props) {
+export function Chat({ messages, generating, ready, loading, disabled = false, onSend, onCancel, onConfigure }: Props) {
   const [draft, setDraft] = useState('');
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -49,7 +50,7 @@ export function Chat({ messages, generating, ready, loading, onSend, onCancel, o
   const submitting = useRef(false);
   useEffect(() => { if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [messages]);
   async function submit() {
-    if (!draft.trim() || !ready || generating || loading || submitting.current) return;
+    if (!draft.trim() || !ready || generating || loading || disabled || submitting.current) return;
     submitting.current = true;
     const content = draft;
     setDraft('');
@@ -77,7 +78,7 @@ export function Chat({ messages, generating, ready, loading, onSend, onCancel, o
         <textarea ref={input} aria-label="Message" placeholder="Ask anything, or work on an idea…" value={draft} rows={2} maxLength={100000} onChange={e => setDraft(e.target.value)} onKeyDown={e => {
           if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void submit(); }
         }} />
-        <div className="composer-bottom"><span><span className={`status-dot ${ready ? 'ready' : ''}`} />{ready ? 'Local model' : 'No model loaded'}</span><div><small>Shift + Enter for a new line</small>{generating ? <button type="button" className="send-button" aria-label="Stop response" onClick={onCancel}><Square size={15} fill="currentColor" /></button> : <button className="send-button" type="submit" aria-label="Send message" disabled={!draft.trim() || !ready || loading}><ArrowUp size={20} /></button>}</div></div>
+        <div className="composer-bottom"><span><span className={`status-dot ${ready ? 'ready' : ''}`} />{ready ? 'Local model' : 'No model loaded'}</span><div><small>Shift + Enter for a new line</small>{generating ? <button type="button" className="send-button" aria-label="Stop response" onClick={onCancel}><Square size={15} fill="currentColor" /></button> : <button className="send-button" type="submit" aria-label="Send message" disabled={!draft.trim() || !ready || loading || disabled}><ArrowUp size={20} /></button>}</div></div>
       </form>
       <p className="composer-note">Local inference. A space to make things happen.</p>
     </div>

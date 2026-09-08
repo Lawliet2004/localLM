@@ -52,6 +52,25 @@ pub fn get_messages(state: State<'_, AppState>, id: String) -> Result<Vec<Messag
     state.database()?.messages(&id)
 }
 #[tauri::command]
+pub fn get_conversation_tools(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<crate::store::ConversationTools, String> {
+    state.database()?.conversation_tools(&id)
+}
+#[tauri::command]
+pub async fn save_conversation_tools(
+    state: State<'_, AppState>,
+    id: String,
+    tools: crate::store::ConversationTools,
+) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the active operation before changing conversation tools.")?;
+    state.database()?.save_conversation_tools(&id, &tools)
+}
+#[tauri::command]
 pub fn save_runtime_config(
     state: State<'_, AppState>,
     config: RuntimeConfig,

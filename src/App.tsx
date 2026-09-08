@@ -29,6 +29,8 @@ export default function App() {
   const [loading, setLoading] = useState(nativeAvailable);
   const [generating, setGenerating] = useState(false);
   const [modelBusy, setModelBusy] = useState(false);
+  const [savingTools, setSavingTools] = useState(false);
+  const toolSave = useRef(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
   const [collapsed, setCollapsed] = useState(false);
@@ -37,7 +39,20 @@ export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('locallm-theme') || 'dark');
   const selection = useRef(0);
   const active = data.conversations.find(item => item.id === activeId);
-  const busy = generating || modelBusy || loading;
+  const busy = generating || modelBusy || loading || savingTools;
+  function newConversation() {
+    selection.current++; setActiveId(null); setMessages([]); setPage('chat'); setError(''); setRenaming(false);
+    setSelectedConnectors([]); setSelectedTools([]);
+  }
+  async function changeTools(sources: string[], tools: ToolSelection[]) {
+    if (busy || toolSave.current) return;
+    toolSave.current = true; setSavingTools(true); setError('');
+    try {
+      if (activeId) await api.saveConversationTools(activeId, { sources, tools });
+      setSelectedConnectors(sources); setSelectedTools(tools);
+    } catch (e) { setError(errorMessage(e)); }
+    finally { toolSave.current = false; setSavingTools(false); }
+  }
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('locallm-theme', theme); }, [theme]);
   useEffect(() => {
@@ -49,19 +64,25 @@ export default function App() {
   useEffect(() => {
     function keydown(event: KeyboardEvent) {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n') {
-        event.preventDefault(); if (!busy) { selection.current++; setActiveId(null); setMessages([]); setPage('chat'); }
+        event.preventDefault(); if (!busy) newConversation();
       }
     }
     window.addEventListener('keydown', keydown); return () => window.removeEventListener('keydown', keydown);
   }, [busy]);
   async function selectConversation(id: string) {
+    if (busy || toolSave.current) return;
     const version = ++selection.current;
     setPage('chat'); setActiveId(id); setLoading(true); setError(''); setRenaming(false);
-    try { const next = await api.messages(id); if (version === selection.current) setMessages(next); }
-    catch (e) { setError(errorMessage(e)); }
+    setMessages([]); setSelectedConnectors([]); setSelectedTools([]);
+    try {
+      const [next, tools] = await Promise.all([api.messages(id), api.conversationTools(id)]);
+      if (version === selection.current) { setMessages(next); setSelectedConnectors(tools.sources); setSelectedTools(tools.tools); }
+    }
+    catch (e) { if (version === selection.current) { setError(errorMessage(e)); setActiveId(null); } }
     finally { if (version === selection.current) setLoading(false); }
   }
   async function send(content: string) {
+    if (busy || toolSave.current) throw new Error('Wait for the active operation before sending a message.');
     setGenerating(true); setError('');
     let id = activeId;
     const previousIds = new Set(messages.map(message => message.id));
@@ -70,6 +91,7 @@ export default function App() {
         const conversation = await api.createConversation(); id = conversation.id;
         setActiveId(id); setData(current => ({ ...current, conversations: [conversation, ...current.conversations] }));
       }
+      await api.saveConversationTools(id, { sources: selectedConnectors, tools: selectedTools });
       const conversationId = id;
       setMessages(current => [...current, { id: 'pending-user', conversationId, role: 'user', content, reasoning: '', status: 'complete', createdAt: Date.now() }]);
       await api.sendMessage(conversationId, content, event => { if ('approval' in event) setApproval(event.approval || null); setMessages(current => {
@@ -107,7 +129,7 @@ export default function App() {
   async function removeConversation() {
     if (!activeId || busy) return;
     if (!await confirm('This permanently deletes this conversation from your device.', { title: 'Delete conversation?', kind: 'warning' })) return;
-    try { await api.deleteConversation(activeId); setData(current => ({ ...current, conversations: current.conversations.filter(item => item.id !== activeId) })); setActiveId(null); setMessages([]); }
+    try { await api.deleteConversation(activeId); setData(current => ({ ...current, conversations: current.conversations.filter(item => item.id !== activeId) })); newConversation(); }
     catch (e) { setError(errorMessage(e)); }
   }
   async function rename() {
@@ -121,13 +143,13 @@ export default function App() {
     const link = document.createElement('a'); link.href = url; link.download = 'conversation.md'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   return <div className={`app ${collapsed ? 'sidebar-collapsed' : ''}`}>
-    {!collapsed && <Sidebar page={page} onPage={setPage} conversations={data.conversations} activeId={activeId} onSelect={id => void selectConversation(id)} onNew={() => { selection.current++; setActiveId(null); setMessages([]); setPage('chat'); setError(''); }} busy={busy} search={search} onSearch={setSearch} theme={theme} onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')} onCollapse={() => setCollapsed(true)} />}
+    {!collapsed && <Sidebar page={page} onPage={setPage} conversations={data.conversations} activeId={activeId} onSelect={id => void selectConversation(id)} onNew={newConversation} busy={busy} search={search} onSearch={setSearch} theme={theme} onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')} onCollapse={() => setCollapsed(true)} />}
     {approval && <ApprovalDialog key={approval.id} request={approval} onResolve={allow => api.resolveToolApproval(approval.id, allow)} />}
     <main className="workspace"><header className="workspace-header"><div>{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{renaming && page === 'chat' ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{page === 'chat' ? active?.title || 'New conversation' : page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : 'Skills'}</span>}</div><div className="header-actions">{page === 'chat' && active && <><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length} onClick={exportChat}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></>}<button className="model-selector" onClick={() => setPage('models')}><span className={`status-dot ${data.runtime.phase === 'ready' ? 'ready' : ''}`} />{data.runtime.phase === 'ready' ? 'Model loaded' : 'Select model'}<ChevronDown size={13} /></button></div></header>
       {!nativeAvailable && <div className="preview-banner">Browser preview · Open the desktop application to load models and save conversations.</div>}
       {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
-      {page === 'chat' && <ToolPicker selectedTools={selectedTools} onToolsChange={setSelectedTools} selected={selectedConnectors} onChange={setSelectedConnectors} busy={busy} />}
-      {page === 'chat' ? <Chat messages={messages} generating={generating} ready={nativeAvailable && data.runtime.phase === 'ready'} loading={loading} onSend={send} onCancel={() => { void api.cancelGeneration().catch(e => setError(errorMessage(e))); }} onConfigure={() => setPage('models')} /> : page === 'models' ? <Models config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveConfig={async config => { try { await api.saveConfig(config); setData(current => ({ ...current, config })); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(current => ({ ...current, preferences })); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
+      {page === 'chat' && <ToolPicker selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} busy={busy} />}
+      {page === 'chat' ? <Chat messages={messages} generating={generating} ready={nativeAvailable && data.runtime.phase === 'ready'} loading={loading} disabled={savingTools} onSend={send} onCancel={() => { void api.cancelGeneration().catch(e => setError(errorMessage(e))); }} onConfigure={() => setPage('models')} /> : page === 'models' ? <Models config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveConfig={async config => { try { await api.saveConfig(config); setData(current => ({ ...current, config })); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(current => ({ ...current, preferences })); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
     </main>
   </div>;
 }

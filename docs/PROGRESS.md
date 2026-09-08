@@ -78,3 +78,11 @@ The chat picker supports individual discovered tools, searchable by connector/na
 Verification: 32 Rust tests and strict Clippy pass; 9 frontend tests, production build and 2 browser tests pass. Regression fixtures cover selecting two exact tools from a 100-tool catalog, unknown tool rejection, and selecting/searching a tool from a 40-tool UI catalog. Native MiniCPM/DeepWiki smoke tests enabled only `read_wiki_structure` and passed real allowed-result continuation, denied-call handling and cancellation. Native stale-selection smoke verified an error and zero persisted messages. Native screenshot inspected at `test-results/native-agent.png` (ignored).
 
 Remaining: selections are currently session state, not persisted per conversation. Account-specific provider compatibility, larger-context management, Daytona, runtime installation and release acceptance remain open.
+
+### Conversation-specific tool persistence
+
+Connector selections and local tool enablement now belong to each conversation in SQLite. Existing chats default to tools off; selecting a chat loads messages and tool settings together, and new chats clear selections. Changes in an existing chat are reflected after successful persistence; sends wait until settings are saved. A foreign-key table removes settings on conversation deletion. Invalid, duplicate and excessive selections are rejected before writes. Settings retain unavailable tool identities for user review rather than silently granting replacements.
+
+Verification: 34 Rust tests, strict Clippy, 9 frontend tests, production build and both browser tests pass. Database reopen tests prove independent settings survive, rejected writes preserve previous data and deletion cascades. `scripts/conversation-tools-smoke.mjs` exercised two different selections through native UI, switching, UI reload and new-chat reset. Real MiniCPM/DeepWiki allow/deny/cancel smoke passed again after persistence integration.
+
+Workspace folder and skill activation are still global settings; this slice persists tool enablement and connector/tool identities only. Full release acceptance remains open.

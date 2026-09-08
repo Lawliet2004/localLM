@@ -74,6 +74,48 @@ impl Preferences {
 pub struct Store {
     connection: Connection,
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationTools {
+    pub sources: Vec<String>,
+    pub tools: Vec<crate::connectors::ToolSelection>,
+}
+impl ConversationTools {
+    pub fn validate(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        let mut count = self.tools.len();
+        for source in &self.sources {
+            if !seen.insert(source) {
+                return Err("Duplicate tool source.".into());
+            }
+            count += match source.as_str() {
+                "__workspace" => 4,
+                "__execution" => 1,
+                _ => return Err("Unknown local tool source.".into()),
+            };
+        }
+        if count > 32 {
+            return Err("At most 32 tools can be selected.".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for tool in &self.tools {
+            if tool.connector_id.is_empty()
+                || tool.connector_id.len() > 120
+                || !tool
+                    .connector_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                || tool.tool_name.is_empty()
+                || tool.tool_name.len() > 256
+                || tool.tool_name.chars().any(char::is_control)
+                || !seen.insert((&tool.connector_id, &tool.tool_name))
+            {
+                return Err("Invalid or duplicate connector tool selection.".into());
+            }
+        }
+        Ok(())
+    }
+}
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         Self::initialize(Connection::open(path).map_err(db_error)?)
@@ -93,8 +135,28 @@ impl Store {
                 status TEXT NOT NULL CHECK(status IN ('complete','streaming','interrupted','error')), created_at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id,created_at);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS conversation_tools(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, value TEXT NOT NULL);
             UPDATE messages SET status='interrupted' WHERE status='streaming';").map_err(db_error)?;
         Ok(Self { connection })
+    }
+    pub fn conversation_tools(&self, id: &str) -> Result<ConversationTools> {
+        let value: Option<Option<String>> = self.connection.query_row(
+            "SELECT t.value FROM conversations c LEFT JOIN conversation_tools t ON t.conversation_id=c.id WHERE c.id=?1", [id], |row| row.get(0),
+        ).optional().map_err(db_error)?;
+        let tools: ConversationTools = match value {
+            None => return Err("Conversation no longer exists.".into()),
+            Some(None) => ConversationTools::default(),
+            Some(Some(value)) => serde_json::from_str(&value)
+                .map_err(|_| "Stored conversation tools are invalid.")?,
+        };
+        tools.validate()?;
+        Ok(tools)
+    }
+    pub fn save_conversation_tools(&self, id: &str, tools: &ConversationTools) -> Result<()> {
+        tools.validate()?;
+        let value = serde_json::to_string(tools).map_err(|error| error.to_string())?;
+        self.connection.execute("INSERT INTO conversation_tools(conversation_id,value) VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET value=excluded.value", params![id, value]).map_err(db_error)?;
+        Ok(())
     }
     pub fn create_conversation(&self) -> Result<Conversation> {
         let conversation = Conversation {
@@ -271,6 +333,83 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conversation_tools_are_isolated_durable_and_deleted_with_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tools.sqlite");
+        let first;
+        let second;
+        let settings = ConversationTools {
+            sources: vec!["__workspace".into()],
+            tools: vec![crate::connectors::ToolSelection {
+                connector_id: "deepwiki".into(),
+                tool_name: "read_wiki_structure".into(),
+            }],
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            first = store.create_conversation().unwrap().id;
+            second = store.create_conversation().unwrap().id;
+            store.save_conversation_tools(&first, &settings).unwrap();
+            assert_eq!(
+                store.conversation_tools(&second).unwrap(),
+                ConversationTools::default()
+            );
+            let invalid = ConversationTools {
+                sources: vec!["unknown".into()],
+                ..settings.clone()
+            };
+            assert!(store.save_conversation_tools(&first, &invalid).is_err());
+            assert_eq!(store.conversation_tools(&first).unwrap(), settings);
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.conversation_tools(&first).unwrap(), settings);
+        assert_eq!(
+            store.conversation_tools(&second).unwrap(),
+            ConversationTools::default()
+        );
+        store.delete_conversation(&first).unwrap();
+        assert!(store.conversation_tools(&first).is_err());
+        assert!(store.save_conversation_tools(&first, &settings).is_err());
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM conversation_tools", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn conversation_tools_reject_duplicates_and_excessive_combined_tools() {
+        let mut settings = ConversationTools {
+            sources: vec!["__workspace".into(), "__execution".into()],
+            tools: (0..27)
+                .map(|index| crate::connectors::ToolSelection {
+                    connector_id: "github".into(),
+                    tool_name: format!("tool_{index}"),
+                })
+                .collect(),
+        };
+        assert!(settings.validate().is_ok());
+        settings.tools.push(crate::connectors::ToolSelection {
+            connector_id: "github".into(),
+            tool_name: "extra".into(),
+        });
+        assert!(settings.validate().is_err());
+        settings.tools.clear();
+        settings.sources.push("__execution".into());
+        assert!(settings.validate().is_err());
+        settings.sources.clear();
+        settings.tools = vec![
+            crate::connectors::ToolSelection {
+                connector_id: "github".into(),
+                tool_name: "duplicate".into()
+            };
+            2
+        ];
+        assert!(settings.validate().is_err());
+    }
 
     #[test]
     fn conversations_and_messages_survive_reopening() {

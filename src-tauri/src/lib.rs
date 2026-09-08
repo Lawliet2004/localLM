@@ -77,6 +77,8 @@ pub fn run() {
             commands::rename_conversation,
             commands::delete_conversation,
             commands::get_messages,
+            commands::get_conversation_tools,
+            commands::save_conversation_tools,
             commands::save_runtime_config,
             commands::save_preferences,
             commands::load_model,
