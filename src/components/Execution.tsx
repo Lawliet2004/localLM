@@ -25,7 +25,7 @@ export function Execution() {
     finally { setBusy(false); }
   }
   return <div className="settings-page"><div className="page-heading"><p className="eyebrow">CODE & AUTOMATION</p><h1>Execution</h1><p>Run code with your installed Python, Node.js, or PowerShell interpreter.</p></div>
-    <p className="catalog-notice">Local execution runs with your Windows account’s permissions, including network and filesystem access. It is not a sandbox. Each run requires approval of the complete code.</p>
+    <p className="catalog-notice">Local execution runs with your Windows account’s permissions, including network and filesystem access. It is not a sandbox. Ask and Auto-approve reads require approval of the complete code. Full access runs enabled code tools without prompts.</p>
     <form className="runtime-form" onSubmit={event => { event.preventDefault(); void save(); }}>
       {([['pythonPath', 'Python executable'], ['nodePath', 'Node.js executable'], ['powershellPath', 'PowerShell executable']] as const).map(([key, label]) => <label key={key}>{label}<div className="execution-path"><input aria-label={label} value={config[key]} placeholder="Not configured" disabled={busy} onChange={event => { setNotice(''); setConfig(current => ({ ...current, [key]: event.target.value })); }} /><button type="button" className="secondary" disabled={!nativeAvailable || busy} onClick={() => void browse(key)}>Browse</button></div></label>)}
       <button className="primary" disabled={!nativeAvailable || busy}>{busy ? 'Saving…' : 'Save interpreters'}</button>

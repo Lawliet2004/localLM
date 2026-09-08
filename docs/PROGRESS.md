@@ -178,3 +178,10 @@ The runtime no longer writes directly to an unbounded file. Shared stdout/stderr
 
 Verification: the full 53-test Rust suite passed after implementation, then both logging tests passed after adding a write-failure fixture (54 total tests now). Tests stream 200,000 bytes through tiny pipes into a small cap, verify a single marker and exact size, verify reset on new load, and verify read-only-file failure cannot deadlock a producer. Strict Clippy and native build passed. Rebuilt-app offload checks again reported 43/43, 5/43 and 0/43; the real response-limit generation/reload check also passed. Frontend code was unchanged. Full release scope remains active.
 
+
+### Daytona API contract and permission copy audit
+
+Audited remaining SPEC items and selected Daytona as the next missing execution provider. Inspected official platform/toolbox OpenAPI schemas and recorded hashes, request requirements, unresolved proxy-auth/timeout details and the durable cleanup design in docs/DAYTONA.md. No cloud resources or account calls were made. Implementation and live-account evidence remain outstanding.
+
+Corrected the Execution page's outdated claim that all runs require approval: it now accurately explains Ask/Auto-approve versus Full access. The production frontend build passed. This turn establishes the next implementation contract; it does not claim Daytona is available.
+
