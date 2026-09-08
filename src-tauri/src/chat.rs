@@ -37,6 +37,8 @@ pub async fn send_message(
     }
     let mut connector_ids = connector_ids.unwrap_or_default();
     let use_workspace = connector_ids.iter().any(|id| id == "__workspace");
+    let use_execution = connector_ids.iter().any(|id| id == "__execution");
+    connector_ids.retain(|id| id != "__execution");
     connector_ids.retain(|id| id != "__workspace");
     let mut tools = state
         .connectors
@@ -46,6 +48,15 @@ pub async fn send_message(
     if use_workspace {
         let path = state.database()?.workspace_path()?;
         tools.extend(std::sync::Arc::new(crate::workspace::Workspace::open(&path)?).tools());
+    }
+    if use_execution {
+        let (config, path) = {
+            let store = state.database()?;
+            (store.execution_config()?, store.workspace_path()?)
+        };
+        tools.push(
+            std::sync::Arc::new(crate::execution::LocalExecution::new(config, &path)?).tool(),
+        );
     }
     if tools.len() > 32 {
         return Err("Select fewer tool sources: at most 32 tools can be offered in a turn.".into());
@@ -172,7 +183,7 @@ pub async fn send_message(
                     result = tokio::time::timeout(Duration::from_secs(120),tool.call(call.arguments.clone())) => Some(result.unwrap_or_else(|_| Err("Tool request timed out. Its remote outcome may be unknown; do not automatically retry.".into()))),
                 };
                 match outcome {
-                    None => { state.database()?.update_message(&row.id,&json!({"request":audit,"result":"Cancelled; remote outcome may be unknown."}).to_string(),"","interrupted")?; return Ok(false); },
+                    None => { state.database()?.update_message(&row.id,&json!({"request":audit,"result":"Cancelled; the action may already have changed data."}).to_string(),"","interrupted")?; return Ok(false); },
                     Some(Ok(value)) => value,
                     Some(Err(error)) => json!({"isError":true,"message":error}),
                 }

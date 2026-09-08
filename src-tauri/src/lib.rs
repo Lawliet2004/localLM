@@ -2,6 +2,7 @@ mod approval;
 mod chat;
 mod commands;
 mod connectors;
+mod execution;
 mod oauth;
 mod runtime;
 mod runtime_config;
@@ -61,6 +62,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            execution::get_execution_config,
+            execution::save_execution_config,
             workspace::get_workspace,
             workspace::set_workspace,
             skills::list_skills,

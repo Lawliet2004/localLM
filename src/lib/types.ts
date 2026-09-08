@@ -41,3 +41,4 @@ export interface SkillView {
   id: string; description: string; repo: string; revision: string; sourcePath: string;
   files: { path: string; size: number; sha256: string }[]; installed: boolean; active: boolean;
 }
+export interface ExecutionConfig { pythonPath: string; nodePath: string; powershellPath: string }

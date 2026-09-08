@@ -1,8 +1,10 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Bootstrap, ChatEvent, ConnectorView, Conversation, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillView } from './types';
+import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ExecutionConfig, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillView } from './types';
 
 export const nativeAvailable = isTauri();
 export const api = {
+  getExecutionConfig: () => invoke<ExecutionConfig>('get_execution_config'),
+  saveExecutionConfig: (config: ExecutionConfig) => invoke<void>('save_execution_config', { config }),
   getWorkspace: () => invoke<{ path: string }>('get_workspace'),
   setWorkspace: (path: string) => invoke<void>('set_workspace', { path }),
   listSkills: () => invoke<SkillView[]>('list_skills'),

@@ -43,10 +43,19 @@ pub struct AgentTool {
     backend: ToolBackend,
 }
 enum ToolBackend {
+    Execution(Arc<crate::execution::LocalExecution>),
     Mcp(rmcp::Peer<RoleClient>),
     Workspace(Arc<crate::workspace::Workspace>),
 }
 impl AgentTool {
+    pub fn execution(execution: Arc<crate::execution::LocalExecution>, tool: ToolView) -> Self {
+        Self {
+            connector: "Local execution".into(),
+            alias: "local_run_code".into(),
+            tool,
+            backend: ToolBackend::Execution(execution),
+        }
+    }
     pub fn workspace(workspace: Arc<crate::workspace::Workspace>, tool: ToolView) -> Self {
         Self {
             connector: "Workspace".into(),
@@ -60,6 +69,7 @@ impl AgentTool {
     }
     pub async fn call(&self, arguments: Value) -> Result<Value, String> {
         let peer = match &self.backend {
+            ToolBackend::Execution(execution) => return execution.run(arguments).await,
             ToolBackend::Mcp(peer) => peer,
             ToolBackend::Workspace(workspace) => {
                 let workspace = workspace.clone();

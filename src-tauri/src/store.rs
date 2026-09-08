@@ -250,6 +250,12 @@ impl Store {
     pub fn workspace_path(&self) -> Result<String> {
         self.setting("workspace_path")
     }
+    pub fn execution_config(&self) -> Result<crate::execution::ExecutionConfig> {
+        self.setting("execution")
+    }
+    pub fn save_execution_config(&self, config: &crate::execution::ExecutionConfig) -> Result<()> {
+        self.save_setting("execution", config)
+    }
     pub fn save_workspace_path(&self, path: &str) -> Result<()> {
         self.save_setting("workspace_path", &path)
     }
