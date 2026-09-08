@@ -316,3 +316,9 @@ Both targeted Rust tests, strict Clippy, all 25 frontend tests, production front
 The backend now forwards its successful exact-token preflight count before each model request, including subsequent tool rounds. Chat shows the latest input count, reserved response budget and loaded context size, explicitly excluding unsent draft changes. Counts are associated with the active conversation in UI state; they are not persisted or presented as a current draft estimate.
 
 Strict Clippy, frontend production build, all 26 frontend tests and the targeted native context tests passed. The new UI test confirms editing a draft does not silently change the measured count. Native channel-to-render acceptance for the indicator remains outstanding, as do persistent usage history, draft preflight and context compaction.
+
+### Native context indicator acceptance
+
+After rebuilding and restarting the native app, the context-indicator smoke loaded the model, sent an arithmetic prompt, observed the measured input count and 512-token response reserve, and verified a completed answer containing 42. Editing an unsent draft did not change the measured count; starting a new conversation removed the previous conversation's indicator. The test restored preferences/load state and deleted its temporary conversation and draft.
+
+The native build and smoke passed. The indicator remains session-local and reports the latest accepted model request, not a draft estimate or persistent token-usage ledger. Tool-round count rendering, compaction and the broader acceptance checklist remain open.
