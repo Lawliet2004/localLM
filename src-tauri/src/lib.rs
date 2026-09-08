@@ -18,6 +18,7 @@ mod model_install;
 mod oauth;
 mod permissions;
 mod runtime;
+pub mod runtime_archive;
 mod runtime_config;
 mod runtime_log;
 mod skills;
