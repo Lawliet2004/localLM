@@ -282,3 +282,9 @@ The real cached CUDA archive extraction acceptance test passed in 43.53 seconds,
 Added runtime metadata/install/status/cancel IPC and a CUDA runtime card in Model files. Progress distinguishes downloads from extraction, completed installation requires explicit selection into the settings draft, and saved preferences remain unchanged until Save. Model and runtime installations share an execution lock to prevent competing storage preflights; their status and cancellation remain separate.
 
 All 24 frontend tests, production frontend build, native debug build, the installer guard regression and strict Clippy passed. The native read-only setup smoke verified both model and runtime metadata, including the exact combined archive download size, and the resulting screen was inspected. No runtime transfer was started. Full download/install/launch acceptance, crash recovery, installed-runtime inventory and remaining project scope are still open.
+
+### Full runtime download, installation and GPU load acceptance
+
+The native UI downloaded both pinned GitHub CUDA archives (645,512,786 bytes combined), verified them, extracted the complete bundle and published a new managed runtime. The initial smoke stopped after successful selection because its exact field-label matcher excluded the input help text. The corrected script resumed the already completed installation with --reuse-installed; no repeat download occurred.
+
+The installed executable loaded MiniCPM5-2B Q6_K and reported 43/43 layers offloaded with the saved 8192 context and q8_0 K/V settings. Original preferences and model load state were restored. The managed runtime remains installed at the path recorded in test-results/runtime-install-smoke.json. The README now describes in-app setup. Full model network-transfer acceptance, native cancellation, crash recovery and installation inventory remain open; this is runtime download-to-GPU-load evidence, not full product completion.
