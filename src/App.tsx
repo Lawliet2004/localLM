@@ -11,6 +11,7 @@ import { Execution } from './components/Execution';
 import { Connectors } from './components/Connectors';
 import { ApprovalDialog, ToolPicker } from './components/ToolControls';
 import './styles.css';
+import { loadDraft, saveDraft, moveNewDraft } from './lib/drafts';
 
 const initialData: Bootstrap = {
   conversations: [], config: defaultRuntimeConfig,
@@ -19,6 +20,17 @@ const initialData: Bootstrap = {
 };
 
 export default function App() {
+  const draftId = useRef<string | null>(null);
+  const draftValue = useRef(loadDraft(null));
+  const [draft, setDraft] = useState(draftValue.current);
+  function changeDraft(value: string | ((previous: string) => string)) {
+    const next = typeof value === 'function' ? value(draftValue.current) : value;
+    draftValue.current = next; setDraft(next);
+    try { saveDraft(draftId.current, next); } catch (e) { setError(errorMessage(e)); }
+  }
+  function switchDraft(id: string | null) {
+    draftId.current = id; draftValue.current = loadDraft(id); setDraft(draftValue.current);
+  }
   const [selectedConnectors, setSelectedConnectors] = useState<string[]>([]);
   const [accessMode, setAccessMode] = useState<AccessMode>('ask');
   const [selectedTools, setSelectedTools] = useState<ToolSelection[]>([]);
@@ -44,6 +56,7 @@ export default function App() {
   const active = data.conversations.find(item => item.id === activeId);
   const busy = generating || modelBusy || loading || savingTools || exporting;
   function newConversation() {
+    switchDraft(null);
     selection.current++; setActiveId(null); setMessages([]); setPage('chat'); setError(''); setRenaming(false);
     setSelectedConnectors([]); setSelectedTools([]); setAccessMode('ask');
   }
@@ -75,13 +88,14 @@ export default function App() {
   async function selectConversation(id: string) {
     if (busy || toolSave.current) return;
     const version = ++selection.current;
+    switchDraft(id);
     setPage('chat'); setActiveId(id); setLoading(true); setError(''); setRenaming(false);
     setMessages([]); setSelectedConnectors([]); setSelectedTools([]); setAccessMode('ask');
     try {
       const [next, tools] = await Promise.all([api.messages(id), api.conversationTools(id)]);
       if (version === selection.current) { setMessages(next); setSelectedConnectors(tools.sources); setSelectedTools(tools.tools); setAccessMode(tools.accessMode || 'ask'); }
     }
-    catch (e) { if (version === selection.current) { setError(errorMessage(e)); setActiveId(null); } }
+    catch (e) { if (version === selection.current) { setError(errorMessage(e)); setActiveId(null); switchDraft(null); } }
     finally { if (version === selection.current) setLoading(false); }
   }
   async function send(content: string) {
@@ -92,6 +106,8 @@ export default function App() {
     try {
       if (!id) {
         const conversation = await api.createConversation(); id = conversation.id;
+        try { moveNewDraft(id); } catch (e) { setError(errorMessage(e)); }
+        draftId.current = id;
         setActiveId(id); setData(current => ({ ...current, conversations: [conversation, ...current.conversations] }));
       }
       await api.saveConversationTools(id, { sources: selectedConnectors, tools: selectedTools, accessMode });
@@ -132,7 +148,7 @@ export default function App() {
   async function removeConversation() {
     if (!activeId || busy) return;
     if (!await confirm('This permanently deletes this conversation from your device.', { title: 'Delete conversation?', kind: 'warning' })) return;
-    try { await api.deleteConversation(activeId); setData(current => ({ ...current, conversations: current.conversations.filter(item => item.id !== activeId) })); newConversation(); }
+    try { await api.deleteConversation(activeId); try { saveDraft(activeId, ''); } catch (e) { setError(errorMessage(e)); } setData(current => ({ ...current, conversations: current.conversations.filter(item => item.id !== activeId) })); newConversation(); }
     catch (e) { setError(errorMessage(e)); }
   }
   async function rename() {
@@ -159,7 +175,7 @@ export default function App() {
       {exportedPath && <div className="preview-banner" role="status">Saved conversation to {exportedPath}<button className="icon-button" aria-label="Dismiss export confirmation" onClick={() => setExportedPath('')}><X size={16} /></button></div>}
       {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
       {page === 'chat' && <ToolPicker accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} busy={busy} />}
-      {page === 'chat' ? <Chat messages={messages} generating={generating} ready={nativeAvailable && data.runtime.phase === 'ready'} loading={loading} disabled={savingTools || exporting} onSend={send} onCancel={() => { void api.cancelGeneration().catch(e => setError(errorMessage(e))); }} onConfigure={() => setPage('models')} /> : page === 'models' ? <Models config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveConfig={async config => { try { await api.saveConfig(config); setData(current => ({ ...current, config })); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(current => ({ ...current, preferences })); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
+      {page === 'chat' ? <Chat draft={draft} onDraftChange={changeDraft} messages={messages} generating={generating} ready={nativeAvailable && data.runtime.phase === 'ready'} loading={loading} disabled={savingTools || exporting} onSend={send} onCancel={() => { void api.cancelGeneration().catch(e => setError(errorMessage(e))); }} onConfigure={() => setPage('models')} /> : page === 'models' ? <Models config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveConfig={async config => { try { await api.saveConfig(config); setData(current => ({ ...current, config })); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(current => ({ ...current, preferences })); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
     </main>
   </div>;
 }

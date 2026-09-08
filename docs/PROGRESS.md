@@ -126,3 +126,11 @@ Verification: 47 Rust tests, strict Clippy, 14 frontend tests, production build 
 `docs/CONTEXT.md` records behavior and pinned upstream source references. Automatic compaction, live composer usage, context selection and full release acceptance remain open.
 
 Live DeepWiki Auto/denial and Full-access call regressions also passed with token preflight enabled.
+
+### Conversation draft recovery
+
+Unsent text now belongs to its conversation rather than the mounted chat component. Drafts persist in the desktop WebView's local storage and remain available when switching chats, navigating to another page, or reloading. The new-chat draft has its own slot; conversation creation transfers it to the assigned conversation ID. Submitted text clears through the existing send flow, while rejected sends restore it. Deleting a conversation clears its draft. Storage failures retain the current text in session memory and report that it could not be saved.
+
+Verification: 16 frontend tests, production build and both browser checks pass. Native `scripts/drafts-smoke.mjs` verified two independent unsent drafts, a separate new-chat draft, reload recovery and navigation away/back. Fixtures restored the prior new-chat draft and removed their temporary conversations. Rust was unchanged in this slice.
+
+Drafts are local WebView data, separate from SQLite conversation exports. Crash recovery during the interval between submitting a draft and backend acceptance remains to be hardened; this slice verifies unsent draft persistence, not transactional draft-to-message handoff.

@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm';
 import type { Message } from '../lib/types';
 
 interface Props {
+  draft?: string; onDraftChange?: (value: string | ((previous: string) => string)) => void;
   messages: Message[]; generating: boolean; ready: boolean; loading: boolean;
   disabled?: boolean;
   onSend: (content: string) => Promise<void>; onCancel: () => void; onConfigure: () => void;
@@ -42,8 +43,10 @@ function MessageBody({ message }: { message: Message }) {
   </article>;
 }
 
-export function Chat({ messages, generating, ready, loading, disabled = false, onSend, onCancel, onConfigure }: Props) {
-  const [draft, setDraft] = useState('');
+export function Chat({ messages, generating, ready, loading, disabled = false, onSend, onCancel, onConfigure, draft: controlledDraft, onDraftChange }: Props) {
+  const [localDraft, setLocalDraft] = useState('');
+  const draft = controlledDraft ?? localDraft;
+  const setDraft = onDraftChange ?? setLocalDraft;
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
   const input = useRef<HTMLTextAreaElement>(null);
