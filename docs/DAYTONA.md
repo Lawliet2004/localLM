@@ -34,3 +34,10 @@ These are application decisions, not claims about completed functionality:
 6. Test authentication, response limits, invalid proxy origins, timeouts, cancellation during every lifecycle phase, ambiguous creation and failed cleanup using local HTTP fixtures. Real-account verification remains separate and requires credentials entered in the application.
 
 Implement the native client and durable cleanup record first, then provider settings, tool selection, approval presentation and live acceptance. This work does not narrow the existing Daytona requirement to configuration-only support.
+
+## Durable operation journal
+
+The app now opens a separate daytona.sqlite journal in its data directory. Records store an operation name, credential scope identifier, optional sandbox ID, creation time and sanitized cleanup error. A name is committed before creation; its first sandbox association cannot later be reassigned. Acknowledging verified remote absence requires the matching credential scope. Conversation deletion does not cascade into this separate journal.
+
+A read-only native command exposes pending records to the Execution page. Reopen tests verify unknown creation outcomes and failed cleanup remain, conflicting sandbox association fails, and mismatched scopes cannot clear ownership. UI tests verify pending errors and journal-read failures are visible. The native empty-journal/page check passed. The journal is infrastructure for the upcoming lifecycle manager: automated recovery and actual cloud execution are not yet wired.
+

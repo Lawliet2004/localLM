@@ -4,6 +4,7 @@ mod commands;
 mod connectors;
 mod context;
 pub mod daytona;
+pub mod daytona_journal;
 mod execution;
 mod export;
 mod hardware;
@@ -24,6 +25,7 @@ use std::sync::Mutex;
 use tauri::Manager;
 
 pub struct AppState {
+    daytona_journal: Mutex<daytona_journal::Journal>,
     skills: tokio::sync::Mutex<skills::Skills>,
     approvals: approval::Approvals,
     store: Mutex<store::Store>,
@@ -69,6 +71,10 @@ pub fn run() {
             let store =
                 store::Store::open(&data.join("locallm.sqlite")).map_err(std::io::Error::other)?;
             app.manage(AppState {
+                daytona_journal: Mutex::new(
+                    daytona_journal::Journal::open(&data.join("daytona.sqlite"))
+                        .map_err(std::io::Error::other)?,
+                ),
                 skills: tokio::sync::Mutex::new(skills::Skills::new(data.join("skills"))),
                 approvals: approval::Approvals::default(),
                 store: Mutex::new(store),
@@ -84,6 +90,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            daytona_journal::pending_daytona_operations,
             commands::bootstrap,
             hardware::hardware_status,
             execution::get_execution_config,

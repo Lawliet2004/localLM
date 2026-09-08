@@ -192,3 +192,10 @@ Implemented a low-level Rust client for sandbox creation, inspection, deletion a
 
 Verified current SDK source at daytona/clients revision 246056df8886a020396cb46ad17c1d8b93653648 for seconds-based execution timeout, Bearer configuration and toolbox URL construction. Three targeted Rust tests passed using local TCP fixtures for authentication, creation payloads, response bounds, 404, redirects and validation. Strict Clippy passed (57 tests now exist overall). No real Daytona resources were created and no account credentials were used.
 
+
+### Durable Daytona ownership records
+
+Added a SQLite journal independent of conversation storage, initialized by native startup, plus a read-only pending-operations command and Execution-page recovery display. Records retain ambiguous creation, sandbox identity and cleanup errors across restart; reassignment and mismatched-scope acknowledgement are rejected. No cloud calls are made by this slice.
+
+Two journal tests pass (59 Rust tests now exist), all 19 frontend tests pass, strict Clippy, native build and frontend build pass. The rebuilt native app returned an empty journal and opened Execution without an alert. Lifecycle orchestration, credential settings, automatic cleanup recovery and the executable Daytona tool still remain.
+
