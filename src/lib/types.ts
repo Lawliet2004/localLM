@@ -29,7 +29,7 @@ export interface Preferences {
   runtimePath: string; modelPath: string; temperature: number; topP: number; maxTokens: number;
   systemPrompt: string;
 }
-export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null }
+export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null; gpuOffload?: { layers: number; totalLayers: number } | null }
 export interface Bootstrap { conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus }
 export interface ToolApproval { id: string; connector: string; name: string; arguments: Record<string, unknown> }
 export interface ChatEvent { messageId: string; content: string; reasoning: string; approval?: ToolApproval | null }

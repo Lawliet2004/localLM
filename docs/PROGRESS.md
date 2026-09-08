@@ -164,3 +164,10 @@ Silent current-user installation into a temporary folder succeeded. The installe
 
 This proves the packaging/desktop checklist item, not production readiness. Clean-profile setup, signing, updates, account-specific connectors, downloads, execution providers and other full acceptance requirements remain open.
 
+
+### Runtime-reported GPU layer placement
+
+Models now shows actual layer counts from the runtime startup summary alongside requested settings. Parsing is bounded to 2 MiB and rejects malformed, impossible or missing evidence rather than inferring success from configuration. The pinned runtime needs trace verbosity 4 for library startup diagnostics; debug verbosity 5 remains disabled. Stopping/exiting clears the report.
+
+Verification: 52 Rust tests, 17 frontend tests and the frontend production build passed. Strict Clippy passed after replacing a forward full scan with reverse lookup. Native scripts/offload-smoke.mjs verified 43/43, 5/43 and 0/43 for all-layer, five-layer and zero-layer requests, including visible UI checks. Saved configuration and loaded/stopped state were restored. The screenshot was inspected. This reports layer placement; per-device allocation and KV placement reporting still remain. The existing installer predates this change.
+

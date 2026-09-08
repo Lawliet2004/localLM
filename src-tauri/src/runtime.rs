@@ -15,6 +15,39 @@ pub struct RuntimeStatus {
     pub message: String,
     pub model_path: Option<String>,
     pub loaded_config: Option<RuntimeConfig>,
+    pub gpu_offload: Option<GpuOffload>,
+}
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuOffload {
+    pub layers: u32,
+    pub total_layers: u32,
+}
+fn parse_offload(log: &str) -> Option<GpuOffload> {
+    log.lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once("load_tensors: offloaded ")?;
+            let counts = rest.strip_suffix(" layers to GPU")?;
+            let (layers, total) = counts.split_once('/')?;
+            let layers = layers.parse::<u32>().ok()?;
+            let total_layers = total.parse::<u32>().ok()?;
+            (total_layers > 0 && total_layers <= 100_000 && layers <= total_layers).then_some(
+                GpuOffload {
+                    layers,
+                    total_layers,
+                },
+            )
+        })
+        .next_back()
+}
+fn read_offload(path: &Path) -> Option<GpuOffload> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(2 * 1024 * 1024)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    parse_offload(&String::from_utf8_lossy(&bytes))
 }
 impl Default for RuntimeStatus {
     fn default() -> Self {
@@ -23,6 +56,7 @@ impl Default for RuntimeStatus {
             message: "No model loaded".into(),
             model_path: None,
             loaded_config: None,
+            gpu_offload: None,
         }
     }
 }
@@ -59,6 +93,7 @@ impl Runtime {
                         ),
                         model_path: None,
                         loaded_config: None,
+                        gpu_offload: None,
                     };
                 }
                 Err(error) => {
@@ -126,6 +161,8 @@ impl Runtime {
                 "--no-agent",
                 "--fit",
                 "off",
+                "--log-verbosity",
+                "4",
             ])
             .env("LLAMA_API_KEY", &self.api_key)
             .stdin(Stdio::null())
@@ -144,6 +181,7 @@ impl Runtime {
             message: "Loading model into memory".into(),
             model_path: Some(model.to_string_lossy().into_owned()),
             loaded_config: None,
+            gpu_offload: None,
         };
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -167,6 +205,7 @@ impl Runtime {
                         if health.status().is_success() {
                             self.context_length = config.context_length;
                             self.status.loaded_config = Some(config.clone());
+                            self.status.gpu_offload = read_offload(&self.log_path);
                             self.status.phase = "ready".into();
                             self.status.message = "Model ready".into();
                             return Ok(self.status.clone());
@@ -197,6 +236,39 @@ fn validate_model(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn offload_reporting_requires_valid_runtime_evidence() {
+        assert_eq!(
+            parse_offload("load_tensors: offloaded 25/25 layers to GPU\n"),
+            Some(GpuOffload {
+                layers: 25,
+                total_layers: 25
+            })
+        );
+        assert_eq!(
+            parse_offload("0.01 I load_tensors: offloaded 0/25 layers to GPU\r\n"),
+            Some(GpuOffload {
+                layers: 0,
+                total_layers: 25
+            })
+        );
+        for text in [
+            "offloaded 25/25 layers to GPU",
+            "load_tensors: offloaded 26/25 layers to GPU",
+            "load_tensors: offloaded -1/25 layers to GPU",
+            "load_tensors: offloaded 0/0 layers to GPU",
+            "load_tensors: offloaded 25/25 layers to GPU extra",
+            "load_tensors: offloaded 9999999999999999/25 layers to GPU",
+        ] {
+            assert_eq!(parse_offload(text), None);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("log");
+        let mut content = vec![b'x'; 2 * 1024 * 1024];
+        content.extend_from_slice(b"\nload_tensors: offloaded 1/25 layers to GPU\n");
+        std::fs::write(&file, content).unwrap();
+        assert_eq!(read_offload(&file), None);
+    }
     #[test]
     fn rejects_truncated_or_non_gguf_models() {
         let directory = tempfile::tempdir().unwrap();
