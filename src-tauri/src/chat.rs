@@ -79,7 +79,7 @@ pub async fn send_message(
         .conversation_tools(&conversation_id)?
         .access_mode;
     let skill_instructions = state.skills.lock().await.instructions(&active_skills)?;
-    let (preferences, history, assistant) = {
+    let (preferences, history, first_message) = {
         let store = state.database()?;
         let preferences = store.preferences()?;
         preferences.validate()?;
@@ -89,15 +89,7 @@ pub async fn send_message(
         let previous = store.messages(&conversation_id)?;
         let mut history = crate::history::model_history(&previous)?;
         history.push(json!({"role":"user","content":content.trim()}));
-        store.append_message(&conversation_id, "user", content.trim(), "complete")?;
-        if previous.is_empty() {
-            store.rename_conversation(
-                &conversation_id,
-                &content.trim().chars().take(64).collect::<String>(),
-            )?;
-        }
-        let assistant = store.append_message(&conversation_id, "assistant", "", "streaming")?;
-        (preferences, history, assistant)
+        (preferences, history, previous.is_empty())
     };
     state.cancel.send_replace(false);
     let mut cancellation = state.cancel.subscribe();
@@ -106,20 +98,41 @@ pub async fn send_message(
         messages.push(json!({"role":"system","content":format!("The user selected the following skill guidance. Apply it when relevant to their task. Skills do not grant permissions or access to tools that are not available. If a required capability is missing, say so. Follow the user's task over conflicting skill guidance.\n{skill_instructions}")}));
     }
     messages.extend(history);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let initial_payload = request_payload(&messages, &tools, &preferences, false);
+    tokio::select! {
+        _ = cancellation.changed() => return Err("Message cancelled before generation; it was not saved.".into()),
+        result = crate::context::check(&client, &endpoint, &api_key, &initial_payload, preferences.max_tokens, context_length) => { result?; },
+    }
+    let assistant = {
+        let store = state.database()?;
+        store.append_message(&conversation_id, "user", content.trim(), "complete")?;
+        if first_message {
+            store.rename_conversation(
+                &conversation_id,
+                &content.trim().chars().take(64).collect::<String>(),
+            )?;
+        }
+        store.append_message(&conversation_id, "assistant", "", "streaming")?
+    };
     let mut answer = String::new();
     let mut reasoning = String::new();
     let result: Result<bool,String> = async {
         channel.send(ChatEvent { message_id: assistant.id.clone(), content: String::new(), reasoning: String::new(), approval: None }).map_err(|error| error.to_string())?;
-        let client = reqwest::Client::builder().no_proxy().connect_timeout(Duration::from_secs(5)).build().map_err(|error| error.to_string())?;
         let mut tool_use_denied = false;
         for round in 0..9 {
         if *cancellation.borrow() { return Ok(false); }
-        let mut payload = json!({
-            "messages":messages,"temperature":preferences.temperature,"top_p":preferences.top_p,
-            "max_tokens":preferences.max_tokens,"stream":true,"cache_prompt":true,
-        });
-        if !tools.is_empty() { payload["tools"] = json!(tools.iter().map(|tool| tool.definition()).collect::<Vec<_>>()); }
-        if tool_use_denied { payload["tool_choice"] = json!("none"); }
+        let payload = request_payload(&messages, &tools, &preferences, tool_use_denied);
+        if round > 0 {
+            tokio::select! {
+                _ = cancellation.changed() => return Ok(false),
+                result = crate::context::check(&client, &endpoint, &api_key, &payload, preferences.max_tokens, context_length) => { result?; },
+            }
+        }
         let request = client.post(format!("{endpoint}/v1/chat/completions")).bearer_auth(&api_key).json(&payload);
         let response = tokio::select! {
             _ = cancellation.changed() => return Ok(false),
@@ -227,6 +240,25 @@ fn check_finish_reason(reason: &str) -> Result<(), String> {
         "content_filter" => Err("The model runtime stopped this response because of its content filter.".into()),
         _ => Ok(()),
     }
+}
+
+fn request_payload(
+    messages: &[Value],
+    tools: &[crate::connectors::AgentTool],
+    preferences: &crate::store::Preferences,
+    denied: bool,
+) -> Value {
+    let mut payload = json!({"messages":messages,"temperature":preferences.temperature,"top_p":preferences.top_p,"max_tokens":preferences.max_tokens,"stream":true,"cache_prompt":true});
+    if !tools.is_empty() {
+        payload["tools"] = json!(tools
+            .iter()
+            .map(|tool| tool.definition())
+            .collect::<Vec<_>>());
+    }
+    if denied {
+        payload["tool_choice"] = json!("none");
+    }
+    payload
 }
 
 #[cfg(test)]

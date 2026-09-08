@@ -116,3 +116,13 @@ During verification, one 512-token run exhausted its budget in reasoning before 
 Generation now checks the runtime's finish reason before accepting a response or executing assembled tool calls. A `length` finish produces an actionable response-limit error; partial text/reasoning remain saved, and unfinished tool calls are not executed. Runtime content-filter termination is also reported. Terminal generation state and its error text are saved together. SQLite migration adds a nullable message error column to existing databases; the UI renders the saved error after reopening, and JSON/Markdown exports include it.
 
 Verification: 45 Rust tests and strict Clippy pass; 14 frontend tests, production build and both browser checks pass. `scripts/response-limit-smoke.mjs` used the real loaded MiniCPM runtime with a one-token response limit, verified error status and identical persisted error text, reloaded the UI and confirmed the error remained visible. Original preferences were restored afterward. Database reopen tests verify partial content, reasoning and error text survive. Context-token budgeting and proactive overflow handling remain open.
+
+### Tokenizer-based context checks
+
+Added authenticated preflight using the pinned runtime's `/v1/chat/completions/input_tokens` endpoint. The exact generation payload is counted before saving a new user message; prompt tokens plus the requested response must fit the loaded context. Each subsequent tool round is counted again. Oversized initial sends restore the draft without persisting messages. Overflow after a tool preserves completed audits and saves a generation error. No history is silently discarded. Count responses and request time are bounded; invalid/unsupported count responses fail visibly instead of using a character approximation.
+
+Verification: 47 Rust tests, strict Clippy, 14 frontend tests, production build and both browser checks pass. Native `scripts/context-smoke.mjs` rejected a 12,038-token prompt plus 2,048 response tokens against an 8,192-token loaded context, confirmed zero saved messages and restored draft, then successfully sent a short message. An approved 90,000-byte workspace read subsequently triggered a context error before the next model round; its successful result and audit remained saved. The corrected native test passed twice. HTTP fixtures verified authentication, exact Unicode/tool payload forwarding and rejection of negative, missing or oversized count responses.
+
+`docs/CONTEXT.md` records behavior and pinned upstream source references. Automatic compaction, live composer usage, context selection and full release acceptance remain open.
+
+Live DeepWiki Auto/denial and Full-access call regressions also passed with token preflight enabled.

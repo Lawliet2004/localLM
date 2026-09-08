@@ -1,0 +1,9 @@
+# Context-window checks
+
+Before a new message is saved, LocalLM asks the loaded llama.cpp runtime to count the complete generation payload. It includes the chat template, system and active skill instructions, selected tool definitions, conversation history, and historical tool exchanges. The app reserves the configured maximum response tokens. If prompt plus response exceeds the loaded context, it rejects the send and restores the draft with a token-count explanation.
+
+After tool results arrive, the next model round is counted again. If a result makes the context too large, the turn ends with a saved error; already completed tool actions and their audit records remain available. No history is silently removed or summarized. Automatic compaction, live composer token usage and selective context removal are not yet implemented.
+
+Counting is local and authenticated, using `/v1/chat/completions/input_tokens`. The request has a 15-second timeout; the response is limited to 4 KiB. Counting failures are reported instead of substituting a character estimate. Cancellation can interrupt the check. A runtime without this endpoint must be replaced with the supported pinned runtime.
+
+The implementation is based on llama.cpp commit `7d701b592`: [route registration](https://github.com/ggml-org/llama.cpp/blob/7d701b592/tools/server/server.cpp) and [template parsing/token counting](https://github.com/ggml-org/llama.cpp/blob/7d701b592/tools/server/server-context.cpp). The count endpoint uses the same chat-parameter parser and tokenization path used for the formatted prompt.

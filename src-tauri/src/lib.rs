@@ -2,6 +2,7 @@ mod approval;
 mod chat;
 mod commands;
 mod connectors;
+mod context;
 mod execution;
 mod export;
 mod hardware;
