@@ -16,6 +16,13 @@ describe('chat action reporting and submission', () => {
     rerender(<Chat {...props} messages={[{...message,content:JSON.stringify({request:{connector:'Legacy',name:'lookup'},result:{}})}]} />);
     expect(screen.getByText('Legacy · lookup')).toBeInTheDocument();
   });
+  it('shows a reviewable unified diff for workspace edits', () => {
+    const message: Message = { id:'edit', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'note.txt'},decision:'allowed'},result:{replacements:1,diff:'--- a/note.txt\n+++ b/note.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n'}}) };
+    render(<Chat {...props} messages={[message]} />);
+    fireEvent.click(screen.getByText('Workspace · edit_file'));
+    expect(screen.getByText('Diff')).toBeVisible();
+    expect(screen.getByText(/--- a\/note\.txt/, { exact: false })).toBeVisible();
+  });
   it('retries the failed prompt as a new send without changing the draft', async () => {
     const onSend = vi.fn(async () => {});
     const messages: Message[] = [

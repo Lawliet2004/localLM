@@ -88,6 +88,58 @@ fn is_device(part: &str) -> bool {
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.as_bytes()[3].is_ascii_digit())
 }
+fn unified_diff(path: &str, before: &str, after: &str) -> String {
+    // A small reviewable hunk around the single unique replacement site.
+    // The edit backend already guarantees exactly one match.
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+    let mut start = 0;
+    while start < before_lines.len()
+        && start < after_lines.len()
+        && before_lines[start] == after_lines[start]
+    {
+        start += 1;
+    }
+    let mut end_before = before_lines.len();
+    let mut end_after = after_lines.len();
+    while end_before > start
+        && end_after > start
+        && before_lines[end_before - 1] == after_lines[end_after - 1]
+    {
+        end_before -= 1;
+        end_after -= 1;
+    }
+    let context = 3;
+    let show_start = start.saturating_sub(context);
+    let show_end_before = (end_before + context).min(before_lines.len());
+    let show_end_after = (end_after + context).min(after_lines.len());
+    let mut diff = format!("--- a/{path}\n+++ b/{path}\n");
+    diff.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        show_start + 1,
+        show_end_before - show_start,
+        show_start + 1,
+        show_end_after - show_start
+    ));
+    for (index, line) in before_lines[show_start..start].iter().enumerate() {
+        let _ = index;
+        diff.push_str(&format!(" {line}\n"));
+    }
+    for line in &before_lines[start..end_before] {
+        diff.push_str(&format!("-{line}\n"));
+    }
+    for line in &after_lines[start..end_after] {
+        diff.push_str(&format!("+{line}\n"));
+    }
+    for line in &after_lines[end_after..show_end_after] {
+        diff.push_str(&format!(" {line}\n"));
+    }
+    if diff.len() > 16_384 {
+        diff.truncate(16_384);
+        diff.push_str("\n…diff truncated…\n");
+    }
+    diff
+}
 impl Workspace {
     pub fn open(path: &str) -> Result<Self, String> {
         if path.is_empty() || !Path::new(path).is_absolute() {
@@ -257,7 +309,7 @@ impl Workspace {
                             format!("File write failed; the file may be incomplete: {error}")
                         })?;
                 }
-                Ok(json!({"path":request.path,"replacements":1,"bytesWritten":updated.len(),"sha256":format!("{:x}",Sha256::digest(updated.as_bytes()))}))
+                Ok(json!({"path":request.path,"replacements":1,"bytesWritten":updated.len(),"sha256":format!("{:x}",Sha256::digest(updated.as_bytes())),"diff":unified_diff(&request.path,&text,&updated)}))
             }
             _ => Err("Unknown workspace tool.".into()),
         }
@@ -268,7 +320,7 @@ impl Workspace {
             ("read_file","Read UTF-8 workspace text with line numbers and SHA-256. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":500}}),vec!["path"]),
             ("create_file","Create a new UTF-8 file inside the workspace. Existing files are never overwritten. Parent directory must exist.",json!({"path":{"type":"string"},"content":{"type":"string"}}),vec!["path","content"]),
             ("create_directory","Create one directory inside the workspace. Parent directory must exist.",json!({"path":{"type":"string"}}),vec!["path"]),
-            ("edit_file","Replace one unique text match in an existing UTF-8 file. Requires the SHA-256 from a fresh read_file; fails when the file changed, the match is missing, or it occurs more than once. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"expected_sha256":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}}),vec!["path","expected_sha256","old_text","new_text"]),
+            ("edit_file","Replace one unique text match in an existing UTF-8 file. Requires the SHA-256 from a fresh read_file; fails when the file changed, the match is missing, or it occurs more than once. Returns a unified diff of the change for review. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"expected_sha256":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}}),vec!["path","expected_sha256","old_text","new_text"]),
         ];
         definitions.into_iter().map(|(name,description,properties,required)| crate::connectors::AgentTool::workspace(self.clone(),crate::connectors::ToolView { name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}) })).collect()
     }
@@ -375,6 +427,9 @@ mod tests {
             .call("edit_file", json!({"path":"note.txt","expected_sha256":hash,"old_text":"alpha\nbeta\ngamma","new_text":"alpha\nBETA\ngamma"}))
             .unwrap();
         assert_eq!(edited["replacements"], 1);
+        let diff = edited["diff"].as_str().unwrap();
+        assert!(diff.contains("--- a/note.txt") && diff.contains("+++ b/note.txt"));
+        assert!(diff.contains("-beta") && diff.contains("+BETA"));
         let reread = workspace.call("read_file", json!({"path":"note.txt"})).unwrap();
         assert!(reread["content"].as_str().unwrap().contains("BETA"));
         assert_eq!(reread["sha256"], edited["sha256"]);

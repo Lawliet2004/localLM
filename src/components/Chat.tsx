@@ -19,9 +19,12 @@ function ToolMessage({ message }: { message: Message }) {
   const connector = typeof request.connector === 'string' ? request.connector : 'Connector';
   const localName = typeof request.localServerName === 'string' && request.localServerName ? request.localServerName : undefined;
   const result = record.result;
-  const failed = message.status === 'error' || (result !== null && typeof result === 'object' && 'isError' in result && result.isError === true);
+  const resultRecord = result !== null && typeof result === 'object' && !Array.isArray(result) ? result as Record<string, unknown> : null;
+  const diff = resultRecord && typeof resultRecord.diff === 'string' ? resultRecord.diff as string : null;
+  const displayResult = resultRecord ? Object.fromEntries(Object.entries(resultRecord).filter(([key]) => key !== 'diff')) : (result ?? message.content);
+  const failed = message.status === 'error' || (resultRecord !== null && resultRecord.isError === true);
   const status = message.status === 'interrupted' ? 'Stopped · outcome unknown' : request.decision === 'denied' ? 'Denied' : message.status === 'streaming' ? 'Running…' : failed ? 'Failed' : 'Finished';
-  return <article className="message message-tool" aria-label="tool message"><details className="tool-record"><summary><Terminal size={14} /><strong>{localName ?? connector} · {name}</strong><span>{status}</span></summary>{localName && <p>Local server ID: <code>{connector}</code></p>}{typeof request.authorization === 'string' && <p>Authorization: {request.authorization}</p>}<h4>Arguments</h4><pre>{JSON.stringify(request.arguments ?? {}, null, 2)}</pre><h4>Result</h4><pre>{JSON.stringify(record.result ?? message.content, null, 2)}</pre></details></article>;
+  return <article className="message message-tool" aria-label="tool message"><details className="tool-record"><summary><Terminal size={14} /><strong>{localName ?? connector} · {name}</strong><span>{status}</span></summary>{localName && <p>Local server ID: <code>{connector}</code></p>}{typeof request.authorization === 'string' && <p>Authorization: {request.authorization}</p>}{request.connector === 'Workspace' && request.name === 'edit_file' && <p>Review the unified diff below before continuing. Re-read the file when the hash no longer matches.</p>}<h4>Arguments</h4><pre>{JSON.stringify(request.arguments ?? {}, null, 2)}</pre><h4>Result</h4><pre>{JSON.stringify(displayResult, null, 2)}</pre>{diff && <><h4>Diff</h4><pre className="tool-diff">{diff}</pre></>}</details></article>;
 }
 function MessageBody({ message }: { message: Message }) {
   const [copied, setCopied] = useState(false);

@@ -87,7 +87,8 @@ All 13 packages (`algorithmic-art`, `skill-creator`, `mcp-builder`,
 | --- | --- | --- |
 | list/read/create files + directories, traversal/junction protection, permission enforcement, audits | verified | `docs/PROGRESS.md` (workspace + permission slices), `workspace::` tests |
 | Conflict-checked `edit_file` (fresh SHA-256, unique match, reliable write, durable audit) | verified | `scripts/workspace-edit-smoke.mjs` → `workspace-edit-smoke.json` (2026-09-09), `workspace::tests::edits_require_a_fresh_read_and_one_unique_match` |
-| Reviewable diffs, file browsing UI, artifact previews/opening, untrusted HTML/script isolation | missing | No diff view, no artifact viewer, no preview sandbox |
+| Reviewable unified diffs in edit results and chat audits | verified | `edit_file` returns a bounded `diff` shown in its own audit section; saved record verified natively (`--- a/note.txt` retained after reload) |
+| Reviewable diffs, file browsing UI, artifact previews/opening, untrusted HTML/script isolation | missing | No file browser, artifact viewer, or preview sandbox beyond the edit diff |
 
 ## 7. Execution (local + Daytona)
 
