@@ -12,11 +12,27 @@ pub struct LocalSession {
 }
 
 impl LocalSession {
-    pub async fn close(mut self) {
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.service.cancel()).await;
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await;
+    pub async fn close(mut self) -> ShutdownReport {
+        let protocol = tokio::time::timeout(Duration::from_secs(3), self.service.cancel())
+            .await
+            .map(|result| result.is_ok())
+            .unwrap_or(false);
+        let signal = self.child.start_kill().is_ok();
+        let reaped = tokio::time::timeout(Duration::from_secs(3), self.child.wait())
+            .await
+            .map(|result| result.is_ok())
+            .unwrap_or(false);
+        ShutdownReport { protocol, signal, reaped }
     }
+}
+
+/// What each shutdown stage accomplished. A failed reap keeps the process
+/// under KillOnDrop/job ownership and surfaces a retryable disconnect error.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShutdownReport {
+    pub protocol: bool,
+    pub signal: bool,
+    pub reaped: bool,
 }
 
 pub async fn connect(config: &LocalServer) -> Result<LocalSession, String> {
@@ -173,7 +189,10 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
                         matches!(task.await.unwrap(), Err(error) if error.contains("timed out"))
                     );
                 }
-                "close" => task.await.unwrap().unwrap().close().await,
+                "close" => {
+                    let report = task.await.unwrap().unwrap().close().await;
+                    assert!(report.reaped, "close did not reap the fixture tree");
+                }
                 _ => drop(task.await.unwrap().unwrap()),
             }
             for handle in handles {
@@ -218,7 +237,8 @@ readline.createInterface({input:process.stdin}).on('line', line => {
             .unwrap()
             .unwrap();
         assert!(result.tools.is_empty());
-        session.close().await;
+        let report = session.close().await;
+        assert!(report.reaped, "fixture process was not reaped");
     }
     #[tokio::test]
     async fn invalid_executable_returns_no_configuration_secrets() {

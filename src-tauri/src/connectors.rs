@@ -74,8 +74,17 @@ impl ConnectorSession {
                 .map(|_| ())
                 .map_err(|_| "Could not close the connector session cleanly.".into()),
             Self::Local(session) => {
-                session.close().await;
-                Ok(())
+                let report = session.close().await;
+                if report.reaped {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "The local server process did not exit within 3 seconds (protocol close {}, kill signal {}, process reaped {}). Saved configuration is unchanged; try Disconnect again.",
+                        stage(report.protocol),
+                        stage(report.signal),
+                        stage(report.reaped),
+                    ))
+                }
             }
         }
     }
@@ -101,6 +110,13 @@ fn local_view(server: &crate::local_mcp_config::LocalServer) -> ConnectorView {
         connected: false,
         has_credential: false,
         tools: Vec::new(),
+    }
+}
+fn stage(value: bool) -> &'static str {
+    if value {
+        "ok"
+    } else {
+        "failed"
     }
 }
 pub struct McpHub {
@@ -560,11 +576,10 @@ impl McpHub {
             preset(id)?;
         }
         if let Some(connection) = self.connections.remove(id) {
-            connection
-                .service
-                .cancel()
-                .await
-                .map_err(|_| "Could not close the connector session cleanly.")?;
+            // A failed local shutdown keeps the saved configuration but
+            // releases the session lock so the user can retry, inspect, or
+            // remove the server. Cleanup never deletes saved configuration.
+            connection.service.cancel().await?;
         }
         if forget && !local {
             self.vault.clear(&format!("token-{id}"))?;
