@@ -3,6 +3,12 @@ use crate::local_mcp_config::LocalServer;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use rmcp::{service::RunningService, RoleClient, ServiceExt};
 use std::{process::Stdio, time::Duration};
+use tokio::io::AsyncRead;
+
+/// Maximum bytes accepted for one newline-delimited stdio frame (including
+/// the delimiter). The pinned SDK transport reads unbounded lines, so bound
+/// frames here before handing the pipe to the SDK service.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct LocalSession {
     pub service: RunningService<RoleClient, ()>,
@@ -101,6 +107,7 @@ async fn connect_with_timeout(
         .stdout()
         .take()
         .ok_or("Local connector output pipe unavailable.")?;
+    let output = FramedStdout::new(output);
     let service = tokio::time::timeout(handshake_timeout, ().serve((output, input)))
         .await
         .map_err(|_| "Local connector handshake timed out.")?
@@ -110,9 +117,170 @@ async fn connect_with_timeout(
     Ok(LocalSession { service, child })
 }
 
+/// Newline-delimited stdout wrapper enforcing [`MAX_FRAME_BYTES`] per frame.
+/// A frame that exceeds the bound fails the read, which the SDK surfaces as a
+/// closed/failed transport instead of buffering it without limit. Because the
+/// caller reads through 8 KiB chunks, a frame is rejected once more than the
+/// bound has been observed without a newline, even if the newline has not been
+/// seen yet.
+struct FramedStdout<R> {
+    inner: R,
+    pending: Vec<u8>,
+    observed: usize,
+    failed: bool,
+}
+
+impl<R> FramedStdout<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, pending: Vec::new(), observed: 0, failed: false }
+    }
+    fn fail(&mut self) -> std::io::Error {
+        self.pending.clear();
+        self.failed = true;
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Local connector frame exceeds 4 MiB.",
+        )
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for FramedStdout<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.failed {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Local connector frame exceeds 4 MiB.",
+            )));
+        }
+        if !self.pending.is_empty() {
+            let take = self.pending.len().min(buffer.remaining());
+            buffer.put_slice(&self.pending.drain(..take).collect::<Vec<_>>());
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let mut chunk = vec![0u8; buffer.remaining().clamp(1, 8192)];
+        let mut read = tokio::io::ReadBuf::new(&mut chunk);
+        match std::pin::Pin::new(&mut self.inner).poll_read(context, &mut read) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+            std::task::Poll::Ready(Ok(())) => {
+                let bytes = read.filled();
+                if bytes.is_empty() {
+                    // EOF with a partial frame still counts toward the bound.
+                    if self.observed > MAX_FRAME_BYTES {
+                        return std::task::Poll::Ready(Err(self.fail()));
+                    }
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                // Track bytes seen since the last newline so a frame spread
+                // across many small reads is still bounded before its
+                // delimiter arrives.
+                let mut newline_end = None;
+                for (index, byte) in bytes.iter().enumerate() {
+                    self.observed += 1;
+                    if *byte == b'\n' {
+                        newline_end = Some(index + 1);
+                        break;
+                    }
+                    if self.observed > MAX_FRAME_BYTES {
+                        return std::task::Poll::Ready(Err(self.fail()));
+                    }
+                }
+                let (frame, rest) = match newline_end {
+                    Some(end) => bytes.split_at(end),
+                    None => (bytes, &[][..]),
+                };
+                if newline_end.is_none() {
+                    self.pending.extend_from_slice(frame);
+                    context.waker().wake_by_ref();
+                    return std::task::Poll::Pending;
+                }
+                // A complete frame resets the bound for the next line; any
+                // bytes after the delimiter start the next frame's count.
+                self.observed = rest.len();
+                let take = frame.len().min(buffer.remaining());
+                buffer.put_slice(&frame[..take]);
+                self.pending.extend_from_slice(&frame[take..]);
+                self.pending.extend_from_slice(rest);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    #[tokio::test]
+    async fn oversized_frame_fails_connection_instead_of_buffering() {
+        async fn read_all(reader: FramedStdout<&[u8]>) -> std::io::Result<Vec<u8>> {
+            let mut reader = reader;
+            let mut output = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let count = reader.read(&mut chunk).await?;
+                if count == 0 {
+                    break;
+                }
+                output.extend_from_slice(&chunk[..count]);
+            }
+            Ok(output)
+        }
+        async fn read_small(reader: FramedStdout<&[u8]>) -> std::io::Result<Vec<u8>> {
+            let mut reader = reader;
+            let mut output = Vec::new();
+            // Small reads force an oversized frame across many chunks.
+            let mut chunk = [0u8; 64];
+            loop {
+                let count = reader.read(&mut chunk).await?;
+                if count == 0 {
+                    break;
+                }
+                output.extend_from_slice(&chunk[..count]);
+                if output.len() > MAX_FRAME_BYTES + 4096 {
+                    panic!("oversized frame was not bounded");
+                }
+            }
+            Ok(output)
+        }
+        assert_eq!(
+            read_all(FramedStdout::new(&b"{\"a\":1}\n{\"b\":2}\n"[..])).await.unwrap(),
+            b"{\"a\":1}\n{\"b\":2}\n",
+        );
+        let mut oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+        oversized.push(b'\n');
+        assert!(read_small(FramedStdout::new(&oversized[..])).await.is_err());
+        // Unterminated accumulation cannot grow without limit either.
+        let unterminated = vec![b'y'; MAX_FRAME_BYTES + 16];
+        assert!(read_small(FramedStdout::new(&unterminated[..])).await.is_err());
+    }
+    #[tokio::test]
+    async fn oversized_stdio_frame_fails_hub_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("flood.cjs");
+        std::fs::write(
+            &script,
+            "process.stdout.write('x'.repeat(4 * 1024 * 1024 + 8) + '\\n'); setInterval(()=>{},1000);\n",
+        )
+        .unwrap();
+        let hub_config = LocalServer {
+            id: format!("local-{}", uuid::Uuid::new_v4()),
+            name: "flood".into(),
+            executable: crate::execution::ExecutionConfig::default().node_path,
+            arguments: vec![script.to_string_lossy().into_owned()],
+            working_directory: temp.path().to_string_lossy().into_owned(),
+            environment: Default::default(),
+        };
+        let error = match connect_with_timeout(&hub_config, Duration::from_secs(15)).await {
+            Ok(_) => panic!("oversized frame unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("handshake"), "unexpected error: {error}");
+    }
     #[cfg(windows)]
     #[tokio::test]
     async fn process_tree_exits_after_close_drop_and_handshake_cancellation() {

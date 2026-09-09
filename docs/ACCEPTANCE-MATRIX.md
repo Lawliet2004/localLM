@@ -39,7 +39,7 @@ insufficiently verified), **missing** (not implemented), **external**
 | Cancellation, tool failure, server exit, disconnect durable outcomes | verified | `test-results/local-mcp-failure-smoke.json` (2026-09-09) |
 | Malformed/truncated input, unexpected exit, handshake/discovery failure, closed-transport selection, edit/disconnect race | verified | `connectors::tests::malformed_protocol_input_and_unexpected_exit_are_reported`, session snapshot changes |
 | Structured arguments/environment, browsing, focus, validation, cancellation, duplicate names, pending states, secret visibility, stable IDs | verified | `test-results/local-connector-smoke.json` (`structuredControls`, `secretHiddenByDefault`), `LocalConnectorForm.test.tsx` |
-| Individual transport-frame size bound | partial | 512-tool / 2 MiB accumulation bounds after page deserialization; no per-frame cap |
+| Individual transport-frame size bound | partial | Local stdio frames capped at 4 MiB before SDK deserialization (`local_mcp_process::` frame tests); 512-tool/2 MiB accumulation still applies after page deserialization; remote HTTP framing unchanged |
 | Shutdown observability | partial | `close()` reports protocol/signal/reap stages and failed reaps return stage detail; full-suite + native disconnect rerun deferred by disk pressure |
 | Reconnect UX beyond disconnect-then-connect | partial | Covered by explicit disconnect/connect; no dedicated reconnect flow |
 
