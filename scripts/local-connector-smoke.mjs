@@ -7,11 +7,11 @@ const name = `Local fixture ${Date.now()}`;
 const script = join(directory, 'server.cjs');
 writeFileSync(script, `
 require('node:readline').createInterface({input:process.stdin}).on('line', line => {
- const r = JSON.parse(line); if (r.id === undefined) return;
- const result = r.method === 'initialize'
- ? {protocolVersion:r.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}
- : {tools:[{name:'fixture_echo',description:'Return fixture text',inputSchema:{type:'object'}}]};
- process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n');
+  const r = JSON.parse(line); if (r.id === undefined) return;
+  const result = r.method === 'initialize'
+  ? {protocolVersion:r.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}
+  : {tools:[{name:'fixture_echo',description:'Return fixture text',inputSchema:{type:'object'}}]};
+  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n');
 });`);
 const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
 let page;
@@ -27,13 +27,19 @@ try {
   await page.getByLabel('Name', {exact:true}).fill(name);
   await page.getByLabel('Executable path', {exact:true}).fill(process.execPath);
   await page.getByLabel('Working directory', {exact:true}).fill(directory);
-  await page.getByLabel('Arguments (JSON array)', {exact:true}).fill(JSON.stringify([script]));
-  await page.getByLabel('Environment variables (JSON object)', {exact:true}).fill(JSON.stringify({FIXTURE_KEY:'test-value'}));
+  await page.getByRole('button', {name:'Add argument',exact:true}).click();
+  await page.getByLabel('Argument 1', {exact:true}).fill(script);
+  await page.getByRole('button', {name:'Add variable',exact:true}).click();
+  await page.getByLabel('Environment name 1', {exact:true}).fill('FIXTURE_KEY');
+  await page.getByLabel('Environment value 1', {exact:true}).fill('test-value');
+  await expect(page.getByLabel('Environment value 1', {exact:true})).toHaveAttribute('type', 'password');
+  await page.getByRole('button', {name:'Show environment value 1',exact:true}).click();
+  await expect(page.getByLabel('Environment value 1', {exact:true})).toHaveAttribute('type', 'text');
   await page.getByRole('button', {name:'Save local server',exact:true}).click();
   await expect(page.getByRole('status')).toContainText('Saved.');
   const saved = (await invoke('list_connectors')).find(item => item.description === name);
   expect(saved.connected).toBe(false); id = saved.id;
-  await expect(page.getByLabel('Environment variables (JSON object)', {exact:true})).toHaveValue('{}');
+  await expect(page.getByLabel('Name', {exact:true})).toHaveValue('');
   const card = page.locator('details.catalog-item').filter({has:page.locator('strong', {hasText:name})});
   await card.locator(':scope > summary').click();
   await card.getByRole('button', {name:'Connect',exact:true}).click();
@@ -44,10 +50,11 @@ try {
   await expect(card.getByText('Not connected', {exact:true})).toBeVisible();
   await card.getByRole('button', {name:'Edit configuration',exact:true}).click();
   await expect(page.getByLabel('Name', {exact:true})).toHaveValue(name);
-  await expect(page.getByLabel('Arguments (JSON array)', {exact:true})).toHaveValue(JSON.stringify([script]));
-  await expect(page.getByLabel('Environment variables (JSON object)', {exact:true})).toHaveValue(JSON.stringify({FIXTURE_KEY:'test-value'}));
+  await expect(page.getByLabel('Argument 1', {exact:true})).toHaveValue(script);
+  await expect(page.getByLabel('Environment name 1', {exact:true})).toHaveValue('FIXTURE_KEY');
+  await expect(page.getByLabel('Environment value 1', {exact:true})).toHaveValue('test-value');
   await page.getByLabel('Name', {exact:true}).fill('Unsaved change');
-  await page.getByLabel('Environment variables (JSON object)', {exact:true}).fill('{}');
+  await page.getByRole('button', {name:'Remove environment variable 1',exact:true}).click();
   await page.getByRole('button', {name:'Cancel editing',exact:true}).click();
   const afterCancel = await invoke('read_local_connector', {id});
   expect(afterCancel.name).toBe(name);
@@ -61,7 +68,7 @@ try {
   expect(edited.environment).toEqual({FIXTURE_KEY:'test-value'});
   expect(edited.executable).toBe(process.execPath);
   expect(edited.workingDirectory).toBe(directory);
-  await expect(page.getByLabel('Environment variables (JSON object)', {exact:true})).toHaveValue('{}');
+  await expect(page.getByLabel('Name', {exact:true})).toHaveValue('');
   const renamed = page.locator('details.catalog-item').filter({has:page.locator('strong', {hasText:`${name} renamed`})});
   await renamed.getByRole('button', {name:'Connect',exact:true}).click();
   await expect(renamed.getByText('1 tools', {exact:true})).toBeVisible();
@@ -69,7 +76,7 @@ try {
   await renamed.getByRole('button', {name:'Remove server',exact:true}).click();
   await expect(renamed).toHaveCount(0);
   expect((await invoke('list_local_connectors')).some(item => item.id === id)).toBe(false);
-  writeFileSync('test-results/local-connector-smoke.json', JSON.stringify({testedAt:new Date().toISOString(),savedWithoutLaunching:true,discoveredTool:'fixture_echo',cancelPreservedConfiguration:true,editedSameId:true,connectionSettingsPreserved:true,reconnectedAfterEdit:true,disconnectedAndRemoved:true},null,2));
+  writeFileSync('test-results/local-connector-smoke.json', JSON.stringify({testedAt:new Date().toISOString(),savedWithoutLaunching:true,discoveredTool:'fixture_echo',cancelPreservedConfiguration:true,editedSameId:true,connectionSettingsPreserved:true,reconnectedAfterEdit:true,disconnectedAndRemoved:true,structuredControls:true,secretHiddenByDefault:true},null,2));
 } finally {
   if (page) {
     // Recover only this fixture if an assertion failed before its ID was read.

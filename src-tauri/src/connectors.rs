@@ -65,15 +65,6 @@ enum ConnectorSession {
     Remote(RunningService<RoleClient, ()>),
     Local(crate::local_mcp_process::LocalSession),
 }
-impl std::ops::Deref for ConnectorSession {
-    type Target = RunningService<RoleClient, ()>;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Remote(service) => service,
-            Self::Local(session) => &session.service,
-        }
-    }
-}
 impl ConnectorSession {
     async fn cancel(self) -> Result<(), String> {
         match self {
@@ -86,6 +77,18 @@ impl ConnectorSession {
                 session.close().await;
                 Ok(())
             }
+        }
+    }
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Remote(service) => service.is_closed(),
+            Self::Local(session) => session.service.is_closed(),
+        }
+    }
+    fn peer(&self) -> rmcp::Peer<RoleClient> {
+        match self {
+            Self::Remote(service) => service.peer().clone(),
+            Self::Local(session) => session.service.peer().clone(),
         }
     }
 }
@@ -301,7 +304,9 @@ impl McpHub {
             let connection = self
                 .connections
                 .get(id)
-                .filter(|value| !value.service.is_closed())
+                .filter(|value| {
+                    !value.service.is_closed() && !value.service.peer().is_transport_closed()
+                })
                 .ok_or_else(|| format!("Connector {id} is not connected."))?;
             let selected = select_views(
                 &connection.tools,
@@ -322,7 +327,7 @@ impl McpHub {
                     tool: tool.clone(),
                     alias: tool_alias(id, &tool.name),
                     backend: ToolBackend::Mcp {
-                        peer: connection.service.peer().clone(),
+                        peer: connection.service.peer(),
                         local_name: connection.local_name.clone(),
                     },
                 });
@@ -485,13 +490,15 @@ impl McpHub {
         };
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            crate::tool_discovery::discover(|cursor| async {
-                service
-                    .list_tools(Some(
+            crate::tool_discovery::discover(|cursor| {
+                let peer = service.peer();
+                async move {
+                    peer.list_tools(Some(
                         rmcp::model::PaginatedRequestParams::default().with_cursor(cursor),
                     ))
                     .await
                     .map_err(|error| error.to_string())
+                }
             }),
         )
         .await;
@@ -657,6 +664,78 @@ pub fn cancel_connector_sign_in(state: tauri::State<'_, crate::AppState>) {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn malformed_protocol_input_and_unexpected_exit_are_reported() {
+        async fn fixture(name: &str, script: &str) -> (tempfile::TempDir, super::McpHub, crate::local_mcp_config::LocalServer) {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("fixture.cjs");
+            std::fs::write(&path, script).unwrap();
+            let hub = super::McpHub::new(std::sync::Arc::new(crate::vault::Vault::new(
+                temp.path().join("vault"),
+            )));
+            let server = crate::local_mcp_config::LocalServer {
+                id: format!("local-{}", uuid::Uuid::new_v4()),
+                name: name.into(),
+                executable: crate::execution::ExecutionConfig::default().node_path,
+                arguments: vec![path.to_string_lossy().into_owned()],
+                working_directory: temp.path().to_string_lossy().into_owned(),
+                environment: Default::default(),
+            };
+            hub.save_local(server.clone()).unwrap();
+            (temp, hub, server)
+        }
+        let (_temp, mut hub, server) = fixture("garbage", "process.stdout.write('not json\\n'); setInterval(()=>{},1000);\n").await;
+        let error = match hub.connect(&server.id).await {
+            Ok(_) => panic!("garbage protocol unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("handshake"), "unexpected error: {error}");
+        assert!(!hub.list().unwrap().iter().find(|item| item.id == server.id).unwrap().connected);
+        hub.remove_local(&server.id).unwrap();
+        let (_temp, mut hub, server) = fixture("truncated", "process.stdout.write('{\"jsonrpc\":\"2.0\",\"id\":'); setInterval(()=>{},1000);\n").await;
+        let error = match hub.connect(&server.id).await {
+            Ok(_) => panic!("truncated protocol unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("handshake"), "unexpected error: {error}");
+        hub.remove_local(&server.id).unwrap();
+        let (_temp, mut hub, server) = fixture("early-exit", "process.exit(3);\n").await;
+        let error = match hub.connect(&server.id).await {
+            Ok(_) => panic!("early exit unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("handshake"), "unexpected error: {error}");
+        assert!(!hub.list().unwrap().iter().find(|item| item.id == server.id).unwrap().connected);
+        hub.remove_local(&server.id).unwrap();
+        // A server that exits right after discovery leaves a closed transport;
+        // selection must report it as disconnected instead of offering stale tools.
+        let (_temp, mut hub, server) = fixture(
+            "exit-after-discovery",
+            r#"
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const r = JSON.parse(line); if (r.id === undefined) return;
+  const result = r.method === 'initialize'
+  ? {protocolVersion:r.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}
+  : {tools:[{name:'read_file',description:'fixture',inputSchema:{type:'object'}}]};
+  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\n');
+  if (r.method === 'tools/list') setTimeout(() => process.exit(0), 200);
+});"#,
+        )
+        .await;
+        hub.connect(&server.id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(hub
+            .selected_tools(
+                &[],
+                &[super::ToolSelection {
+                    connector_id: server.id.clone(),
+                    tool_name: "read_file".into(),
+                }],
+            )
+            .is_err());
+        hub.disconnect(&server.id, false).await.unwrap();
+        hub.remove_local(&server.id).unwrap();
+    }
+    #[tokio::test]
     async fn local_server_discovery_selection_and_disconnect_use_the_hub() {
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("fixture.cjs");
@@ -698,6 +777,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         assert!(hub.save_local(server.clone()).is_err());
         assert!(hub.read_local(&server.id).is_err());
         assert!(hub.remove_local(&server.id).is_err());
+        assert!(!hub.list().unwrap().iter().find(|item| item.id == server.id).unwrap().tools.is_empty());
         let tools = hub
             .selected_tools(
                 &[],
