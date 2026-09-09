@@ -11,6 +11,7 @@ page.on('pageerror', error => errors.push(error.message));
 try {
   await expect(page.getByText('Browser preview', { exact: false })).toHaveCount(0);
   await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
+  await page.getByRole('tab', { name: 'Model files', exact: true }).click();
   await page.getByRole('textbox', { name: 'llama-server executable' }).fill(resolve('.local/runtime/llama-server.exe'));
   await page.getByRole('textbox', { name: 'GGUF model file' }).fill(resolve('.local/models/MiniCPM5-2B.Q6_K.gguf'));
   await page.getByRole('button', { name: 'Save settings' }).click();
@@ -19,10 +20,13 @@ try {
   await page.getByRole('spinbutton', { name: 'Maximum response tokens' }).fill('512');
   await page.getByRole('button', { name: 'Save settings' }).click();
   const started = Date.now();
-  await page.getByRole('button', { name: 'Load model', exact: true }).click();
+  if (await page.getByRole('button', { name: 'Load model', exact: true }).count()) {
+    await page.getByRole('button', { name: 'Load model', exact: true }).click();
+  }
   await expect(page.getByRole('button', { name: 'Unload', exact: true })).toBeVisible({ timeout: 120000 });
   const loadMs = Date.now() - started;
   await page.getByRole('button', { name: 'New conversation', exact: false }).click();
+  const smokeTitle = `GPU smoke test ${Date.now()}`;
   await page.getByRole('textbox', { name: 'Message', exact: true }).fill('What is 17 + 25? Answer briefly.');
   const generationStarted = Date.now();
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
@@ -32,11 +36,11 @@ try {
   if (!response.includes('42')) throw new Error(`Unexpected arithmetic response: ${response}`);
   await expect(page.getByRole('alert')).toHaveCount(0);
   await page.getByRole('button', { name: 'Rename conversation', exact: true }).click();
-  await page.getByRole('textbox', { name: 'Conversation title' }).fill('GPU smoke test');
+  await page.getByRole('textbox', { name: 'Conversation title' }).fill(smokeTitle);
   await page.getByRole('button', { name: 'Save title' }).click();
-  await expect(page.locator('.workspace-title')).toHaveText('GPU smoke test');
+  await expect(page.locator('.workspace-title')).toHaveText(smokeTitle);
   await page.reload();
-  await page.getByRole('button', { name: 'GPU smoke test', exact: true }).click();
+  await page.getByRole('button', { name: smokeTitle, exact: true }).click();
   await expect(page.locator('.message-assistant .markdown')).toContainText('42');
   mkdirSync('test-results', { recursive: true });
   await page.screenshot({ path: 'test-results/native-chat.png' });

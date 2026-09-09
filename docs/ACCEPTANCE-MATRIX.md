@@ -1,7 +1,12 @@
 # Requirement-to-evidence matrix
 
-Date: 2026-09-09. Scope: Windows x64, RTX 2050 4 GB, 16 GB RAM, MiniCPM5-2B
-Q6_K, managed llama.cpp b10855.
+Date: 2026-09-09 (re-verified against HEAD `c5ba113` with the matching debug
+executable built 18:41 local time). Scope: Windows x64, RTX 2050 4 GB, 16 GB
+RAM, MiniCPM5-2B Q6_K, managed llama.cpp b10855. Running debug app PID 2304,
+Vite 200 on 127.0.0.1:1420, WebView2 CDP on 127.0.0.1:9223, ~1.8 GiB free on
+C:. Pending uncommitted follow-ups at verification time: Model-files
+accessible labels (`src/components/Models.tsx`), hardened `native-smoke`
+(`scripts/native-smoke.mjs`), and this matrix header.
 
 `test-results/` is git-ignored, so JSON/PNG artifacts are local reproduction
 outputs, not committed evidence. The matrix cites the reproducible script or
