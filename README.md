@@ -39,7 +39,7 @@ Choose a workspace folder to enable file tools. Configure an installed Python, N
 
 Every conversation has **Ask for approval**, **Auto-approve reads** and **Full access** modes. New chats default to Ask. Auto-approve permits known workspace reads; other tools ask. Full access runs enabled tools without prompts. Decisions and results remain in tool history. See [permissions](docs/PERMISSIONS.md).
 
-Skills installs 13 pinned packages. Active skills supply instructions and a tool for reading supporting files. Dedicated script execution, dependency management and updates remain incomplete. See [skills](docs/SKILLS.md).
+Skills installs 13 pinned packages. Active skills supply instructions and a tool for reading supporting files. **Check dependencies** reports connector/interpreter/CLI status with repair guidance, and the **Version** panel reports installed versus pinned revisions with integrity results; reinstalling verifies every file before publishing and never executes package scripts. Skill scripts themselves run only through a separately enabled execution tool after approval. See [skills](docs/SKILLS.md).
 
 ## Data and privacy
 
@@ -68,4 +68,4 @@ The configured Windows target is NSIS under `src-tauri/target/release/bundle/nsi
 - **Tool denied:** denial prevents further tool calls for that turn. Change permissions before sending a new message if needed.
 - **Skill integrity failure:** remove and reinstall the affected package.
 
-Outstanding work includes managed-download crash recovery and full model-transfer acceptance, live Daytona verification and credential rotation, custom stdio connectors, skill execution workflows, existing-file editing/artifact previews, retry/compaction, third-party notices and full release verification. [Progress](docs/PROGRESS.md) records evidence and limitations; [desktop lifecycle](docs/DESKTOP.md) describes launch behavior.
+Outstanding work includes managed-download crash recovery and full model-transfer acceptance, live Daytona verification and credential rotation, skill script execution workflows and representative per-skill coverage, file browsing/artifact previews beyond the edit diff, retry/compaction, and full release verification. Current installer provenance, dependency audits, and third-party notices are in [release notes](docs/RELEASE.md). [Progress](docs/PROGRESS.md) records evidence and limitations; [desktop lifecycle](docs/DESKTOP.md) describes launch behavior.

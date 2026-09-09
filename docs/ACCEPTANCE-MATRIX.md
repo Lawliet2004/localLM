@@ -1,12 +1,11 @@
 # Requirement-to-evidence matrix
 
-Date: 2026-09-09 (re-verified against HEAD `c5ba113` with the matching debug
-executable built 18:41 local time). Scope: Windows x64, RTX 2050 4 GB, 16 GB
-RAM, MiniCPM5-2B Q6_K, managed llama.cpp b10855. Running debug app PID 2304,
+Date: 2026-09-09 (re-verified against HEAD `57e0806` with the fresh
+`NotSigned` installer built and silent-smoked the same day). Scope: Windows
+x64, RTX 2050 4 GB, 16 GB RAM, MiniCPM5-2B Q6_K, managed llama.cpp b10855.
 Vite 200 on 127.0.0.1:1420, WebView2 CDP on 127.0.0.1:9223, ~1.8 GiB free on
-C:. Pending uncommitted follow-ups at verification time: Model-files
-accessible labels (`src/components/Models.tsx`), hardened `native-smoke`
-(`scripts/native-smoke.mjs`), and this matrix header.
+C:. The debug app was closed for the installer smoke and relaunched afterward;
+rebuilt debug executable timestamp 18:41 local time.
 
 `test-results/` is git-ignored, so JSON/PNG artifacts are local reproduction
 outputs, not committed evidence. The matrix cites the reproducible script or
@@ -123,14 +122,14 @@ All 13 packages (`algorithmic-art`, `skill-creator`, `mcp-builder`,
 | --- | --- | --- |
 | Vault encryption, IPC validation, CSP, traversal/junction/symlink handling, child-process ownership, MCP bounds, permission enforcement paths, crash recovery | partial | `docs/SECURITY.md`, `vault::`, `workspace::`, `skills::`, `execution::`, `local_mcp_process::` tests |
 | Adversarial review: hostile servers/content, redirect/header leaks, OAuth mismatch, expired/revoked credentials, oversized catalogs/results, unavailable-tool selection, approval cancellation races, archive/symlink attacks, traversal, escape/orphans | partial | Unit/integration coverage exists; no end-to-end adversarial pass this cycle |
-| Dependency vulnerabilities / third-party notices | partial | `npm audit --omit=dev` clean at installer time; no current license-notice bundle for app, runtime, model, skills |
+| Dependency vulnerabilities / third-party notices | partial | `npm audit --omit=dev` zero vulns (250 pkgs); `cargo audit` zero vulns with transitive unmaintained warnings; notices in `docs/THIRD-PARTY-NOTICES.npm.csv`, `docs/THIRD-PARTY-NOTICES.cargo.txt`, `catalog/TRUEFORGE-LICENSE`, `docs/RELEASE.md`; runtime/model/skill licenses recorded but not bundled |
 
 ## 11. Release
 
 | Requirement | Status | Evidence |
 | --- | --- | --- |
-| Old unsigned NSIS installer + silent install/uninstall smoke | partial | `docs/RELEASE.md` (commit `8e36be7`, SHA-256 recorded); predates current code |
-| Fresh optimized build, clean-profile onboarding, WebView2 prerequisites, install/launch/setup/inference/tools/shutdown/upgrade/rollback/uninstall, data preservation choices, interactive installer, signing, notices, provenance/hashes/benchmarks | missing / **external** | Needs release infrastructure + signing credentials |
+| Fresh optimized Windows installer (HEAD `57e0806`) + silent install/uninstall smoke with inference | verified | `docs/RELEASE.md` (installer 3,678,128 bytes, SHA-256 `61E72A…52E16`; app 10,988,544 bytes, SHA-256 `2C1621…32D7F`; `NotSigned`); `scripts/installer-smoke.ps1` → `installer-smoke.json` + `scripts/release-smoke.mjs` → `release-smoke.json`/`installed-release.png` (2026-09-09: install/uninstall exits 0, tauri.localhost inference `42`, 2 saved messages, DB hash unchanged) |
+| Clean-profile onboarding, WebView2 prerequisites, install/launch/setup/inference/tools/shutdown/upgrade/rollback/uninstall, data preservation choices, interactive installer, signing, provenance/hashes/benchmarks | missing / **external** | Silent smoke only; needs release infrastructure + signing credentials; interactive installer pages, upgrade/rollback, and clean-profile onboarding unverified |
 
 ## External dependencies still required
 
