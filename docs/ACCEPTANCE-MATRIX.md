@@ -51,12 +51,20 @@ insufficiently verified), **missing** (not implemented), **external**
 | Linear, Notion, Sentry, Exa, Parallel Web, GitHub, Tavily, Bright Data, Supabase, Stripe, Confluence, Jira, PostHog | see `src/lib/catalog.json` | OAuth DCR or bearer | partial: presets, validation, discovery path, permission enforcement; **no live account coverage** |
 
 Status: **partial**. Provenance: `catalog/PROVENANCE.md`
-(truefoundry/trueforge `e956915`). Missing per service: sign-in/token
-storage/refresh/expiry/revocation/disconnect/reconnect verification, exact
-per-conversation selection against live tools, actionable account errors, real
-tool calls + continuation, credential redaction audit. **External:** accounts,
-credentials, billing authorization, and official-docs rechecks are required.
-Do not mutate external accounts for coverage without authorization.
+(truefoundry/trueforge `e956915`). Credential paths are now enforced in Rust:
+OAuth DCR presets never read bearer tokens and reject token saves; bearer
+presets (`github`, `tavily`, `bright-data`) require validated tokens with
+redaction; public presets (`deepwiki`, `exa`, `parallel-web`) connect without
+credentials (`connectors::tests::connector_lifecycle_errors_are_actionable_and_never_leak_tokens`).
+Re-verified 2026-09-09: DeepWiki discovery + allow/deny/cancel tool flows
+(`scripts/connector-smoke.mjs`, `scripts/agent-smoke.mjs`), remote permission
+enforcement (`scripts/permissions-connector-smoke.mjs`). Missing per service:
+sign-in/token storage/refresh/expiry/revocation/disconnect/reconnect
+verification, exact per-conversation selection against live tools, actionable
+account errors, real tool calls + continuation, credential redaction audit.
+**External:** accounts, credentials, billing authorization, and official-docs
+rechecks are required. Do not mutate external accounts for coverage without
+authorization.
 
 ## 5. Skills (13)
 

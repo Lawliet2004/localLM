@@ -285,6 +285,18 @@ fn preset(id: &str) -> Result<ConnectorView, String> {
         .find(|item| item.id == id)
         .ok_or_else(|| "Unknown connector.".into())
 }
+/// How a bundled connector expects credentials to be supplied. `header`
+/// presets require a saved bearer API token sent as `Authorization: Bearer`;
+/// `dcr` presets use the OAuth flow exclusively (the token vault is never
+/// consulted for them); `none` presets are public endpoints. Local servers
+/// never use this transport.
+fn preset_credential(id: &str) -> Result<&'static str, String> {
+    Ok(match preset(id)?.auth_type.as_str() {
+        "oauth" => "dcr",
+        "apiKey" => "header",
+        _ => "none",
+    })
+}
 fn validate_token(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 8192
@@ -366,7 +378,9 @@ impl McpHub {
             .transpose()
     }
     fn save_token(&self, id: &str, value: &str) -> Result<(), String> {
-        preset(id)?;
+        if preset_credential(id)? != "header" {
+            return Err("This connector does not use an API token. Use account sign-in for OAuth connectors.".into());
+        }
         validate_token(value)?;
         self.vault.save(&format!("token-{id}"), value.as_bytes())
     }
@@ -452,10 +466,16 @@ impl McpHub {
         if local.is_some() && self.connections.contains_key(id) {
             return Err("Disconnect the local server before reconnecting.".into());
         }
+        let credential = preset_credential(id).ok();
         let secret = if local.is_some() {
             None
-        } else {
+        } else if credential == Some("header") {
             self.token(id)?
+        } else {
+            // OAuth presets authenticate through the sign-in flow; a saved
+            // bearer token must never be attached to them. Public presets
+            // connect without credentials.
+            None
         };
         if item.auth_type == "apiKey" && secret.is_none() {
             return Err("Add an API token before connecting.".into());
@@ -1045,7 +1065,19 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         assert!(hub.save_token("github", " token-with-space").is_err());
         assert!(hub.save_token("github", "token\r\nAuthorization: injected").is_err());
         assert!(hub.save_token("unknown-connector", "fixture-token-abcdef").is_err());
-        assert!(hub.save_token("linear", "fixture-token-abcdef").is_ok());
+        // OAuth presets have no bearer-token path: leftover tokens are ignored
+        // at connect time and rejected at save time, so an OAuth sign-in can
+        // never silently fall back to a bearer header.
+        assert!(hub.save_token("linear", "fixture-token-abcdef").is_err());
+        for (id, expected) in [
+            ("linear", "dcr"),
+            ("github", "header"),
+            ("deepwiki", "none"),
+            ("bright-data", "header"),
+            ("supabase", "dcr"),
+        ] {
+            assert_eq!(super::preset_credential(id).unwrap(), expected);
+        }
         let error = "Could not connect: 401 with fixture-token-abcdef embedded";
         let redacted = error.replace("fixture-token-abcdef", "[redacted]");
         assert!(!redacted.contains("fixture-token-abcdef"));
