@@ -9,7 +9,7 @@ page.setDefaultTimeout(15000);
 try {
   await page.getByRole('button', { name: 'Connectors', exact: true }).click();
   await page.getByRole('searchbox', { name: 'Search connectors' }).fill('deepwiki');
-  const item = page.locator('.catalog-item');
+  const item = page.locator('.catalog-list .catalog-item');
   await expect(item).toHaveCount(1);
   if (await item.getAttribute('open') === null) await item.locator('summary').first().click();
   await item.getByRole('button', { name: 'Connect', exact: true }).click();

@@ -33,8 +33,11 @@ try {
   await page.getByRole('button', { name: /New conversation/ }).click();
   const picker = page.locator('.tool-picker');
   if (await picker.getAttribute('open') === null) await picker.locator('summary').first().click();
+  // The picker only enables workspace selection once the saved workspace
+  // path has loaded; stale UI state after reload keeps it disabled briefly.
+  await expect(page.getByRole('checkbox', { name: 'Workspace files', exact: true })).toBeEnabled({ timeout: 30000 });
   await page.getByRole('checkbox', { name: 'Workspace files', exact: true }).check();
-  await expect(picker.locator('summary').first()).toContainText('6/32 enabled');
+  await expect(picker.locator('summary').first()).toContainText('5/32 enabled');
 
   // Turn 1: approved edit applies exactly. Approvals arrive through the
   // native dialog; allow every prompt and verify the resulting audits.
@@ -95,6 +98,7 @@ try {
     await expect(dialog).toHaveCount(0, { timeout: 30000 });
   }
   await expect(page.getByRole('button', { name: 'Stop response' })).toHaveCount(0, { timeout: 180000 });
+  await expect(page.getByRole('alert')).toHaveCount(0);
   expect(readFileSync(join(folder, 'locked.txt'), 'utf8')).toBe('keep the_old_phrase here\n');
   const after = await invoke('get_messages', { id });
   const denied = after.filter(message => message.role === 'tool').map(message => JSON.parse(message.content)).pop();

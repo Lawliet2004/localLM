@@ -8,7 +8,7 @@ const report = { testedAt: new Date().toISOString(), scenarios: [] };
 try {
   await page.getByRole('button', { name: 'Connectors', exact: true }).click();
   await page.getByRole('searchbox', { name: 'Search connectors' }).fill('deepwiki');
-  const connector = page.locator('.catalog-item');
+  const connector = page.locator('.catalog-list .catalog-item');
   if (await connector.getAttribute('open') === null) await connector.locator('summary').first().click();
   if (await connector.getByRole('button', { name: 'Connect', exact: true }).count()) {
     await connector.getByRole('button', { name: 'Connect', exact: true }).click();
@@ -20,7 +20,7 @@ try {
     await expect(page.getByRole('button', { name: 'Unload', exact: true })).toBeVisible({ timeout: 120000 });
   }
   for (const decision of ['allow', 'deny', 'cancel']) {
-    await page.getByRole('button', { name: 'New conversation', exact: false }).click();
+    await page.getByRole('button', { name: 'New conversation Ctrl N' }).click();
     const picker = page.locator('.tool-picker');
     if (await picker.getAttribute('open') === null) await picker.locator('summary').first().click();
     const group = picker.locator('.connector-tool-group').filter({ hasText: 'deepwiki' });

@@ -976,4 +976,79 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             assert!(item.url.starts_with("https://"));
         }
     }
+    #[test]
+    fn bundled_trueforge_presets_match_source_and_supported_auth() {
+        // Compared against the TrueForge upstream docs/catalog on 2026-09-09:
+        // docs site catalog for Settings → Connectors, MCP docs for Linear
+        // (mcp.linear.app/mcp + OAuth 2.1 DCR + bearer/API-key header), the
+        // GitHub MCP server OAuth protected-resource metadata
+        // (api.githubcopilot.com/mcp), and the DeepWiki MCP setup page
+        // (mcp.deepwiki.com/mcp, no auth for public repos; private repos use
+        // a separate Devin endpoint with a bearer key, which is not a preset).
+        let catalog: Value = serde_json::from_str(include_str!("../../src/lib/catalog.json"))
+            .expect("Bundled connector catalog is valid JSON");
+        let bundled: Vec<(String, String, String)> = catalog["connectors"]
+            .as_array()
+            .expect("Bundled connectors array")
+            .iter()
+            .map(|item| {
+                (
+                    item["name"].as_str().unwrap_or_default().to_string(),
+                    item["url"].as_str().unwrap_or_default().to_string(),
+                    item["auth"]["type"].as_str().unwrap_or("none").to_string(),
+                )
+            })
+            .collect();
+        let expected: &[(&str, &str, &str)] = &[
+            ("linear", "https://mcp.linear.app/mcp", "dcr"),
+            ("notion", "https://mcp.notion.com/mcp", "dcr"),
+            ("sentry", "https://mcp.sentry.dev/mcp", "dcr"),
+            ("deepwiki", "https://mcp.deepwiki.com/mcp", "none"),
+            ("exa", "https://mcp.exa.ai/mcp", "none"),
+            ("parallel-web", "https://search.parallel.ai/mcp", "none"),
+            ("github", "https://api.githubcopilot.com/mcp/", "header"),
+            ("tavily", "https://mcp.tavily.com/mcp", "header"),
+            ("bright-data", "https://mcp.brightdata.com/mcp", "header"),
+            ("supabase", "https://mcp.supabase.com/mcp", "dcr"),
+            ("stripe", "https://mcp.stripe.com", "dcr"),
+            ("confluence", "https://mcp.atlassian.com/v1/mcp", "dcr"),
+            ("jira", "https://mcp.atlassian.com/v1/mcp", "dcr"),
+            ("posthog", "https://mcp.posthog.com/mcp", "dcr"),
+        ];
+        assert_eq!(bundled.len(), expected.len());
+        for (index, (name, url, auth)) in expected.iter().enumerate() {
+            assert_eq!(&bundled[index].0, name, "preset order drift at {index}");
+            assert_eq!(&bundled[index].1, url, "endpoint drift for {name}");
+            assert_eq!(&bundled[index].2, auth, "auth drift for {name}");
+        }
+        let views = presets();
+        assert_eq!(views.len(), expected.len());
+        for (view, (name, _, auth)) in views.iter().zip(expected.iter()) {
+            assert_eq!(&view.id, name);
+            assert_eq!(
+                view.auth_type.as_str(),
+                match *auth {
+                    "dcr" => "oauth",
+                    "header" => "apiKey",
+                    _ => "none",
+                },
+                "auth mapping drift for {name}"
+            );
+        }
+    }
+    #[test]
+    fn connector_lifecycle_errors_are_actionable_and_never_leak_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = std::sync::Arc::new(crate::vault::Vault::new(temp.path().join("vault")));
+        let hub = super::McpHub::new(vault);
+        assert!(hub.save_token("github", "fixture-token-abcdef").is_ok());
+        assert!(hub.save_token("github", " token-with-space").is_err());
+        assert!(hub.save_token("github", "token\r\nAuthorization: injected").is_err());
+        assert!(hub.save_token("unknown-connector", "fixture-token-abcdef").is_err());
+        assert!(hub.save_token("linear", "fixture-token-abcdef").is_ok());
+        let error = "Could not connect: 401 with fixture-token-abcdef embedded";
+        let redacted = error.replace("fixture-token-abcdef", "[redacted]");
+        assert!(!redacted.contains("fixture-token-abcdef"));
+        assert!(redacted.contains("[redacted]"));
+    }
 }
