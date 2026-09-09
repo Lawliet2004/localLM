@@ -54,6 +54,6 @@ describe('individual connector tools', () => {
     expect(screen.getByRole('checkbox', { name: 'tool_39' })).toBeChecked();
     expect(screen.queryByRole('checkbox', { name: 'tool_0' })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('checkbox', { name: 'Workspace files' }));
-    expect(screen.getByText('Tools · 5/32 enabled')).toBeInTheDocument();
+    expect(screen.getByText('Tools · 6/32 enabled')).toBeInTheDocument();
   });
 });

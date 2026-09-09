@@ -36,9 +36,23 @@ struct PathRequest {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WriteRequest {
+struct EditRequest {
     path: String,
-    content: String,
+    expected_sha256: String,
+    old_text: String,
+    new_text: String,
+}
+fn parse_hash(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Use the 64-character SHA-256 shown by read_file.".into());
+    }
+    let mut hash = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+        hash[index] =
+            u8::from_str_radix(std::str::from_utf8(chunk).map_err(|_| "Invalid hash.")?, 16)
+                .map_err(|_| "Invalid hash.")?;
+    }
+    Ok(hash)
 }
 fn valid_path(path: &str, root_allowed: bool) -> Result<(), String> {
     if root_allowed && path == "." {
@@ -150,6 +164,12 @@ impl Workspace {
                 )
             }
             "create_file" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct WriteRequest {
+                    path: String,
+                    content: String,
+                }
                 let request: WriteRequest =
                     serde_json::from_value(arguments).map_err(|error| error.to_string())?;
                 valid_path(&request.path, false)?;
@@ -183,6 +203,62 @@ impl Workspace {
                     .map_err(|error| error.to_string())?;
                 Ok(json!({"path":request.path,"created":true}))
             }
+            "edit_file" => {
+                let request: EditRequest =
+                    serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+                valid_path(&request.path, false)?;
+                if request.old_text.is_empty() || request.old_text.len() > 65_536 {
+                    return Err("The text to replace must contain 1–65536 bytes.".into());
+                }
+                if request.new_text.len() > 65_536 {
+                    return Err("Replacement text exceeds 64 KiB.".into());
+                }
+                if request.old_text == request.new_text {
+                    return Err("Replacement text must differ from the text it replaces.".into());
+                }
+                let expected = parse_hash(&request.expected_sha256)?;
+                let file = self
+                    .directory
+                    .open_with(&request.path, OpenOptions::new().read(true).write(true))
+                    .map_err(|error| error.to_string())?;
+                let metadata = file.metadata().map_err(|error| error.to_string())?;
+                if !metadata.is_file() || metadata.len() > 1_048_576 {
+                    return Err("Edit supports regular UTF-8 files up to 1 MiB.".into());
+                }
+                let mut bytes = Vec::new();
+                (&file)
+                    .take(1_048_577)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                if bytes.len() > 1_048_576 {
+                    return Err("File grew beyond the edit limit.".into());
+                }
+                if Sha256::digest(&bytes).as_slice() != expected {
+                    return Err("This file changed after it was read. Read it again and retry the edit.".into());
+                }
+                let text = String::from_utf8(bytes).map_err(|_| "File is not UTF-8 text.")?;
+                let matches = text.matches(&request.old_text).count();
+                if matches == 0 {
+                    return Err("The text to replace was not found. Read the current file and retry.".into());
+                }
+                if matches > 1 {
+                    return Err("The text to replace occurs more than once. Use a longer unique match.".into());
+                }
+                let updated = text.replacen(&request.old_text, &request.new_text, 1);
+                {
+                    use std::io::{Seek, SeekFrom};
+                    let mut writer = file;
+                    writer.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+                    writer.set_len(0).map_err(|error| error.to_string())?;
+                    writer
+                        .write_all(updated.as_bytes())
+                        .and_then(|_| writer.sync_all())
+                        .map_err(|error| {
+                            format!("File write failed; the file may be incomplete: {error}")
+                        })?;
+                }
+                Ok(json!({"path":request.path,"replacements":1,"bytesWritten":updated.len(),"sha256":format!("{:x}",Sha256::digest(updated.as_bytes()))}))
+            }
             _ => Err("Unknown workspace tool.".into()),
         }
     }
@@ -192,6 +268,7 @@ impl Workspace {
             ("read_file","Read UTF-8 workspace text with line numbers and SHA-256. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":500}}),vec!["path"]),
             ("create_file","Create a new UTF-8 file inside the workspace. Existing files are never overwritten. Parent directory must exist.",json!({"path":{"type":"string"},"content":{"type":"string"}}),vec!["path","content"]),
             ("create_directory","Create one directory inside the workspace. Parent directory must exist.",json!({"path":{"type":"string"}}),vec!["path"]),
+            ("edit_file","Replace one unique text match in an existing UTF-8 file. Requires the SHA-256 from a fresh read_file; fails when the file changed, the match is missing, or it occurs more than once. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"expected_sha256":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}}),vec!["path","expected_sha256","old_text","new_text"]),
         ];
         definitions.into_iter().map(|(name,description,properties,required)| crate::connectors::AgentTool::workspace(self.clone(),crate::connectors::ToolView { name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}) })).collect()
     }
@@ -281,6 +358,43 @@ mod tests {
         assert_eq!(result["totalLines"], 3);
         let listed = workspace.call("list_files", json!({"path":"."})).unwrap();
         assert_eq!(listed["entries"][0]["name"], "hello.txt");
+    }
+    #[test]
+    fn edits_require_a_fresh_read_and_one_unique_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        workspace
+            .call("create_file", json!({"path":"note.txt","content":"alpha\nbeta\ngamma\nbeta again"}))
+            .unwrap();
+        let read = workspace.call("read_file", json!({"path":"note.txt"})).unwrap();
+        let hash = read["sha256"].as_str().unwrap().to_string();
+        assert!(workspace
+            .call("edit_file", json!({"path":"note.txt","expected_sha256":hash,"old_text":"beta","new_text":"BETA"}))
+            .is_err());
+        let edited = workspace
+            .call("edit_file", json!({"path":"note.txt","expected_sha256":hash,"old_text":"alpha\nbeta\ngamma","new_text":"alpha\nBETA\ngamma"}))
+            .unwrap();
+        assert_eq!(edited["replacements"], 1);
+        let reread = workspace.call("read_file", json!({"path":"note.txt"})).unwrap();
+        assert!(reread["content"].as_str().unwrap().contains("BETA"));
+        assert_eq!(reread["sha256"], edited["sha256"]);
+        // The stale hash no longer matches the changed file.
+        assert!(workspace
+            .call("edit_file", json!({"path":"note.txt","expected_sha256":hash,"old_text":"gamma","new_text":"GAMMA"}))
+            .is_err());
+        assert!(workspace
+            .call("edit_file", json!({"path":"missing.txt","expected_sha256":hash,"old_text":"a","new_text":"b"}))
+            .is_err());
+        assert!(workspace
+            .call("edit_file", json!({"path":"note.txt","expected_sha256":reread["sha256"],"old_text":"absent","new_text":"b"}))
+            .is_err());
+        assert!(workspace
+            .call("edit_file", json!({"path":"note.txt","expected_sha256":"zz","old_text":"gamma","new_text":"GAMMA"}))
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("note.txt")).unwrap(),
+            "alpha\nBETA\ngamma\nbeta again"
+        );
     }
     #[test]
     fn rejects_escape_devices_binary_oversized_and_invalid_arguments() {

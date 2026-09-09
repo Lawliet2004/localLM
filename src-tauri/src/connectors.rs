@@ -881,6 +881,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             crate::workspace::Workspace::open(directory.path().to_str().unwrap()).unwrap(),
         );
         let tools = workspace.tools();
+        assert_eq!(tools.len(), 5);
+        assert!(tools.iter().any(|tool| tool.tool.name == "edit_file"));
         assert_eq!(tools.iter().filter(|tool| tool.trusted_read()).count(), 2);
         for tool in tools {
             assert_eq!(

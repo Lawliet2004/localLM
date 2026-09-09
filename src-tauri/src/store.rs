@@ -92,7 +92,7 @@ impl ConversationTools {
                 return Err("Duplicate tool source.".into());
             }
             count += match source.as_str() {
-                "__workspace" => 4,
+                "__workspace" => 5,
                 "__execution" => 1,
                 "__daytona" => 1,
                 _ => return Err("Unknown local tool source.".into()),
@@ -525,7 +525,7 @@ mod tests {
         let mut settings = ConversationTools {
             access_mode: crate::permissions::AccessMode::Ask,
             sources: vec!["__workspace".into(), "__execution".into()],
-            tools: (0..27)
+            tools: (0..26)
                 .map(|index| crate::connectors::ToolSelection {
                     connector_id: "github".into(),
                     tool_name: format!("tool_{index}"),
