@@ -40,7 +40,8 @@ insufficiently verified), **missing** (not implemented), **external**
 | Malformed/truncated input, unexpected exit, handshake/discovery failure, closed-transport selection, edit/disconnect race | verified | `connectors::tests::malformed_protocol_input_and_unexpected_exit_are_reported`, session snapshot changes |
 | Structured arguments/environment, browsing, focus, validation, cancellation, duplicate names, pending states, secret visibility, stable IDs | verified | `test-results/local-connector-smoke.json` (`structuredControls`, `secretHiddenByDefault`), `LocalConnectorForm.test.tsx` |
 | Individual transport-frame size bound | partial | 512-tool / 2 MiB accumulation bounds after page deserialization; no per-frame cap |
-| Reconnect UX beyond disconnect-then-connect; shutdown/process observability | partial | Covered by explicit disconnect/connect; no dedicated reconnect flow or shutdown error surfacing |
+| Shutdown observability | partial | `close()` reports protocol/signal/reap stages and failed reaps return stage detail; full-suite + native disconnect rerun deferred by disk pressure |
+| Reconnect UX beyond disconnect-then-connect | partial | Covered by explicit disconnect/connect; no dedicated reconnect flow |
 
 ## 4. TrueForge remote connectors (14)
 

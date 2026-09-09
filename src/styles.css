@@ -160,6 +160,19 @@ h1 { font-weight: 450; font-size: 38px; line-height: 1.22; letter-spacing: -1.3p
 @media (max-width: 480px) { h1 { font-size: 30px; } .suggestions { flex-direction: column; } .suggestions button { flex: auto; } .composer-bottom small, .wide-only { display: none; } .setup-hint { flex-wrap: wrap; } .setup-hint button { margin-left: 22px; } .field-pair { grid-template-columns: 1fr; gap: 0; } .catalog-toolbar { align-items: stretch; flex-direction: column; } .catalog-toolbar .search-field { width: 100%; } .model-status { flex-wrap: wrap; } .header-actions > .icon-button { display: none; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }
 .connector-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; } .connector-tools { display: grid; gap: 8px; margin-top: 20px; } .connector-tools pre { overflow: auto; max-height: 260px; font-size: 12px; } .connector-tools summary { cursor: pointer; } .catalog-detail form input { display: block; width: 100%; margin-top: 8px; }
+.local-connector-form .catalog-detail { max-height: min(70vh, 720px); overflow-y: auto; padding-right: 8px; }
+.local-connector-form .field-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.local-connector-form .field-row input { flex: 1; min-width: 0; margin-top: 0; }
+.local-connector-form .field-row .secondary { flex-shrink: 0; white-space: nowrap; }
+.local-connector-form .structured-group { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin: 12px 0; min-width: 0; }
+.local-connector-form .structured-group legend { font-size: 11px; font-weight: 600; padding: 0 6px; }
+.local-connector-form .structured-group label { display: flex; flex-direction: column; gap: 7px; }
+.local-connector-form .structured-group textarea { min-height: 76px; max-height: 220px; overflow-y: auto; white-space: pre; }
+.local-connector-form .env-row { flex-wrap: wrap; }
+.local-connector-form .env-row input:first-child { flex: 1 1 140px; }
+.local-connector-form .env-row input:nth-child(2) { flex: 2 1 180px; }
+.local-connector-form :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 760px) { .local-connector-form .field-row { flex-wrap: wrap; } .local-connector-form .env-row input { flex: 1 1 100%; } }
 .tool-picker { margin: 8px 24px; font-size: 11px; color: var(--secondary); }
 .tool-picker summary { cursor: pointer; padding: 5px 0; }
 .tool-picker label { display: inline-flex; gap: 8px; align-items: center; margin: 8px 18px 8px 0; }

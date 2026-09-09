@@ -14,11 +14,11 @@ test('workspace renders, switches theme and browses catalogs without console err
   await page.screenshot({ path: 'test-results/workspace-light.png', fullPage: true });
   await page.getByRole('button', { name: 'Connectors', exact: true }).click();
   await page.getByRole('searchbox', { name: 'Search connectors' }).fill('Linear');
-  await expect(page.locator('.catalog-item')).toHaveCount(1);
-  await expect(page.locator('.catalog-item')).toContainText('Linear');
+  await expect(page.locator('.catalog-list .catalog-item')).toHaveCount(1);
+  await expect(page.locator('.catalog-list .catalog-item')).toContainText('Linear');
   await page.getByRole('button', { name: 'Skills', exact: true }).click();
   await page.getByRole('searchbox', { name: 'Search skills' }).fill('notebook');
-  await expect(page.locator('.catalog-item')).toHaveCount(1);
+  await expect(page.locator('.catalog-list .catalog-item')).toHaveCount(1);
   expect(errors).toEqual([]);
 });
 
