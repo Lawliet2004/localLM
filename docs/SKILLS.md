@@ -22,6 +22,10 @@ Every installed skill reports its runtime dependencies through `skill_dependenci
 
 Skill instructions never bypass conversation permissions: missing connectors, interpreters, or CLIs produce clear errors naming the absent dependency instead of silent fallback.
 
+## Repair and updates
+
+A package whose `.installed` marker is missing or does not match its directory revision is incomplete: reads fail and activation refuses it until it is reinstalled. Reinstalling (`Install`, or `Verify files` for an already-installed package) downloads every pinned file, verifies size and SHA-256 before publishing, removes any leftover incomplete directory only after the replacement verifies, and never executes package scripts. `skill_update_status` (shown in the Skills **Version** panel next to **Check dependencies**) reports the installed revision, the pinned catalog revision, whether an update is available, whether the package verifies, and the exact repair action.
+
 ## Evidence
 
 `scripts/skill-reader-smoke.mjs` uses the native desktop application and real MiniCPM runtime to request the first three lines of the Jupyter notebook quality checklist. It compares returned lines to the verified package content, checks continuation metadata, checks authorization prompts in all three modes, and verifies the model's answer uses the reference. It restores active skills and generation preferences and deletes its temporary conversations.

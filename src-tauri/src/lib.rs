@@ -142,6 +142,7 @@ pub fn run() {
             skills::remove_skill,
             skills::set_skill_active,
             skills::read_skill_file,
+            skills::skill_update_status,
             skills::skill_dependencies,
             commands::create_conversation,
             commands::rename_conversation,

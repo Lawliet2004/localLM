@@ -48,6 +48,10 @@ export interface SkillDependencyStatus {
   dependency: { kind: string; name: string; detail: string };
   satisfied: boolean; remedy: string;
 }
+export interface SkillUpdateStatus {
+  id: string; installedRevision: string | null; catalogRevision: string;
+  updateAvailable: boolean; intact: boolean; problem: string | null;
+}
 export interface ExecutionConfig { pythonPath: string; nodePath: string; powershellPath: string }
 export interface HardwareStatus {
   logicalCpus: number; memoryTotalBytes: number | null; memoryAvailableBytes: number | null;

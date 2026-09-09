@@ -56,6 +56,16 @@ pub struct SkillView {
     installed: bool,
     active: bool,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillUpdateStatus {
+    pub id: String,
+    pub installed_revision: Option<String>,
+    pub catalog_revision: String,
+    pub update_available: bool,
+    pub intact: bool,
+    pub problem: Option<String>,
+}
 #[derive(Clone)]
 pub struct Skills {
     root: PathBuf,
@@ -110,6 +120,8 @@ impl Skills {
     }
     fn installed(&self, skill: &Skill) -> bool {
         self.directory(skill).join(".installed").is_file()
+            && std::fs::read(self.directory(skill).join(".installed"))
+                .is_ok_and(|bytes| bytes == skill.revision.as_bytes())
     }
     /// Statically declared runtime dependencies for every pinned skill.
     ///
@@ -295,6 +307,74 @@ impl Skills {
             })
             .collect()
     }
+    /// Versioned integrity status for one installed skill.
+    ///
+    /// Reports which revision is installed (when the marker matches a
+    /// directory on disk), whether the catalog pins a different revision, and
+    /// whether every pinned file still verifies. Recovery is explicit: a
+    /// damaged package must be reinstalled through `install_skill`, which
+    /// verifies before publishing and never executes package scripts.
+    pub fn update_status(&self, id: &str) -> Result<SkillUpdateStatus, String> {
+        let expected = skill(id)?;
+        let mut installed_revision: Option<String> = None;
+        let mut intact = false;
+        let mut problem: Option<String> = None;
+        if self.root.is_dir() {
+            for entry in std::fs::read_dir(&self.root).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(revision) = name.strip_prefix(&format!("{}-", expected.id)) else {
+                    continue;
+                };
+                if revision.len() != 40
+                    || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    continue;
+                }
+                let marker = entry.path().join(".installed");
+                if std::fs::read(&marker).is_ok_and(|bytes| bytes == revision.as_bytes()) {
+                    installed_revision = Some(revision.into());
+                }
+            }
+        }
+        if let Some(installed) = installed_revision.clone() {
+            if installed == expected.revision {
+                intact = self.installed(&expected);
+                if intact {
+                    for file in &expected.files {
+                        match std::fs::read(self.directory(&expected).join(&file.path)) {
+                            Ok(bytes) if verify(file, &bytes).is_ok() => {}
+                            _ => {
+                                intact = false;
+                                problem = Some(format!(
+                                    "Integrity check failed for {}. Reinstall the skill.",
+                                    file.path
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    problem = Some("The installed package is incomplete. Reinstall the skill.".into());
+                }
+            } else {
+                problem = Some(format!(
+                    "Installed revision {installed} differs from the pinned revision {}. Reinstall to update.",
+                    expected.revision
+                ));
+            }
+        }
+        let update_available =
+            installed_revision.as_deref() != Some(expected.revision.as_str());
+        Ok(SkillUpdateStatus {
+            id: expected.id.clone(),
+            installed_revision,
+            catalog_revision: expected.revision.clone(),
+            update_available,
+            intact,
+            problem,
+        })
+    }
     pub fn read(&self, id: &str, path: &str) -> Result<String, String> {
         relative(path)?;
         let skill = skill(id)?;
@@ -365,12 +445,22 @@ impl Skills {
     }
     pub async fn install(&self, id: &str) -> Result<(), String> {
         let skill = skill(id)?;
-        if self.installed(&skill) {
+        // Repair path: a directory without a matching marker is incomplete,
+        // so verify every file and reinstall when anything is missing or
+        // fails its hash check. Verification never executes package scripts.
+        let mut intact = self.installed(&skill);
+        if intact {
             for file in &skill.files {
-                let bytes = std::fs::read(self.directory(&skill).join(&file.path))
-                    .map_err(|error| error.to_string())?;
-                verify(file, &bytes)?;
+                match std::fs::read(self.directory(&skill).join(&file.path)) {
+                    Ok(bytes) if verify(file, &bytes).is_ok() => {}
+                    _ => {
+                        intact = false;
+                        break;
+                    }
+                }
             }
+        }
+        if intact {
             return Ok(());
         }
         std::fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
@@ -417,7 +507,13 @@ impl Skills {
             }
             std::fs::write(stage.join(".installed"), &skill.revision)
                 .map_err(|error| error.to_string())?;
-            std::fs::rename(&stage, self.directory(&skill)).map_err(|error| error.to_string())?;
+            // A leftover incomplete directory from an interrupted install must
+            // not shadow the verified replacement.
+            let destination = self.directory(&skill);
+            if destination.exists() {
+                std::fs::remove_dir_all(&destination).map_err(|error| error.to_string())?;
+            }
+            std::fs::rename(&stage, destination).map_err(|error| error.to_string())?;
             Ok(())
         }
         .await;
@@ -427,7 +523,8 @@ impl Skills {
         result
     }
     pub fn remove(&self, id: &str) -> Result<(), String> {
-        let target = self.directory(&skill(id)?);
+        let skill = skill(id)?;
+        let target = self.directory(&skill);
         if !target.exists() {
             return Ok(());
         }
@@ -562,6 +659,14 @@ pub async fn read_skill_file(
 }
 
 #[tauri::command]
+pub async fn skill_update_status(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+) -> Result<SkillUpdateStatus, String> {
+    state.skills.lock().await.update_status(&id)
+}
+
+#[tauri::command]
 pub async fn skill_dependencies(
     state: tauri::State<'_, crate::AppState>,
     id: String,
@@ -578,6 +683,42 @@ pub async fn skill_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn versioned_update_status_distinguishes_missing_stale_and_damaged_packages() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Skills::new(temp.path().into());
+        let item = skill("wiki-qa").unwrap();
+        let missing = manager.update_status("wiki-qa").unwrap();
+        assert_eq!(missing.installed_revision, None);
+        assert!(!missing.intact);
+        assert!(missing.update_available);
+        let directory = manager.directory(&item);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(".installed"), &item.revision).unwrap();
+        std::fs::write(directory.join("SKILL.md"), "partial").unwrap();
+        let damaged = manager.update_status("wiki-qa").unwrap();
+        assert_eq!(damaged.installed_revision.as_deref(), Some(item.revision.as_str()));
+        assert!(!damaged.intact);
+        assert!(damaged.problem.as_deref().unwrap().contains("Reinstall"));
+        assert!(manager.update_status("unknown-skill").is_err());
+    }
+    #[test]
+    fn damaged_or_mismarked_packages_repair_instead_of_loading_partially() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Skills::new(temp.path().into());
+        let item = skill("wiki-qa").unwrap();
+        let directory = manager.directory(&item);
+        // A directory without a matching marker is incomplete: reads fail and
+        // the package is not reported as installed.
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("SKILL.md"), "partial").unwrap();
+        assert!(manager.read("wiki-qa", "SKILL.md").is_err());
+        assert!(!manager.installed(&item));
+        // A stale marker from another revision is not an installation either.
+        std::fs::write(directory.join(".installed"), "stale-marker").unwrap();
+        assert!(!manager.installed(&item));
+        assert!(manager.read("wiki-qa", "SKILL.md").is_err());
+    }
     #[test]
     fn every_skill_declares_reviewed_connector_and_interpreter_dependencies() {
         for item in catalog() {

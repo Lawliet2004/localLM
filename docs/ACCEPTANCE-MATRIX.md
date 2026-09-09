@@ -72,6 +72,7 @@ authorization.
 | --- | --- | --- |
 | Pinned provenance, install/verify/inspect/activate/remove, reference reader with permissions | verified | `catalog/skills.lock.json`, `docs/SKILLS.md`, `docs/PROGRESS.md` (skill + skill-reader slices) |
 | Dependency detection/status with actionable remedies | verified | `docs/SKILLS.md` (Dependencies), `skill_dependencies` IPC + Skills-page **Check dependencies**; covers all 13 skills for connectors/interpreters/external CLIs, never installs; native acceptance `scripts/skill-dependencies-smoke.mjs` → `skill-dependencies-smoke.json` + `skill-dependencies.png` (2026-09-09, IPC rows + rendered UI) |
+| Repair of damaged/incomplete installs + versioned update status | partial | `skill_update_status` IPC + Skills-page Version panel report installed/catalog revisions, integrity failures, and update availability (`skills::` status tests, native `test-results/skill-update-status.png`); repair runs through verified `install_skill`; scripted dependency installation and catalog revision changes remain untested |
 | Explicit dependency installation, permission-controlled script workflows, versioned updates, artifact creation/opening, representative workflow per skill | missing | Reader returns text only; no execution, installation, update, or artifact workflows |
 | Per-conversation activation | missing | Activation is global, captured per turn |
 

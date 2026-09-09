@@ -1,5 +1,5 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
-import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ConversationTools, ExecutionConfig, HardwareStatus, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillDependencyStatus, SkillView, ToolSelection } from './types';
+import type { Bootstrap, ChatEvent, ConnectorView, Conversation, ConversationTools, ExecutionConfig, HardwareStatus, Message, Preferences, RuntimeConfig, RuntimeStatus, SkillDependencyStatus, SkillUpdateStatus, SkillView, ToolSelection } from './types';
 
 export const nativeAvailable = isTauri();
 export interface LocalServerConfig { id: string; name: string; executable: string; arguments: string[]; workingDirectory: string; environment: Record<string, string> }
@@ -34,6 +34,7 @@ export const api = {
   removeSkill: (id: string) => invoke<void>('remove_skill', { id }),
   setSkillActive: (id: string, active: boolean) => invoke<void>('set_skill_active', { id, active }),
   readSkillFile: (id: string, path: string) => invoke<string>('read_skill_file', { id, path }),
+  skillUpdateStatus: (id: string) => invoke<SkillUpdateStatus>('skill_update_status', { id }),
   skillDependencies: (id: string) => invoke<SkillDependencyStatus[]>('skill_dependencies', { id }),
   listConnectors: () => invoke<ConnectorView[]>('list_connectors'),
   connectConnector: (id: string, apiToken?: string) => invoke<ConnectorView>('connect_connector', { id, apiToken }),

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { BookOpen, Search } from 'lucide-react';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import catalog from '../lib/catalog.json';
-import type { SkillDependencyStatus, SkillView } from '../lib/types';
+import type { SkillDependencyStatus, SkillUpdateStatus, SkillView } from '../lib/types';
 
 const presets: SkillView[] = catalog.skills.map(item => ({ id: item.name, description: item.description, repo: item.url.replace('https://github.com/', ''), revision: '', sourcePath: item.path, files: [], installed: false, active: false }));
 export function Skills() {
@@ -12,6 +12,7 @@ export function Skills() {
   const [error, setError] = useState('');
   const [preview, setPreview] = useState<{ id: string; path: string; text: string } | null>(null);
   const [dependencies, setDependencies] = useState<{ id: string; rows: SkillDependencyStatus[] } | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<{ id: string; status: SkillUpdateStatus } | null>(null);
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
@@ -22,9 +23,10 @@ export function Skills() {
     setPending(item.id); setError('');
     try {
       if (kind === 'install') await api.installSkill(item.id);
-      if (kind === 'remove') { await api.removeSkill(item.id); if (preview?.id === item.id) setPreview(null); if (dependencies?.id === item.id) setDependencies(null); }
+      if (kind === 'remove') { await api.removeSkill(item.id); if (preview?.id === item.id) setPreview(null); if (dependencies?.id === item.id) setDependencies(null); if (updateStatus?.id === item.id) setUpdateStatus(null); }
       if (kind === 'activate') await api.setSkillActive(item.id, !item.active);
       setItems(await api.listSkills());
+      if (item.installed) setUpdateStatus({ id: item.id, status: await api.skillUpdateStatus(item.id) });
     } catch (e) { setError(errorMessage(e)); }
     finally { setPending(''); }
   }
@@ -35,8 +37,12 @@ export function Skills() {
   }
   async function checkDependencies(item: SkillView) {
     setPending(item.id); setError('');
-    try { setDependencies({ id: item.id, rows: await api.skillDependencies(item.id) }); }
-    catch (e) { setDependencies(null); setError(errorMessage(e)); }
+    try {
+      const [rows, status] = await Promise.all([api.skillDependencies(item.id), api.skillUpdateStatus(item.id)]);
+      setDependencies({ id: item.id, rows });
+      setUpdateStatus({ id: item.id, status });
+    }
+    catch (e) { setDependencies(null); setUpdateStatus(null); setError(errorMessage(e)); }
     finally { setPending(''); }
   }
   const filtered = items.filter(item => `${item.id} ${item.description}`.toLowerCase().includes(query.toLowerCase()));
@@ -50,6 +56,7 @@ export function Skills() {
         {item.installed && <><button className="secondary" disabled={!!pending} onClick={() => void inspect(item.id, 'SKILL.md')}>Read instructions</button><button className="secondary" disabled={!!pending} onClick={() => void checkDependencies(item)}>Check dependencies</button><button className="secondary" disabled={!!pending} onClick={() => void action(item, 'install')}>Verify files</button><button className="secondary" disabled={!!pending} onClick={() => void action(item, 'remove')}>Remove</button></>}
       </div>
       {dependencies?.id === item.id && <div className="skill-dependencies"><strong>Dependencies</strong><ul>{dependencies.rows.map(row => <li key={`${row.dependency.kind}:${row.dependency.name}`}>{row.satisfied ? 'Ready' : 'Missing'} · {row.dependency.kind} · <code>{row.dependency.name}</code> — {row.dependency.detail} {row.remedy}</li>)}</ul><p><small>Checks only report status. Skill instructions never bypass conversation permissions; scripts run only through an enabled execution tool after approval.</small></p></div>}
+      {updateStatus?.id === item.id && <div className="skill-dependencies"><strong>Version</strong><p>Pinned revision <code>{updateStatus.status.catalogRevision}</code>{updateStatus.status.installedRevision ? <> · installed <code>{updateStatus.status.installedRevision}</code></> : ' · not installed'}{updateStatus.status.updateAvailable && updateStatus.status.installedRevision ? ' · update available: reinstall to replace the old package after it verifies.' : ''}{!updateStatus.status.intact && updateStatus.status.installedRevision ? ' Package failed verification; reinstall to repair it.' : ''}</p>{updateStatus.status.problem && <p><small>{updateStatus.status.problem} Reinstalling verifies every file before publishing and never executes package scripts.</small></p>}</div>}
       {item.installed && <label>Package files<select aria-label={`${item.id} package files`} value={preview?.id === item.id ? preview.path : ''} onChange={event => { if (event.target.value) void inspect(item.id, event.target.value); }}><option value="">Choose a file to inspect</option>{item.files.map(file => <option key={file.path} value={file.path}>{file.path}</option>)}</select></label>}
       {preview?.id === item.id && <div className="skill-preview"><strong>{preview.path}</strong><pre>{preview.text}</pre></div>}
     </div></details>)}</div>
