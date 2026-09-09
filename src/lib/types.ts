@@ -44,6 +44,10 @@ export interface SkillView {
   id: string; description: string; repo: string; revision: string; sourcePath: string;
   files: { path: string; size: number; sha256: string }[]; installed: boolean; active: boolean;
 }
+export interface SkillDependencyStatus {
+  dependency: { kind: string; name: string; detail: string };
+  satisfied: boolean; remedy: string;
+}
 export interface ExecutionConfig { pythonPath: string; nodePath: string; powershellPath: string }
 export interface HardwareStatus {
   logicalCpus: number; memoryTotalBytes: number | null; memoryAvailableBytes: number | null;

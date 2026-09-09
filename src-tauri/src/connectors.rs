@@ -394,6 +394,13 @@ impl McpHub {
         }
         Ok(items)
     }
+    /// Whether a preset connector currently has a live session. Skill
+    /// dependency checks use only this boolean; they never expose sessions.
+    pub fn is_connected(&self, id: &str) -> bool {
+        self.connections
+            .get(id)
+            .is_some_and(|connection| !connection.service.is_closed())
+    }
     pub fn list_local(&self) -> Result<Vec<crate::local_mcp_config::LocalServerSummary>, String> {
         Ok(crate::local_mcp_config::load(&self.vault)?
             .iter()

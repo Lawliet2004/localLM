@@ -10,7 +10,17 @@ The tool accepts optional `start_line` (default 1) and `line_count` (default 200
 
 The reader consumes one of the 32 tool slots regardless of active skill count. The chat tool picker displays it. Ask and Auto-approve reads require approval for package reads; Full access skips the prompt. The ordinary tool audit records arguments, authorization and results. Deactivate every skill to remove the reader.
 
-Reading script source does not execute it or install dependencies. Dedicated package script execution, dependency reporting and package update workflows remain incomplete. Current local code execution is a separate selected tool and is not sandboxed.
+Reading script source does not execute it or install dependencies. Package script execution and update workflows remain incomplete; dependency *status* is implemented below. Current local code execution is a separate selected tool and is not sandboxed.
+
+## Dependencies
+
+Every installed skill reports its runtime dependencies through `skill_dependencies` and the Skills page **Check dependencies** button. Dependencies are statically declared from each skill's `SKILL.md` workflow at its pinned revision plus the packaged script inventory; the check only reports status and never installs anything or changes configuration.
+
+- `connector` names a TrueForge preset (for example `tavily`, `github`, `notion`). Satisfied means that connector currently has a live session; otherwise the remedy points at Connectors and per-conversation tool selection.
+- `interpreter` names the Execution-page interpreter (`python`, `node`, `powershell`). Satisfied means the saved absolute path exists; otherwise the remedy points at Execution.
+- `externalCli` names a separately installed CLI (`uv`, `gh`, `sentry`, `tvly`, `bash`). Satisfied means it resolves on PATH; LocalLM never installs these.
+
+Skill instructions never bypass conversation permissions: missing connectors, interpreters, or CLIs produce clear errors naming the absent dependency instead of silent fallback.
 
 ## Evidence
 

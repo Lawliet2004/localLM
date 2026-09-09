@@ -63,7 +63,8 @@ Do not mutate external accounts for coverage without authorization.
 | Requirement | Status | Evidence |
 | --- | --- | --- |
 | Pinned provenance, install/verify/inspect/activate/remove, reference reader with permissions | verified | `catalog/skills.lock.json`, `docs/SKILLS.md`, `docs/PROGRESS.md` (skill + skill-reader slices) |
-| Dependency detection/status, explicit installation, permission-controlled script workflows, versioned updates, artifact creation/opening, representative workflow per skill | missing | Reader returns text only; no execution, dependency, update, or artifact workflows |
+| Dependency detection/status with actionable remedies | partial | `docs/SKILLS.md` (Dependencies), `skill_dependencies` IPC + Skills-page check; covers all 13 skills for connectors/interpreters/external CLIs, never installs; no native UI acceptance yet |
+| Explicit dependency installation, permission-controlled script workflows, versioned updates, artifact creation/opening, representative workflow per skill | missing | Reader returns text only; no execution, installation, update, or artifact workflows |
 | Per-conversation activation | missing | Activation is global, captured per turn |
 
 All 13 packages (`algorithmic-art`, `skill-creator`, `mcp-builder`,

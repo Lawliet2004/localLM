@@ -25,6 +25,25 @@ pub struct Skill {
     source_path: String,
     files: Vec<SkillFile>,
 }
+/// A runtime requirement an installed skill needs before its scripted
+/// workflows can run. Every dependency maps to a user-actionable remedy.
+///
+/// Skill authors declare only connectors and interpreters. `SkillDependency`
+/// never executes installers or mutates configuration.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDependency {
+    pub kind: String,
+    pub name: String,
+    pub detail: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDependencyStatus {
+    pub dependency: SkillDependency,
+    pub satisfied: bool,
+    pub remedy: String,
+}
 #[derive(Deserialize)]
 struct Catalog {
     skills: Vec<Skill>,
@@ -91,6 +110,180 @@ impl Skills {
     }
     fn installed(&self, skill: &Skill) -> bool {
         self.directory(skill).join(".installed").is_file()
+    }
+    /// Statically declared runtime dependencies for every pinned skill.
+    ///
+    /// Sources: each skill's `SKILL.md` workflow at its pinned revision plus
+    /// the packaged script inventory in `catalog/skills.lock.json`. Connector
+    /// entries name the TrueForge preset in `src/lib/catalog.json`; interpreter
+    /// entries name the Execution-page interpreter (`python`, `node`,
+    /// `powershell`). `uv`, `gh`, `sentry`, and `tvly` are external CLIs the
+    /// user installs separately; they are reported, never installed here.
+    pub fn dependencies(id: &str) -> Result<Vec<SkillDependency>, String> {
+        Ok(match skill(id)?.id.as_str() {
+            "algorithmic-art" => vec![Self::interpreter(
+                "node",
+                "Render or preview the p5.js viewer artifact.",
+            )],
+            "skill-creator" => vec![
+                Self::interpreter("python", "Run the eval/benchmark helper scripts."),
+                Self::external_cli(
+                    "uv",
+                    "Run skill-creator helper scripts when its SKILL.md suggests uv.",
+                ),
+            ],
+            "mcp-builder" => vec![
+                Self::interpreter("python", "Run scripts/connections.py and scripts/evaluation.py."),
+                Self::interpreter("node", "Build or inspect TypeScript MCP servers."),
+                Self::external_cli(
+                    "uv",
+                    "Install scripts/requirements.txt (anthropic, mcp) for scripted checks.",
+                ),
+            ],
+            "web-artifacts-builder" => vec![
+                Self::interpreter("node", "Initialize and bundle React/Vite artifacts."),
+                Self::external_cli("bash", "Run scripts/init-artifact.sh and bundle-artifact.sh."),
+            ],
+            "tavily-research" => vec![
+                Self::connector("tavily", "Tavily MCP search/extract/crawl and reporting."),
+                Self::external_cli(
+                    "tvly",
+                    "Run tvly research/search when the workflow uses the CLI instead of MCP tools.",
+                ),
+            ],
+            "supabase" => vec![Self::connector(
+                "supabase",
+                "Supabase MCP execute_sql, advisors, docs, and project tools.",
+            )],
+            "wiki-architect" => vec![
+                Self::connector("deepwiki", "DeepWiki repository wiki and structure tools."),
+                Self::connector("github", "GitHub repository file access for private repos."),
+            ],
+            "wiki-qa" => vec![
+                Self::connector("deepwiki", "DeepWiki repository wiki and structure tools."),
+                Self::connector("github", "GitHub repository file access for private repos."),
+            ],
+            "linear" => vec![Self::connector(
+                "linear",
+                "Linear MCP issue/project/team management over OAuth.",
+            )],
+            "gh-fix-ci" => vec![
+                Self::connector("github", "GitHub MCP pull-request and CI context."),
+                Self::interpreter("python", "Run scripts/inspect_pr_checks.py for failing checks."),
+                Self::external_cli(
+                    "gh",
+                    "Authenticate once with gh auth login, then inspect PR checks.",
+                ),
+            ],
+            "notion-knowledge-capture" => vec![Self::connector(
+                "notion",
+                "Notion MCP search/fetch/create/update pages and databases.",
+            )],
+            "sentry" => vec![
+                Self::connector("sentry", "Sentry MCP issue/event inspection over OAuth."),
+                Self::external_cli(
+                    "sentry",
+                    "Run read-only sentry issue/event commands from its SKILL.md.",
+                ),
+            ],
+            "jupyter-notebook" => vec![
+                Self::interpreter("python", "Run scripts/new_notebook.py and notebook cells."),
+                Self::external_cli(
+                    "uv",
+                    "Optional: uv pip install jupyterlab ipykernel for execution.",
+                ),
+            ],
+            _ => return Err("Unknown skill.".into()),
+        })
+    }
+    fn connector(name: &str, detail: &str) -> SkillDependency {
+        SkillDependency { kind: "connector".into(), name: name.into(), detail: detail.into() }
+    }
+    fn interpreter(name: &str, detail: &str) -> SkillDependency {
+        SkillDependency { kind: "interpreter".into(), name: name.into(), detail: detail.into() }
+    }
+    fn external_cli(name: &str, detail: &str) -> SkillDependency {
+        SkillDependency { kind: "externalCli".into(), name: name.into(), detail: detail.into() }
+    }
+    /// Evaluate declared dependencies against live application state.
+    ///
+    /// Connector entries check the hub's connected sessions; interpreter
+    /// entries check the saved Execution-page paths; external CLIs resolve on
+    /// PATH. Nothing here launches installers, and skill instructions never
+    /// bypass the conversation permission policy.
+    pub fn dependency_status(
+        &self,
+        id: &str,
+        connectors: &crate::connectors::McpHub,
+        execution: &crate::execution::ExecutionConfig,
+    ) -> Result<Vec<SkillDependencyStatus>, String> {
+        if !self.installed(&skill(id)?) {
+            return Err("Install this skill first.".into());
+        }
+        Self::dependencies(id)?
+            .into_iter()
+            .map(|dependency| {
+                let (satisfied, remedy) = match dependency.kind.as_str() {
+                    "connector" => {
+                        let connected = connectors.is_connected(&dependency.name);
+                        (
+                            connected,
+                            if connected {
+                                format!("{} connector is connected.", dependency.name)
+                            } else {
+                                format!(
+                                    "Connect {} in Connectors, then select its tools for this conversation.",
+                                    dependency.name
+                                )
+                            },
+                        )
+                    }
+                    "interpreter" => {
+                        let path = match dependency.name.as_str() {
+                            "python" => &execution.python_path,
+                            "node" => &execution.node_path,
+                            "powershell" => &execution.powershell_path,
+                            _ => "",
+                        };
+                        let configured =
+                            !path.is_empty() && Path::new(path).is_absolute() && Path::new(path).is_file();
+                        (
+                            configured,
+                            if configured {
+                                format!("{} interpreter is configured in Execution.", dependency.name)
+                            } else {
+                                format!(
+                                    "Set the {} interpreter path in Execution; skill scripts stay idle until then.",
+                                    dependency.name
+                                )
+                            },
+                        )
+                    }
+                    _ => {
+                        let available = std::env::var_os("PATH")
+                            .into_iter()
+                            .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+                            .any(|directory| {
+                                let candidate = directory.join(format!("{}.exe", dependency.name));
+                                let bare = directory.join(&dependency.name);
+                                candidate.is_file() || bare.is_file()
+                            });
+                        (
+                            available,
+                            if available {
+                                format!("{} is available on PATH.", dependency.name)
+                            } else {
+                                format!(
+                                    "Install {} separately; LocalLM never installs external CLIs.",
+                                    dependency.name
+                                )
+                            },
+                        )
+                    }
+                };
+                Ok(SkillDependencyStatus { dependency, satisfied, remedy })
+            })
+            .collect()
     }
     pub fn list(&self, active: &[String]) -> Vec<SkillView> {
         catalog()
@@ -368,9 +561,147 @@ pub async fn read_skill_file(
     state.skills.lock().await.read(&id, &path)
 }
 
+#[tauri::command]
+pub async fn skill_dependencies(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+) -> Result<Vec<SkillDependencyStatus>, String> {
+    let execution = {
+        let store = state.database()?;
+        store.execution_config().unwrap_or_default()
+    };
+    let hub = state.connectors.lock().await;
+    let skills = state.skills.lock().await.clone();
+    skills.dependency_status(&id, &hub, &execution)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_skill_declares_reviewed_connector_and_interpreter_dependencies() {
+        for item in catalog() {
+            let dependencies = Skills::dependencies(&item.id).unwrap();
+            assert!(!dependencies.is_empty(), "no dependencies for {}", item.id);
+            for dependency in &dependencies {
+                assert!(
+                    matches!(
+                        dependency.kind.as_str(),
+                        "connector" | "interpreter" | "externalCli"
+                    ),
+                    "unknown kind for {}",
+                    item.id
+                );
+                assert!(!dependency.name.trim().is_empty());
+                assert!(!dependency.detail.trim().is_empty());
+            }
+            let packaged_scripts = item
+                .files
+                .iter()
+                .filter(|file| {
+                    file.path.ends_with(".py") || file.path.ends_with(".sh")
+                })
+                .count();
+            let has = |kind: &str, name: &str| {
+                dependencies
+                    .iter()
+                    .any(|dependency| dependency.kind == kind && dependency.name == name)
+            };
+            match item.id.as_str() {
+                "mcp-builder" | "skill-creator" | "gh-fix-ci" | "jupyter-notebook" => {
+                    assert!(has("interpreter", "python"), "python missing for {}", item.id);
+                }
+                "algorithmic-art" | "web-artifacts-builder" => {
+                    assert!(has("interpreter", "node"), "node missing for {}", item.id);
+                }
+                _ => {}
+            }
+            if packaged_scripts > 0 {
+                assert!(
+                    dependencies.iter().any(|dependency| dependency.kind == "interpreter"),
+                    "scripts without interpreter for {}",
+                    item.id
+                );
+            }
+            for name in ["tavily", "supabase", "linear", "github", "notion", "sentry", "deepwiki"] {
+                if item.id.contains(name)
+                    || (item.id == "wiki-architect" && name == "deepwiki")
+                    || (item.id == "wiki-qa" && name == "deepwiki")
+                {
+                    assert!(has("connector", name), "{name} missing for {}", item.id);
+                }
+            }
+        }
+        assert!(Skills::dependencies("unknown-skill").is_err());
+    }
+    #[test]
+    fn dependency_status_reports_actionable_remedies_without_launching() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Skills::new(temp.path().into());
+        let item = skill("gh-fix-ci").unwrap();
+        let directory = manager.directory(&item);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(".installed"), &item.revision).unwrap();
+        let hub = crate::connectors::McpHub::new(std::sync::Arc::new(crate::vault::Vault::new(
+            temp.path().join("vault"),
+        )));
+        let empty = crate::execution::ExecutionConfig {
+            python_path: String::new(),
+            node_path: String::new(),
+            powershell_path: String::new(),
+        };
+        let statuses = manager.dependency_status("gh-fix-ci", &hub, &empty).unwrap();
+        assert_eq!(statuses.len(), 3);
+        let by_name = |name: &str| statuses.iter().find(|status| status.dependency.name == name).unwrap();
+        // PATH-dependent CLI rows vary by machine; only the actionable remedy is asserted.
+        assert!(!by_name("github").satisfied);
+        assert!(!by_name("python").satisfied);
+        assert!(!by_name("gh").remedy.trim().is_empty());
+        for status in &statuses {
+            assert!(!status.remedy.trim().is_empty());
+        }
+        let connector = statuses
+            .iter()
+            .find(|status| status.dependency.name == "github")
+            .unwrap();
+        assert!(connector.remedy.contains("Connect github in Connectors"));
+        let interpreter = statuses
+            .iter()
+            .find(|status| status.dependency.name == "python")
+            .unwrap();
+        assert!(interpreter.remedy.contains("Execution"));
+        let cli = statuses
+            .iter()
+            .find(|status| status.dependency.name == "gh")
+            .unwrap();
+        assert!(
+            cli.remedy.contains("never installs") || cli.remedy.contains("available on PATH"),
+            "unexpected gh remedy: {}",
+            cli.remedy
+        );
+        // A configured interpreter flips only its own row; connectors stay missing.
+        let python = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        let configured = crate::execution::ExecutionConfig {
+            python_path: python,
+            node_path: String::new(),
+            powershell_path: String::new(),
+        };
+        let statuses = manager.dependency_status("gh-fix-ci", &hub, &configured).unwrap();
+        assert!(statuses
+            .iter()
+            .find(|status| status.dependency.name == "python")
+            .unwrap()
+            .satisfied);
+        assert!(!statuses
+            .iter()
+            .find(|status| status.dependency.name == "github")
+            .unwrap()
+            .satisfied);
+        assert!(manager.dependency_status("gh-fix-ci", &hub, &empty).unwrap().len() == 3);
+        assert!(manager.dependency_status("unknown-skill", &hub, &empty).is_err());
+        let fresh = Skills::new(temp.path().join("empty-root"));
+        assert!(fresh.dependency_status("gh-fix-ci", &hub, &empty).unwrap_err().contains("Install this skill"));
+    }
     #[cfg(windows)]
     #[test]
     fn package_junction_cannot_escape_skill_storage() {
