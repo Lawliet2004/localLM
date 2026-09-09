@@ -63,7 +63,7 @@ Do not mutate external accounts for coverage without authorization.
 | Requirement | Status | Evidence |
 | --- | --- | --- |
 | Pinned provenance, install/verify/inspect/activate/remove, reference reader with permissions | verified | `catalog/skills.lock.json`, `docs/SKILLS.md`, `docs/PROGRESS.md` (skill + skill-reader slices) |
-| Dependency detection/status with actionable remedies | partial | `docs/SKILLS.md` (Dependencies), `skill_dependencies` IPC + Skills-page check; covers all 13 skills for connectors/interpreters/external CLIs, never installs; no native UI acceptance yet |
+| Dependency detection/status with actionable remedies | verified | `docs/SKILLS.md` (Dependencies), `skill_dependencies` IPC + Skills-page **Check dependencies**; covers all 13 skills for connectors/interpreters/external CLIs, never installs; native acceptance `scripts/skill-dependencies-smoke.mjs` (2026-09-09, IPC rows + rendered UI + screenshot) |
 | Explicit dependency installation, permission-controlled script workflows, versioned updates, artifact creation/opening, representative workflow per skill | missing | Reader returns text only; no execution, installation, update, or artifact workflows |
 | Per-conversation activation | missing | Activation is global, captured per turn |
 

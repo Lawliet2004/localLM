@@ -446,3 +446,7 @@ Verification: a new native regression covers fresh-hash success, ambiguous-match
 ### Per-frame local MCP transport bound
 
 Local stdio stdout now passes through a 4 MiB newline-delimited frame wrapper before reaching the pinned SDK transport, which otherwise reads unbounded lines. Frames beyond the bound (terminated or never-terminated) fail the read so the handshake/discovery/tool path surfaces a closed/failed transport instead of buffering without limit. Verified with a unit test over small 64-byte reads plus a real flood-fixture connection failure; strict Clippy passes. The 512-tool/2 MiB discovery accumulation limits still apply after deserialization; per-tool result limits and remote HTTP framing are unchanged.
+
+### Skill dependency status and native UI acceptance
+
+Declared connector/interpreter/external-CLI dependencies for all 13 skills with actionable remedies, evaluated live against hub sessions, saved interpreter paths, and PATH. `scripts/skill-dependencies-smoke.mjs` installs `gh-fix-ci` and `jupyter-notebook` through native IPC, asserts the exact IPC rows (`connector:github`, `interpreter:python`, `externalCli:gh` / `interpreter:python`, `externalCli:uv`), verifies the github connector reports missing with a Connectors remedy, opens the native Skills page, expands the gh-fix-ci card, runs **Check dependencies**, and screenshots the rendered rows. Evidence: `test-results/skill-dependencies-smoke.json` and `test-results/skill-dependencies.png` (2026-09-09).
