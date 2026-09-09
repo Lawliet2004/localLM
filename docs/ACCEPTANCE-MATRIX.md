@@ -3,10 +3,10 @@
 Date: 2026-09-09. Scope: Windows x64, RTX 2050 4 GB, 16 GB RAM, MiniCPM5-2B
 Q6_K, managed llama.cpp b10855.
 
-Only `test-results/` files regenerated in this cycle are cited as JSON
-evidence below. Older JSON results were cleaned from the worktree, so earlier
-slices are cited through `docs/PROGRESS.md` plus the reproducible scripts and
-unit tests that back them. Later progress entries supersede earlier ones.
+`test-results/` is git-ignored, so JSON/PNG artifacts are local reproduction
+outputs, not committed evidence. The matrix cites the reproducible script or
+command plus the artifact name; `docs/PROGRESS.md` records the observed run.
+Later progress entries supersede earlier ones.
 
 Status key: **verified** (reproducible evidence), **partial** (implemented but
 insufficiently verified), **missing** (not implemented), **external**
@@ -27,18 +27,18 @@ insufficiently verified), **missing** (not implemented), **external**
 
 | Requirement | Status | Evidence |
 | --- | --- | --- |
-| Ask / Auto-approve reads / Full access, Ask default, per-conversation persistence, Rust enforcement, durable audits, denial blocks turn, metadata cannot grant permissions | verified | `docs/PERMISSIONS.md`, `docs/PROGRESS.md` (permission-mode + skill-reader slices), `test-results/local-mcp-chat-smoke.json` |
-| Save/edit connector never launches; Full access limits | verified | `scripts/local-connector-smoke.json`, `connectors::` CRUD tests |
+| Ask / Auto-approve reads / Full access, Ask default, per-conversation persistence, Rust enforcement, durable audits, denial blocks turn, metadata cannot grant permissions | verified | `docs/PERMISSIONS.md`, `docs/PROGRESS.md` (permission-mode + skill-reader slices), `scripts/local-mcp-chat-smoke.mjs` → `local-mcp-chat-smoke.json` |
+| Save/edit connector never launches; Full access limits | verified | `scripts/local-connector-smoke.mjs` → `local-connector-smoke.json`, `connectors::` CRUD tests |
 
 ## 3. Local MCP
 
 | Requirement | Status | Evidence |
 | --- | --- | --- |
-| Encrypted config CRUD, explicit launch, discovery, selection, invocation, ownership, process-tree cleanup | verified | `test-results/local-connector-smoke.json`, `cargo test local_mcp_` |
-| MiniCPM allow/deny/auto/full-access chat workflow with identity, args, results, reload persistence | verified | `test-results/local-mcp-chat-smoke.json` (2026-09-09) |
-| Cancellation, tool failure, server exit, disconnect durable outcomes | verified | `test-results/local-mcp-failure-smoke.json` (2026-09-09) |
+| Encrypted config CRUD, explicit launch, discovery, selection, invocation, ownership, process-tree cleanup | verified | `scripts/local-connector-smoke.mjs` → `local-connector-smoke.json`, `cargo test local_mcp_` |
+| MiniCPM allow/deny/auto/full-access chat workflow with identity, args, results, reload persistence | verified | `scripts/local-mcp-chat-smoke.mjs` → `local-mcp-chat-smoke.json` (re-verified 2026-09-09: ask-allow/deny, auto prompt, full-access no-prompt, reload persistence) |
+| Cancellation, tool failure, server exit, disconnect durable outcomes | verified | `scripts/local-mcp-failure-smoke.mjs` → `local-mcp-failure-smoke.json` (2026-09-09) |
 | Malformed/truncated input, unexpected exit, handshake/discovery failure, closed-transport selection, edit/disconnect race | verified | `connectors::tests::malformed_protocol_input_and_unexpected_exit_are_reported`, session snapshot changes |
-| Structured arguments/environment, browsing, focus, validation, cancellation, duplicate names, pending states, secret visibility, stable IDs | verified | `test-results/local-connector-smoke.json` (`structuredControls`, `secretHiddenByDefault`), `LocalConnectorForm.test.tsx` |
+| Structured arguments/environment, browsing, focus, validation, cancellation, duplicate names, pending states, secret visibility, stable IDs | verified | `scripts/local-connector-smoke.mjs` → `local-connector-smoke.json` (`structuredControls`, `secretHiddenByDefault`), `LocalConnectorForm.test.tsx` |
 | Individual transport-frame size bound | partial | Local stdio frames capped at 4 MiB before SDK deserialization (`local_mcp_process::` frame tests); 512-tool/2 MiB accumulation still applies after page deserialization; remote HTTP framing unchanged |
 | Shutdown observability | partial | `close()` reports protocol/signal/reap stages and failed reaps return stage detail; full-suite + native disconnect rerun deferred by disk pressure |
 | Reconnect UX beyond disconnect-then-connect | partial | Covered by explicit disconnect/connect; no dedicated reconnect flow |
@@ -63,7 +63,7 @@ Do not mutate external accounts for coverage without authorization.
 | Requirement | Status | Evidence |
 | --- | --- | --- |
 | Pinned provenance, install/verify/inspect/activate/remove, reference reader with permissions | verified | `catalog/skills.lock.json`, `docs/SKILLS.md`, `docs/PROGRESS.md` (skill + skill-reader slices) |
-| Dependency detection/status with actionable remedies | verified | `docs/SKILLS.md` (Dependencies), `skill_dependencies` IPC + Skills-page **Check dependencies**; covers all 13 skills for connectors/interpreters/external CLIs, never installs; native acceptance `scripts/skill-dependencies-smoke.mjs` (2026-09-09, IPC rows + rendered UI + screenshot) |
+| Dependency detection/status with actionable remedies | verified | `docs/SKILLS.md` (Dependencies), `skill_dependencies` IPC + Skills-page **Check dependencies**; covers all 13 skills for connectors/interpreters/external CLIs, never installs; native acceptance `scripts/skill-dependencies-smoke.mjs` → `skill-dependencies-smoke.json` + `skill-dependencies.png` (2026-09-09, IPC rows + rendered UI) |
 | Explicit dependency installation, permission-controlled script workflows, versioned updates, artifact creation/opening, representative workflow per skill | missing | Reader returns text only; no execution, installation, update, or artifact workflows |
 | Per-conversation activation | missing | Activation is global, captured per turn |
 
@@ -77,7 +77,7 @@ All 13 packages (`algorithmic-art`, `skill-creator`, `mcp-builder`,
 | Requirement | Status | Evidence |
 | --- | --- | --- |
 | list/read/create files + directories, traversal/junction protection, permission enforcement, audits | verified | `docs/PROGRESS.md` (workspace + permission slices), `workspace::` tests |
-| Conflict-checked `edit_file` (fresh SHA-256, unique match, reliable write, durable audit) | verified | `test-results/workspace-edit-smoke.json` (2026-09-09), `workspace::tests::edits_require_a_fresh_read_and_one_unique_match` |
+| Conflict-checked `edit_file` (fresh SHA-256, unique match, reliable write, durable audit) | verified | `scripts/workspace-edit-smoke.mjs` → `workspace-edit-smoke.json` (2026-09-09), `workspace::tests::edits_require_a_fresh_read_and_one_unique_match` |
 | Reviewable diffs, file browsing UI, artifact previews/opening, untrusted HTML/script isolation | missing | No diff view, no artifact viewer, no preview sandbox |
 
 ## 7. Execution (local + Daytona)
@@ -100,7 +100,7 @@ All 13 packages (`algorithmic-art`, `skill-creator`, `mcp-builder`,
 
 | Requirement | Status | Evidence |
 | --- | --- | --- |
-| Codex-inspired light/dark workspace, keyboard/focus/dialogs, responsive sizes, empty/loading/error/cancelled/disconnected states, readable tool/approval/code/table/artifact presentation | partial | `test-results/*.png`, `npx playwright test` (2 browser tests); component tests only for newer dialogs; no systematic accessibility/responsive audit |
+| Codex-inspired light/dark workspace, keyboard/focus/dialogs, responsive sizes, empty/loading/error/cancelled/disconnected states, readable tool/approval/code/table/artifact presentation | partial | `npx playwright test` (2 browser tests, screenshots to `test-results/*.png`); component tests only for newer dialogs; no systematic accessibility/responsive audit |
 
 ## 10. Security and reliability
 

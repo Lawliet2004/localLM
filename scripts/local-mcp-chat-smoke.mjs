@@ -2,6 +2,7 @@ import { chromium, expect } from '@playwright/test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 // Local MCP chat acceptance: real MiniCPM -> local fixture tool -> approval ->
 // tool result -> completed response -> persisted records verified after reload.
@@ -61,27 +62,18 @@ try {
   originalActiveSkills = (await invoke('list_skills')).filter(item => item.active).map(item => item.id);
   for (const skill of originalActiveSkills) await invoke('set_skill_active', { id: skill, active: false });
   await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Load model', exact: true })).toBeEnabled({ timeout: 30000 });
-  if (await page.getByRole('button', { name: 'Load model', exact: true }).count()) {
+  if (await page.getByRole('button', { name: 'Unload', exact: true }).count()) {
+    // Model already loaded from an earlier smoke run; reuse it.
+  } else {
+    await expect(page.getByRole('button', { name: 'Load model', exact: true })).toBeEnabled({ timeout: 30000 });
     await page.getByRole('button', { name: 'Load model', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Unload', exact: true })).toBeVisible({ timeout: 180000 });
   }
   await invoke('save_local_connector', {
     server: {
-      id: `local-${Date.now().toString(16)}-0000-4000-8000-000000000000`.slice(0, 44),
+      id: `local-${randomUUID()}`,
       name, executable: process.execPath, arguments: [script], workingDirectory: directory, environment: {},
     },
-  }).catch(async () => {
-    // Fall back to UI save when direct IPC validation rejects the generated ID shape.
-    await page.getByRole('button', { name: 'Connectors', exact: true }).click();
-    await page.getByText('Add a local MCP server', { exact: true }).click();
-    await page.getByLabel('Name', { exact: true }).fill(name);
-    await page.getByLabel('Executable path', { exact: true }).fill(process.execPath);
-    await page.getByLabel('Working directory', { exact: true }).fill(directory);
-    await page.getByLabel('Arguments (JSON array)', { exact: true }).fill(JSON.stringify([script]));
-    await page.getByLabel('Environment variables (JSON object)', { exact: true }).fill('{}');
-    await page.getByRole('button', { name: 'Save local server', exact: true }).click();
-    await expect(page.getByRole('status')).toContainText('Saved.');
   });
   const saved = (await invoke('list_connectors')).find(item => item.description === name);
   if (!saved) throw new Error('Local fixture was not saved.');
