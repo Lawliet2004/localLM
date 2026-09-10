@@ -1,6 +1,10 @@
+pub mod agent_run;
 mod approval;
+pub mod artifacts;
+pub mod capabilities;
 mod chat;
 mod commands;
+pub mod compaction;
 mod connectors;
 mod context;
 pub mod daytona;
@@ -12,7 +16,9 @@ pub mod download;
 mod execution;
 mod export;
 mod hardware;
+pub mod harness;
 mod history;
+mod inference;
 mod install_recovery;
 pub mod local_mcp_config;
 pub mod local_mcp_process;
@@ -20,6 +26,11 @@ mod model_catalog;
 mod model_install;
 mod oauth;
 mod permissions;
+pub mod memory;
+pub mod plans;
+pub mod plugins;
+pub mod presets;
+mod providers;
 mod runtime;
 pub mod runtime_archive;
 mod runtime_config;
@@ -27,11 +38,16 @@ pub mod runtime_install;
 mod runtime_install_commands;
 mod runtime_inventory;
 mod runtime_log;
+pub mod sandbox;
+pub mod scheduling;
+pub mod sessions;
 mod skills;
 mod sse;
-mod store;
+pub mod store;
+pub mod subagents;
 mod tool_calls;
 mod tool_discovery;
+pub mod system_tools;
 mod vault;
 mod workspace;
 
@@ -54,12 +70,19 @@ pub struct AppState {
     connectors: tokio::sync::Mutex<connectors::McpHub>,
     oauth_operation: tokio::sync::Mutex<()>,
     oauth_cancel: tokio::sync::watch::Sender<bool>,
+    pub subagents: std::sync::Arc<subagents::SubagentRegistry>,
+    pub terminals: tokio::sync::Mutex<sandbox::TerminalRegistry>,
+    pub db_path: std::path::PathBuf,
+    pub data_dir: std::path::PathBuf,
 }
 impl AppState {
     fn database(&self) -> Result<std::sync::MutexGuard<'_, store::Store>, String> {
         self.store
             .lock()
             .map_err(|_| "Database lock is unavailable. Restart the application.".into())
+    }
+    pub fn cancel_requested(&self) -> bool {
+        *self.cancel.borrow()
     }
 }
 
@@ -109,6 +132,10 @@ pub fn run() {
                 connectors: tokio::sync::Mutex::new(connectors::McpHub::new(vault)),
                 oauth_operation: tokio::sync::Mutex::new(()),
                 oauth_cancel: tokio::sync::watch::channel(false).0,
+                subagents: subagents::global_registry(),
+                terminals: tokio::sync::Mutex::new(sandbox::TerminalRegistry::new()),
+                db_path: data.join("locallm.sqlite"),
+                data_dir: data.clone(),
             });
             let handle = app.handle().clone();
             for (folder, runtime) in [("models", false), ("runtimes", true)] {
@@ -122,6 +149,10 @@ pub fn run() {
                 if daytona_settings::recover_at_startup(&handle.state::<AppState>()).await.is_err() {
                     eprintln!("Startup cloud cleanup could not access its journal; pending ownership is retained.");
                 }
+            });
+            let scheduler_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                scheduling::run_background(scheduler_app).await;
             });
             Ok(())
         })
@@ -151,11 +182,65 @@ pub fn run() {
             export::export_conversation,
             commands::get_conversation_tools,
             commands::save_conversation_tools,
+            commands::get_remembered_tools,
+            commands::save_remembered_tools,
+            commands::save_provider,
+            commands::list_providers,
+            providers::provider_formats,
+            commands::delete_provider,
+            commands::test_provider,
+            commands::list_provider_models,
+            commands::preferred_model,
+            commands::save_preferred_model,
+            commands::save_conversation_model,
             commands::save_runtime_config,
             commands::save_preferences,
             commands::load_model,
             commands::unload_model,
             commands::runtime_status,
+            commands::test_provider_inference,
+            commands::get_run,
+            commands::get_conversation_run,
+            commands::get_run_events,
+            commands::get_conversation_runs,
+            capabilities::list_capabilities,
+            capabilities::set_capability_enabled,
+            capabilities::dump_config,
+            presets::list_presets,
+            presets::get_preset,
+            presets::set_preset,
+            sessions::fork_session,
+            sessions::replay_session,
+            sessions::search_sessions,
+            plans::get_todos,
+            plans::get_goal,
+            subagents::list_subagent_runs,
+            subagents::interrupt_subagent,
+            subagents::list_subagent_models,
+            memory::list_facts,
+            memory::teach_fact_cmd,
+            memory::forget_fact,
+            memory::ingest_repo,
+            scheduling::list_schedules,
+            scheduling::save_schedule,
+            scheduling::delete_schedule,
+            scheduling::run_schedule_now,
+            scheduling::webhook_state,
+            scheduling::set_webhook,
+            scheduling::rotate_webhook_token,
+            sandbox::sandbox_status,
+            sandbox::set_sandbox_provider,
+            plugins::list_plugins,
+            plugins::install_plugin,
+            plugins::set_plugin_enabled,
+            plugins::remove_plugin,
+            plugins::scan_plugin,
+            plugins::test_plugin,
+            compaction::compact_conversation_cmd,
+            compaction::compaction_status,
+            compaction::set_compaction_auto,
+            commands::get_artifact,
+            commands::list_conversation_artifacts,
             runtime_log::read_runtime_log,
             model_catalog::model_download_info,
             runtime_install_commands::runtime_download_info,

@@ -10,7 +10,7 @@ describe('runtime settings', () => {
     render(<RuntimeForm initial={defaultRuntimeConfig} onSave={onSave} busy={false} />);
     await userEvent.selectOptions(screen.getByLabelText('Compute device'), 'cpu');
     await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }));
-    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ gpuLayers: 0, contextLength: 8192 }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ gpuLayers: 0, contextLength: 131072 }));
   });
 
   it('prevents saving quantized value cache without Flash Attention', async () => {

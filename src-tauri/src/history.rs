@@ -3,10 +3,27 @@ use serde_json::{json, Value};
 
 /// Rebuild completed tool exchanges before the turn's consolidated assistant answer.
 /// Stored UI messages place the assistant row before its subsequently appended audits.
+/// With a compaction cutoff, the dropped prefix is replaced by a checkpoint
+/// notice citing the artifact id; audits stay queryable in the database.
 pub fn model_history(history: &[Message]) -> Result<Vec<Value>, String> {
+    model_history_with_cutoff(history, None)
+}
+
+pub fn model_history_with_cutoff(history: &[Message], cutoff: Option<(i64, &str)>) -> Result<Vec<Value>, String> {
     let mut messages = Vec::new();
+    if let Some((cutoff, artifact_id)) = cutoff {
+        let dropped = history.iter().filter(|message| message.created_at <= cutoff).count();
+        if dropped > 0 {
+            messages.push(json!({"role": "user", "content": format!(
+                "Context checkpoint: the first {dropped} messages were compacted into artifact {artifact_id} to fit context. \
+                 Audits and full history remain in the local database; ask before expanding anything back.")}));
+        }
+    }
     let mut answer: Option<&Message> = None;
     for message in history {
+        if cutoff.is_some_and(|(cutoff, _)| message.created_at <= cutoff) {
+            continue;
+        }
         match message.role.as_str() {
             "user" => {
                 flush_answer(&mut messages, &mut answer);

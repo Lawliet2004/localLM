@@ -40,6 +40,7 @@ Use named types, explicit errors and small functions. Example: `async function l
 - [ ] Polished light/dark interface, keyboard navigation, responsive layout, useful empty/loading/error states, readable Markdown/code/tables.
 - [ ] Automated unit/integration tests plus browser and native acceptance tests; GPU benchmark and release install/uninstall verification recorded.
 - [ ] Documentation: setup, credentials, data locations, runtime options, privacy, troubleshooting, third-party notices and release limitations.
+- [ ] Harness (feature/dsh-harness): capability seam + dump_config; append-only session log with Trajectory, fork/replay/search; Standard/Code/Minimal/Creator presets; subagents with depth cap + lineage; todos/goals/workflows/Ralph as logged state; Docker boundary + terminal + FS policy + web tools + guards; SQLite memory bank; schedules + webhook + headless CLI + SDKs; Anthropic adapter + compaction; plugin manifest + malware scan. Unit/integration covered (cargo 143, vitest 62, static smokes); live-model, live-provider, and live-connector end-to-end remain unverified.
 
 ## Verification and boundaries
 Use actual SQLite, local HTTP test servers and temporary directories for integration tests. Test malformed/truncated streams, cancellation, startup failures, context overflow and tool failures. Real service credentials are needed for account-specific end-to-end evidence; never claim fixtures prove those accounts work.

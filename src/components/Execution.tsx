@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import type { ExecutionConfig } from '../lib/types';
+import { Schedules } from './Schedules';
+import { SandboxPanel } from './SandboxPanel';
 
 export function Execution() {
   const [config, setConfig] = useState<ExecutionConfig>({ pythonPath: '', nodePath: '', powershellPath: '' });
@@ -68,5 +70,7 @@ export function Execution() {
     <p className="catalog-notice">Enable Daytona cloud code under Tools in chat to run Python, JavaScript or TypeScript in a temporary remote sandbox. Code leaves this device and cloud usage may incur charges. Local workspace files are not uploaded automatically. Cleanup is attempted after every run; unresolved resources appear below.</p>
     <form className="runtime-form" onSubmit={event => { event.preventDefault(); void cloudAction('save'); }}><h2>Daytona credentials</h2><p>{hasCloudKey ? 'An encrypted API key is saved.' : 'No Daytona key saved.'} Saving a key does not create a sandbox or verify account access.</p><label>Daytona API key<input type="password" autoComplete="off" spellCheck={false} value={cloudKey} disabled={!nativeAvailable || cloudBusy} onChange={event => setCloudKey(event.target.value)} /></label><div className="connector-actions"><button className="primary" disabled={!nativeAvailable || cloudBusy || !cloudKey}>Save Daytona key</button>{hasCloudKey && <button type="button" className="secondary" disabled={cloudBusy || pendingCloud.length > 0} onClick={() => void cloudAction('forget')}>Forget Daytona key</button>}</div></form>
     {pendingCloud.length > 0 && <section aria-label="Pending cloud cleanup"><h2>Cloud cleanup needs attention</h2><p>These operations may still have cloud resources. Their records are retained until removal is verified.</p>{pendingCloud.map(item => <div className="catalog-notice" key={item.name}><strong>{item.name}</strong><p>{item.sandboxId ? `Sandbox: ${item.sandboxId}` : 'Creation outcome unknown; look up this operation name before retrying.'}</p>{item.cleanupError && <p>{item.cleanupError}</p>}<button className="secondary" disabled={!hasCloudKey || cloudBusy} onClick={() => void cloudAction('cleanup', item.name)}>Retry cleanup</button></div>)}</section>}
+    <SandboxPanel />
+    <Schedules />
   </div>;
 }

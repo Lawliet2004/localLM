@@ -131,6 +131,9 @@ pub struct AgentTool {
     backend: ToolBackend,
 }
 pub fn tool_alias(connector: &str, name: &str) -> String {
+    if connector == "System" {
+        return name.into();
+    }
     if connector == "Skills" && name == "read_file" {
         return "skills_read_file".into();
     }
@@ -157,6 +160,10 @@ pub fn tool_alias(connector: &str, name: &str) -> String {
     format!("{readable}_{}", &digest[..16])
 }
 enum ToolBackend {
+    System,
+    Harness {
+        name: String,
+    },
     Daytona(Arc<crate::daytona_execution::Executor>),
     Skills(Arc<crate::skills::SkillReader>),
     Execution(Arc<crate::execution::LocalExecution>),
@@ -181,6 +188,9 @@ impl AgentTool {
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(if matches!(self.backend, ToolBackend::Daytona(_)) {
             300
+        } else if matches!(self.backend, ToolBackend::Harness { .. }) {
+            // Orchestration tools (workflows, Ralph, parallel children) settle durably.
+            600
         } else {
             120
         })
@@ -193,9 +203,31 @@ impl AgentTool {
             backend: ToolBackend::Skills(reader),
         }
     }
+    pub fn system_time() -> Self {
+        Self {
+            connector: "System".into(),
+            alias: "system_time".into(),
+            tool: crate::system_tools::system_time_tool_definition(),
+            backend: ToolBackend::System,
+        }
+    }
+    /// Harness-owned tool (subagents, todos, memory, ...). Schemas come from
+    /// the harness registry; execution runs through the harness dispatcher so
+    /// approval, audit, and run states apply. Direct calls fail loud.
+    pub fn harness(alias: &str) -> Result<Self, String> {
+        let tool = crate::harness::definition(alias).ok_or_else(|| format!("Unknown harness tool '{alias}'."))?;
+        Ok(Self {
+            connector: "Harness".into(),
+            alias: alias.into(),
+            tool,
+            backend: ToolBackend::Harness { name: alias.into() },
+        })
+    }
     pub fn trusted_read(&self) -> bool {
-        matches!(&self.backend, ToolBackend::Workspace(_))
-            && matches!(self.tool.name.as_str(), "read_file" | "list_files")
+        matches!(&self.backend, ToolBackend::System)
+            || matches!(&self.backend, ToolBackend::Harness { name } if crate::harness::is_trusted_read(name))
+            || (matches!(&self.backend, ToolBackend::Workspace(_))
+                && matches!(self.tool.name.as_str(), "read_file" | "list_files"))
     }
     pub fn execution(execution: Arc<crate::execution::LocalExecution>, tool: ToolView) -> Self {
         Self {
@@ -218,6 +250,15 @@ impl AgentTool {
     }
     pub async fn call(&self, arguments: Value) -> Result<Value, String> {
         let peer = match &self.backend {
+            ToolBackend::System => {
+                if self.tool.name == "system_time" {
+                    return crate::system_tools::execute_system_time(&arguments);
+                }
+                return Err("Unknown system tool.".into());
+            }
+            ToolBackend::Harness { name } => {
+                return Err(format!("Harness tool '{name}' runs through the agent dispatcher, not direct calls."));
+            }
             ToolBackend::Daytona(executor) => return executor.call(arguments).await,
             ToolBackend::Skills(reader) => {
                 let reader = reader.clone();

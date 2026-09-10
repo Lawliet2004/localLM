@@ -144,6 +144,9 @@ mod tests {
                 id: "chat".into(),
                 title: "Unicode 日本語".into(),
                 updated_at: 100,
+                provider_id: None,
+                model_id: None,
+                provider_selection_required: false,
             },
             tool_selection: ConversationTools::default(),
             messages: vec![

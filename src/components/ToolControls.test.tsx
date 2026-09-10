@@ -4,10 +4,15 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { ApprovalDialog, ToolPicker } from './ToolControls';
 import type { ToolSelection } from '../lib/types';
-const fixtures = vi.hoisted(() => ({ skills: [] as { id: string; active: boolean }[] }));
+const fixtures = vi.hoisted(() => {
+  const example = { id: 'example', connected: true, hasCredential: true, description: '', url: '', authType: 'apiKey', tools: Array.from({ length: 40 }, (_, index) => ({ name: `tool_${index}`, description: `Action ${index}`, inputSchema: {} })) };
+  const offline = { id: 'offline', connected: false, hasCredential: true, description: '', url: '', authType: 'apiKey', tools: [{ name: 'their_tool', description: '', inputSchema: {} }] };
+  return { skills: [] as { id: string; active: boolean }[], connectors: [example] as (typeof example | typeof offline)[] };
+});
 vi.mock('../lib/api', () => ({ nativeAvailable: true, errorMessage: String, api: {
   hasDaytonaKey: async () => false,
-  listConnectors: async () => [{ id: 'example', connected: true, tools: Array.from({ length: 40 }, (_, index) => ({ name: `tool_${index}`, description: `Action ${index}`, inputSchema: {} })) }],
+  listConnectors: async () => fixtures.connectors,
+  connectConnector: async (id: string) => ({ ...fixtures.connectors.find(item => item.id === id)!, connected: true }),
   listSkills: async () => fixtures.skills, getWorkspace: async () => ({ path: 'C:/workspace' }),
 } }));
 function Picker() {
@@ -16,6 +21,13 @@ function Picker() {
   return <><ToolPicker selected={selected} onChange={setSelected} selectedTools={tools} onToolsChange={setTools} busy={false} /><output data-testid="selection">{JSON.stringify(tools)}</output></>;
 }
 describe('individual connector tools', () => {
+  it('does not submit the chat when Enter is pressed in tool search', async () => {
+    const onSubmit = vi.fn(event => event.preventDefault());
+    render(<form onSubmit={onSubmit}><Picker /><button type="submit">Send</button></form>);
+    await userEvent.click(screen.getByText('Tools · Off'));
+    await userEvent.type(await screen.findByLabelText('Search available tools'), 'tool{Enter}');
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
   it.each([['Allow once', true], ['Deny', false]] as const)('identifies a local server before %s', async (button, decision) => {
     const original = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'showModal');
     Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable:true, value:function(this: HTMLDialogElement) { this.open = true; } });
@@ -55,5 +67,54 @@ describe('individual connector tools', () => {
     expect(screen.queryByRole('checkbox', { name: 'tool_0' })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('checkbox', { name: 'Workspace files' }));
     expect(screen.getByText('Tools · 6/32 enabled')).toBeInTheDocument();
+  });
+  it('explains that choices are remembered for new chats and shows the workspace name and path', async () => {
+    render(<Picker />);
+    await userEvent.click(await screen.findByText('Tools · Off'));
+    expect(screen.getByText(/Tool choices are remembered for new chats. Existing chats keep their own selections./)).toBeInTheDocument();
+    expect(screen.getByText('Workspace', { selector: 'h4' })).toBeInTheDocument();
+    expect(screen.getByText('Code execution', { selector: 'h4' })).toBeInTheDocument();
+    expect(screen.getByText('Connected services', { selector: 'h4' })).toBeInTheDocument();
+    expect(screen.getByText('workspace', { selector: '.workspace-choice strong' })).toBeInTheDocument();
+    await userEvent.click(screen.getByText('Full path'));
+    expect(screen.getByText('C:/workspace', { selector: '.workspace-path code' })).toBeInTheDocument();
+  });
+  it('marks group selection state and keeps searching per tool', async () => {
+    render(<Picker />);
+    await userEvent.click(await screen.findByText('Tools · Off'));
+    await userEvent.click(await screen.findByText('example'));
+    const all = screen.getByRole('checkbox', { name: 'example' });
+    expect(all).not.toBeChecked();
+    await userEvent.click(screen.getByRole('checkbox', { name: 'tool_0' }));
+    expect(screen.getByText('1/40 selected')).toBeInTheDocument();
+    expect(all).not.toBeChecked();
+  });
+  it('keeps unavailable selections visible with a reason until removal is explicit', async () => {
+    const onToolsChange = vi.fn();
+    render(<ToolPicker selected={[]} onChange={vi.fn()} selectedTools={[
+      { connectorId: 'example', toolName: 'tool_39' },
+      { connectorId: 'gone', toolName: 'lost_tool' },
+    ]} onToolsChange={onToolsChange} busy={false} />);
+    await expect(await screen.findByText('Tools · 2/32 enabled · 1 unavailable')).toBeVisible();
+    expect(screen.getByText(/connector is no longer configured/)).toBeInTheDocument();
+    // The selection survives; only an explicit removal changes it.
+    expect(onToolsChange).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Remove unavailable tools' }));
+    expect(onToolsChange).toHaveBeenCalledExactlyOnceWith([{ connectorId: 'example', toolName: 'tool_39' }]);
+  });
+  it('offers a reconnect action for a selected tool of a disconnected service', async () => {
+    const offline = { id: 'offline', connected: false, hasCredential: true, description: '', url: '', authType: 'apiKey', tools: [{ name: 'their_tool', description: '', inputSchema: {} }] };
+    fixtures.connectors = [...fixtures.connectors, offline];
+    try {
+      render(<ToolPicker selected={[]} onChange={vi.fn()} selectedTools={[{ connectorId: 'offline', toolName: 'their_tool' }]} onToolsChange={vi.fn()} busy={false} />);
+      await userEvent.click(await screen.findByText('Tools · 1/32 enabled · 1 unavailable'));
+      expect(screen.getByText('offline')).toBeInTheDocument();
+      expect(screen.getByText(/Not connected/)).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
+      // Reconnecting restores availability: the service offers the tool again.
+      expect(await screen.findByText('1/1 selected')).toBeVisible();
+      expect(screen.getByText('Tools · 1/32 enabled')).toBeInTheDocument();
+      expect(screen.queryByText(/Not connected/)).not.toBeInTheDocument();
+    } finally { fixtures.connectors = [fixtures.connectors[0]]; }
   });
 });

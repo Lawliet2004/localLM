@@ -6,6 +6,10 @@ vi.mock('../lib/api',()=>({nativeAvailable:true,errorMessage:String,api:{
   getExecutionConfig:async()=>({pythonPath:'',nodePath:'',powershellPath:''}),
   pendingDaytonaOperations:fixtures.pending,
   hasDaytonaKey:async()=>false,
+  sandboxStatus:async()=>({provider:'local',warning:'',docker:'unavailable'}),
+  setSandboxProvider:async()=>{},
+  listSchedules:async()=>[],
+  webhookState:async()=>({enabled:false,port:4317,hasToken:false}),
 }}));
 describe('cloud recovery visibility',()=>{
   it('refreshes background cleanup and stops polling after unmount',async()=>{

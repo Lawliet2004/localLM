@@ -1,31 +1,42 @@
 import { useState } from 'react';
 import { Cpu, Play, Square } from 'lucide-react';
 import type { Preferences, RuntimeConfig, RuntimeStatus } from '../lib/types';
+import type { ModelSelection, ProviderConnection } from '../lib/types';
 import { RuntimeForm } from './RuntimeForm';
 import { HardwareStatus } from './HardwareStatus';
 import { RuntimeDiagnostics } from './RuntimeDiagnostics';
 import { ModelDownload } from './ModelDownload';
 import { RuntimeDownload } from './RuntimeDownload';
 import { open } from '@tauri-apps/plugin-dialog';
+import { ModelSelectorPanel } from './ModelSelectorPanel';
+import { ProviderManager } from './ProviderManager';
 
 interface Props {
   config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus; busy: boolean;
+  providers?: ProviderConnection[]; selection?: ModelSelection;
   onSaveConfig: (config: RuntimeConfig) => Promise<void>;
   onSavePreferences: (preferences: Preferences) => Promise<void>;
+  onSaveSelection?: (selection: ModelSelection) => Promise<void>;
+  onProvidersChanged?: () => Promise<void>;
   onLoad: () => void; onUnload: () => void;
 }
-export function Models({ config, preferences, runtime, busy, onSaveConfig, onSavePreferences, onLoad, onUnload }: Props) {
+export function Models({ config, preferences, runtime, busy, providers = [], selection = { providerId: null, modelId: '' }, onSaveConfig, onSavePreferences, onSaveSelection = async () => {}, onProvidersChanged = async () => {}, onLoad, onUnload }: Props) {
   const [draft, setDraft] = useState(preferences);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
-  const [tab, setTab] = useState<'model' | 'runtime' | 'generation' | 'diagnostics'>('model');
+  const [tab, setTab] = useState<'model' | 'runtime' | 'generation' | 'providers' | 'diagnostics'>('model');
+  const pendingConfig = runtime.phase === 'ready' && runtime.loadedConfig &&
+    (Object.keys(config) as (keyof RuntimeConfig)[]).some(key => config[key] !== runtime.loadedConfig?.[key]);
   return <div className="settings-page">
     <div className="page-heading"><p className="eyebrow">ON YOUR MACHINE</p><h1>Models & runtime</h1><p>Make the most of your hardware. Keep control of every response.</p></div>
+    <ModelSelectorPanel providers={providers} selection={selection} busy={busy} onSave={onSaveSelection} />
     <div className="model-status"><div className="model-icon"><Cpu size={24} /></div><div><strong>{runtime.modelPath?.split(/[\\/]/).pop() || 'Your local model'}</strong><p><span className={`status-dot ${runtime.phase === 'ready' ? 'ready' : ''}`} />{runtime.message}</p></div>{runtime.phase === 'ready' ? <button className="secondary" disabled={busy} onClick={onUnload}><Square size={14} />Unload</button> : <button className="primary" disabled={busy || !preferences.modelPath || !preferences.runtimePath} onClick={onLoad}><Play size={14} />{busy ? 'Loading…' : 'Load model'}</button>}</div>
     <HardwareStatus runtime={runtime} />
-    <div className="tabs" role="tablist" aria-label="Model settings">{(['model','runtime','generation','diagnostics'] as const).map(value => <button role="tab" aria-selected={tab === value} key={value} onClick={() => { setTab(value); setNotice(''); }}>{value === 'model' ? 'Model files' : value === 'runtime' ? 'Runtime' : value === 'generation' ? 'Generation' : 'Diagnostics'}</button>)}</div>
+    {pendingConfig && <div className="loaded-settings"><p role="status">Saved configuration is not active. Context: {config.contextLength.toLocaleString()} saved / {runtime.loadedConfig!.contextLength.toLocaleString()} loaded. Apply to reload the model with your saved settings.</p><button className="primary" disabled={busy} onClick={onLoad}>Apply saved configuration</button></div>}
+    <div className="tabs" role="tablist" aria-label="Model settings">{(['model','runtime','generation','providers','diagnostics'] as const).map(value => <button role="tab" aria-selected={tab === value} key={value} onClick={() => { setTab(value); setNotice(''); }}>{value === 'model' ? 'Model files' : value === 'runtime' ? 'Runtime' : value === 'generation' ? 'Generation' : value === 'providers' ? 'Providers' : 'Diagnostics'}</button>)}</div>
     {notice && <p className="success" role="status">{notice}</p>}
     {error && <p className="error" role="alert">{error}</p>}
+    {tab === 'providers' ? <ProviderManager providers={providers} busy={busy} onChanged={onProvidersChanged} /> : <>
     {tab === 'model' && <ModelDownload busy={busy} onSelect={path => { setDraft(current => ({ ...current, modelPath: path })); setNotice('Verified model selected. Save settings to apply it.'); }} />}
     {tab === 'model' && <RuntimeDownload busy={busy} onSelect={path => { setDraft(current => ({ ...current, runtimePath: path })); setNotice('Installed runtime selected. Save settings to apply it.'); }} />}
     {tab === 'diagnostics' ? <RuntimeDiagnostics /> : tab === 'runtime' ? <RuntimeForm initial={config} busy={busy} onSave={async value => { try { setError(''); await onSaveConfig(value); setNotice('Runtime configuration saved. Reload the model to apply it.'); } catch (e) { setError(String(e)); } }} /> :
@@ -39,5 +50,6 @@ export function Models({ config, preferences, runtime, busy, onSaveConfig, onSav
         }}>{key === 'modelPath' ? 'Browse model…' : 'Browse runtime…'}</button>)}</div>}
         <div className="form-footer"><small>{tab === 'model' ? 'Model files stay on your computer.' : 'Applies to your next response.'}</small><button className="primary" disabled={busy}>Save settings</button></div>
       </form>}
+    </>}
   </div>;
 }

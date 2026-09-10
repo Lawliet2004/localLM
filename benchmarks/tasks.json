@@ -1,0 +1,20 @@
+[
+  {
+    "id": "fix-failing-test",
+    "kind": "self-correction",
+    "prompt": "Run the pytest suite in the workspace, read the first failure with compiler/test output, fix it, and re-run until green or 3 iterations pass. End with a ```handoff fence.",
+    "pass": "test suite green and handoff status complete"
+  },
+  {
+    "id": "add-bounded-helper",
+    "kind": "codegen",
+    "prompt": "Add a small, bounded file-search helper with tests following repo conventions. Do not add dependencies.",
+    "pass": "new tests pass, no new dependencies, diff reviewable"
+  },
+  {
+    "id": "summarize-repo",
+    "kind": "comprehension",
+    "prompt": "Survey the workspace top level and produce a 10-line architecture summary with file references.",
+    "pass": "references resolve to real files"
+  }
+]

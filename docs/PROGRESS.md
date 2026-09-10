@@ -470,3 +470,35 @@ Installation now treats a missing or mismatched `.installed` marker as incomplet
 Built a fresh optimized installer from HEAD `57e0806` with `npm run tauri build` (frontend `tsc && vite build` plus release Rust/NSIS, about 7m14s): `LocalLM_0.1.0_x64-setup.exe` (3,678,128 bytes, SHA-256 `61E72A…52E16`) and `locallm.exe` (10,988,544 bytes, SHA-256 `2C1621…32D7F`), `NotSigned` (no signing infrastructure). `scripts/installer-smoke.ps1` then passed against this build: silent install/uninstall exits 0, installed app served `tauri.localhost`, loaded the real model, answered `17 + 25` with `42`, saved 2 completed messages with no JS errors, and left the SQLite hash unchanged. Native follow-ups (`native-smoke` tab/label hardening, unique smoke titles) also passed, as did Playwright (2 passed).
 
 Dependency posture at release time: `npm audit --omit=dev` zero vulnerabilities (250 packages; 110 production packages all MIT/Apache-2.0/ISC); `cargo audit` zero vulnerabilities with transitive unmaintained warnings only. Committed `docs/THIRD-PARTY-NOTICES.npm.csv` (license-checker production inventory) and `docs/THIRD-PARTY-NOTICES.cargo.txt` (normal-dependency cargo tree); runtime/model/skill licenses are recorded via `docs/RUNTIME.md`, `catalog/runtime-assets.json`, `catalog/TRUEFORGE-LICENSE`, and the pinned `skills.lock.json` license files. `docs/RELEASE.md` now records the current artifact and supersedes the old 2026-09-08 hashes; the acceptance matrix reflects the verified installer smoke plus the remaining external release gaps (clean profile, interactive installer, upgrade/rollback, signing).
+
+## DSH harness adoption (feature/dsh-harness, unmerged)
+
+Implemented Phases 0-9 as Rust-owned seams with SQLite durability on a separate
+worktree/branch to avoid colliding with the parallel scaffold on
+feature/locallm. What was copied from DSH vs adapted vs omitted is recorded in
+docs/ARCHITECTURE.md under Deliberately deferred.
+
+- Backend: capabilities registry + dump_config; presets (standard/code/minimal/
+creator); harness dispatcher (26 tools) through the existing approval/audit/
+artifact/RunState path; subagents (foreground inline + background supervisor
+tasks, depth cap, exact-parent followup, interrupt, structured-output
+validation); todos/goals/plan state; sequential/parallel workflows; Ralph loop
+with handoff fences; Docker provider + persistent terminal + FS deny-list +
+bounded web tools + loop-hygiene/timeout guards; SQLite memory bank + repo
+survey; cron schedules + unattended execution + loopback webhook/API + headless
+CLI + TS/Python SDKs; Anthropic Messages adapter with tool_use translation;
+explicit + auto (opt-in, logged) compaction; plugin manifest + malware scan.
+- Frontend: Trajectory (run selector, filter, agent tree, compact), Plan panel,
+Sessions (fork/replay/search), preset picker, Memory + Plugins pages, Schedules
++ Sandbox on Execution, Anthropic format in ProviderManager.
+- Evidence: cargo test 143 passed; npm test 62 passed (15 files); npm run
+build green; 9 static smoke scripts
+(dump-config, trajectory-fork-replay, subagent-parallel, workflow-ralph,
+memory-recall, ptc-sdk, minimal-bench, scheduling-webhook, plugin-scan,
+adapters, sandbox-terminal); benchmarks/tasks.json live-gate definitions.
+- Limits: NO live-model verification (no inference ran here); no live
+provider/connector account e2e; Docker/terminal/webhook paths are unit-tested
+only; background children are local-tools-only by design; ACP bridges and
+dsh-sdk peer processes are stubs-by-omission (documented, not faked).
+- Note: C: filled to 0 bytes during worktree builds; reclaimed ~3 GB from TEMP
+plus the worktree target dir. Keep an eye on disk before release builds.
