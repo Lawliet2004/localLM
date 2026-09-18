@@ -105,7 +105,9 @@ pub fn cancel_model_install(state: tauri::State<'_, crate::AppState>) -> Result<
 pub async fn install_model(
     app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
+    filename: Option<String>,
 ) -> Result<Status, String> {
+    let (filename, asset) = crate::model_catalog::model(filename.as_deref())?;
     let _installation = state
         .installation_operation
         .try_lock()
@@ -123,7 +125,7 @@ pub async fn install_model(
         inner.0 = Status {
             busy: true,
             phase: "preparing".into(),
-            total: crate::model_catalog::MODEL.bytes,
+            total: asset.bytes,
             ..Default::default()
         };
         inner.1 = Some(sender);
@@ -139,7 +141,7 @@ pub async fn install_model(
         tokio::fs::create_dir_all(&directory)
             .await
             .map_err(|error| error.to_string())?;
-        let path = directory.join(crate::model_catalog::MODEL_FILENAME);
+        let path = directory.join(filename);
         let exists = tokio::fs::try_exists(&path)
             .await
             .map_err(|error| error.to_string())?;
@@ -155,12 +157,12 @@ pub async fn install_model(
             }
         };
         if exists {
-            crate::download::verify_file(&path, &crate::model_catalog::MODEL, receiver, progress)
+            crate::download::verify_file(&path, &asset, receiver, progress)
                 .await?;
         } else {
             crate::download::fetch(
                 &crate::download::client()?,
-                &crate::model_catalog::MODEL,
+                &asset,
                 &path,
                 receiver,
                 progress,

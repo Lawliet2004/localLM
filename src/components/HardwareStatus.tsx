@@ -26,7 +26,7 @@ export function HardwareStatus({ runtime }: { runtime: RuntimeStatus }) {
       {!hardware.gpus.length && <p>{hardware.gpuStatus}</p>}
       <small className="hardware-note">Device-wide readings include other applications. They are not model-specific memory measurements.</small>
     </>}
-    {loaded && <p className="loaded-settings">Loaded settings · {loaded.contextLength.toLocaleString()} context · {loaded.gpuLayers === 0 ? 'CPU only requested' : loaded.gpuLayers === -1 ? 'All GPU layers requested' : `${loaded.gpuLayers} GPU layers requested`} · K/V cache {loaded.cacheTypeK} / {loaded.cacheTypeV}</p>}
+    {loaded && <p className="loaded-settings">Loaded settings · {loaded.contextLength.toLocaleString()} context · {loaded.gpuLayers === 0 ? 'CPU only requested' : loaded.gpuLayers === -1 ? 'Automatic GPU fill requested' : `${loaded.gpuLayers} GPU layers requested`} · K/V cache {loaded.cacheTypeK} / {loaded.cacheTypeV}</p>}
     {runtime.phase === 'ready' && <p className="loaded-settings">{runtime.gpuOffload ? `Runtime reports ${runtime.gpuOffload.layers} / ${runtime.gpuOffload.totalLayers} model layers offloaded to GPU.` : 'Actual GPU layer count unavailable from this runtime.'} Layer placement does not measure GPU utilization.</p>}
     {error && <p role="status">Telemetry unavailable: {error}</p>}
   </section>;

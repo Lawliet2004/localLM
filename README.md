@@ -33,6 +33,8 @@ GPU layers `-1` requests all supported layers; `0` uses CPU layers. Context leng
 
 ## Connectors, tools and skills
 
+Local web grounding is available through the Research preset's `web_search` tool. It uses self-hosted SearXNG and the loaded local model, with bounded evidence and source citations. See [Phase 1 setup and diagnostic test commands](docs/WEB_SEARCH_PHASE1.md).
+
 Connectors includes 14 TrueForge presets. Connect and authenticate a service, then select individual discovered tools above the chat. Account-specific services require your credentials. Public DeepWiki calls have native end-to-end coverage; this does not prove every authenticated service works with your account.
 
 Choose a workspace folder to enable file tools. Configure an installed Python, Node.js or PowerShell executable in Execution to enable local code. Local code runs with your account's filesystem and network permissions and is not sandboxed.

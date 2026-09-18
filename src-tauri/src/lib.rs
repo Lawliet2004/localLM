@@ -1,6 +1,13 @@
-mod approval;
+pub mod agent_run;
+pub mod approval;
+pub mod artifacts;
+pub mod capabilities;
 mod chat;
+mod attachments;
+mod workspace_ui;
+mod claude_adapter;
 mod commands;
+pub mod compaction;
 mod connectors;
 mod context;
 pub mod daytona;
@@ -12,14 +19,24 @@ pub mod download;
 mod execution;
 mod export;
 mod hardware;
+pub mod harness;
 mod history;
+pub mod gguf;
+mod inference;
 mod install_recovery;
 pub mod local_mcp_config;
 pub mod local_mcp_process;
 mod model_catalog;
 mod model_install;
+mod model_library;
 mod oauth;
 mod permissions;
+pub mod memory;
+pub mod plans;
+mod prompt;
+pub mod plugins;
+pub mod presets;
+mod providers;
 mod runtime;
 pub mod runtime_archive;
 mod runtime_config;
@@ -27,11 +44,20 @@ pub mod runtime_install;
 mod runtime_install_commands;
 mod runtime_inventory;
 mod runtime_log;
-mod skills;
+pub mod sandbox;
+pub mod scheduling;
+pub mod sessions;
+pub mod skills;
 mod sse;
 mod store;
+mod tool_envelope;
+mod research_tasks;
+pub mod web_search;
 mod tool_calls;
 mod tool_discovery;
+pub mod subscription_auth;
+pub mod subagents;
+pub mod system_tools;
 mod vault;
 mod workspace;
 
@@ -47,6 +73,7 @@ pub struct AppState {
     daytona_journal: std::sync::Arc<Mutex<daytona_journal::Journal>>,
     skills: tokio::sync::Mutex<skills::Skills>,
     approvals: approval::Approvals,
+    pub ask_user: approval::ChoiceApprovals,
     store: Mutex<store::Store>,
     runtime: tokio::sync::Mutex<runtime::Runtime>,
     operation: tokio::sync::Mutex<()>,
@@ -54,6 +81,12 @@ pub struct AppState {
     connectors: tokio::sync::Mutex<connectors::McpHub>,
     oauth_operation: tokio::sync::Mutex<()>,
     oauth_cancel: tokio::sync::watch::Sender<bool>,
+    pub subagents: std::sync::Arc<subagents::SubagentRegistry>,
+    pub terminals: tokio::sync::Mutex<sandbox::TerminalRegistry>,
+    /// Per-run web_search cache: (conversation_id, run_id, normalized question, mode) -> compact result.
+    pub web_search_cache: Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    pub db_path: std::path::PathBuf,
+    pub data_dir: std::path::PathBuf,
 }
 impl AppState {
     fn database(&self) -> Result<std::sync::MutexGuard<'_, store::Store>, String> {
@@ -61,10 +94,28 @@ impl AppState {
             .lock()
             .map_err(|_| "Database lock is unavailable. Restart the application.".into())
     }
+    pub fn cancel_requested(&self) -> bool {
+        *self.cancel.borrow()
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    std::panic::set_hook(Box::new(|info| {
+        let message = format!(
+            "[LocalLM PANIC] {}\nLocation: {}\nThread: {:?}\nTime: {:?}\n",
+            info,
+            info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_else(|| "unknown".into()),
+            std::thread::current().name().unwrap_or("unnamed"),
+            std::time::SystemTime::now(),
+        );
+        eprintln!("{message}");
+        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            let path = std::path::Path::new(&appdata).join("com.locallm.app").join("panic.log");
+            let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+            let _ = std::fs::write(&path, &message);
+        }
+    }));
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -102,6 +153,7 @@ pub fn run() {
                 )),
                 skills: tokio::sync::Mutex::new(skills::Skills::new(data.join("skills"))),
                 approvals: approval::Approvals::default(),
+                ask_user: approval::ChoiceApprovals::default(),
                 store: Mutex::new(store),
                 runtime: tokio::sync::Mutex::new(runtime::Runtime::new(data.join("runtime.log"))),
                 operation: tokio::sync::Mutex::new(()),
@@ -109,6 +161,11 @@ pub fn run() {
                 connectors: tokio::sync::Mutex::new(connectors::McpHub::new(vault)),
                 oauth_operation: tokio::sync::Mutex::new(()),
                 oauth_cancel: tokio::sync::watch::channel(false).0,
+                subagents: subagents::global_registry(),
+                terminals: tokio::sync::Mutex::new(sandbox::TerminalRegistry::new()),
+                web_search_cache: Mutex::new(std::collections::HashMap::new()),
+                db_path: data.join("locallm.sqlite"),
+                data_dir: data.clone(),
             });
             let handle = app.handle().clone();
             for (folder, runtime) in [("models", false), ("runtimes", true)] {
@@ -123,6 +180,10 @@ pub fn run() {
                     eprintln!("Startup cloud cleanup could not access its journal; pending ownership is retained.");
                 }
             });
+            let scheduler_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                scheduling::run_background(scheduler_app).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -135,6 +196,8 @@ pub fn run() {
             hardware::hardware_status,
             execution::get_execution_config,
             execution::save_execution_config,
+            execution::detect_interpreters,
+            execution::test_interpreter,
             workspace::get_workspace,
             workspace::set_workspace,
             skills::list_skills,
@@ -151,13 +214,92 @@ pub fn run() {
             export::export_conversation,
             commands::get_conversation_tools,
             commands::save_conversation_tools,
+            commands::get_remembered_tools,
+            commands::save_remembered_tools,
+            commands::save_provider,
+            commands::list_providers,
+            commands::delete_provider,
+            commands::test_provider,
+            commands::list_provider_models,
+            commands::preferred_model,
+            commands::save_preferred_model,
+            commands::save_conversation_model,
             commands::save_runtime_config,
             commands::save_preferences,
             commands::load_model,
             commands::unload_model,
             commands::runtime_status,
+            commands::test_provider_inference,
+            commands::detect_subscription_cli,
+            commands::import_subscription_cli,
+            commands::get_subscription_status,
+            commands::save_manual_subscription_token,
+            commands::disconnect_subscription,
+            commands::start_subscription_sign_in,
+            commands::cancel_subscription_sign_in,
+            commands::get_run,
+            commands::get_conversation_run,
+            commands::get_run_events,
+            commands::get_conversation_runs,
+            capabilities::list_capabilities,
+            capabilities::set_capability_enabled,
+            capabilities::dump_config,
+            presets::list_presets,
+            presets::get_preset,
+            presets::set_preset,
+            sessions::get_session_events,
+            sessions::fork_session,
+            sessions::replay_session,
+            sessions::search_sessions,
+            plans::get_todos,
+            plans::get_goal,
+            subagents::list_subagent_runs,
+            subagents::interrupt_subagent,
+            subagents::list_subagent_models,
+            memory::list_facts,
+            memory::teach_fact_cmd,
+            memory::forget_fact,
+            memory::ingest_repo,
+            scheduling::list_schedules,
+            workspace_ui::workspace_index,
+            workspace_ui::save_project,
+            workspace_ui::remove_project,
+            workspace_ui::save_task_meta,
+            workspace_ui::workspace_inspect,
+            workspace_ui::workspace_git,
+            workspace_ui::workspace_command,
+            scheduling::save_schedule,
+            scheduling::delete_schedule,
+            scheduling::run_schedule_now,
+            scheduling::webhook_state,
+            scheduling::set_webhook,
+            scheduling::rotate_webhook_token,
+            sandbox::sandbox_status,
+            sandbox::set_sandbox_provider,
+            plugins::list_plugins,
+            plugins::install_plugin,
+            plugins::set_plugin_enabled,
+            plugins::remove_plugin,
+            plugins::scan_plugin,
+            plugins::test_plugin,
+            web_search::web_search_health,
+            web_search::get_web_search_config,
+            web_search::save_web_search_config,
+            web_search::web_search,
+            web_search::list_research_sessions,
+            web_search::get_research_session,
+            web_search::delete_research_session,
+            commands::get_artifact,
+            commands::list_conversation_artifacts,
             runtime_log::read_runtime_log,
             model_catalog::model_download_info,
+            model_library::search_hugging_face,
+            model_library::hugging_face_files,
+            model_library::download_hugging_face_model,
+            model_library::list_installed_models,
+            model_library::delete_installed_model,
+            model_library::use_installed_model,
+            gguf::read_model_metadata,
             runtime_install_commands::runtime_download_info,
             runtime_inventory::list_installed_runtimes,
             runtime_install_commands::runtime_install_status,
@@ -167,8 +309,10 @@ pub fn run() {
             model_install::install_model,
             model_install::cancel_model_install,
             chat::send_message,
+            chat::context_preflight,
             chat::cancel_generation,
             approval::resolve_tool_approval,
+            approval::resolve_ask_user,
             connectors::list_connectors,
             connectors::list_local_connectors,
             connectors::read_local_connector,

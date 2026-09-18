@@ -58,7 +58,7 @@ export function Connectors() {
   return <div className="settings-page catalog-page">
     <div className="page-heading"><p className="eyebrow">EXTEND YOUR WORKSPACE</p><h1>Connectors</h1><p>Connect your accounts and discover the tools they provide.</p></div>
     <div className="catalog-toolbar"><label className="search-field"><Search size={16} /><input type="search" aria-label="Search connectors" placeholder="Search connectors…" value={query} onChange={e => setQuery(e.target.value)} /></label><span>{filtered.length} connectors</span></div>
-    <p className="catalog-notice">Credentials are encrypted on this device. Select connected services under Tools in your conversation. Actions follow your conversation's permission mode. Services that need an account ask for credentials through this settings form, never through chat. Connecting a remote service sends tool arguments to that service; it never runs code on this device.</p>
+    <p className="catalog-notice">Credentials are encrypted on this device. Connected services automatically provide their tools to conversations. Actions follow your conversation's permission mode. Services that need an account ask for credentials through this settings form, never through chat. Connecting a remote service sends tool arguments to that service; it never runs code on this device.</p>
     <LocalConnectorForm key={editing?.id ?? 'new'} initial={editing} onCancel={editing ? () => setEditing(undefined) : undefined} onSaved={async () => { setEditing(undefined); setItems(await api.listConnectors()); }} />
     {error && <p role="alert" className="error-banner">{error}</p>}
     <div className="catalog-list">{filtered.map(item => <details className="catalog-item" key={item.id}>

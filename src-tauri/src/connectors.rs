@@ -130,7 +130,34 @@ pub struct AgentTool {
     pub alias: String,
     backend: ToolBackend,
 }
+
+impl Clone for AgentTool {
+    fn clone(&self) -> Self {
+        let backend = match &self.backend {
+            ToolBackend::System => ToolBackend::System,
+            ToolBackend::Harness { name } => ToolBackend::Harness { name: name.clone() },
+            ToolBackend::Daytona(executor) => ToolBackend::Daytona(executor.clone()),
+            ToolBackend::Skills(reader) => ToolBackend::Skills(reader.clone()),
+            ToolBackend::Execution(execution) => ToolBackend::Execution(execution.clone()),
+            ToolBackend::Workspace(workspace) => ToolBackend::Workspace(workspace.clone()),
+            // MCP peers hold a live session handle that cannot cross the
+            // workflow/spawn boundary; mark the clone detached.
+            ToolBackend::Mcp { local_name, .. } => ToolBackend::DetachedMcp { local_name: local_name.clone() },
+            ToolBackend::DetachedMcp { local_name } => ToolBackend::DetachedMcp { local_name: local_name.clone() },
+        };
+        Self { connector: self.connector.clone(), tool: self.tool.clone(), alias: self.alias.clone(), backend }
+    }
+}
 pub fn tool_alias(connector: &str, name: &str) -> String {
+    if connector == "System" {
+        return name.into();
+    }
+    // Harness tools are exposed to the model under their bare registry alias
+    // (e.g. todo_write); replay must reuse that exact name or round 2+ history
+    // references tools that no longer match the live schema.
+    if connector == "Harness" {
+        return name.into();
+    }
     if connector == "Skills" && name == "read_file" {
         return "skills_read_file".into();
     }
@@ -139,6 +166,9 @@ pub fn tool_alias(connector: &str, name: &str) -> String {
     }
     if connector == "Local execution" && name == "run_code" {
         return "local_run_code".into();
+    }
+    if connector == "Local execution" && name == "execute_command" {
+        return "local_execute_command".into();
     }
     use sha2::{Digest, Sha256};
     let identity = format!("{connector}\0{name}");
@@ -157,6 +187,10 @@ pub fn tool_alias(connector: &str, name: &str) -> String {
     format!("{readable}_{}", &digest[..16])
 }
 enum ToolBackend {
+    System,
+    Harness {
+        name: String,
+    },
     Daytona(Arc<crate::daytona_execution::Executor>),
     Skills(Arc<crate::skills::SkillReader>),
     Execution(Arc<crate::execution::LocalExecution>),
@@ -164,12 +198,31 @@ enum ToolBackend {
         peer: rmcp::Peer<RoleClient>,
         local_name: Option<String>,
     },
+    /// Clone marker for MCP tools carried across workflow/spawn boundaries.
+    /// The live peer cannot be cloned; the alias/definition still describe the
+    /// tool so filters inherit correctly, while `call` fails loud directing
+    /// the child to ask the parent.
+    DetachedMcp {
+        local_name: Option<String>,
+    },
     Workspace(Arc<crate::workspace::Workspace>),
 }
 impl AgentTool {
     pub fn local_server_name(&self) -> Option<&str> {
         match &self.backend {
-            ToolBackend::Mcp { local_name, .. } => local_name.as_deref(),
+            ToolBackend::Mcp { local_name, .. } | ToolBackend::DetachedMcp { local_name } => local_name.as_deref(),
+            _ => None,
+        }
+    }
+    pub fn is_mcp(&self) -> bool {
+        matches!(&self.backend, ToolBackend::Mcp { .. } | ToolBackend::DetachedMcp { .. })
+    }
+    pub fn is_harness(&self) -> bool {
+        matches!(&self.backend, ToolBackend::Harness { .. })
+    }
+    pub fn harness_name(&self) -> Option<&str> {
+        match &self.backend {
+            ToolBackend::Harness { name } => Some(name.as_str()),
             _ => None,
         }
     }
@@ -181,6 +234,9 @@ impl AgentTool {
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(if matches!(self.backend, ToolBackend::Daytona(_)) {
             300
+        } else if matches!(self.backend, ToolBackend::Harness { .. }) {
+            // Orchestration tools (workflows, Ralph, parallel children) settle durably.
+            600
         } else {
             120
         })
@@ -193,14 +249,41 @@ impl AgentTool {
             backend: ToolBackend::Skills(reader),
         }
     }
+    pub fn system_time() -> Self {
+        Self {
+            connector: "System".into(),
+            alias: "system_time".into(),
+            tool: crate::system_tools::system_time_tool_definition(),
+            backend: ToolBackend::System,
+        }
+    }
+    /// Harness-owned tool (subagents, todos, memory, ...). Schemas come from
+    /// the harness registry; execution runs through the harness dispatcher so
+    /// approval, audit, and run states apply. Direct calls fail loud.
+    pub fn harness(alias: &str) -> Result<Self, String> {
+        let tool = crate::harness::definition(alias).ok_or_else(|| format!("Unknown harness tool '{alias}'."))?;
+        Ok(Self {
+            connector: "Harness".into(),
+            alias: alias.into(),
+            tool,
+            backend: ToolBackend::Harness { name: alias.into() },
+        })
+    }
     pub fn trusted_read(&self) -> bool {
-        matches!(&self.backend, ToolBackend::Workspace(_))
-            && matches!(self.tool.name.as_str(), "read_file" | "list_files")
+        matches!(&self.backend, ToolBackend::System)
+            || matches!(&self.backend, ToolBackend::Harness { name } if crate::harness::is_trusted_read(name))
+            || (matches!(&self.backend, ToolBackend::Workspace(_))
+                && matches!(self.tool.name.as_str(), "read_file" | "list_files"))
     }
     pub fn execution(execution: Arc<crate::execution::LocalExecution>, tool: ToolView) -> Self {
+        let alias = if tool.name == "execute_command" {
+            "local_execute_command".into()
+        } else {
+            "local_run_code".into()
+        };
         Self {
             connector: "Local execution".into(),
-            alias: "local_run_code".into(),
+            alias,
             tool,
             backend: ToolBackend::Execution(execution),
         }
@@ -217,7 +300,23 @@ impl AgentTool {
         serde_json::json!({"type":"function","function":{"name":self.alias,"description":format!("{}: {} — {}", self.connector,self.tool.name,self.tool.description),"parameters":self.tool.input_schema}})
     }
     pub async fn call(&self, arguments: Value) -> Result<Value, String> {
+        self.call_with_stream(arguments, None).await
+    }
+    pub async fn call_with_stream(
+        &self,
+        arguments: Value,
+        on_chunk: Option<crate::execution::ChunkCallback>,
+    ) -> Result<Value, String> {
         let peer = match &self.backend {
+            ToolBackend::System => {
+                if self.tool.name == "system_time" {
+                    return crate::system_tools::execute_system_time(&arguments);
+                }
+                return Err("Unknown system tool.".into());
+            }
+            ToolBackend::Harness { name } => {
+                return Err(format!("Harness tool '{name}' runs through the agent dispatcher, not direct calls."));
+            }
             ToolBackend::Daytona(executor) => return executor.call(arguments).await,
             ToolBackend::Skills(reader) => {
                 let reader = reader.clone();
@@ -225,8 +324,17 @@ impl AgentTool {
                     .await
                     .map_err(|_| "Skill read failed unexpectedly.")?;
             }
-            ToolBackend::Execution(execution) => return execution.run(arguments).await,
+            ToolBackend::Execution(execution) => {
+                if self.tool.name == "execute_command" {
+                    return execution.run_command_with_stream(arguments, on_chunk).await;
+                } else {
+                    return execution.run_with_stream(arguments, on_chunk).await;
+                }
+            }
             ToolBackend::Mcp { peer, .. } => peer,
+            ToolBackend::DetachedMcp { .. } => {
+                return Err("This connector tool was inherited without its live session. Ask the parent for what you need instead.".into());
+            }
             ToolBackend::Workspace(workspace) => {
                 let workspace = workspace.clone();
                 let name = self.tool.name.clone();
@@ -312,6 +420,29 @@ fn validate_token(value: &str) -> Result<(), String> {
 }
 
 impl McpHub {
+    /// Saved choices survive disconnects, but only live, explicitly selected tools
+    /// belong in a request. Return omissions so both the UI and model can explain them.
+    pub fn tools_for_turn(
+        &self,
+        ids: &[String],
+        selections: &[ToolSelection],
+    ) -> Result<(Vec<AgentTool>, Vec<String>), String> {
+        if ids.len() > 32 || selections.len() > 32 {
+            return Err("At most 32 tools can be offered in a turn.".into());
+        }
+        let live = self.active_connector_ids();
+        let mut unavailable = Vec::new();
+        for id in ids.iter().chain(selections.iter().map(|tool| &tool.connector_id)) {
+            if !live.contains(id) && !unavailable.contains(id) {
+                unavailable.push(id.clone());
+            }
+        }
+        let ids: Vec<_> = ids.iter().filter(|id| live.contains(id)).cloned().collect();
+        let selections: Vec<_> = selections.iter()
+            .filter(|tool| live.contains(&tool.connector_id)).cloned().collect();
+        Ok((self.selected_tools(&ids, &selections)?, unavailable))
+    }
+
     pub fn selected_tools(
         &self,
         ids: &[String],
@@ -346,9 +477,7 @@ impl McpHub {
             )?;
             for tool in selected {
                 if tools.len() >= 32 {
-                    return Err(
-                        "Select fewer tools: at most 32 tools can be offered in a turn.".into(),
-                    );
+                    break;
                 }
                 tools.push(AgentTool {
                     connector: id.clone(),
@@ -414,6 +543,16 @@ impl McpHub {
         self.connections
             .get(id)
             .is_some_and(|connection| !connection.service.is_closed())
+    }
+    pub fn active_connector_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .connections
+            .iter()
+            .filter(|(_, conn)| !conn.service.is_closed() && !conn.service.peer().is_transport_closed())
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
     }
     pub fn list_local(&self) -> Result<Vec<crate::local_mcp_config::LocalServerSummary>, String> {
         Ok(crate::local_mcp_config::load(&self.vault)?
@@ -815,6 +954,18 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         let view = hub.connect(&server.id).await.unwrap();
         assert!(view.connected);
         assert_eq!(view.tools.len(), 1);
+        let (unselected, omitted) = hub.tools_for_turn(&[], &[]).unwrap();
+        assert!(unselected.is_empty(), "Connecting a server must not enable its tools");
+        assert!(omitted.is_empty());
+        let choices = vec![
+            super::ToolSelection { connector_id: server.id.clone(), tool_name: "read_file".into() },
+            super::ToolSelection { connector_id: "parallel-web".into(), tool_name: "web_search".into() },
+            super::ToolSelection { connector_id: "deepwiki".into(), tool_name: "ask_question".into() },
+        ];
+        let (available, omitted) = hub.tools_for_turn(&[], &choices).unwrap();
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].connector, server.id);
+        assert_eq!(omitted, ["parallel-web", "deepwiki"]);
         assert_eq!(view.auth_type, "local");
         assert!(hub.save_local(server.clone()).is_err());
         assert!(hub.read_local(&server.id).is_err());
@@ -947,6 +1098,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
         assert_eq!(tool_alias("Workspace", "read_file"), "workspace_read_file");
         assert_eq!(tool_alias("Local execution", "run_code"), "local_run_code");
+        assert_eq!(tool_alias("Local execution", "execute_command"), "local_execute_command");
+        assert_eq!(tool_alias("Harness", "todo_write"), "todo_write");
     }
     #[test]
     fn selects_exact_tools_from_large_catalog_and_rejects_stale_names() {

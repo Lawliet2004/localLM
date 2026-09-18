@@ -1,0 +1,58 @@
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "LocalLM Search Engine"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "locallm-local-search-secret-key-change-in-production"
+  limiter: false
+  image_proxy: false
+
+ui:
+  static_use_hash: true
+
+outgoing:
+  request_timeout: 8.0
+  max_request_timeout: 12.0
+  useragent_suffix: "LocalLM/1.0"
+
+# Key-free default: only engines that need no credentials. The client sends
+# matching `engines`/`disabled_engines` params and verifies health at runtime
+# instead of assuming an enabled engine works.
+engines:
+  - name: duckduckgo
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: stackoverflow
+    disabled: false
+  - name: github
+    disabled: false
+  - name: arxiv
+    disabled: false
+  - name: openstreetmap
+    disabled: false
+  - name: google
+    disabled: true
+  - name: bing
+    disabled: true
+  - name: yandex
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: mojeek
+    disabled: true
+
+enabled_plugins:
+  - 'Hash plugin'

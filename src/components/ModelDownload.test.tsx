@@ -8,6 +8,15 @@ vi.mock('../lib/api', () => ({ nativeAvailable: true, errorMessage: String, api:
   modelInstallStatus: fixtures.status,
 } }));
 const info = { filename: 'model.gguf', bytes: 100, requiredBytes: 200, availableBytes: 300, destinationExists: false, destination: 'C:/models/model.gguf', sha256: 'abc' };
+it('requests the exact Bonsai model and never selects another model installer result', async () => {
+  const filename = 'Ternary-Bonsai-8B-Q2_0.gguf';
+  fixtures.info.mockResolvedValue({...info, filename, destination:`C:/models/${filename}`});
+  fixtures.status.mockResolvedValue({busy:false, phase:'ready', path:'C:/models/MiniCPM5-2B.Q6_K.gguf', received:100, total:100});
+  render(<ModelDownload busy={false} onSelect={vi.fn()} filename={filename} />);
+  expect(await screen.findByText(/Requires a Prism/)).toBeVisible();
+  expect(fixtures.info).toHaveBeenCalledWith(filename);
+  expect(screen.queryByRole('button', {name:'Use verified model'})).not.toBeInTheDocument();
+});
 it('presents cancellation as a normal outcome and allows retry', async () => {
   fixtures.info.mockResolvedValue(info);
   fixtures.status.mockResolvedValue({ busy: false, phase: 'cancelled', received: 10, total: 100, path: null, error: 'Download cancelled.' });

@@ -17,6 +17,8 @@ async function openTools() {
 }
 try {
   await invoke('connect_connector', { id: 'deepwiki' });
+  // Start from a known default so the inheritance checks are deterministic.
+  await invoke('save_remembered_tools', { tools: { sources: [], tools: [] } });
   for (const name of ['A', 'B']) {
     const chat = await invoke('create_conversation'); chats.push(chat);
     await invoke('rename_conversation', { id: chat.id, title: `Tool settings ${name} ${suffix}` });
@@ -26,19 +28,29 @@ try {
   let group = await openTools();
   await group.getByRole('checkbox', { name: 'read_wiki_structure', exact: true }).click();
   await expect.poll(() => invoke('get_conversation_tools', { id: chats[0].id })).toEqual({ accessMode: 'ask', sources: [], tools: [{ connectorId: 'deepwiki', toolName: 'read_wiki_structure' }] });
+  await expect.poll(() => invoke('get_remembered_tools', {})).toEqual({ sources: [], tools: [{ connectorId: 'deepwiki', toolName: 'read_wiki_structure' }] });
   await page.getByRole('button', { name: `Tool settings B ${suffix}`, exact: true }).click();
   await expect(group.getByRole('checkbox', { name: 'read_wiki_structure', exact: true })).not.toBeChecked();
   await group.getByRole('checkbox', { name: 'ask_question', exact: true }).click();
   await expect.poll(() => invoke('get_conversation_tools', { id: chats[1].id })).toEqual({ accessMode: 'ask', sources: [], tools: [{ connectorId: 'deepwiki', toolName: 'ask_question' }] });
+  await expect.poll(() => invoke('get_remembered_tools', {})).toEqual({ sources: [], tools: [{ connectorId: 'deepwiki', toolName: 'ask_question' }] });
   await page.reload();
   await page.getByRole('button', { name: `Tool settings A ${suffix}`, exact: true }).click();
   group = await openTools();
   await expect(group.getByRole('checkbox', { name: 'read_wiki_structure', exact: true })).toBeChecked();
   await expect(group.getByRole('checkbox', { name: 'ask_question', exact: true })).not.toBeChecked();
+  // Merely opening an older conversation must not overwrite the future-chat default.
+  await expect.poll(() => invoke('get_remembered_tools', {})).toEqual({ sources: [], tools: [{ connectorId: 'deepwiki', toolName: 'ask_question' }] });
   await page.getByRole('button', { name: 'New conversation', exact: false }).click();
-  await expect(page.locator('.tool-picker > summary')).toHaveText('Tools · Off');
+  group = await openTools();
+  await expect(page.locator('.tool-picker > summary')).toHaveText('Tools · 1/32 enabled');
+  await expect(group.getByRole('checkbox', { name: 'ask_question', exact: true })).toBeChecked();
   await expect(group.getByRole('checkbox', { name: 'read_wiki_structure', exact: true })).not.toBeChecked();
-  const report = { testedAt: new Date().toISOString(), isolation: true, reload: true, newChatToolsOff: true };
+  // An explicitly empty selection is valid and persists for future chats.
+  await group.getByRole('checkbox', { name: 'ask_question', exact: true }).click();
+  await expect.poll(() => invoke('get_remembered_tools', {})).toEqual({ sources: [], tools: [] });
+  await expect(page.locator('.tool-picker > summary')).toHaveText('Tools · Off');
+  const report = { testedAt: new Date().toISOString(), isolation: true, reload: true, newChatInheritsRemembered: true, openDoesNotOverwriteRemembered: true, explicitClearPersists: true };
   writeFileSync('test-results/conversation-tools-smoke.json', JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report));
 } finally {

@@ -1,5 +1,21 @@
 # Evidence and remaining work
 
+## 2026-09-16
+Context window save/load and first-turn overflow.
+
+- First load no longer pairs an 8,192-token context with an 8,192-token response reserve. The reserve is capped so a typical first prompt (~2.5k tokens) fits; at 8,192 context the reserve becomes 4,096.
+- Saving Runtime configuration writes the per-model profile and, if a model is already loaded, reloads it so “Use full context” actually changes the loaded `--ctx-size`. Re-clicking Use on the same model keeps that saved context.
+- ZAYA auto-configure still switches to the custom CPU runtime, but it no longer overwrites a user-saved context with 8,192.
+- Generation warns when the reserve would consume the entire window.
+
+## 2026-09-15
+Hugging Face model library and Runtime limits dashboard.
+
+- Models tab loads popular GGUF repositories on open, searches by name, and browses any `owner/repository`. Search hits include download counts. GGUF files are chosen as cards. Incomplete downloads expose Retry when provenance is known.
+- MiniCPM, Bonsai, and ZAYA1 appear as Hugging Face library entries with Use and Delete. Delete unloads a running copy, removes listed files, leftover `model.json`, empty managed hash directories, and saved runtime profiles. Conversations stay.
+- Runtime tab shows model layer count vs layers estimated to fit in free VRAM, full GGUF context vs harness cap, live GPU/RAM/cache estimates, and recommended vs current settings. Saving a context above the known model limit is blocked. Unknown/hybrid caches stay unknown.
+- Verification: 115 frontend tests, `npm run build`, 203 Rust lib tests (2 ignored as before), Clippy `-D warnings`, and both Playwright checks including Runtime at 320/768/1024/1440. Native WebView2 confirmation of a live Hugging Face download was not repeated in this slice.
+
 ## 2026-09-08
 - Empty workspace inspected. Scaffolded official Tauri React/TypeScript template.
 - Rust 1.98.1, Node 24.14.1 and npm 11.11.0 available.
@@ -470,3 +486,17 @@ Installation now treats a missing or mismatched `.installed` marker as incomplet
 Built a fresh optimized installer from HEAD `57e0806` with `npm run tauri build` (frontend `tsc && vite build` plus release Rust/NSIS, about 7m14s): `LocalLM_0.1.0_x64-setup.exe` (3,678,128 bytes, SHA-256 `61E72A…52E16`) and `locallm.exe` (10,988,544 bytes, SHA-256 `2C1621…32D7F`), `NotSigned` (no signing infrastructure). `scripts/installer-smoke.ps1` then passed against this build: silent install/uninstall exits 0, installed app served `tauri.localhost`, loaded the real model, answered `17 + 25` with `42`, saved 2 completed messages with no JS errors, and left the SQLite hash unchanged. Native follow-ups (`native-smoke` tab/label hardening, unique smoke titles) also passed, as did Playwright (2 passed).
 
 Dependency posture at release time: `npm audit --omit=dev` zero vulnerabilities (250 packages; 110 production packages all MIT/Apache-2.0/ISC); `cargo audit` zero vulnerabilities with transitive unmaintained warnings only. Committed `docs/THIRD-PARTY-NOTICES.npm.csv` (license-checker production inventory) and `docs/THIRD-PARTY-NOTICES.cargo.txt` (normal-dependency cargo tree); runtime/model/skill licenses are recorded via `docs/RUNTIME.md`, `catalog/runtime-assets.json`, `catalog/TRUEFORGE-LICENSE`, and the pinned `skills.lock.json` license files. `docs/RELEASE.md` now records the current artifact and supersedes the old 2026-09-08 hashes; the acceptance matrix reflects the verified installer smoke plus the remaining external release gaps (clean profile, interactive installer, upgrade/rollback, signing).
+
+### Context preflight, compaction, tool-result budgeting, and presets
+
+Implemented Step 1 of `docs/ZAYA1-FREETOKEN-PLAN.md`:
+- Debounced preflight token counter (400ms) evaluating rendered turn payload with breakdown across instructions, tool schemas, replayed history, and draft tokens, distinguishing exact tokenizer counts from provider estimates.
+- Explicit Chat, Research, and Coding tool profiles in `src-tauri/src/presets.rs`, preventing automatic injection of unnecessary harness tools for conversational workflows.
+- Non-destructive SQLite-backed compaction in `src-tauri/src/compaction.rs`: bounded checkpoints keeping recent complete turns, preserving full history in queryable artifacts with stable artifact IDs, enforcing turn boundaries on user messages to preserve tool-call/result pairs, and auto-compaction retry on context overflow.
+- Dynamic tool-result budgeting in `src-tauri/src/artifacts.rs`: derives excerpt size from remaining context and response reserve (bounded within [512, 8192] chars), captures oversized outputs in artifacts, and supports paged retrieval via `artifact_read`.
+
+- Hardened compaction timestamps (64-bit epoch support beyond u32::MAX), turn-boundary preserved ordering on timestamp collisions, and loopback provider support without API keys.
+- Registered Tauri IPC handlers for presets (`list_presets`, `get_preset`, `set_preset`) and wired preset selection in `ToolControls` and `App`.
+
+Verification: Full Rust test suite (168 passed, 2 ignored, 0 failed), strict `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` passed cleanly with zero warnings, Vitest frontend suite (83 passed across 16 files), and production build (`tsc && vite build` passed).
+

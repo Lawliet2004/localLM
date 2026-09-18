@@ -11,7 +11,7 @@ try {
   await expect(panel.getByRole('progressbar',{name:'NVIDIA GeForce RTX 2050 VRAM usage'})).toBeVisible();
   const before=await page.evaluate(async()=>{const {invoke}=await import('/node_modules/@tauri-apps/api/core.js'); return invoke('hardware_status');});
   if(await page.getByRole('button',{name:'Load model',exact:true}).count()) { await page.getByRole('button',{name:'Load model',exact:true}).click(); await expect(page.getByRole('button',{name:'Unload',exact:true})).toBeVisible({timeout:120000}); }
-  await expect(panel.getByText('All GPU layers requested',{exact:false})).toBeVisible();
+  await expect(panel.getByText('Automatic GPU fill requested',{exact:false})).toBeVisible();
   const changed=await page.evaluate(async()=>{
     const {invoke}=await import('/node_modules/@tauri-apps/api/core.js'); const initial=await invoke('bootstrap');
     await invoke('save_runtime_config',{config:{...initial.config,gpuLayers:0}});

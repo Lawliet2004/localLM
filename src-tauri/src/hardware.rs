@@ -22,6 +22,13 @@ pub struct Hardware {
     gpu_status: String,
     sampled_at: i64,
 }
+
+impl Hardware {
+    pub fn free_vram_bytes(&self) -> Option<u64> {
+        let gpu = self.gpus.first()?;
+        Some(gpu.memory_total_mib?.saturating_sub(gpu.memory_used_mib?) * 1024 * 1024)
+    }
+}
 fn optional_number(value: &str) -> Result<Option<u64>, String> {
     if matches!(value, "N/A" | "[N/A]" | "[Not Supported]" | "Not Supported") {
         return Ok(None);
@@ -165,6 +172,15 @@ mod tests {
         assert_eq!(devices[0].utilization_percent, Some(37));
         assert_eq!(devices[1].memory_used_mib, None);
         assert_eq!(devices[1].utilization_percent, None);
+        let hardware = Hardware {
+            logical_cpus: 8,
+            memory_total_bytes: None,
+            memory_available_bytes: None,
+            gpus: devices,
+            gpu_status: "ok".into(),
+            sampled_at: 0,
+        };
+        assert_eq!(hardware.free_vram_bytes(), Some((4096 - 2047) * 1024 * 1024));
     }
     #[test]
     fn rejects_invalid_or_inconsistent_driver_output() {

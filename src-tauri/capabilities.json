@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "defaultPreset": "standard",
+  "presets": {
+    "standard": {
+      "name": "Standard",
+      "description": "Full standard toolset and agent loop",
+      "enabled": [
+        "workspace_files",
+        "local_execution",
+        "cloud_execution",
+        "system_time",
+        "skills_reader",
+        "session_log",
+        "storage_sqlite",
+        "agent_loop",
+        "trajectory_ui"
+      ],
+      "disabled": []
+    },
+    "code_ptc": {
+      "name": "Code (PTC)",
+      "description": "Programmatic Tool Calling via TypeScript SDK",
+      "enabled": [
+        "workspace_files",
+        "local_execution",
+        "system_time",
+        "session_log",
+        "storage_sqlite",
+        "agent_loop",
+        "trajectory_ui"
+      ],
+      "disabled": [
+        "workflows"
+      ]
+    },
+    "minimal": {
+      "name": "Minimal",
+      "description": "Persistent shell and string replace editor for benchmarks",
+      "enabled": [
+        "local_execution",
+        "workspace_files",
+        "session_log",
+        "storage_sqlite",
+        "agent_loop"
+      ],
+      "disabled": [
+        "cloud_execution",
+        "system_time",
+        "skills_reader"
+      ]
+    },
+    "creator": {
+      "name": "Creator",
+      "description": "Standard mode with runtime inspector and plugin composition",
+      "enabled": [
+        "workspace_files",
+        "local_execution",
+        "cloud_execution",
+        "system_time",
+        "skills_reader",
+        "session_log",
+        "storage_sqlite",
+        "agent_loop",
+        "trajectory_ui"
+      ],
+      "disabled": []
+    }
+  },
+  "capabilities": [
+    {
+      "id": "workspace_files",
+      "kind": "Tool",
+      "version": 1,
+      "enabled": true,
+      "description": "Workspace list/read/create/edit (5 tools, cap-std).",
+      "config": {}
+    },
+    {
+      "id": "local_execution",
+      "kind": "Tool",
+      "version": 1,
+      "enabled": true,
+      "description": "Local Python/Node/PowerShell execution.",
+      "config": {}
+    },
+    {
+      "id": "cloud_execution",
+      "kind": "Tool",
+      "version": 1,
+      "enabled": true,
+      "description": "Daytona cloud execution.",
+      "config": {}
+    },
+    {
+      "id": "system_time",
+      "kind": "Tool",
+      "version": 1,
+      "enabled": true,
+      "description": "Local clock for the model; disable to hide it.",
+      "config": {}
+    },
+    {
+      "id": "skills_reader",
+      "kind": "Tool",
+      "version": 1,
+      "enabled": true,
+      "description": "Read installed skill files when skills are active.",
+      "config": {}
+    },
+    {
+      "id": "session_log",
+      "kind": "Session",
+      "version": 1,
+      "enabled": true,
+      "description": "Append-only session event log, lineage tracking, and replay.",
+      "config": {}
+    },
+    {
+      "id": "storage_sqlite",
+      "kind": "Storage",
+      "version": 1,
+      "enabled": true,
+      "description": "Local SQLite database persistence.",
+      "config": {}
+    },
+    {
+      "id": "agent_loop",
+      "kind": "Loop",
+      "version": 1,
+      "enabled": true,
+      "description": "Bounded agent iteration loop with approval gates.",
+      "config": {}
+    },
+    {
+      "id": "trajectory_ui",
+      "kind": "Ui",
+      "version": 1,
+      "enabled": true,
+      "description": "Interactive Trajectory event inspector and session branching UI.",
+      "config": {}
+    },
+    {
+      "id": "subagents",
+      "kind": "Session",
+      "version": 1,
+      "enabled": false,
+      "description": "Subagent spawning, forking, and background task execution.",
+      "config": {
+        "maxDepth": 3
+      }
+    },
+    {
+      "id": "workflows",
+      "kind": "Loop",
+      "version": 1,
+      "enabled": false,
+      "description": "Multi-stage fan-out workflow orchestration and Ralph loop.",
+      "config": {}
+    },
+    {
+      "id": "compaction",
+      "kind": "Model",
+      "version": 1,
+      "enabled": true,
+      "description": "Automatic context compaction at 80% plus manual checkpointing.",
+      "config": {}
+    }
+  ]
+}

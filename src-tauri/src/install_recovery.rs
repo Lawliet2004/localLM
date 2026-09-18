@@ -39,6 +39,18 @@ pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
     let mut removed = 0;
     for name in entries(&directory)? {
         if !runtime {
+            if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let metadata = directory.symlink_metadata(&name).map_err(|e| e.to_string())?;
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    let model = directory.open_dir(&name).map_err(|e| e.to_string())?;
+                    for file in entries(&model)? {
+                        if owned(&file, ".locallm-download-", ".part") && regular(&model, &file) {
+                            model.remove_file(&file).map_err(|e| e.to_string())?;
+                            removed += 1;
+                        }
+                    }
+                }
+            }
             if owned(&name, ".locallm-download-", ".part") && regular(&directory, &name) {
                 directory
                     .remove_file(&name)

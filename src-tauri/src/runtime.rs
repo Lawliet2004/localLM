@@ -1,4 +1,5 @@
 use crate::{runtime_config::RuntimeConfig, store::Preferences};
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use serde::Serialize;
 use std::{
     io::Read,
@@ -6,7 +7,7 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,11 +63,13 @@ impl Default for RuntimeStatus {
 }
 
 pub struct Runtime {
-    child: Option<Child>,
+    child: Option<Box<dyn ChildWrapper>>,
     pub status: RuntimeStatus,
     pub endpoint: String,
     pub api_key: String,
     pub context_length: u32,
+    /// A loaded vision projector makes the local llama.cpp endpoint vision-capable.
+    pub supports_images: bool,
     log_path: PathBuf,
     log_tasks: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
@@ -78,6 +81,7 @@ impl Runtime {
             endpoint: String::new(),
             api_key: String::new(),
             context_length: 0,
+            supports_images: false,
             log_path,
             log_tasks: Vec::new(),
         }
@@ -108,10 +112,8 @@ impl Runtime {
     }
     pub async fn stop(&mut self) -> Result<RuntimeStatus, String> {
         if let Some(mut child) = self.child.take() {
-            child
-                .kill()
-                .await
-                .map_err(|error| format!("Could not stop model: {error}"))?;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
         }
         for mut task in self.log_tasks.drain(..) {
             if tokio::time::timeout(Duration::from_secs(2), &mut task)
@@ -125,6 +127,7 @@ impl Runtime {
         self.status = RuntimeStatus::default();
         self.api_key.clear();
         self.endpoint.clear();
+        self.supports_images = false;
         Ok(self.status.clone())
     }
     pub async fn load(
@@ -139,6 +142,20 @@ impl Runtime {
         let model = std::fs::canonicalize(&preferences.model_path)
             .map_err(|_| "Select an existing GGUF model in Models.")?;
         validate_model(&model)?;
+        validate_model_context(&model, config)?;
+        // A vision projector is optional: text-only models load exactly as
+        // before, while multimodal GGUFs load vision support when a valid
+        // projector file is configured.
+        let projector = if preferences.projector_path.trim().is_empty() {
+            None
+        } else {
+            let path = std::fs::canonicalize(preferences.projector_path.trim())
+                .map_err(|_| "Select an existing mmproj projector file in Models, or clear it for text-only chat.")?;
+            validate_projector(&path)?;
+            Some(path)
+        };
+        let flags = inspect_runtime(&executable).await?;
+        let launch = resolve_launch_config(config, &model, flags.fit).await?;
         self.stop().await?;
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .map_err(|error| error.to_string())?
@@ -150,48 +167,57 @@ impl Runtime {
         let log = crate::runtime_log::RuntimeLog::create(&self.log_path)
             .await
             .map_err(|error| format!("Cannot create runtime log: {error}"))?;
-        let mut command = Command::new(executable);
-        // Inherited llama options could expose tools or change the selected model.
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("LLAMA_") {
-                command.env_remove(key);
-            }
-        }
+        let mut command = runtime_command(&executable);
         command
-            .args(config.arguments()?)
+            .args(launch.arguments()?)
             .arg("--model")
-            .arg(&model)
-            .args([
+            .arg(&model);
+        if let Some(projector) = &projector {
+            command.arg("--mmproj").arg(projector);
+        }
+        command.args([
                 "--host",
                 "127.0.0.1",
                 "--port",
                 &port.to_string(),
-                "--parallel",
-                "1",
                 "--jinja",
                 "--no-webui",
-                "--no-agent",
-                "--fit",
-                "off",
                 "--log-verbosity",
                 "4",
-            ])
+            ]);
+        if flags.fit {
+            command.arg("--fit").arg(if config.automatic_gpu() { "on" } else { "off" });
+        }
+        command
             .env("LLAMA_API_KEY", &self.api_key)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
+        // Older Prism builds predate --no-agent. They default to no tools;
+        // runtime_command removes LLAMA_* overrides for both old and new builds.
+        if flags.no_agent {
+            command.arg("--no-agent");
+        }
+        let mut command = CommandWrap::from(command);
+        command.wrap(KillOnDrop);
         #[cfg(windows)]
-        command.creation_flags(0x08000000);
+        {
+            command.wrap(process_wrap::tokio::CreationFlags(
+                windows::Win32::System::Threading::CREATE_NO_WINDOW,
+            ));
+            command.wrap(process_wrap::tokio::JobObject);
+        }
+        #[cfg(unix)]
+        command.wrap(process_wrap::tokio::ProcessGroup::leader());
         let mut child = command
             .spawn()
             .map_err(|error| format!("Cannot start llama-server: {error}"))?;
         let stdout = child
-            .stdout
+            .stdout()
             .take()
             .ok_or("Runtime stdout pipe unavailable")?;
         let stderr = child
-            .stderr
+            .stderr()
             .take()
             .ok_or("Runtime stderr pipe unavailable")?;
         self.log_tasks
@@ -202,7 +228,10 @@ impl Runtime {
         self.status = RuntimeStatus {
             phase: "loading".into(),
             message: "Loading model into memory".into(),
-            model_path: Some(model.to_string_lossy().into_owned()),
+            // Keep the user-facing spelling from settings. `canonicalize` on
+            // Windows adds a `\\?\\` device prefix, which made the UI report
+            // a false model mismatch after every successful load.
+            model_path: Some(preferences.model_path.clone()),
             loaded_config: None,
             gpu_offload: None,
         };
@@ -227,10 +256,15 @@ impl Runtime {
                     {
                         if health.status().is_success() {
                             self.context_length = config.context_length;
+                            self.supports_images = projector.is_some();
                             self.status.loaded_config = Some(config.clone());
                             self.status.gpu_offload = read_offload(&self.log_path);
                             self.status.phase = "ready".into();
-                            self.status.message = "Model ready".into();
+                            self.status.message = if projector.is_some() {
+                                "Model ready · vision enabled".into()
+                            } else {
+                                "Model ready".into()
+                            };
                             return Ok(self.status.clone());
                         }
                     }
@@ -245,6 +279,82 @@ impl Runtime {
     }
 }
 
+fn runtime_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    // Inherited llama options could expose tools or change the selected model.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("LLAMA_") {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
+struct RuntimeFlags {
+    no_agent: bool,
+    fit: bool,
+}
+
+async fn inspect_runtime(executable: &Path) -> Result<RuntimeFlags, String> {
+    let mut command = runtime_command(executable);
+    command.arg("--help").kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .map_err(|_| "Runtime compatibility check timed out.".to_string())?
+        .map_err(|error| format!("Cannot inspect llama-server: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("llama-server could not start ({}). Check that its matching CUDA DLLs are installed alongside the executable.", output.status));
+    }
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(RuntimeFlags {
+        no_agent: help.contains("--no-agent"),
+        fit: help.contains("--fit"),
+    })
+}
+
+async fn resolve_launch_config(
+    config: &RuntimeConfig,
+    model: &Path,
+    fit_supported: bool,
+) -> Result<RuntimeConfig, String> {
+    if !config.automatic_gpu() || fit_supported {
+        return Ok(config.clone());
+    }
+    let available = crate::hardware::hardware_status().await.free_vram_bytes();
+    let mut launch = config.clone();
+    launch.gpu_layers = crate::gguf::model_metadata(model)
+        .ok()
+        .map(|metadata| RuntimeConfig::auto_gpu_layers(&metadata, &launch, available))
+        .unwrap_or(0);
+    if launch.gpu_layers == 0 {
+        launch.offload_kv_cache = false;
+    }
+    Ok(launch)
+}
+
+fn validate_model_context(path: &Path, config: &RuntimeConfig) -> Result<(), String> {
+    if let Ok(metadata) = crate::gguf::model_metadata(path) {
+        if metadata.context_length.is_some_and(|max| config.context_length > max) {
+            return Err(format!("This model supports at most {} context tokens. Adjust Context window in Runtime before loading.", metadata.context_length.unwrap()));
+        }
+        if metadata.block_count.is_some_and(|blocks| config.gpu_layers > 0 && config.gpu_layers as u32 > blocks.saturating_add(1)) {
+            return Err("GPU layer selection exceeds the model's layer count. Choose Automatic or reduce the manual count in Runtime.".into());
+        }
+    }
+    if path.file_name().and_then(|name| name.to_str()) == Some(crate::model_catalog::BONSAI_FILENAME)
+        && config.context_length > crate::model_catalog::BONSAI_CONTEXT_LENGTH
+    {
+        return Err("Bonsai Q2_0 supports at most 65,536 context tokens. Set Context window to 65,536 or less in Runtime, save settings, then load again.".into());
+    }
+    Ok(())
+}
+
 fn validate_model(path: &Path) -> Result<(), String> {
     let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut magic = [0u8; 4];
@@ -256,9 +366,55 @@ fn validate_model(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A vision projector must be a real GGUF file inside managed or user-owned
+/// storage. Symlink, junction, and mount-point escapes fail before launch,
+/// and a mistyped non-GGUF file fails with an actionable message instead of
+/// a silent text-only startup or a crashed llama-server.
+fn validate_projector(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("The projector must be a regular file, not a shortcut or symlink.".into());
+    }
+    if !metadata.is_file() {
+        return Err("The projector must be an mmproj GGUF file.".into());
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    if !name.ends_with(".gguf") || !name.contains("mmproj") {
+        return Err("The projector must be an mmproj GGUF file (for example mmproj-model-f16.gguf).".into());
+    }
+    validate_model(path).map_err(|_| "The projector file is incomplete or is not a GGUF model.".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bonsai_rejects_oversized_context_before_starting_runtime() {
+        let bonsai = Path::new(crate::model_catalog::BONSAI_FILENAME);
+        let mut config = RuntimeConfig::default();
+        assert!(validate_model_context(bonsai, &config).unwrap_err().contains("65,536 or less"));
+        config.context_length = 65536;
+        assert!(validate_model_context(bonsai, &config).is_ok());
+        config.context_length = 4096;
+        assert!(validate_model_context(bonsai, &config).is_ok());
+        assert!(validate_model_context(Path::new(crate::model_catalog::MODEL_FILENAME), &RuntimeConfig::default()).is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires cached upstream and Prism Windows CUDA runtime installations"]
+    async fn recognizes_old_prism_and_current_runtime_flags() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let current = inspect_runtime(&root.join(".local/runtime/llama-server.exe")).await.unwrap();
+        assert!(current.no_agent);
+        assert!(current.fit);
+        let prism = inspect_runtime(&root.join(".local/runtime-prism-b9601-68faa14/llama-server.exe")).await.unwrap();
+        assert!(!prism.no_agent);
+    }
+
     #[test]
     fn offload_reporting_requires_valid_runtime_evidence() {
         assert_eq!(
@@ -300,5 +456,28 @@ mod tests {
         assert!(validate_model(&path).is_err());
         std::fs::write(&path, b"HTML error document").unwrap();
         assert!(validate_model(&path).is_err());
+    }
+    #[test]
+    fn projector_must_be_a_regular_mmproj_gguf_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("mmproj-model-f16.gguf");
+        std::fs::write(&valid, b"GGUF").unwrap();
+        assert!(validate_projector(&valid).is_ok());
+        let wrong_name = directory.path().join("model.gguf");
+        std::fs::write(&wrong_name, b"GGUF").unwrap();
+        let error = validate_projector(&wrong_name).unwrap_err();
+        assert!(error.contains("mmproj"), "{error}");
+        let truncated = directory.path().join("mmproj-truncated.gguf");
+        std::fs::write(&truncated, b"GG").unwrap();
+        assert!(validate_projector(&truncated).is_err());
+        assert!(validate_projector(&directory.path().join("mmproj-missing.gguf")).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = directory.path().join("mmproj-link.gguf");
+            symlink(&valid, &link).unwrap();
+            let error = validate_projector(&link).unwrap_err();
+            assert!(error.contains("symlink"), "{error}");
+        }
     }
 }

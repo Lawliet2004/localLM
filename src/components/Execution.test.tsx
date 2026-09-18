@@ -4,6 +4,7 @@ import { Execution } from './Execution';
 const fixtures=vi.hoisted(()=>({pending:vi.fn()}));
 vi.mock('../lib/api',()=>({nativeAvailable:true,errorMessage:String,api:{
   getExecutionConfig:async()=>({pythonPath:'',nodePath:'',powershellPath:''}),
+  getWebSearchConfig:async()=>({provider:'searxng',searxngBaseUrl:'http://127.0.0.1:8080',googleApiKey:'',googleCxId:'',searchFallbackEnabled:true}),
   pendingDaytonaOperations:fixtures.pending,
   hasDaytonaKey:async()=>false,
 }}));

@@ -13,6 +13,8 @@
     "windows": [
       {
         "title": "LocalLM",
+        "decorations": false,
+        "dragDropEnabled": false,
         "width": 1280,
         "height": 840,
         "minWidth": 760,

@@ -55,6 +55,9 @@ fn parse_hash(value: &str) -> Result<[u8; 32], String> {
     Ok(hash)
 }
 fn valid_path(path: &str, root_allowed: bool) -> Result<(), String> {
+    // ponytail: FS exfiltration deny-list lives in sandbox.rs; path-shape
+    // rules stay here next to the cap-std enforcement.
+    crate::sandbox::check_fs_path("", path, false)?;
     if root_allowed && path == "." {
         return Ok(());
     }

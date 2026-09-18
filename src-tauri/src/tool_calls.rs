@@ -18,6 +18,11 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 impl ToolCalls {
+    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    /// Assemble one OpenAI-compatible streaming delta. Some local runtimes
+    /// (AREX-family templates) interleave `content` reasoning prose with tool
+    /// deltas in the same round; prose is ignored here and separated by the
+    /// chat-level think filter instead.
     pub fn push(&mut self, delta: &Value) -> Result<(), String> {
         let Some(calls) = delta.get("tool_calls") else {
             return Ok(());
@@ -49,14 +54,20 @@ impl ToolCalls {
     }
     pub fn finish(self) -> Result<Vec<ToolCall>, String> {
         let mut ids = std::collections::HashSet::new();
-        self.0
+        let calls: Vec<ToolCall> = self.0
             .into_values()
             .map(|call| {
                 if call.id.is_empty() || call.name.is_empty() || !ids.insert(call.id.clone()) {
                     return Err("Tool call has missing or duplicate identifiers.".into());
                 }
+                // Truncated generations arrive as partial JSON; detect them
+                // here so the chat loop rejects unfinished arguments instead
+                // of executing a guessed call.
+                if call.arguments.trim().is_empty() {
+                    return Err("Tool arguments are empty; the generation may have been truncated.".into());
+                }
                 let arguments: Value = serde_json::from_str(&call.arguments)
-                    .map_err(|_| "Tool arguments are not valid JSON.")?;
+                    .map_err(|_| "Tool arguments are not valid JSON. The generation may have been truncated; unfinished tool calls are not executed.")?;
                 if !arguments.is_object() {
                     return Err("Tool arguments must be a JSON object.".into());
                 }
@@ -66,8 +77,45 @@ impl ToolCalls {
                     arguments,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, String>>()?;
+        // Incomplete tool arguments (unbalanced braces from a cut-off stream)
+        // are a truncation signal, not an executable call.
+        for call in &calls {
+            let text = call.arguments.to_string();
+            if !braces_balanced(&text) {
+                return Err("Tool arguments are incomplete (unbalanced JSON); the generation was truncated and the call was not executed.".into());
+            }
+        }
+        Ok(calls)
     }
+}
+
+/// True when every `{`/`[` outside strings is closed. Local runtimes cut
+/// streams at the response budget; an unbalanced suffix means truncation.
+fn braces_balanced(text: &str) -> bool {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' if stack.pop() != Some(ch) => return false,
+            _ => {}
+        }
+    }
+    !in_string && stack.is_empty()
 }
 impl ToolCall {
     pub fn model_value(&self) -> Value {
@@ -102,10 +150,20 @@ mod tests {
         ] {
             assert!(ToolCalls::default().push(&fragment).is_err());
         }
-        for arguments in ["[]", "{", "null"] {
+        for arguments in ["[]", "{", "null", ""] {
             let mut calls = ToolCalls::default();
             calls.push(&json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"tool","arguments":arguments}}]})).unwrap();
             assert!(calls.finish().is_err());
         }
+    }
+    #[test]
+    fn truncated_arguments_are_never_executable() {
+        // Balanced JSON with a brace inside a string is fine.
+        let mut calls = ToolCalls::default();
+        calls.push(&json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"tool","arguments":"{\"q\":\"a{b}\"}"}}]})).unwrap();
+        assert!(calls.finish().is_ok());
+        assert!(braces_balanced("{\"q\":\"a{b}\"}"));
+        assert!(!braces_balanced("{\"q\":\"abc\""));
+        assert!(!braces_balanced("{\"q\":"));
     }
 }

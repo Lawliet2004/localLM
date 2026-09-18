@@ -1,8 +1,14 @@
 //! Streaming verified downloads. Final filenames are published only after verification.
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::Duration};
-use tokio::{io::AsyncWriteExt, sync::watch};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::watch,
+};
 
 pub async fn verify_file(
     path: &Path,
@@ -100,8 +106,17 @@ pub fn available_space(_: &Path) -> Result<u64, String> {
     Err("Managed downloads currently support Windows only.".into())
 }
 
+pub fn partial_path(destination: &Path) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".part");
+    destination.with_file_name(name)
+}
+
 /// The caller supplies a pinned asset and an application-owned destination.
-/// Dropping this future or cancellation removes the unpublished temporary file.
+/// Interrupted transfers keep `{name}.part` so a later retry can resume with HTTP Range.
 pub async fn fetch(
     client: &reqwest::Client,
     asset: &Asset<'_>,
@@ -109,6 +124,12 @@ pub async fn fetch(
     cancel: watch::Receiver<bool>,
     progress: impl FnMut(u64),
 ) -> Result<(), String> {
+    if asset.sha256.bytes().all(|b| b == b'0') {
+        // A placeholder checksum cannot be verified after download; refuse it
+        // up front instead of wasting the transfer (plan step 2: pin the
+        // revision and checksum before any large download).
+        return Err("This model entry has no pinned checksum yet. Its revision and sha256 must be verified before it can be downloaded.".into());
+    }
     fetch_with_header_timeout(
         client,
         asset,
@@ -140,44 +161,104 @@ async fn fetch_with_header_timeout(
     let parent = destination
         .parent()
         .ok_or("Download destination has no parent directory.")?;
-    let needed = required_space(asset.bytes)?;
+    if destination.exists() {
+        return Err(
+            "Could not install verified file; an existing destination is preserved.".into(),
+        );
+    }
+    let partial = partial_path(destination);
+    let mut have = tokio::fs::metadata(&partial)
+        .await
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if have > asset.bytes {
+        let _ = tokio::fs::remove_file(&partial).await;
+        have = 0;
+    }
+    let remaining = asset.bytes.saturating_sub(have);
+    let needed = required_space(remaining.max(1))?;
     if available_space(parent)? < needed {
         return Err(format!("Not enough disk space. Download requires {needed} free bytes, including a 256 MiB reserve."));
     }
-    let temporary = tempfile::Builder::new()
-        .prefix(".locallm-download-")
-        .rand_bytes(32)
-        .suffix(".part")
-        .tempfile_in(parent)
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&partial)
+        .await
         .map_err(|error| format!("Cannot create download file: {error}"))?;
-    // Keep the tempfile owner alive until the asynchronous file handle is closed.
-    let mut file =
-        tokio::fs::File::from_std(temporary.reopen().map_err(|error| error.to_string())?);
     let work = async {
-        let request = client
+        let mut hash = Sha256::new();
+        if have > 0 {
+            // These bytes are already saved. Rehashing is not network progress.
+            progress(have);
+            file.seek(std::io::SeekFrom::Start(0))
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut read = 0_u64;
+            let mut buffer = vec![0; 1024 * 1024];
+            while read < have {
+                let want = std::cmp::min(buffer.len() as u64, have - read) as usize;
+                let count = file
+                    .read(&mut buffer[..want])
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if count == 0 {
+                    return Err("Saved download was truncated. Delete it and retry.".into());
+                }
+                hash.update(&buffer[..count]);
+                read += count as u64;
+            }
+        }
+        if have == asset.bytes {
+            if !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(asset.sha256) {
+                return Err("Saved download failed SHA-256 verification. It was removed.".into());
+            }
+            file.sync_all()
+                .await
+                .map_err(|error| format!("Could not flush verified download: {error}"))?;
+            return Ok(());
+        }
+        let mut request = client
             .get(asset.url)
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .send();
-        let response = tokio::time::timeout(header_timeout, request)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+        if have > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
+        }
+        let response = tokio::time::timeout(header_timeout, request.send())
             .await
             .map_err(|_| "Download service did not send response headers within 60 seconds.")?
             .map_err(|_| "Could not connect to the download service.")?;
-        if response.status() != reqwest::StatusCode::OK {
+        let status = response.status();
+        let resume_ok = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+        let fresh_ok = status == reqwest::StatusCode::OK;
+        if have > 0 && fresh_ok {
+            file.set_len(0).await.map_err(|error| error.to_string())?;
+            file.seek(std::io::SeekFrom::Start(0))
+                .await
+                .map_err(|error| error.to_string())?;
+            have = 0;
+            hash = Sha256::new();
+            progress(0);
+        } else if !resume_ok && !fresh_ok {
             return Err(format!(
                 "Download service returned HTTP {}.",
-                response.status().as_u16()
+                status.as_u16()
             ));
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length != asset.bytes)
+        if have == 0
+            && response
+                .content_length()
+                .is_some_and(|length| length != asset.bytes)
         {
             return Err("Download size differs from the pinned asset.".into());
         }
         let mut stream = response.bytes_stream();
-        let mut received = 0_u64;
-        let mut hash = Sha256::new();
-        progress(0);
+        let mut received = have;
+        progress(received);
         loop {
             let chunk = tokio::time::timeout(Duration::from_secs(60), stream.next())
                 .await
@@ -197,6 +278,7 @@ async fn fetch_with_header_timeout(
             progress(received);
         }
         if received != asset.bytes {
+            file.sync_all().await.ok();
             return Err("Download ended before the pinned size was received.".into());
         }
         if !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(asset.sha256) {
@@ -212,13 +294,30 @@ async fn fetch_with_header_timeout(
         _ = cancel.changed() => Err("Download cancelled.".into()),
         result = work => result,
     };
+    let _ = file.sync_all().await;
     drop(file);
-    result?;
-    temporary.persist_noclobber(destination).map_err(|error| {
-        format!(
-            "Could not install verified file; an existing destination is preserved: {}",
-            error.error
-        )
+    if let Err(error) = &result {
+        let saved = std::fs::metadata(&partial)
+            .ok()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let discard = saved == 0
+            || saved > asset.bytes
+            || error.contains("SHA-256")
+            || error.contains("truncated");
+        if discard {
+            let _ = std::fs::remove_file(&partial);
+        }
+        return result;
+    }
+    if destination.exists() {
+        let _ = std::fs::remove_file(&partial);
+        return Err(
+            "Could not install verified file; an existing destination is preserved.".into(),
+        );
+    }
+    std::fs::rename(&partial, destination).map_err(|error| {
+        format!("Could not install verified file; an existing destination is preserved: {error}")
     })?;
     Ok(())
 }
@@ -295,7 +394,7 @@ mod tests {
         let asset = Asset {
             url: "https://example.invalid/never-requested",
             bytes: u64::MAX / 2,
-            sha256: &"0".repeat(64),
+            sha256: &"a".repeat(64),
         };
         let error = fetch(
             &client().unwrap(),
@@ -316,7 +415,7 @@ mod tests {
             .is_err());
     }
     #[tokio::test]
-    async fn cancellation_during_transfer_removes_partial_file() {
+    async fn cancellation_during_transfer_keeps_partial_file() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("model.gguf");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -335,7 +434,7 @@ mod tests {
         let asset = Asset {
             url: &url,
             bytes: 100,
-            sha256: &"0".repeat(64),
+            sha256: &"b".repeat(64),
         };
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -355,7 +454,71 @@ mod tests {
         .unwrap();
         assert_eq!(result.unwrap_err(), "Download cancelled.");
         assert!(!destination.exists());
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        let partial = partial_path(&destination);
+        assert!(partial.exists());
+        assert!(std::fs::metadata(&partial).unwrap().len() > 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn saved_bytes_do_not_count_as_new_download_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("model.gguf");
+        let bytes = vec![42; 2 * 1024 * 1024];
+        std::fs::write(partial_path(&destination), &bytes).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let asset = Asset { url: "http://unused.invalid", bytes: bytes.len() as u64, sha256: &hash };
+        let (_sender, receiver) = watch::channel(false);
+        let mut updates = Vec::new();
+        fetch(&reqwest::Client::new(), &asset, &destination, receiver, |n| updates.push(n)).await.unwrap();
+        assert!(!updates.is_empty());
+        assert!(updates.iter().all(|&n| n == asset.bytes), "Rehashing must not move the download meter backwards: {updates:?}");
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_resumes_from_saved_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("model.gguf");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/asset", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for resume in [false, true] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let count = socket.read(&mut request).await.unwrap();
+                let header = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+                if !resume {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfixt")
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(header.contains("range: bytes=4-"), "{header}");
+                    socket
+                        .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-6/7\r\nContent-Length: 3\r\nConnection: close\r\n\r\nure")
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let hash = format!("{:x}", Sha256::digest(b"fixture"));
+        let asset = Asset {
+            url: &url,
+            bytes: 7,
+            sha256: &hash,
+        };
+        let (_sender, receiver) = watch::channel(false);
+        let first = fetch(&reqwest::Client::new(), &asset, &destination, receiver.clone(), |_| {}).await.unwrap_err();
+        assert!(
+            first.contains("before the pinned size") || first.contains("interrupted") || first.contains("stalled"),
+            "{first}"
+        );
+        assert_eq!(std::fs::read(partial_path(&destination)).unwrap(), b"fixt");
+        fetch(&reqwest::Client::new(), &asset, &destination, receiver, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"fixture");
+        assert!(!partial_path(&destination).exists());
         server.abort();
     }
     #[tokio::test]
@@ -380,7 +543,7 @@ mod tests {
                     .unwrap();
             });
             let hash = if case == "hash" {
-                "0".repeat(64)
+                format!("{:x}", Sha256::digest(b"different-content"))
             } else {
                 format!("{:x}", Sha256::digest(b"fixture"))
             };
@@ -399,10 +562,10 @@ mod tests {
             )
             .await;
             drop(sender);
-            if case == "cancel" {
+            if case == "cancel" || case == "existing" {
                 server.abort();
             } else {
-                server.await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
             }
             assert_eq!(result.is_ok(), case == "success");
             if case == "success" {
@@ -417,5 +580,26 @@ mod tests {
                 usize::from(destination.exists())
             );
         }
+    }
+    #[tokio::test]
+    async fn unpinned_placeholder_checksums_are_refused_before_any_transfer() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_sender, receiver) = watch::channel(false);
+        let asset = Asset {
+            url: "https://example.invalid/never-requested",
+            bytes: 7,
+            sha256: &"0".repeat(64),
+        };
+        let error = fetch(
+            &client().unwrap(),
+            &asset,
+            &temp.path().join("model"),
+            receiver,
+            |_| panic!("no download should start"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("no pinned checksum"));
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }
