@@ -3,6 +3,21 @@ import { extractMainContent } from './main_content';
 import { DocumentStore, extractPdfText } from '../documents/document_store';
 
 describe('full-document reading', () => {
+  it('prefers JSON-LD articleBody when HTML extraction is thin', () => {
+    const body = 'The stable release is 19.0 and it shipped Actions plus useActionState. '.repeat(8);
+    const html = `<html><head>
+      <script type="application/ld+json">${JSON.stringify({
+        '@type': 'TechArticle',
+        headline: 'React 19',
+        articleBody: body,
+      })}</script>
+    </head><body><nav>chrome</nav><p>short</p></body></html>`;
+    const ext = extractMainContent(html, 'fallback');
+    expect(ext.title).toBe('React 19');
+    expect(ext.text).toContain('useActionState');
+    expect(ext.text.length).toBeGreaterThan(200);
+  });
+
   it('preserves headings, links, and table structure', () => {
     const html = `<html><head><title>Release</title></head><body>
       <h1>Model Release</h1><h2>Benchmarks</h2>

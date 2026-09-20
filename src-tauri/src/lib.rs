@@ -1,4 +1,5 @@
 pub mod agent_run;
+mod arex;
 pub mod approval;
 pub mod artifacts;
 pub mod capabilities;
@@ -34,7 +35,6 @@ mod permissions;
 pub mod memory;
 pub mod plans;
 mod prompt;
-pub mod plugins;
 pub mod presets;
 mod providers;
 mod runtime;
@@ -45,7 +45,6 @@ mod runtime_install_commands;
 mod runtime_inventory;
 mod runtime_log;
 pub mod sandbox;
-pub mod scheduling;
 pub mod sessions;
 pub mod skills;
 mod sse;
@@ -168,6 +167,12 @@ pub fn run() {
                 data_dir: data.clone(),
             });
             let handle = app.handle().clone();
+            let connector_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = connectors::restore_connections(&connector_handle.state::<AppState>()).await {
+                    eprintln!("Could not restore saved connector selections: {error}");
+                }
+            });
             for (folder, runtime) in [("models", false), ("runtimes", true)] {
                 if let Err(error) = install_recovery::clean(&data.join(folder), runtime) {
                     let state = app.state::<AppState>();
@@ -179,10 +184,6 @@ pub fn run() {
                 if daytona_settings::recover_at_startup(&handle.state::<AppState>()).await.is_err() {
                     eprintln!("Startup cloud cleanup could not access its journal; pending ownership is retained.");
                 }
-            });
-            let scheduler_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                scheduling::run_background(scheduler_app).await;
             });
             Ok(())
         })
@@ -260,7 +261,6 @@ pub fn run() {
             memory::teach_fact_cmd,
             memory::forget_fact,
             memory::ingest_repo,
-            scheduling::list_schedules,
             workspace_ui::workspace_index,
             workspace_ui::save_project,
             workspace_ui::remove_project,
@@ -268,20 +268,8 @@ pub fn run() {
             workspace_ui::workspace_inspect,
             workspace_ui::workspace_git,
             workspace_ui::workspace_command,
-            scheduling::save_schedule,
-            scheduling::delete_schedule,
-            scheduling::run_schedule_now,
-            scheduling::webhook_state,
-            scheduling::set_webhook,
-            scheduling::rotate_webhook_token,
             sandbox::sandbox_status,
             sandbox::set_sandbox_provider,
-            plugins::list_plugins,
-            plugins::install_plugin,
-            plugins::set_plugin_enabled,
-            plugins::remove_plugin,
-            plugins::scan_plugin,
-            plugins::test_plugin,
             web_search::web_search_health,
             web_search::get_web_search_config,
             web_search::save_web_search_config,

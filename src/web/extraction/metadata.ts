@@ -9,6 +9,8 @@ export interface PageMetadata {
   publishedAt?: string;
   description?: string;
   canonicalUrl?: string;
+  /** Schema.org Article body when publishers ship it in JSON-LD. */
+  articleBody?: string;
 }
 
 export function extractPageMetadata(html: string): PageMetadata {
@@ -79,6 +81,9 @@ export function extractPageMetadata(html: string): PageMetadata {
         }
         if (!meta.title && item.headline) {
           meta.title = String(item.headline);
+        }
+        if (!meta.articleBody && typeof item.articleBody === 'string' && item.articleBody.trim().length > 200) {
+          meta.articleBody = item.articleBody.trim();
         }
       }
     } catch {

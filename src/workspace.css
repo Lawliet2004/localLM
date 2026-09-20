@@ -931,41 +931,7 @@
   }
 }
 
-/* Center Codex Empty State */
-.codex-welcome {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  margin: auto 0;
-  padding: 40px 20px 20px;
-}
-.codex-cloud-icon-wrapper {
-  margin-bottom: 22px;
-}
-.codex-cloud-icon {
-  color: #555866;
-  width: 56px;
-  height: 50px;
-}
-.codex-welcome-heading {
-  font-size: 26px;
-  font-weight: 500;
-  color: #ececef;
-  letter-spacing: -0.4px;
-  margin: 0;
-}
-.codex-welcome-heading u.project-highlight {
-  text-decoration-thickness: 1.5px;
-  text-underline-offset: 4px;
-  text-decoration-color: #ffffff;
-  cursor: pointer;
-  transition: text-decoration-color 0.15s ease;
-}
-.codex-welcome-heading u.project-highlight:hover {
-  text-decoration-color: #a4a7b5;
-}
+
 
 /* Floating Two-Tier Composer */
 .composer-region {
@@ -1172,5 +1138,258 @@
   background: #2b2c36;
   color: #555765;
   opacity: 0.7;
+}
+
+/* Compact composer */
+.composer-region {
+  padding: 0 24px 14px;
+}
+.codex-composer-body {
+  padding: 6px 14px 6px !important;
+}
+.codex-composer-body textarea {
+  min-height: 28px;
+  max-height: 140px;
+  font-size: 13.5px;
+  padding: 2px 0;
+  line-height: 1.45;
+}
+.composer-meta-bar {
+  padding: 5px 14px 4px;
+  font-size: 11.5px;
+  gap: 14px;
+}
+.composer-bottom {
+  padding-top: 2px;
+}
+
+/* Plan checklist */
+.plan-checklist {
+  margin: 0 0 8px;
+  background: #1c1d24;
+  border: 1px solid #323442;
+  border-radius: 12px;
+  overflow: hidden;
+}
+.plan-checklist.live {
+  border-color: #3d4154;
+}
+.plan-checklist-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  text-align: left;
+  color: #c9cbd6;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  min-height: 36px;
+}
+.plan-checklist-toggle:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+.plan-checklist-chevron {
+  display: grid;
+  place-items: center;
+  color: #8b8ea0;
+}
+.plan-checklist-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: #ececef;
+}
+.plan-checklist-count {
+  font-size: 11.5px;
+  color: #8b8ea0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.plan-checklist-meter {
+  display: inline-flex;
+  width: 56px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.plan-checklist-meter-fill {
+  display: block;
+  height: 100%;
+  background: #86efac;
+  border-radius: inherit;
+  transition: width 0.25s ease;
+}
+.plan-checklist.complete .plan-checklist-meter-fill {
+  background: #34d399;
+}
+.plan-checklist-current-preview {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: #a5b4fc;
+}
+.plan-checklist-items {
+  list-style: none;
+  margin: 0;
+  padding: 2px 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.plan-checklist-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  color: #d6d8e0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.plan-checklist-item.in_progress {
+  background: rgba(129, 140, 248, 0.08);
+}
+.plan-checklist-item.completed .plan-checklist-text {
+  color: #8b8ea0;
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  text-decoration-color: #5b5e6e;
+}
+.plan-checklist-mark {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 18px;
+  color: #6e7180;
+  flex-shrink: 0;
+}
+.plan-checklist-check {
+  display: grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #22c55e;
+  color: #052e16;
+}
+.plan-checklist-item.in_progress .plan-checklist-mark {
+  color: #a5b4fc;
+}
+.plan-checklist-current-dot {
+  fill: #818cf8;
+  color: #818cf8;
+}
+.plan-checklist-spin {
+  animation: plan-spin 0.9s linear infinite;
+}
+.plan-checklist-now {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #a5b4fc;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(129, 140, 248, 0.14);
+  flex-shrink: 0;
+}
+.plan-checklist-text {
+  min-width: 0;
+  flex: 1;
+}
+@keyframes plan-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Streaming caret and response polish */
+.markdown.is-streaming > *:last-child::after {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  margin-left: 3px;
+  background: #ececef;
+  border-radius: 1px;
+  vertical-align: text-bottom;
+  animation: stream-caret 1s steps(1, end) infinite;
+}
+@keyframes stream-caret {
+  50% { opacity: 0; }
+}
+.activity-feed .message-assistant .markdown {
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+.activity-feed .message-assistant {
+  animation: message-in 0.18s ease;
+}
+@keyframes message-in {
+  from { opacity: 0.55; transform: translateY(2px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Web search result polish */
+.web-icon {
+  color: #7dd3fc;
+}
+.web-result-summary {
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.web-answer-excerpt {
+  margin: 0 0 8px;
+  color: #cbd5e1;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.web-source-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.web-source-list a,
+.web-source-list span {
+  display: inline-flex;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(125, 211, 252, 0.08);
+  color: #7dd3fc;
+  font-size: 11px;
+  text-decoration: none;
+}
+.web-source-list a:hover {
+  background: rgba(125, 211, 252, 0.16);
+}
+
+.command-run-card.running .card-header {
+  background: rgba(129, 140, 248, 0.06);
+}
+.command-run-card .cmd-title {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .plan-checklist-spin,
+  .markdown.is-streaming > *:last-child::after,
+  .activity-feed .message-assistant {
+    animation: none !important;
+  }
 }
 

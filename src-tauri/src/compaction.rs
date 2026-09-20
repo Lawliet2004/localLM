@@ -93,8 +93,9 @@ pub fn compact_model_messages(
     let volatile = if user > leading && messages[user - 1]["role"] == "system" { Some(user - 1) } else { None };
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
+    let research_checkpoint = messages.iter().rposition(|m| m["role"] == "assistant" && m["content"].as_str().is_some_and(|s| s.starts_with(crate::arex::CONTEXT_MARKER)));
     for (i, message) in messages.iter().enumerate() {
-        if i < leading || volatile == Some(i) || i == user || i >= tail {
+        if i < leading || volatile == Some(i) || research_checkpoint == Some(i) || i == user || i >= tail {
             kept.push(message.clone());
         } else {
             dropped.push(message.clone());

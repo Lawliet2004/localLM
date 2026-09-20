@@ -40,6 +40,93 @@ pub fn validate_objective(objective: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Pull numbered or bulleted steps out of a Phase-1 plan so the UI has a
+/// checklist even before the model calls `todo_write`.
+pub fn parse_plan_steps(plan_text: &str) -> Vec<Todo> {
+    let now = crate::store::now();
+    let mut todos = Vec::new();
+    for line in plan_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(raw) = step_text(trimmed) else { continue };
+        let text = strip_md(raw);
+        if text.len() < 3 || text.len() > 500 {
+            continue;
+        }
+        let status = if todos.is_empty() { IN_PROGRESS } else { PENDING };
+        todos.push(Todo {
+            text,
+            status: status.to_string(),
+            updated_at: now,
+        });
+        if todos.len() >= 50 {
+            break;
+        }
+    }
+    todos
+}
+
+fn step_text(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() && matches!(bytes[i], b'.' | b')' | b':') {
+        return Some(line[i + 1..].trim());
+    }
+    for prefix in ["- ", "* ", "+ ", "– ", "— "] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return Some(rest.trim());
+        }
+    }
+    None
+}
+
+fn strip_md(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '*' || ch == '_' {
+            continue;
+        }
+        if ch == '`' {
+            continue;
+        }
+        out.push(ch);
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One-line "work only on this" reminder injected while a plan is executing.
+pub fn current_task_line(todos: &[Todo]) -> Option<String> {
+    if todos.is_empty() {
+        return None;
+    }
+    let total = todos.len();
+    let done = todos.iter().filter(|todo| todo.status == COMPLETED).count();
+    let current = todos
+        .iter()
+        .enumerate()
+        .find(|(_, todo)| todo.status == IN_PROGRESS)
+        .or_else(|| todos.iter().enumerate().find(|(_, todo)| todo.status == PENDING));
+    let mut line = format!("Checklist progress: {done}/{total} complete.");
+    match current {
+        Some((index, todo)) => {
+            line.push_str(&format!(
+                " Current task (index {index}): {}. Work only on this task. When it is done, mark it completed and start the next pending task. Do not skip ahead.",
+                todo.text
+            ));
+        }
+        None => {
+            line.push_str(" All tasks are complete. Summarize the answer and do not call more tools.");
+        }
+    }
+    Some(line)
+}
+
 /// Parse the `todo_write` tool arguments (full-replacement list).
 pub fn parse_todo_write(arguments: &serde_json::Value) -> Result<Vec<Todo>, String> {
     let items = arguments
@@ -78,9 +165,17 @@ pub fn summary_line(todos: &[Todo], goal: Option<&str>) -> Option<String> {
     if open.is_empty() && goal.is_none() {
         return None;
     }
+    let total = todos.len();
+    let done = todos.iter().filter(|todo| todo.status == COMPLETED).count();
     let mut line = String::from("Tracked plan state (update via todo_add/todo_update; do not edit silently): ");
     if let Some(objective) = goal {
         line.push_str(&format!("goal: {objective}. "));
+    }
+    if total > 0 {
+        line.push_str(&format!("progress: {done}/{total} complete. "));
+    }
+    if let Some(current) = todos.iter().find(|todo| todo.status == IN_PROGRESS) {
+        line.push_str(&format!("current: {}. ", current.text));
     }
     if !open.is_empty() {
         line.push_str(&format!("open todos: {}.", open.join("; ")));
@@ -125,5 +220,41 @@ mod tests {
         assert!(make_todo("write tests").is_ok());
         assert!(make_todo("").is_err());
         assert!(make_todo(&"x".repeat(501)).is_err());
+    }
+
+    #[test]
+    fn parse_plan_steps_takes_numbered_and_bulleted_lines() {
+        let plan = "# Plan\n\n1. **Search** fusion yield papers\n2. Open the top source\n3. Calculate the yield\n- skip headings above\n\nThen we are done.";
+        let todos = parse_plan_steps(plan);
+        assert_eq!(todos.len(), 4);
+        assert_eq!(todos[0].text, "Search fusion yield papers");
+        assert_eq!(todos[0].status, IN_PROGRESS);
+        assert_eq!(todos[1].text, "Open the top source");
+        assert_eq!(todos[1].status, PENDING);
+        assert_eq!(todos[2].status, PENDING);
+        assert_eq!(todos[3].text, "skip headings above");
+    }
+
+    #[test]
+    fn parse_plan_steps_ignores_prose_without_markers() {
+        assert!(parse_plan_steps("I will look this up and then calculate.").is_empty());
+        assert!(parse_plan_steps("").is_empty());
+    }
+
+    #[test]
+    fn current_task_line_names_the_in_progress_item() {
+        let todos = vec![
+            Todo { text: "done thing".into(), status: COMPLETED.into(), updated_at: 0 },
+            Todo { text: "open the paper".into(), status: IN_PROGRESS.into(), updated_at: 0 },
+            Todo { text: "verify".into(), status: PENDING.into(), updated_at: 0 },
+        ];
+        let line = current_task_line(&todos).unwrap();
+        assert!(line.contains("1/3 complete"));
+        assert!(line.contains("index 1"));
+        assert!(line.contains("open the paper"));
+        assert!(line.contains("Do not skip ahead"));
+        let finished = vec![Todo { text: "done".into(), status: COMPLETED.into(), updated_at: 0 }];
+        assert!(current_task_line(&finished).unwrap().contains("All tasks are complete"));
+        assert!(current_task_line(&[]).is_none());
     }
 }

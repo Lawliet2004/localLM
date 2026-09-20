@@ -84,9 +84,9 @@ pub fn get(id: &str) -> Result<Preset, String> {
                 "todo_write", "todo_add", "todo_update", "goal_set", "goal_clear", "subagent", "send_message",
                 "interrupt_agent", "list_agents", "list_subagent_models", "workflow_run", "ralph_run",
                 "terminal_create", "terminal_send", "terminal_close", "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch",
-                "file_search", "memory_teach", "memory_recall", "schedule_create",
-                "schedule_list", "schedule_run", "ask_user", "artifact_read", "docker_exec",
-                "plugin_test", "preset_guide", "compact_conversation", "research_pause", "research_resume", "research_cancel", "research_progress",
+                "file_search", "memory_teach", "memory_recall",
+                "ask_user", "artifact_read", "docker_exec",
+                "preset_guide", "compact_conversation", "research_pause", "research_resume", "research_cancel", "research_progress",
             ]),
         },
         CHAT => Preset {
@@ -109,6 +109,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             skills: true,
             harness: harness(&[
                 "todo_write", "memory_recall", "compact_conversation",
+                "search", "visit", "update_context", "finish", "artifact_read",
                 "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch", "file_search",
             ]),
         },
@@ -138,7 +139,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             skills: true,
             // Lean for small local models: core workspace ops, shell, web,
             // memory, subagents, and granular todos. Advanced orchestration
-            // (workflow_run, ralph_run), schedules, docker, and guides live in
+            // (workflow_run, ralph_run), docker, and guides live in
             // Creator or behind subagent delegation.
             harness: harness(&[
                 "todo_write", "todo_add", "todo_update", "goal_set", "goal_clear",
@@ -206,7 +207,7 @@ pub fn authoring_guide() -> &'static str {
     "Compose a preset without forking source: pick sources (workspace, execution, daytona), \
      MCP on/off, system_time on/off, skills on/off, and a harness tool subset. Standard = lean core \
      (todos, subagents, shell, web, memory, ask_user, artifacts); \
-     Creator = Standard plus orchestration (workflow_run, ralph_run), schedules, docker, and guides. \
+     Creator = Standard plus orchestration (workflow_run, ralph_run), docker, and guides. \
      Minimal = execution + edit_file + terminal_* only. New presets need a Rust change today; \
      file-based preset overlays are future work."
 }
@@ -238,7 +239,7 @@ mod tests {
         assert!(standard.harness.contains(&"todo_add".to_string()));
         assert!(standard.harness.contains(&"todo_update".to_string()));
         assert!(standard.harness.contains(&"artifact_read".to_string()));
-        for advanced in ["workflow_run", "ralph_run", "schedule_create", "schedule_list",
+        for advanced in ["workflow_run", "ralph_run",
             "docker_exec", "preset_guide", "list_subagent_models"] {
             assert!(!standard.harness.contains(&advanced.to_string()), "{advanced} should be Creator-only");
         }
@@ -246,7 +247,7 @@ mod tests {
         for alias in &standard.harness {
             assert!(creator.harness.contains(alias), "creator should include standard {alias}");
         }
-        for advanced in ["workflow_run", "ralph_run", "schedule_create", "docker_exec", "preset_guide"] {
+        for advanced in ["workflow_run", "ralph_run", "docker_exec", "preset_guide"] {
             assert!(creator.harness.contains(&advanced.to_string()));
         }
     }

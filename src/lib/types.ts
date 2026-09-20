@@ -79,7 +79,7 @@ export interface Bootstrap {
   conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus;
   rememberedTools: RememberedTools; providers: ProviderConnection[]; preferredModel: ModelSelection;
 }
-export interface RememberedTools { sources: string[]; tools: ToolSelection[] }
+export interface RememberedTools { sources: string[]; tools: ToolSelection[]; accessMode?: AccessMode }
 export interface ToolApproval { id: string; kind?: 'tool' | 'ask_user'; connector: string; localServerName?: string | null; name: string; arguments: Record<string, unknown> }
 export interface AskUserApproval extends ToolApproval { kind: 'ask_user'; }
 export interface ContextUsage { inputTokens: number; responseReserve: number; contextLength: number; estimated?: boolean }
@@ -114,12 +114,6 @@ export interface CompactionStatus {
 export interface Project { id: string; name: string; path: string }
 export interface TaskMeta { projectId: string | null; archived: boolean; pinned: boolean }
 export interface WorkspaceIndex { projects: Project[]; tasks: Record<string, TaskMeta> }
-export interface Schedule {
-  id: string; name: string; cron: string; task: string; conversationId: string | null;
-  allowWrite: boolean; enabled: boolean; runOnce: boolean; lastRunAt: number | null;
-  lastResult: string | null; createdAt: number;
-}
-export interface InstalledPlugin { name: string; version: string; path: string; enabled: boolean; sha256: string; installedAt: number }
 export type RunState =
   | 'preparing'
   | 'generating'
@@ -178,6 +172,12 @@ export interface Hit {
   createdAt: number;
 }
 
+export interface TodoItem {
+  text: string;
+  status: 'pending' | 'in_progress' | 'completed' | string;
+  updatedAt: number;
+}
+
 export interface ChatEvent {
   notice?: string;
   messageId: string;
@@ -198,7 +198,7 @@ export interface ToolView { name: string; description: string; inputSchema: Reco
 export interface ToolSelection { connectorId: string; toolName: string }
 export interface ConnectorView {
   id: string; description: string; url: string; authType: 'none' | 'apiKey' | 'oauth' | 'local';
-  connected: boolean; hasCredential: boolean; tools: ToolView[];
+  connected: boolean; hasCredential: boolean; tools: ToolView[]; connectionError?: string;
 }
 export interface SkillView {
   id: string; description: string; repo: string; revision: string; sourcePath: string;
@@ -221,7 +221,7 @@ export interface HardwareStatus {
 }
 export type AccessMode = 'ask' | 'autoApprove' | 'fullAccess';
 export interface ConversationTools { sources: string[]; tools: ToolSelection[]; accessMode: AccessMode }
-export type CapabilityKind = 'Model' | 'Tool' | 'Skill' | 'Session' | 'Sandbox' | 'Storage' | 'Loop' | 'Scheduling' | 'Ui';
+export type CapabilityKind = 'Model' | 'Tool' | 'Skill' | 'Session' | 'Sandbox' | 'Storage' | 'Loop' | 'Ui';
 export interface Capability { id: string; kind: CapabilityKind | string; version: number; enabled: boolean; description: string; config?: Record<string, unknown> }
 export interface SessionEvent {
   id: string;

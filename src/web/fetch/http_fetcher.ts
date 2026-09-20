@@ -1,6 +1,10 @@
-/** Native Node transport required: a WebView cannot safely pin DNS or enforce robots. */
+/**
+ * Native Node transport required: a WebView cannot safely pin DNS or enforce robots.
+ * The transport itself owns fetch policy: SSRF-pinned DNS, robots compliance,
+ * rate limiting, the GitHub raw-content fast path, and bounded reads.
+ */
 export interface FetchOptions { timeoutSeconds?: number; maxBytes?: number; maxRedirects?: number; userAgent?: string; maxRetries?: number }
-export interface FetchResult { url: string; finalUrl: string; success: boolean; status?: number; body?: string; mimeType?: string; error?: string; durationMs: number }
+export interface FetchResult { url: string; finalUrl: string; success: boolean; status?: number; body?: string; mimeType?: string; error?: string; durationMs: number; fastPath?: 'github_raw' }
 export class HttpFetcher {
   private transport?: Promise<{fetch(url: string, options: FetchOptions): Promise<FetchResult>}>;
   constructor(private globalConcurrency = 8, private perDomainConcurrency = 2) {}

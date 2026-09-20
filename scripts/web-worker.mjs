@@ -68,6 +68,8 @@ try {
         passages,
       };
     }
+  } else if (request.action === 'search') {
+    result = await engine.searchQueries(request.query);
   } else if (request.action === 'fetch-url') {
     const doc = await engine.fetchUrl(request.url);
     result = {

@@ -1,11 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Archive,
-  AtSign,
   Bell,
   BookOpen,
   ChevronDown,
-  Clock,
   Cpu,
   Folder,
   MessageCircle,
@@ -25,7 +23,7 @@ import { confirm, open } from '@tauri-apps/plugin-dialog';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import type { Conversation, Hit, Project, WorkspaceIndex } from '../lib/types';
 
-export type Page = 'chat' | 'models' | 'connectors' | 'skills' | 'execution' | 'tools' | 'automations' | 'plugins';
+export type Page = 'chat' | 'models' | 'connectors' | 'skills' | 'execution' | 'tools';
 
 interface Props {
   page: Page;
@@ -423,24 +421,6 @@ export function Sidebar(props: Props) {
               >
                 Execution
               </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  props.onPage('automations');
-                  setBrandMenuOpen(false);
-                }}
-              >
-                Scheduled Tasks
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  props.onPage('plugins');
-                  setBrandMenuOpen(false);
-                }}
-              >
-                Plugins
-              </button>
             </div>
           )}
         </div>
@@ -537,24 +517,6 @@ export function Sidebar(props: Props) {
         >
           <Terminal size={15} />
           <span>Execution</span>
-        </button>
-        <button
-          className={props.page === 'automations' ? 'selected' : ''}
-          aria-label="Scheduled"
-          title="Scheduled tasks"
-          onClick={() => props.onPage('automations')}
-        >
-          <Clock size={15} />
-          <span>Scheduled</span>
-        </button>
-        <button
-          className={props.page === 'plugins' ? 'selected' : ''}
-          aria-label="Plugins"
-          title="Plugins"
-          onClick={() => props.onPage('plugins')}
-        >
-          <AtSign size={15} />
-          <span>Plugins</span>
         </button>
       </nav>
 
@@ -801,7 +763,7 @@ export function Sidebar(props: Props) {
           className={`sidebar-settings-btn ${props.page !== 'chat' ? 'active-settings' : ''}`}
           aria-label="Settings"
           onClick={() => props.onPage(props.page === 'chat' ? 'models' : 'chat')}
-          title="Settings (Models & runtime, Connectors, Skills, Tools, Execution, Scheduled, Plugins)"
+          title="Settings (Models & runtime, Connectors, Skills, Tools, Execution)"
         >
           <Settings size={15} className="settings-gear-icon" />
           <span>Settings</span>

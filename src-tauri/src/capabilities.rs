@@ -22,7 +22,6 @@ pub enum CapabilityKind {
     Sandbox,
     Storage,
     Loop,
-    Scheduling,
     Ui,
 }
 

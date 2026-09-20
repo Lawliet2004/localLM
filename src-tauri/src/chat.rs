@@ -92,12 +92,68 @@ impl ThinkFilter {
 }
 
 const FINAL_ANSWER_INSTRUCTION: &str =
-    "The research is complete. Give the user the final answer now. Do not call tools or expose private reasoning.";
+    "Give the user a visible final answer now, using the conversation and tool results already collected. State any unresolved work or missing evidence honestly. Do not call tools, repeat progress updates, or expose private reasoning.";
 const EMPTY_FINAL_ANSWER_ERROR: &str =
     "The model finished without a visible answer after tool work completed. Please retry the request.";
-const PLAN_MODE_INSTRUCTION: &str = "Plan mode is on. Phase 1 of 2: write a concise numbered plan of the work, then stop. Name each step (search, open a source, calculate with local_run_code, compare, verify). Do not call tools and do not implement yet.";
-const PLAN_MODE_ACTIVE: &str = "Plan mode is on. Phase 1 is done. Phase 2: execute every remaining step with tools.";
-const PLAN_IMPLEMENT_INSTRUCTION: &str = "The plan above is ready. Implement it in order. Use web_search and web_open for facts, and local_run_code for exact math or science. Do not stop after the first tool result — continue until every step is done, then summarize the answer. If todo_write is available, record the steps and mark them complete as you go.";
+const RESEARCH_STALLED: &str = "Research stopped because repeated web calls made no progress or reached the research budget. Give the best answer supported by the results already collected, cite available sources, and clearly state any unresolved questions. Do not claim the research or unfinished plan steps are complete. Do not call tools.";
+const RESEARCH_STALLED_FALLBACK: &str = "Research stopped after repeated unproductive web calls or reaching its research budget. The model could not produce a supported final answer. The collected tool results remain available; unresolved claims have not been verified.";
+
+#[derive(Default)]
+struct ResearchProgress {
+    evidence: std::collections::HashSet<u64>,
+    calls: usize,
+    stagnant: usize,
+}
+
+impl ResearchProgress {
+    fn observe(&mut self, name: &str, result: &Value) {
+        if self.stopped() { return; }
+        if !matches!(name, "web_search" | "web_open" | "web_fetch" | "web_fetch_url" | "web_find" | "search" | "visit" | "update_context") { return; }
+        self.calls += 1;
+        let before = self.evidence.len();
+        if name != "update_context" && result["isError"] != true {
+            Self::collect(result, &mut self.evidence, false);
+        }
+        self.stagnant = if self.evidence.len() > before { 0 } else { self.stagnant + 1 };
+    }
+
+    fn collect(value: &Value, seen: &mut std::collections::HashSet<u64>, evidence: bool) {
+        use std::hash::{Hash, Hasher};
+        match value {
+            Value::Object(fields) => {
+                if fields.get("isError") == Some(&Value::Bool(true)) { return; }
+                for (key, value) in fields {
+                    // ponytail: explicit evidence fields ignore query IDs/timing; extend for new web result schemas.
+                    let evidence = matches!(key.as_str(), "url" | "text" | "content" | "snippet" | "excerpt" | "excerpts" | "answer" | "markdown" | "passage" | "body");
+                    Self::collect(value, seen, evidence);
+                }
+            }
+            Value::Array(values) => for value in values { Self::collect(value, seen, evidence); },
+            Value::String(text) if evidence => {
+                // MCP servers can wrap structured results in a text content block.
+                if let Ok(nested) = serde_json::from_str::<Value>(text) {
+                    if nested.is_object() || nested.is_array() {
+                        Self::collect(&nested, seen, false);
+                        return;
+                    }
+                }
+                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !normalized.is_empty() {
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    normalized.hash(&mut hash);
+                    seen.insert(hash.finish());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn stopped(&self) -> bool { self.stagnant >= 4 || self.calls >= 24 }
+}
+const PLAN_MODE_INSTRUCTION: &str = "Plan mode is on. Phase 1 of 2: write a concise numbered checklist of the work, then stop. Each step is one action (search, open a source, calculate with local_run_code, edit a file, compare, verify). 3–12 steps. Do not call tools and do not implement yet.";
+const PLAN_MODE_ACTIVE: &str = "Plan mode is on. Phase 1 is done. Phase 2: execute the checklist one task at a time.";
+const PLAN_IMPLEMENT_INSTRUCTION: &str = "The plan above is ready. Implement it in order, one task at a time. Work only on the current in_progress task. When it is done, mark it completed with todo_update (or todo_write) and start the next pending task. Do not skip ahead or start two tasks at once. Use the offered web tools (search/visit or web_search/web_open) for facts, and local_run_code when offered for exact math or science. Continue through the plan while making progress, then summarize the answer or call finish when offered. If evidence remains unavailable, report the unresolved steps honestly.";
+const PLAN_FOCUS_MARKER: &str = "The plan above is ready.";
 const PLAN_SEPARATOR: &str = "\n\n---\n\n";
 const EMPTY_PLAN_ERROR: &str =
     "The model returned an empty plan. Please retry the request.";
@@ -150,6 +206,56 @@ fn replace_in_content(message: &mut Value, from: &str, to: &str) {
     }
 }
 
+fn plan_focus_message(todos: &[crate::plans::Todo]) -> String {
+    match crate::plans::current_task_line(todos) {
+        Some(focus) => format!("{PLAN_IMPLEMENT_INSTRUCTION}\n\n{focus}"),
+        None => PLAN_IMPLEMENT_INSTRUCTION.to_string(),
+    }
+}
+
+fn is_plan_implement_message(message: &Value) -> bool {
+    if message["role"] != "user" {
+        return false;
+    }
+    match message.get("content") {
+        Some(Value::String(text)) => text.contains(PLAN_FOCUS_MARKER),
+        Some(Value::Array(parts)) => parts.iter().any(|part| {
+            part.get("text")
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| text.contains(PLAN_FOCUS_MARKER))
+        }),
+        _ => false,
+    }
+}
+
+fn set_message_text(message: &mut Value, text: &str) {
+    match message.get_mut("content") {
+        Some(Value::String(content)) => {
+            *content = text.to_string();
+        }
+        Some(Value::Array(parts)) => {
+            if let Some(part) = parts.iter_mut().find(|part| part.get("text").is_some()) {
+                part["text"] = json!(text);
+            } else {
+                message["content"] = json!(text);
+            }
+        }
+        _ => {
+            message["content"] = json!(text);
+        }
+    }
+}
+
+/// Keep the Phase-2 user turn pointed at the single current checklist item.
+fn refresh_plan_focus(messages: &mut Vec<Value>, todos: &[crate::plans::Todo]) {
+    let text = plan_focus_message(todos);
+    if let Some(message) = messages.iter_mut().rev().find(|message| is_plan_implement_message(message)) {
+        set_message_text(message, &text);
+    } else {
+        messages.push(json!({"role": "user", "content": text}));
+    }
+}
+
 /// Park the plan on the transcript and retarget the draft so Phase 2 is not
 /// still told "do not implement".
 fn begin_plan_implementation(messages: &mut Vec<Value>, plan_text: &str) -> Result<(), String> {
@@ -176,7 +282,7 @@ fn finalization_action(
     fallback: Option<&str>,
     retried: bool,
 ) -> FinalizationAction {
-    if !round_answer.trim().is_empty() {
+    if !round_answer.trim().is_empty() && !is_text_tool_call(round_answer) {
         return FinalizationAction::Complete;
     }
     if !retried {
@@ -186,6 +292,10 @@ fn finalization_action(
         Some(answer) => FinalizationAction::Fallback(format!("Research result:\n\n{answer}")),
         None => FinalizationAction::Error,
     }
+}
+
+fn needs_final_answer(finalizing: bool, has_calls: bool, round_answer: &str) -> bool {
+    finalizing || (!has_calls && round_answer.trim().is_empty())
 }
 
 fn is_text_tool_call(text: &str) -> bool {
@@ -607,6 +717,8 @@ async fn assemble_turn(
     } else if !tools.is_empty() {
         return Err("The selected remote model is configured without tool-calling support. Deselect tools or choose a model that supports tool calling.".into());
     }
+    crate::arex::adapt_tools(if selection.provider_id.is_some() { &selection.model_id } else { &preferences.model_path }, &mut tools)?;
+    if tools.len() > 64 { return Err("Select fewer tool sources: at most 64 tools can be offered in a turn.".into()); }
     crate::prompt::sort_tools_by_alias(&mut tools);
     let ptc_sdk = if preset.id == crate::presets::CODE {
         let aliases: Vec<String> = tools.iter().map(|tool| tool.alias.clone()).collect();
@@ -623,6 +735,7 @@ async fn assemble_turn(
         let skills = if exists { state.database()?.active_skills().unwrap_or_default() } else { Vec::new() };
         crate::prompt::selection_hash(&preset.id, &tools_value, &skills, system_time_on, tool_schemas_suppressed)
     };
+    let selection_hash = format!("{selection_hash}:{}", tools.iter().map(|t| t.alias.as_str()).collect::<Vec<_>>().join(","));
     let tool_definitions = freeze_tool_catalog(
         &*state.database()?,
         conversation_id,
@@ -905,7 +1018,7 @@ pub async fn send_message(
             created_at: crate::store::now(),
         });
     }
-    // Snapshot once for harness children (subagents, schedules, workflows).
+    // Snapshot once for harness children (subagents, workflows).
     let snapshot = crate::subagents::snapshot_for_conversation(&state, &conversation_id).await?;
     let preset_id = plan.preset.id.clone();
     let mut answer = String::new();
@@ -929,13 +1042,19 @@ pub async fn send_message(
         let mut tool_use_denied = false;
         // Loop-hygiene streaks: consecutive identical calls, guarded centrally.
         let mut recent_calls: Vec<(String, String)> = Vec::new();
+        let mut research_progress = ResearchProgress::default();
         for round in 0..64 {
             if *cancellation.borrow() { return Ok(false); }
             let step_id = format!("step-{round}");
             // Plan mode spends round 0 on a tool-free planning pass; the
             // ordinary tool loop then implements the plan from round 1 on.
             let planning = plan_mode && round == 0;
-            let finalizing = research_fallback.is_some();
+            if plan_mode && round > 0 {
+                if let Ok(todos) = state.database()?.todos(&conversation_id) {
+                    refresh_plan_focus(&mut messages, &todos);
+                }
+            }
+            let finalizing = research_fallback.is_some() || finalization_retried;
             let _ = run.transition_to(crate::agent_run::RunState::Generating);
             let _ = state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id));
             seq += 1;
@@ -1096,6 +1215,18 @@ pub async fn send_message(
                 check_finish_reason(&finish_reason)?;
                 begin_plan_implementation(&mut messages, &round_answer)?;
                 let plan_text = round_answer.trim();
+                if let Ok(store) = state.database() {
+                    let existing = store.todos(&conversation_id).unwrap_or_default();
+                    if existing.is_empty() {
+                        let seeded = crate::plans::parse_plan_steps(plan_text);
+                        if !seeded.is_empty() {
+                            let _ = store.save_todos(&conversation_id, &seeded);
+                        }
+                    }
+                    if let Ok(todos) = store.todos(&conversation_id) {
+                        refresh_plan_focus(&mut messages, &todos);
+                    }
+                }
                 answer.push_str(PLAN_SEPARATOR);
                 state.database()?.update_message(&assistant.id, &answer, &reasoning, "streaming")?;
                 if let Ok(store) = state.database() {
@@ -1136,7 +1267,7 @@ pub async fn send_message(
                 )).map_err(|error| error.to_string())?;
                 continue;
             }
-            if !finalizing && !plan.tool_definitions.is_empty() && calls.is_empty() && is_text_tool_call(&round_answer) {
+            if !finalizing && calls.is_empty() && is_text_tool_call(&round_answer) {
                 if matches!(&plan.backend, Backend::Local { .. }) {
                     state.database()?.record_local_tool_calling_support(
                         &plan.preferences.runtime_path,
@@ -1146,7 +1277,10 @@ pub async fn send_message(
                 }
                 return Err("The model emitted a text-form tool call that this runtime cannot execute. Tool use is unavailable for this model response; retry without tools or use a runtime with structured tool-call support.".into());
             }
-            if finalizing {
+            // A thinking-only token limit may recover with a tool-free answer pass.
+            // Other runtime failures (including content filtering) must still fail.
+            if finish_reason != "length" { check_finish_reason(&finish_reason)?; }
+            if needs_final_answer(finalizing, !calls.is_empty(), &round_answer) {
                 // A finalization request intentionally has no tool definitions. If a
                 // model ignores that and emits a call anyway, do not execute it or
                 // enter another tool loop; retry once, then use the grounded result.
@@ -1155,8 +1289,12 @@ pub async fn send_message(
                     FinalizationAction::Complete => {}
                     FinalizationAction::Retry => {
                         finalization_retried = true;
-                        messages.push(json!({"role":"assistant","content":round_answer}));
-                        messages.push(json!({"role":"user","content":FINAL_ANSWER_INSTRUCTION}));
+                        // Never replay private reasoning or incomplete tool calls.
+                        // The existing transcript already contains the tool evidence.
+                        if !round_answer.trim().is_empty() && !is_text_tool_call(&round_answer) {
+                            messages.push(json!({"role":"assistant","content":round_answer}));
+                        }
+                        messages.push(json!({"role":"user","content":if research_progress.stopped() { RESEARCH_STALLED } else { FINAL_ANSWER_INSTRUCTION }}));
                         if let Ok(store) = state.database() {
                             emit_session_event(
                                 &store,
@@ -1165,7 +1303,7 @@ pub async fn send_message(
                                 Some(&step_id),
                                 None,
                                 "finalization_retry",
-                                json!({"round": round, "reason": "no_visible_answer"}),
+                                json!({"round": round, "reason": "no_visible_answer", "finishReason": finish_reason, "reasoningLength": round_reasoning.len()}),
                                 false,
                             );
                         }
@@ -1216,6 +1354,7 @@ pub async fn send_message(
                 };
             if !continue_text { check_finish_reason(&finish_reason)?; }
             let calls = calls.finish()?;
+            crate::arex::validate_batch(&calls)?;
             if !calls.is_empty() && matches!(&plan.backend, Backend::Local { .. }) {
                 state.database()?.record_local_tool_calling_support(
                     &plan.preferences.runtime_path,
@@ -1255,7 +1394,7 @@ pub async fn send_message(
                 continue;
             }
             if calls.is_empty() {
-                if answer.trim().is_empty() {
+                if round_answer.trim().is_empty() {
                     return Err(EMPTY_FINAL_ANSWER_ERROR.into());
                 }
                 let _ = run.transition_to(crate::agent_run::RunState::Completed);
@@ -1275,7 +1414,7 @@ pub async fn send_message(
                 return Ok(true);
             }
             if tool_use_denied { return Err("Tool use stopped after your denial. Send a new message to authorize further actions.".into()); }
-            if round >= 63 { return Err("Tool round limit reached. Review the results before continuing.".into()); }
+            if round >= 63 && !calls.iter().any(|c| c.name == "finish") { return Err("Tool round limit reached. Review the results before continuing.".into()); }
             messages.push(json!({"role":"assistant","content":round_answer,"tool_calls":calls.iter().map(|call| call.model_value()).collect::<Vec<_>>() }));
             if let Ok(store) = state.database() {
                 for call in &calls {
@@ -1296,6 +1435,8 @@ pub async fn send_message(
                 }
             }
             let tool_calls_count = calls.len();
+            let mut explicit_finish = None;
+            let research_calls_before = research_progress.calls;
             for call in calls {
                 let Some(tool) = plan.tools.iter().find(|tool| tool.alias == call.name) else {
                     let missing = json!({"isError":true,"message":format!("Tool '{}' is not available in this turn. Do not retry it; use another offered tool or explain the gap.", call.name)});
@@ -1539,6 +1680,8 @@ pub async fn send_message(
                     }
                 };
 
+                research_progress.observe(&tool.tool.name, &result);
+                let control = if tool.connector == "Harness" && matches!(call.name.as_str(), "update_context" | "finish") { Some(result.clone()) } else { None };
                 if let Some(fallback) = arm_research_finalization(plan_mode, &call.name, &result) {
                     research_fallback = Some(fallback);
                     finalization_retried = false;
@@ -1563,6 +1706,9 @@ pub async fn send_message(
                 }
                 state.database()?.update_message(&row.id,&json!({"request":audit,"result":bounded_val}).to_string(),"","complete")?;
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":bounded_val.to_string()}));
+                if let Some(control) = control {
+                    explicit_finish = crate::arex::apply_control(&call.name, &control, &*state.database()?, &conversation_id, &run.id, &mut messages)?;
+                }
                 if let Ok(store) = state.database() {
                     emit_session_event(
                         &store,
@@ -1581,6 +1727,22 @@ pub async fn send_message(
                         false,
                     );
                 }
+            }
+            if let Some(final_answer) = explicit_finish {
+                if !answer.trim().is_empty() { answer.push_str("\n\n"); }
+                answer.push_str(&final_answer);
+                seq += 1;
+                channel.send(ChatEvent::new(&run, Some(&step_id), seq, "Research answer ready", &assistant.id, &final_answer, "", None, None)).map_err(|e| e.to_string())?;
+                return Ok(true);
+            }
+            if !tool_use_denied && research_progress.stopped() {
+                research_fallback = Some(RESEARCH_STALLED_FALLBACK.into());
+                messages.push(json!({"role":"user","content":RESEARCH_STALLED}));
+                let mut event = ChatEvent::progress(&run.id, &step_id, &assistant.id, "Research stopped · preparing answer…", None);
+                event.notice = Some("Research is no longer making progress or has reached its budget. Preparing an answer from the collected results.".into());
+                channel.send(event).map_err(|e| e.to_string())?;
+            } else if !tool_use_denied && research_progress.calls > research_calls_before && research_progress.stagnant == 2 {
+                messages.push(json!({"role":"user","content":"The last web calls added no new evidence. Do not rephrase the same search. Read an unvisited source, change the source or research approach, or answer from existing evidence and explain the gap."}));
             }
             let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
             let _ = state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id));
@@ -1797,7 +1959,7 @@ fn request_payload(
     // reserve without emitting an answer. Its runtime supports this field and
     // treats it as a separate thinking budget; other local models are unchanged.
     if preferences.model_path.ends_with(crate::model_catalog::ZAYA1_FILENAME) {
-        payload["reasoning_budget_tokens"] = json!(2048);
+        payload["reasoning_budget_tokens"] = json!(if finalizing { 0 } else { 2048.min(preferences.max_tokens / 2) });
     }
     if !finalizing && !planning && !tools.is_empty() {
         payload["tools"] = json!(tools);
@@ -1817,11 +1979,102 @@ fn request_payload(
 #[cfg(test)]
 mod finish_tests {
     #[test]
+    fn connector_round_without_an_answer_requests_finalization() {
+        // Earlier progress text is deliberately not an input: only this round counts.
+        assert!(super::needs_final_answer(false, false, ""));
+        assert!(super::needs_final_answer(false, false, " \n"));
+        assert!(!super::needs_final_answer(false, true, ""));
+        assert!(!super::needs_final_answer(false, false, "The result is 42."));
+        assert!(super::needs_final_answer(true, true, ""));
+    }
+
+    #[test]
+    fn text_tool_markup_is_not_a_final_answer() {
+        assert_eq!(super::finalization_action("<tool_call>{}</tool_call>", None, false), super::FinalizationAction::Retry);
+    }
+
+    #[test]
+    fn thinking_only_exhaustion_gets_one_tool_free_answer_attempt() {
+        let mut filter = super::ThinkFilter::new();
+        let (answer, reasoning) = filter.feed("<think>The tool found the result, but the response budget ran out.");
+        assert!(answer.is_empty());
+        assert!(!reasoning.is_empty());
+        assert!(super::needs_final_answer(false, false, &answer));
+        assert_eq!(super::finalization_action(&answer, None, false), super::FinalizationAction::Retry);
+        let prefs = crate::store::Preferences { model_path: crate::model_catalog::ZAYA1_FILENAME.into(), ..Default::default() };
+        let payload = super::request_payload(&[], &[serde_json::json!({"type":"function"})], &prefs, false, true, false, None);
+        assert!(payload.get("tools").is_none());
+        assert_eq!(payload["tool_choice"], "none");
+        assert_eq!(payload["reasoning_budget_tokens"], 0);
+        assert_eq!(super::finalization_action("", None, true), super::FinalizationAction::Error);
+        assert_eq!(super::finalization_action("The result is 42.", None, true), super::FinalizationAction::Complete);
+        assert!(super::check_finish_reason("length").is_err(), "incomplete tool calls must still fail");
+    }
+    #[test]
+    fn arex_context_rewrites_do_not_reset_research_progress() {
+        let mut progress = super::ResearchProgress::default();
+        progress.observe("search", &serde_json::json!({"results":[{"url":"https://example.org"}]}));
+        for i in 0..4 {
+            progress.observe("update_context", &serde_json::json!({"context":format!("reworded notes {i}"),"text":format!("new wording {i}")}));
+        }
+        assert!(progress.stopped());
+    }
+
+    #[test]
+    fn research_progress_ignores_mcp_metadata_and_stays_stopped() {
+        let mut progress = super::ResearchProgress::default();
+        for i in 0..5 {
+            let wrapped = serde_json::json!({"content":[{"type":"text","text":serde_json::json!({"request_id":i,"results":[{"url":"https://example.org","excerpts":["same passage"]}]}).to_string()}]});
+            progress.observe("web_fetch", &wrapped);
+        }
+        assert!(progress.stopped());
+        progress.observe("web_open", &serde_json::json!({"text":"late new evidence"}));
+        assert!(progress.stopped());
+        let payload = super::request_payload(&[], &[serde_json::json!({"type":"function"})], &crate::store::Preferences::default(), false, true, false, None);
+        assert!(payload.get("tools").is_none());
+        assert_eq!(payload["tool_choice"], "none");
+    }
+
+    #[test]
+    fn research_progress_has_a_budget_even_when_results_keep_changing() {
+        let mut progress = super::ResearchProgress::default();
+        for i in 0..24 {
+            progress.observe("web_search", &serde_json::json!({"text":format!("result {i}")}));
+            assert_eq!(progress.stopped(), i == 23);
+        }
+    }
+
+    #[test]
+    fn research_progress_stops_reworded_searches_with_repeated_evidence() {
+        let mut progress = super::ResearchProgress::default();
+        for i in 0..5 {
+            let result = serde_json::json!({"requestId":i,"query":format!("query {i}"),"results":[{"url":"https://example.org","text":"same evidence"}]});
+            progress.observe("web_search", &result);
+            assert_eq!(progress.stopped(), i == 4);
+        }
+    }
+
+    #[test]
+    fn research_progress_allows_new_reading_and_ignores_other_tools() {
+        let mut progress = super::ResearchProgress::default();
+        for _ in 0..10 { progress.observe("read_file", &serde_json::json!({})); }
+        assert!(!progress.stopped());
+        for i in 0..10 {
+            progress.observe("web_open", &serde_json::json!({"text":format!("new passage {i}")}));
+            assert!(!progress.stopped());
+        }
+        for _ in 0..4 { progress.observe("web_fetch", &serde_json::json!({"isError":true,"message":"failed"})); }
+        assert!(progress.stopped());
+    }
+
+    #[test]
     fn zaya_payload_caps_reasoning_without_changing_other_models() {
         let messages = vec![serde_json::json!({"role":"user","content":"Hello"})];
-        let zaya = crate::store::Preferences { model_path: "ZAYA1-8B-Q4_K_M.gguf".into(), ..Default::default() };
+        let zaya = crate::store::Preferences { model_path: "ZAYA1-8B-Q4_K_M.gguf".into(), max_tokens: 8192, ..Default::default() };
         let regular = crate::store::Preferences::default();
         assert_eq!(super::request_payload(&messages, &[], &zaya, false, false, false, None)["reasoning_budget_tokens"], 2048);
+        let small_budget = crate::store::Preferences { max_tokens: 512, ..zaya.clone() };
+        assert_eq!(super::request_payload(&messages, &[], &small_budget, false, false, false, None)["reasoning_budget_tokens"], 256);
         assert!(super::request_payload(&messages, &[], &regular, false, false, false, None).get("reasoning_budget_tokens").is_none());
         let slotted = super::request_payload(&messages, &[], &regular, false, false, false, Some(0));
         assert_eq!(slotted["id_slot"], 0);
@@ -2057,7 +2310,8 @@ mod finish_tests {
         assert_eq!(messages[2]["role"], "assistant");
         assert_eq!(messages[2]["content"], "1. Search\n2. Calculate\n3. Verify");
         assert_eq!(messages[3]["role"], "user");
-        assert!(messages[3]["content"].as_str().unwrap().contains("Do not stop after the first tool result"));
+        assert!(messages[3]["content"].as_str().unwrap().contains("Continue through the plan while making progress"));
+        assert!(messages[3]["content"].as_str().unwrap().contains("report the unresolved steps honestly"));
         assert!(super::begin_plan_implementation(&mut messages, "   ").is_err());
     }
 
@@ -2080,5 +2334,27 @@ mod finish_tests {
         assert!(text.contains(super::PLAN_MODE_ACTIVE));
         assert!(!text.contains("Do not call tools and do not implement yet"));
         assert_eq!(messages[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn refresh_plan_focus_keeps_the_model_on_the_current_task() {
+        let mut messages = vec![
+            serde_json::json!({"role":"user","content":"Investigate"}),
+            serde_json::json!({"role":"assistant","content":"1. Search\n2. Open"}),
+            serde_json::json!({"role":"user","content":super::PLAN_IMPLEMENT_INSTRUCTION}),
+        ];
+        let todos = vec![
+            crate::plans::Todo { text: "Search".into(), status: crate::plans::COMPLETED.into(), updated_at: 0 },
+            crate::plans::Todo { text: "Open the source".into(), status: crate::plans::IN_PROGRESS.into(), updated_at: 0 },
+        ];
+        super::refresh_plan_focus(&mut messages, &todos);
+        let focus = messages[2]["content"].as_str().unwrap();
+        assert!(focus.contains("The plan above is ready"));
+        assert!(focus.contains("one task at a time"));
+        assert!(focus.contains("1/2 complete"));
+        assert!(focus.contains("Open the source"));
+        assert!(focus.contains("index 1"));
+        super::refresh_plan_focus(&mut messages, &todos);
+        assert_eq!(messages.len(), 3);
     }
 }

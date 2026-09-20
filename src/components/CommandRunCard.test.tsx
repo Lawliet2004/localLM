@@ -10,6 +10,29 @@ vi.mock('../lib/api', () => ({
   errorMessage: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
 
+it('renders web search as a compact searched-the-web card with sources', () => {
+  render(
+    <CommandRunCard
+      toolName="web_search"
+      status="completed"
+      arguments={{ question: 'fusion yield 2024' }}
+      structuredResult={JSON.stringify({
+        answer: 'Laser fusion experiments reported a scientific yield above one.',
+        sources: {
+          S1: { title: 'NIF result', url: 'https://example.com/nif' },
+          S2: { title: 'Nature paper', url: 'https://example.com/nature' },
+        },
+      })}
+    />
+  );
+  expect(screen.getByText('Searched the web')).toBeInTheDocument();
+  expect(screen.getByText('fusion yield 2024')).toBeInTheDocument();
+  expect(screen.getByText('2 results')).toBeInTheDocument();
+  fireEvent.click(screen.getByText('fusion yield 2024'));
+  expect(screen.getByRole('link', { name: 'NIF result' })).toHaveAttribute('href', 'https://example.com/nif');
+  expect(document.querySelector('.web-answer-excerpt')).toHaveTextContent('scientific yield above one');
+});
+
 it('renders running state with pulse indicator and running badge', () => {
   render(
     <CommandRunCard

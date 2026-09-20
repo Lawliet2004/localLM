@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Chat } from './Chat';
 import type { Message, ProviderConnection } from '../lib/types';
 
@@ -7,6 +7,7 @@ const apiMocks = vi.hoisted(() => ({
   getArtifact: vi.fn(),
   contextPreflight: vi.fn(),
   compactConversation: vi.fn(),
+  getTodos: vi.fn<() => Promise<any[]>>(async () => []),
 }));
 vi.mock('../lib/api', () => ({
   nativeAvailable: true,
@@ -17,11 +18,35 @@ vi.mock('../lib/api', () => ({
     getArtifact: apiMocks.getArtifact,
     contextPreflight: apiMocks.contextPreflight,
     compactConversation: apiMocks.compactConversation,
+    getTodos: apiMocks.getTodos,
   },
 }));
 
+afterEach(() => {
+  apiMocks.getTodos.mockReset();
+  apiMocks.getTodos.mockResolvedValue([]);
+});
+
 const props = { generating: false, ready: true, loading: false, onSend: vi.fn(), onCancel: vi.fn(), onConfigure: vi.fn() };
 describe('chat action reporting and submission', () => {
+  it('shows a collapsible plan checklist and hides todo harness cards', async () => {
+    apiMocks.getTodos.mockResolvedValue([
+      { text: 'Search papers', status: 'completed', updatedAt: 1 },
+      { text: 'Open the source', status: 'in_progress', updatedAt: 2 },
+    ]);
+    const user: Message = { id: 'u', conversationId: 'c1', role: 'user', status: 'complete', content: 'Research this', reasoning: '', createdAt: 1 };
+    const todoTool: Message = {
+      id: 't', conversationId: 'c1', role: 'tool', status: 'complete', reasoning: '', createdAt: 2,
+      content: JSON.stringify({ request: { connector: 'Harness', name: 'todo_write', arguments: { todos: [] } }, result: { saved: 2 } }),
+    };
+    render(<Chat {...props} conversationKey="c1" messages={[user, todoTool]} generating planMode />);
+    const checklist = await screen.findByLabelText('Plan checklist');
+    expect(checklist).toHaveTextContent('1 of 2');
+    expect(screen.getByText('Search papers')).toBeInTheDocument();
+    expect(screen.queryByText('Harness · todo_write')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Plan\s*1 of 2/i }));
+    expect(screen.queryByRole('list')).not.toBeInTheDocument();
+  });
   it('toggles plan mode from the composer', () => {
     const onPlanModeChange = vi.fn();
     const { rerender } = render(<Chat {...props} messages={[]} planMode={false} onPlanModeChange={onPlanModeChange} />);
@@ -34,6 +59,7 @@ describe('chat action reporting and submission', () => {
     const active = screen.getByRole('button', { name: 'Plan mode' });
     expect(active).toHaveAttribute('aria-pressed', 'true');
     expect(active).toHaveTextContent('Plan');
+    expect(screen.getByLabelText('Message')).toHaveAttribute('placeholder', 'Describe the task to plan…');
   });
   it('shows unavailable tools as a notice without blocking ordinary chat', () => {
     render(<Chat {...props} messages={[]} draft="Hello" chatNotice="Unavailable for this reply: parallel-web, deepwiki." />);
@@ -106,6 +132,21 @@ describe('chat action reporting and submission', () => {
     // Older audit rows retain their existing label without needing live settings.
     rerender(<Chat {...props} messages={[{...message,content:JSON.stringify({request:{connector:'Legacy',name:'lookup'},result:{}})}]} />);
     expect(screen.getByText('Legacy · lookup')).toBeInTheDocument();
+  });
+  it('renders web search as a searched-the-web card with source chips', () => {
+    const message: Message = {
+      id: 'search', conversationId: 'chat', role: 'tool', reasoning: '', createdAt: 0, status: 'complete',
+      content: JSON.stringify({
+        request: { connector: 'Harness', name: 'web_search', arguments: { question: 'fusion yield' }, decision: 'allowed' },
+        result: { answer: 'Yield exceeded one.', sources: { S1: { title: 'NIF', url: 'https://example.com/nif' } } },
+      }),
+    };
+    render(<Chat {...props} messages={[message]} />);
+    expect(screen.getByText('Searched the web')).toBeInTheDocument();
+    expect(screen.getByText('fusion yield')).toBeInTheDocument();
+    expect(screen.getByText('1 result')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('fusion yield'));
+    expect(screen.getByRole('link', { name: 'NIF' })).toHaveAttribute('href', 'https://example.com/nif');
   });
   it('shows a reviewable unified diff for workspace edits', () => {
     const message: Message = { id:'edit', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'note.txt'},decision:'allowed'},result:{replacements:1,diff:'--- a/note.txt\n+++ b/note.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n'}}) };

@@ -53,9 +53,8 @@ pub struct InstalledModel {
 ///
 /// The vision checkpoint is what actually encodes images; loading the text
 /// weights alone leaves a multimodal model text-only, so llama.cpp must get
-/// `--mmproj`. Projector selection is strictly bounded: an exact case-
-/// insensitive filename match against the same repo revision, otherwise a
-/// unique candidate when the repo ships exactly one projector.
+/// `--mmproj`. A missing selection explicitly means text-only. When supplied,
+/// the filename must exactly match a projector from the pinned repo revision.
 pub fn projector_candidates(files: &[HubFile]) -> Vec<&HubFile> {
     let mut result: Vec<&HubFile> = files
         .iter()
@@ -70,47 +69,21 @@ pub fn projector_candidates(files: &[HubFile]) -> Vec<&HubFile> {
 
 pub fn select_projector<'a>(
     files: &'a [HubFile],
-    weight_filename: &str,
+    _weight_filename: &str,
     explicit: Option<&str>,
 ) -> Result<Option<&'a HubFile>, String> {
+    let Some(name) = explicit else {
+        return Ok(None);
+    };
     let candidates = projector_candidates(files);
     if candidates.is_empty() {
-        if explicit.is_some() {
-            return Err("This repository ships no mmproj projector file.".into());
-        }
-        return Ok(None);
+        return Err("This repository ships no mmproj projector file.".into());
     }
-    if let Some(name) = explicit {
-        return candidates
-            .iter()
-            .find(|file| file.filename.eq_ignore_ascii_case(name))
-            .map(|file| Some(*file))
-            .ok_or_else(|| "Projector not found in this revision.".into());
-    }
-    let stem = weight_filename
-        .rsplit('/')
-        .next()
-        .unwrap_or(weight_filename)
-        .strip_suffix(".gguf")
-        .unwrap_or(weight_filename);
-    let stem_lower = stem.to_lowercase();
-    // Prefer the projector that shares the weight file's quant stem
-    // (e.g. AREX-Turbo-Q4_K_M ↔ mmproj-AREX-Turbo-Q4_K_M) over an unrelated one.
-    if let Some(exact) = candidates.iter().find(|file| {
-        let base = file
-            .filename
-            .rsplit('/')
-            .next()
-            .unwrap_or(&file.filename)
-            .to_lowercase();
-        base.contains(&stem_lower) || stem_lower.contains(base.trim_start_matches("mmproj-").trim_end_matches(".gguf"))
-    }) {
-        return Ok(Some(exact));
-    }
-    if candidates.len() == 1 {
-        return Ok(Some(candidates[0]));
-    }
-    Err("This repository ships multiple mmproj projectors. Choose one.".into())
+    candidates
+        .iter()
+        .find(|file| file.filename.eq_ignore_ascii_case(name))
+        .map(|file| Some(*file))
+        .ok_or_else(|| "Projector not found in this revision.".into())
 }
 
 fn valid_component(s: &str) -> bool {
@@ -341,15 +314,17 @@ pub async fn download_hugging_face_model(
             _ = async { let mut cancel = receiver.clone(); let _ = cancel.changed().await; } => return Err("Download cancelled.".into()),
         };
         let files = selected_files(&catalog.files, &filename)?;
-        let projector_file = select_projector(&catalog.files, &filename, projector.as_deref())?;
-        let projector_in_weights = projector_file.is_some_and(|p| files.iter().any(|f| f.filename == p.filename));
-        let total = files.iter().try_fold(0u64, |n, f| n.checked_add(f.bytes).ok_or("Model size overflow."))?;
-        let total = if let Some(p) = projector_file.filter(|_| !projector_in_weights) {
-            total.checked_add(p.bytes).ok_or("Model size overflow.")?
-        } else {
-            total
-        };
+        let weight_bytes = files.iter().try_fold(0u64, |n, f| n.checked_add(f.bytes).ok_or("Model size overflow."))?;
         let directory = state.data_dir.join("models").join(digest(&format!("{}/{}/{}", catalog.repo, catalog.revision, files[0].filename)));
+        let previous = pending_download(&directory);
+        let projector_name = projector_for_resume(&catalog.files, projector.as_deref(), previous.as_ref(), weight_bytes);
+        let projector_file = select_projector(&catalog.files, &filename, projector_name.as_deref())?;
+        let projector_in_weights = projector_file.is_some_and(|p| files.iter().any(|f| f.filename == p.filename));
+        let total = if let Some(p) = projector_file.filter(|_| !projector_in_weights) {
+            weight_bytes.checked_add(p.bytes).ok_or("Model size overflow.")?
+        } else {
+            weight_bytes
+        };
         std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
         let root = std::fs::canonicalize(state.data_dir.join("models")).map_err(|e| e.to_string())?;
         let directory = std::fs::canonicalize(&directory).map_err(|e| e.to_string())?;
@@ -376,6 +351,7 @@ pub async fn download_hugging_face_model(
         write_download_state(&directory, &DownloadState {
             repo: catalog.repo.clone(), revision: catalog.revision.clone(),
             filename: files[0].filename.clone(), bytes: total, sha256: files[0].sha256.clone(), received: already,
+            projector: projector_file.map(|p| p.filename.clone()),
         });
         { let mut inner = installer.inner.lock().map_err(|_| "Installer unavailable.")?;
           inner.0.path = Some(directory.join(files[0].filename.rsplit('/').next().unwrap()).to_string_lossy().into_owned());
@@ -408,6 +384,7 @@ pub async fn download_hugging_face_model(
                     repo: catalog.repo.clone(), revision: catalog.revision.clone(),
                     filename: files[0].filename.clone(), bytes: total, sha256: files[0].sha256.clone(),
                     received: finished + saved,
+                    projector: projector_file.map(|p| p.filename.clone()),
                 });
                 return Err(error);
             }
@@ -474,6 +451,36 @@ struct DownloadState {
     bytes: u64,
     sha256: String,
     received: u64,
+    // Option keeps download.json files from earlier builds readable. Legacy
+    // state can recover the choice when its saved total uniquely matches one
+    // projector plus the selected weights.
+    projector: Option<String>,
+}
+fn projector_for_resume(
+    files: &[HubFile],
+    requested: Option<&str>,
+    previous: Option<&DownloadState>,
+    weight_bytes: u64,
+) -> Option<String> {
+    if let Some(name) = requested {
+        return Some(name.to_owned());
+    }
+    let previous = previous?;
+    if let Some(name) = &previous.projector {
+        return Some(name.clone());
+    }
+    let projector_bytes = previous.bytes.checked_sub(weight_bytes)?;
+    if projector_bytes == 0 {
+        return None;
+    }
+    let mut matches = projector_candidates(files)
+        .into_iter()
+        .filter(|file| file.bytes == projector_bytes);
+    let projector = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(projector.filename.clone())
 }
 fn write_download_state(directory: &Path, state: &DownloadState) {
     if let Ok(body) = serde_json::to_vec_pretty(state) {
@@ -577,14 +584,18 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
                     let entries = std::fs::read_dir(&dir).ok()?;
                     entries.flatten().find_map(|entry| {
                         let name = entry.file_name().to_string_lossy().into_owned();
-                        if name.to_lowercase().contains("mmproj") && name.to_lowercase().ends_with(".gguf") {
+                        if name.to_lowercase().contains("mmproj")
+                            && name.to_lowercase().ends_with(".gguf")
+                        {
                             Some((name.clone(), dir.join(&name).to_string_lossy().into_owned()))
                         } else {
                             None
                         }
                     })
                 });
-                sibling.map(|(name, path)| (Some(name), Some(path))).unwrap_or((None, None))
+                sibling
+                    .map(|(name, path)| (Some(name), Some(path)))
+                    .unwrap_or((None, None))
             }
         };
         result.push(InstalledModel {
@@ -599,7 +610,11 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
             revision: source.as_ref().and_then(|s| s.revision.clone()),
             files: paths,
             complete,
-            received: if complete { bytes } else { group.iter().map(|f| f.bytes).sum() },
+            received: if complete {
+                bytes
+            } else {
+                group.iter().map(|f| f.bytes).sum()
+            },
             projector_filename,
             projector_path,
         });
@@ -607,21 +622,31 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
     if let Some(state) = pending_download(directory) {
         let dest = root.join(state.filename.rsplit('/').next().unwrap_or(&state.filename));
         let part = download::partial_path(&dest);
-        let received = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(state.received);
-        if !result.iter().any(|m| m.filename == state.filename.rsplit('/').next().unwrap_or(&state.filename) || Path::new(&m.path) == dest.as_path()) {
+        let received = std::fs::metadata(&part)
+            .map(|m| m.len())
+            .unwrap_or(state.received);
+        if !result.iter().any(|m| {
+            m.filename == state.filename.rsplit('/').next().unwrap_or(&state.filename)
+                || Path::new(&m.path) == dest.as_path()
+        }) {
             let path = if dest.exists() { dest } else { part.clone() };
             let path_string = path.to_string_lossy().into_owned();
             result.push(InstalledModel {
                 id: path_string.clone(),
                 path: path_string.clone(),
-                filename: state.filename.rsplit('/').next().unwrap_or(&state.filename).to_owned(),
+                filename: state
+                    .filename
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&state.filename)
+                    .to_owned(),
                 bytes: state.bytes,
                 repo: Some(state.repo),
                 revision: Some(state.revision),
                 files: vec![path_string],
                 complete: false,
                 received,
-                projector_filename: None,
+                projector_filename: state.projector.clone(),
                 projector_path: None,
             });
         }
@@ -760,7 +785,9 @@ fn cleanup_model_storage(model: &InstalledModel, data_dir: &Path) -> Result<(), 
                 && canonical
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .is_some_and(|name| {
+                        name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
         });
         if !managed {
             continue;
@@ -811,7 +838,8 @@ fn paths_match(left: &str, right: &str) -> bool {
 }
 
 fn already_using_model(saved_path: &str, model: &InstalledModel) -> bool {
-    paths_match(saved_path, &model.path) || model.files.iter().any(|path| paths_match(saved_path, path))
+    paths_match(saved_path, &model.path)
+        || model.files.iter().any(|path| paths_match(saved_path, path))
 }
 
 fn write_profile(
@@ -1047,6 +1075,7 @@ mod tests {
                 bytes: 7,
                 sha256: "b".repeat(64),
                 received: 4,
+                projector: Some("mmproj-model-f16.gguf".into()),
             },
         );
         let mut result = Vec::new();
@@ -1056,6 +1085,10 @@ mod tests {
         assert_eq!(result[0].received, 4);
         assert_eq!(result[0].bytes, 7);
         assert_eq!(result[0].repo.as_deref(), Some("unsloth/gemma-4-E4B"));
+        assert_eq!(
+            result[0].projector_filename.as_deref(),
+            Some("mmproj-model-f16.gguf")
+        );
     }
 
     #[test]
@@ -1132,38 +1165,162 @@ mod tests {
     }
 
     #[test]
-    fn projector_selection_prefers_the_matching_quant_and_rejects_ambiguity() {
+    fn projector_selection_is_optional_and_validates_explicit_files() {
         let files = vec![
-            HubFile { filename: "BAAI_AREX-Turbo-Q4_K_M.gguf".into(), bytes: 10, sha256: "c".repeat(64) },
-            HubFile { filename: "BAAI_AREX-Turbo-Q8_0.gguf".into(), bytes: 20, sha256: "d".repeat(64) },
-            HubFile { filename: "mmproj-BAAI_AREX-Turbo-Q4_K_M.gguf".into(), bytes: 5, sha256: "a".repeat(64) },
-            HubFile { filename: "mmproj-BAAI_AREX-Turbo-Q8_0.gguf".into(), bytes: 6, sha256: "b".repeat(64) },
+            HubFile {
+                filename: "BAAI_AREX-Turbo-Q4_K_M.gguf".into(),
+                bytes: 10,
+                sha256: "c".repeat(64),
+            },
+            HubFile {
+                filename: "BAAI_AREX-Turbo-Q8_0.gguf".into(),
+                bytes: 20,
+                sha256: "d".repeat(64),
+            },
+            HubFile {
+                filename: "mmproj-BAAI_AREX-Turbo-Q4_K_M.gguf".into(),
+                bytes: 5,
+                sha256: "a".repeat(64),
+            },
+            HubFile {
+                filename: "mmproj-BAAI_AREX-Turbo-Q8_0.gguf".into(),
+                bytes: 6,
+                sha256: "b".repeat(64),
+            },
         ];
-        assert_eq!(
-            select_projector(&files, "BAAI_AREX-Turbo-Q4_K_M.gguf", None).unwrap().unwrap().filename,
-            "mmproj-BAAI_AREX-Turbo-Q4_K_M.gguf"
+        assert!(
+            select_projector(&files, "BAAI_AREX-Turbo-Q4_K_M.gguf", None)
+                .unwrap()
+                .is_none()
         );
         assert_eq!(
-            select_projector(&files, "BAAI_AREX-Turbo-Q4_K_M.gguf", Some("MMPROJ-baai_arex-turbo-q8_0.gguf")).unwrap().unwrap().filename,
+            select_projector(
+                &files,
+                "BAAI_AREX-Turbo-Q4_K_M.gguf",
+                Some("MMPROJ-baai_arex-turbo-q8_0.gguf")
+            )
+            .unwrap()
+            .unwrap()
+            .filename,
             "mmproj-BAAI_AREX-Turbo-Q8_0.gguf"
         );
-        assert!(select_projector(&files, "BAAI_AREX-Turbo-Q4_K_M.gguf", Some("mmproj-missing.gguf")).is_err());
+        assert!(select_projector(
+            &files,
+            "BAAI_AREX-Turbo-Q4_K_M.gguf",
+            Some("mmproj-missing.gguf")
+        )
+        .is_err());
         let ambiguous = vec![
-            HubFile { filename: "model-Q4_K_M.gguf".into(), bytes: 10, sha256: "c".repeat(64) },
-            HubFile { filename: "mmproj-a.gguf".into(), bytes: 5, sha256: "a".repeat(64) },
-            HubFile { filename: "mmproj-b.gguf".into(), bytes: 6, sha256: "b".repeat(64) },
+            HubFile {
+                filename: "model-Q4_K_M.gguf".into(),
+                bytes: 10,
+                sha256: "c".repeat(64),
+            },
+            HubFile {
+                filename: "mmproj-a.gguf".into(),
+                bytes: 5,
+                sha256: "a".repeat(64),
+            },
+            HubFile {
+                filename: "mmproj-b.gguf".into(),
+                bytes: 6,
+                sha256: "b".repeat(64),
+            },
         ];
-        assert!(select_projector(&ambiguous, "model-Q4_K_M.gguf", None).is_err());
+        assert!(select_projector(&ambiguous, "model-Q4_K_M.gguf", None)
+            .unwrap()
+            .is_none());
         let solo = vec![
-            HubFile { filename: "model.gguf".into(), bytes: 10, sha256: "c".repeat(64) },
-            HubFile { filename: "mmproj-model-f16.gguf".into(), bytes: 5, sha256: "a".repeat(64) },
+            HubFile {
+                filename: "model.gguf".into(),
+                bytes: 10,
+                sha256: "c".repeat(64),
+            },
+            HubFile {
+                filename: "mmproj-model-f16.gguf".into(),
+                bytes: 5,
+                sha256: "a".repeat(64),
+            },
         ];
-        assert_eq!(
-            select_projector(&solo, "model.gguf", None).unwrap().unwrap().filename,
-            "mmproj-model-f16.gguf"
-        );
-        let plain = vec![HubFile { filename: "model.gguf".into(), bytes: 10, sha256: "c".repeat(64) }];
-        assert!(select_projector(&plain, "model.gguf", None).unwrap().is_none());
+        assert!(select_projector(&solo, "model.gguf", None)
+            .unwrap()
+            .is_none());
+        let plain = vec![HubFile {
+            filename: "model.gguf".into(),
+            bytes: 10,
+            sha256: "c".repeat(64),
+        }];
+        assert!(select_projector(&plain, "model.gguf", None)
+            .unwrap()
+            .is_none());
         assert!(select_projector(&plain, "model.gguf", Some("mmproj.gguf")).is_err());
+    }
+
+    #[test]
+    fn legacy_download_state_recovers_projector_from_saved_total() {
+        let files = vec![
+            HubFile {
+                filename: "model.gguf".into(),
+                bytes: 100,
+                sha256: "a".repeat(64),
+            },
+            HubFile {
+                filename: "mmproj-BF16.gguf".into(),
+                bytes: 30,
+                sha256: "b".repeat(64),
+            },
+            HubFile {
+                filename: "mmproj-Q8_0.gguf".into(),
+                bytes: 20,
+                sha256: "c".repeat(64),
+            },
+        ];
+        let legacy = DownloadState {
+            repo: "owner/repo".into(),
+            revision: "rev".into(),
+            filename: "model.gguf".into(),
+            bytes: 120,
+            sha256: "a".repeat(64),
+            received: 40,
+            projector: None,
+        };
+        assert_eq!(
+            projector_for_resume(&files, None, Some(&legacy), 100).as_deref(),
+            Some("mmproj-Q8_0.gguf")
+        );
+        assert_eq!(
+            projector_for_resume(&files, Some("mmproj-BF16.gguf"), Some(&legacy), 100).as_deref(),
+            Some("mmproj-BF16.gguf")
+        );
+        let text_only = DownloadState {
+            bytes: 100,
+            ..legacy
+        };
+        assert_eq!(
+            projector_for_resume(&files, None, Some(&text_only), 100),
+            None
+        );
+    }
+
+    #[test]
+    fn download_state_keeps_the_projector_choice_for_resume() {
+        let state = DownloadState {
+            repo: "owner/repo-GGUF".into(),
+            revision: "main".into(),
+            filename: "model-Q4_K_M.gguf".into(),
+            bytes: 10,
+            sha256: "a".repeat(64),
+            received: 4,
+            projector: Some("mmproj-model-f16.gguf".into()),
+        };
+        let parsed: DownloadState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(parsed.projector.as_deref(), Some("mmproj-model-f16.gguf"));
+        let legacy = format!(
+            r#"{{"repo":"owner/repo-GGUF","revision":"main","filename":"model-Q4_K_M.gguf","bytes":10,"sha256":"{}","received":4}}"#,
+            "a".repeat(64)
+        );
+        let legacy: DownloadState = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(legacy.projector, None);
     }
 }

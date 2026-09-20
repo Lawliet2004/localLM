@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Check, Copy, ChevronDown, ChevronRight, FileCode, FileText, AlertCircle, Clock, XCircle, Atom } from 'lucide-react';
+import { Check, Copy, ChevronDown, ChevronRight, FileCode, FileText, AlertCircle, Clock, XCircle, Atom, Globe } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
 
 export function FileIcon({ filename, size = 14 }: { filename?: string; size?: number }) {
@@ -127,6 +127,56 @@ function parseAnsiLine(line: string): AnsiSpan[] {
   return spans.length > 0 ? spans : [{ text: line }];
 }
 
+interface WebSource {
+  id: string;
+  title?: string;
+  url?: string;
+}
+
+function parseObjectJson(value?: string | null): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function webSourcesFrom(result: Record<string, unknown> | null): WebSource[] {
+  if (!result) return [];
+  const sources = result.sources;
+  if (Array.isArray(sources)) {
+    return sources.slice(0, 6).flatMap((item, index): WebSource[] => {
+      if (typeof item === 'string') return [{ id: String(index + 1), url: item }];
+      if (item && typeof item === 'object') {
+        const rec = item as Record<string, unknown>;
+        return [{
+          id: String(rec.id ?? rec.sid ?? index + 1),
+          title: typeof rec.title === 'string' ? rec.title : typeof rec.name === 'string' ? rec.name : undefined,
+          url: typeof rec.url === 'string' ? rec.url : undefined,
+        }];
+      }
+      return [];
+    });
+  }
+  if (sources && typeof sources === 'object') {
+    return Object.entries(sources as Record<string, unknown>).slice(0, 6).map(([id, value]) => {
+      if (typeof value === 'string') return { id, url: value };
+      if (value && typeof value === 'object') {
+        const rec = value as Record<string, unknown>;
+        return {
+          id,
+          title: typeof rec.title === 'string' ? rec.title : typeof rec.name === 'string' ? rec.name : undefined,
+          url: typeof rec.url === 'string' ? rec.url : undefined,
+        };
+      }
+      return { id };
+    });
+  }
+  return [];
+}
+
 export function CommandRunCard({
   toolName,
   command,
@@ -203,16 +253,19 @@ export function CommandRunCard({
     ? args.toolAction
     : undefined;
 
+  const isWeb = /web_search|web_open|web_find|web_fetch/.test(toolName);
   const isEdit = /edit|create_file|write_to_file|replace/.test(toolName) || Boolean(diff);
-  const isSearch = /search|grep|find|list_files|locate/.test(toolName);
+  const isSearch = isWeb || /search|grep|find|list_files|locate/.test(toolName);
   const isRead = /read_file|view_file|open_file|cat/.test(toolName) || (Boolean(path) && !isEdit && !isSearch);
   const isTask = toolName === 'manage_task';
   const isCommand = Boolean(command || code || /exec|run_code|terminal|run_command/.test(toolName));
 
-  const kind = isEdit ? 'Edit' : isSearch ? 'Explore' : isRead ? 'Read' : isCommand ? 'Terminal' : 'Tool';
+  const kind = isWeb ? 'Web' : isEdit ? 'Edit' : isSearch ? 'Explore' : isRead ? 'Read' : isCommand ? 'Terminal' : 'Tool';
 
   let displayVerb = kind;
-  if (isEdit) displayVerb = 'Edited';
+  if (isWeb) {
+    displayVerb = toolName === 'web_open' ? 'Opened' : toolName === 'web_fetch_url' || toolName === 'web_fetch' ? 'Fetched' : toolName === 'web_find' ? 'Found' : 'Searched the web';
+  } else if (isEdit) displayVerb = 'Edited';
   else if (isRead) displayVerb = 'Analyzed';
   else if (isSearch) displayVerb = 'Searched';
   else if (isTask) {
@@ -231,8 +284,14 @@ export function CommandRunCard({
     ? args.Query
     : typeof args?.query === 'string'
     ? args.query
+    : typeof args?.question === 'string'
+    ? args.question
     : typeof args?.Pattern === 'string'
     ? args.Pattern
+    : typeof args?.url === 'string'
+    ? args.url
+    : typeof args?.term === 'string'
+    ? args.term
     : undefined;
 
   const taskTitle = summaryTitle
@@ -261,7 +320,7 @@ export function CommandRunCard({
         else if (Array.isArray(parsed)) searchResultCount = parsed.length;
       } catch { /* ignore */ }
     }
-    if (searchResultCount === undefined && stdout) {
+    if (searchResultCount === undefined && stdout && !isWeb) {
       const trimmedLines = stdout.trim().split(/\r?\n/).filter(Boolean);
       if (trimmedLines.length > 0 && !stdout.includes('"totalResults": 0')) {
         searchResultCount = trimmedLines.length;
@@ -269,7 +328,15 @@ export function CommandRunCard({
     }
   }
 
+  const resultObject = parseObjectJson(structuredResult) ?? parseObjectJson(stdout);
+  const webSources = isWeb ? webSourcesFrom(resultObject) : [];
+  const webAnswer = isWeb && resultObject && typeof resultObject.answer === 'string' ? resultObject.answer.trim() : '';
+  if (isWeb && searchResultCount === undefined && webSources.length > 0) {
+    searchResultCount = webSources.length;
+  }
+
   const renderHeaderIcon = () => {
+    if (isWeb) return <Globe size={14} className="cmd-icon web-icon" />;
     if (path || isRead || isEdit || displayFilename) return <FileIcon filename={displayFilename ?? path} size={14} />;
     return null;
   };
@@ -459,6 +526,24 @@ export function CommandRunCard({
         {authorization && <p>Authorization: {authorization}</p>}
         {environment === 'Workspace' && toolName === 'edit_file' && (
           <p>Review the unified diff below before continuing. Re-read the file when the hash no longer matches.</p>
+        )}
+        {isWeb && (webAnswer || webSources.length > 0) && (
+          <div className="web-result-summary">
+            {webAnswer && <p className="web-answer-excerpt">{webAnswer.length > 280 ? `${webAnswer.slice(0, 280).trim()}…` : webAnswer}</p>}
+            {webSources.length > 0 && (
+              <ul className="web-source-list">
+                {webSources.map(source => (
+                  <li key={source.id}>
+                    {source.url ? (
+                      <a href={source.url} target="_blank" rel="noreferrer">{source.title || source.url.replace(/^https?:\/\//, '')}</a>
+                    ) : (
+                      <span>{source.title || source.id}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         )}
 
         {/* Subheader tabs & actions */}

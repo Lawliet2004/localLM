@@ -72,7 +72,7 @@ pub fn harness_detached_supported(alias: &str) -> bool {
         | "goal_set" | "goal_clear"
         | "memory_teach" | "memory_recall"
         | "file_search" | "list_agents" | "list_subagent_models"
-        | "schedule_list" | "preset_guide" | "artifact_read")
+        | "preset_guide" | "artifact_read" | "update_context" | "finish")
 }
 
 /// Serve the store-only harness subset for background children. Mirrors the
@@ -92,6 +92,10 @@ pub fn harness_detached(
     let store = crate::store::Store::open(&snapshot.db_path)?;
     let workspace_path = snapshot.workspace_path.clone();
     match alias {
+        "update_context" | "finish" => {
+            crate::arex::validate(alias, &args)?;
+            Ok(if alias == "finish" { serde_json::json!({"answer":crate::arex::finish_answer(&args)}) } else { serde_json::json!({"context":args["context"]}) })
+        }
         "todo_write" => {
             let todos = crate::plans::parse_todo_write(&args)?;
             store.save_todos(&request.conversation_id, &todos)?;
@@ -163,10 +167,6 @@ pub fn harness_detached(
         "list_subagent_models" => {
             let allowlist = list_models(&store)?;
             Ok(serde_json::json!({"models": allowlist, "note": "Empty allowlist means the current conversation model only."}))
-        }
-        "schedule_list" => {
-            let schedules = store.schedules()?;
-            Ok(serde_json::json!({"schedules": schedules}))
         }
         "preset_guide" => {
             Ok(serde_json::json!({"guide": crate::presets::authoring_guide(), "presets": crate::presets::list()}))
@@ -349,20 +349,6 @@ pub async fn snapshot_for_conversation(
         snapshot.context_length = runtime.context_length;
     }
     Ok(snapshot)
-}
-
-pub fn policy_for_schedule(
-    state: &crate::AppState,
-    conversation_id: &str,
-    allow_write: bool,
-) -> Result<ChildPolicy, String> {
-    let store = state.database()?;
-    let mode = store.conversation_tools(conversation_id).map(|tools| tools.access_mode).unwrap_or_default();
-    if allow_write && mode == crate::permissions::AccessMode::FullAccess {
-        Ok(ChildPolicy::Full)
-    } else {
-        Ok(ChildPolicy::ReadsOnly)
-    }
 }
 
 pub fn max_depth(store: &crate::store::Store) -> i64 {
@@ -663,10 +649,11 @@ pub async fn drive_child(
             return Err("Subagent hit the response token limit.".into());
         }
         let calls = calls.finish()?;
+        crate::arex::validate_batch(&calls)?;
         if calls.is_empty() {
             break;
         }
-        if round + 1 >= max_rounds {
+        if round + 1 >= max_rounds && !calls.iter().any(|c| c.name == "finish") {
             return Err("Subagent round limit reached.".into());
         }
         messages.push(serde_json::json!({"role": "assistant", "content": round_answer,
@@ -692,6 +679,7 @@ pub async fn drive_child(
             } else {
                 call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call).await
             };
+            let control = if tool.harness_name().is_some() && matches!(call.name.as_str(), "finish" | "update_context") { Some(result.clone()) } else { None };
             let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
                 result, &tool.tool.name, &request.conversation_id, Some(child_run_id),
                 crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
@@ -714,6 +702,12 @@ pub async fn drive_child(
                 });
             }
             messages.push(serde_json::json!({"role": "tool", "tool_call_id": call.id, "content": bounded.to_string()}));
+            if let Some(control) = control {
+                if let Some(final_answer) = crate::arex::apply_control(&call.name, &control, &*state.database()?, &request.conversation_id, child_run_id, &mut messages)? {
+                    if let Some(schema) = &request.output_schema { check_output_schema(schema, &final_answer)?; }
+                    return Ok(final_answer);
+                }
+            }
         }
     }
     if let Some(schema) = &request.output_schema {
@@ -1062,13 +1056,14 @@ pub async fn drive_detached(
             .await
             .map_err(|_| "Subagent model did not respond within ten minutes.")??;
         let outcome = collect_stream(backend, response, &mut answer).await?;
+        crate::arex::validate_batch(&outcome.calls)?;
         if outcome.finish == "length" {
             return Err("Subagent hit the response token limit.".into());
         }
         if outcome.calls.is_empty() {
             break;
         }
-        if round + 1 >= max_rounds {
+        if round + 1 >= max_rounds && !outcome.calls.iter().any(|c| c.name == "finish") {
             return Err("Subagent round limit reached.".into());
         }
         messages.push(serde_json::json!({"role": "assistant", "content": outcome.text,
@@ -1099,6 +1094,7 @@ pub async fn drive_detached(
                     Err(_) => serde_json::json!({"isError": true, "message": "Subagent tool call timed out."}),
                 }
             };
+            let control = if tool.harness_name().is_some() && matches!(call.name.as_str(), "finish" | "update_context") { Some(result.clone()) } else { None };
             let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
                 result, &tool.tool.name, &request.conversation_id, Some(child_run_id),
                 crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
@@ -1121,6 +1117,12 @@ pub async fn drive_detached(
                 });
             }
             messages.push(serde_json::json!({"role": "tool", "tool_call_id": call.id, "content": bounded.to_string()}));
+            if let Some(control) = control {
+                if let Some(final_answer) = crate::arex::apply_control(&call.name, &control, &*store.lock().map_err(|_| "Store lock poisoned")?, &request.conversation_id, child_run_id, &mut messages)? {
+                    if let Some(schema) = &request.output_schema { check_output_schema(schema, &final_answer)?; }
+                    return Ok(final_answer);
+                }
+            }
         }
     }
     if let Some(schema) = &request.output_schema {
@@ -1466,7 +1468,7 @@ mod tests {
     fn detached_support_covers_store_tools_only() {
         for alias in ["todo_write", "todo_add", "todo_update", "goal_set", "goal_clear",
             "memory_teach", "memory_recall", "file_search", "list_agents",
-            "list_subagent_models", "schedule_list", "preset_guide", "artifact_read"] {
+            "list_subagent_models", "preset_guide", "artifact_read"] {
             assert!(harness_detached_supported(alias), "{alias} should run detached");
         }
         for alias in ["subagent", "terminal_send", "docker_exec", "workflow_run", "ask_user", "ptc_run"] {

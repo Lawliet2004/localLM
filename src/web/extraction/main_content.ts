@@ -164,7 +164,15 @@ export function extractMainContent(html: string, fallbackTitle: string = ''): Ex
     .map((l) => l.trim())
     .filter((l) => l.length > 0);
 
-  const cleanText = lines.join('\n\n');
+  let cleanText = lines.join('\n\n');
+  if (
+    meta.articleBody &&
+    meta.articleBody.length > 200 &&
+    (cleanText.length < 500 || meta.articleBody.length > cleanText.length)
+  ) {
+    cleanText = meta.articleBody;
+    method = 'article_dom';
+  }
   const confidence = cleanText.length > 500 ? (method === 'article_dom' ? 0.95 : 0.85) : 0.60;
 
   return {

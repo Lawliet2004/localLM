@@ -1,9 +1,20 @@
 import { FileIcon } from './CommandRunCard';
 import type { ReactNode } from 'react';
 import type { Message, RunRecord } from '../lib/types';
+import { isPlanStateTool } from './PlanChecklist';
+
+function toolNameOf(message: Message): string {
+  try {
+    const value = JSON.parse(message.content);
+    const request = value.request || value;
+    return typeof request.name === 'string' ? request.name : '';
+  } catch {
+    return '';
+  }
+}
 
 export function WorkSummary({ messages, run, children }: { messages: Message[]; run?: RunRecord | null; children: ReactNode }) {
-  const tools = messages.filter(message => message.role === 'tool');
+  const tools = messages.filter(message => message.role === 'tool' && !isPlanStateTool(toolNameOf(message)));
   const edits = tools.flatMap(message => {
     if (message.status !== 'complete') return [];
     try {

@@ -137,7 +137,7 @@ pub fn selection_hash(
     hasher.update([u8::from(system_time), u8::from(tool_schemas_suppressed)]);
     // Bump when model-visible tool schemas/descriptions change so existing
     // conversations pick up the new run_code notebook contract.
-    hasher.update(b"code-repl-v1");
+    hasher.update(b"code-repl-v1-arex-research-v1");
     format!("{:x}", hasher.finalize())
 }
 

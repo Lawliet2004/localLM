@@ -9,9 +9,6 @@
  */
 
 import { WebSearchEngine } from './index';
-import { extractDomain } from './ranking/url_normalizer';
-import { HttpFetcher } from './fetch/http_fetcher';
-import { extractMainContent } from './extraction/main_content';
 import { chunkDocument } from './chunking/semantic_chunker';
 import { InMemoryBM25 } from './retrieval/bm25';
 import type { RetrievedDocument } from './types';
@@ -23,12 +20,9 @@ export interface ToolDefinition {
 }
 
 export class WebAgentTools {
-  private fetcher: HttpFetcher;
   private openedDocuments = new Map<string, RetrievedDocument>();
 
-  constructor(private engine: WebSearchEngine = new WebSearchEngine()) {
-    this.fetcher = new HttpFetcher(4, 2);
-  }
+  constructor(private engine: WebSearchEngine = new WebSearchEngine()) {}
 
   getToolDefinitions(): ToolDefinition[] {
     return [
@@ -108,27 +102,11 @@ export class WebAgentTools {
     if (name === 'web_open') {
       const url = args.url;
       try {
-        // Step 2: OPEN -> Directly fetch and extract the specific page
-        const fetchRes = await this.fetcher.fetch(url, { timeoutSeconds: 10 });
-        if (!fetchRes.success || !fetchRes.body) {
-          return `Error opening ${url}: ${fetchRes.error || 'Failed to fetch page content'}`;
-        }
-
-        const extraction = extractMainContent(fetchRes.body);
-        const doc: RetrievedDocument = {
-          id: `opened-${Date.now()}`,
-          url: fetchRes.finalUrl || url,
-          domain: extractDomain(url),
-          title: extraction.title || 'Web Document',
-          text: extraction.text,
-          contentHash: extraction.contentHash,
-          retrievedAt: new Date().toISOString(),
-          searchResultIds: [],
-        };
+        const doc = await this.engine.fetchUrl(url);
+        doc.id = `opened-${Date.now()}`;
         this.openedDocuments.set(url, doc);
         this.openedDocuments.set(doc.url, doc);
 
-        // Return bounded excerpt (progressive disclosure)
         const excerpt = doc.text.length > 1500 ? `${doc.text.slice(0, 1500)}...\n\n[Content truncated. Use web_find to locate specific information.]` : doc.text;
         return `Title: ${doc.title}\nDomain: ${doc.domain}\nURL: ${doc.url}\n\n${excerpt}`;
       } catch (err: any) {

@@ -4,6 +4,33 @@ import { BlockList, isIP } from "node:net";
 import http from "node:http";
 import https from "node:https";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
+//#region src/web/types.ts
+function emptySearchMeta() {
+	return {
+		answers: [],
+		infoboxes: [],
+		corrections: [],
+		suggestions: []
+	};
+}
+function hasSearchMeta(meta) {
+	return meta.answers.length > 0 || meta.infoboxes.length > 0 || meta.corrections.length > 0 || meta.suggestions.length > 0;
+}
+/** Merge SearXNG meta from concurrent/paginated queries; first-seen wins. */
+function mergeSearchMeta(base, extra) {
+	const answers = [...base.answers];
+	for (const a of extra.answers) if (!answers.some((x) => x.answer === a.answer)) answers.push(a);
+	const infoboxes = [...base.infoboxes];
+	for (const ib of extra.infoboxes) if (!infoboxes.some((x) => x.title === ib.title && x.content === ib.content)) infoboxes.push(ib);
+	const uniq = (items) => [...new Set(items.map((s) => s.trim()).filter(Boolean))];
+	return {
+		answers: answers.slice(0, 5),
+		infoboxes: infoboxes.slice(0, 3),
+		corrections: uniq([...base.corrections, ...extra.corrections]).slice(0, 3),
+		suggestions: uniq([...base.suggestions, ...extra.suggestions]).slice(0, 8)
+	};
+}
+//#endregion
 //#region src/web/config/defaults.ts
 var DEFAULT_CONFIG = {
 	extractEvidenceWithModel: false,
@@ -55,6 +82,8 @@ var DEFAULT_CONFIG = {
 		globalConcurrency: 8,
 		perDomainConcurrency: 2,
 		userAgent: "LocalLM-Research/1.0 (+https://github.com/locallm/desktop)",
+		waybackFallback: true,
+		domainLearning: true,
 		userAgents: [
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -75,7 +104,10 @@ var DEFAULT_CONFIG = {
 		finalLimit: 8,
 		maxChunksPerDoc: 2
 	},
-	reranking: { enabled: false },
+	reranking: {
+		enabled: false,
+		recencyWeight: .15
+	},
 	ranking: {
 		semanticWeight: .35,
 		lexicalWeight: .2,
@@ -152,7 +184,10 @@ function createConfig(overrides) {
 			finalLimit: 5,
 			maxChunksPerDoc: 2
 		},
-		reranking: { enabled: false },
+		reranking: {
+			...base.reranking,
+			enabled: false
+		},
 		context: {
 			totalInputBudget: 4096,
 			evidenceTokenBudget: 1800,
@@ -939,6 +974,419 @@ Return valid JSON: {"queries": [{"query": "...", "purpose": "...", "freshness": 
 	}
 };
 //#endregion
+//#region src/web/search/result_normalizer.ts
+function normalizeRawSearchResult(raw, queryId, rank, page = 1) {
+	const url = String(raw.url || raw.link || "").trim();
+	const title = String(raw.title || "Untitled").trim();
+	const snippet = String(raw.content || raw.snippet || raw.body || "").trim();
+	const domain = extractDomain(url);
+	const publishedAt = raw.publishedDate || raw.publishedAt || raw.date;
+	return {
+		id: page > 1 ? `${queryId}-P${page}-R${rank}` : `${queryId}-R${rank}`,
+		queryId,
+		title,
+		url,
+		snippet,
+		domain,
+		publishedAt: publishedAt ? String(publishedAt) : void 0,
+		engine: raw.engine ? String(raw.engine) : void 0,
+		rank: (page - 1) * 10 + rank,
+		score: typeof raw.score === "number" ? raw.score : void 0,
+		metadata: {
+			...raw.metadata || {},
+			...page > 1 ? { searxngPage: page } : {}
+		}
+	};
+}
+//#endregion
+//#region src/web/extraction/metadata.ts
+function extractPageMetadata(html) {
+	const meta = {};
+	const canonicalMatch = html.match(/<link\s+[^>]*rel=["']canonical["'][^>]*href=["']([^"']+)["']/i) || html.match(/<link\s+[^>]*href=["']([^"']+)["'][^>]*rel=["']canonical["']/i);
+	if (canonicalMatch) meta.canonicalUrl = canonicalMatch[1].trim();
+	const ogTitleMatch = html.match(/<meta\s+[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*content=["']([^"']+)["'][^>]*property=["']og:title["']/i);
+	if (ogTitleMatch) meta.title = ogTitleMatch[1].trim();
+	else {
+		const titleTagMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+		if (titleTagMatch) meta.title = titleTagMatch[1].replace(/\s+/g, " ").trim();
+		else {
+			const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+			if (h1Match) meta.title = h1Match[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+		}
+	}
+	const descMatch = html.match(/<meta\s+[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*property=["']og:description["'][^>]*content=["']([^"']+)["']/i);
+	if (descMatch) meta.description = descMatch[1].trim();
+	const authorMatch = html.match(/<meta\s+[^>]*name=["']author["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*property=["']article:author["'][^>]*content=["']([^"']+)["']/i);
+	if (authorMatch) meta.author = authorMatch[1].trim();
+	const dateMatch = html.match(/<meta\s+[^>]*property=["']article:published_time["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*name=["']publish-date["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*name=["']date["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*itemprop=["']datePublished["'][^>]*content=["']([^"']+)["']/i);
+	if (dateMatch) meta.publishedAt = dateMatch[1].trim();
+	const jsonLdMatches = html.matchAll(/<script\s+[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+	for (const match of jsonLdMatches) try {
+		const parsed = JSON.parse(match[1]);
+		const items = Array.isArray(parsed) ? parsed : [parsed];
+		for (const item of items) {
+			if (!meta.publishedAt && item.datePublished) meta.publishedAt = String(item.datePublished);
+			if (!meta.author && item.author) {
+				if (typeof item.author === "string") meta.author = item.author;
+				else if (item.author.name) meta.author = item.author.name;
+			}
+			if (!meta.title && item.headline) meta.title = String(item.headline);
+			if (!meta.articleBody && typeof item.articleBody === "string" && item.articleBody.trim().length > 200) meta.articleBody = item.articleBody.trim();
+		}
+	} catch {}
+	return meta;
+}
+//#endregion
+//#region src/web/extraction/main_content.ts
+/**
+* Main Content Extractor: Extracts readable article/page text, strips boilerplate
+* (nav, ads, cookie notices, scripts, footers), preserves heading structure,
+* and generates content fingerprints.
+*/
+/**
+* Computes a fast deterministic SHA-256 or djb2 hash string.
+*/
+function computeContentHash(text) {
+	let h1 = 3735928559;
+	let h2 = 1103547991;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text.charCodeAt(i);
+		h1 = Math.imul(h1 ^ ch, 2654435761);
+		h2 = Math.imul(h2 ^ ch, 1597334677);
+	}
+	h1 = Math.imul(h1 ^ h1 >>> 16, 2246822507) ^ Math.imul(h2 ^ h2 >>> 13, 3266489909);
+	h2 = Math.imul(h2 ^ h2 >>> 16, 2246822507) ^ Math.imul(h1 ^ h1 >>> 13, 3266489909);
+	return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
+}
+function extractMainContent(html, fallbackTitle = "") {
+	const meta = extractPageMetadata(html);
+	if (!/<[a-z][\s\S]*>/i.test(html)) {
+		const clean = html.trim();
+		return {
+			title: meta.title || fallbackTitle,
+			author: meta.author,
+			publishedAt: meta.publishedAt,
+			canonicalUrl: meta.canonicalUrl,
+			description: meta.description,
+			text: clean,
+			contentHash: computeContentHash(clean),
+			characters: clean.length,
+			confidence: .9,
+			method: "plain_text",
+			headings: [],
+			links: [],
+			tables: []
+		};
+	}
+	let processed = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "").replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "").replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, "").replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, "").replace(/<!--[\s\S]*?-->/g, "");
+	for (const tag of [
+		"nav",
+		"header",
+		"footer",
+		"aside",
+		"form",
+		"dialog"
+	]) {
+		const regex = new RegExp(`<${tag}\\b[^<]*(?:(?!<\\/${tag}>)<[^<]*)*<\\/${tag}>`, "gi");
+		processed = processed.replace(regex, "");
+	}
+	processed = processed.replace(/<div[^>]*(id|class)=["'][^"']*(cookie|banner|advertisement|sponsor|popup|modal|consent)[^"']*["'][^<]*(?:(?!<\/div>)<[^<]*)*<\/div>/gi, "");
+	let articleContent = "";
+	const mainOrArticleMatch = processed.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i) || processed.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i);
+	let method = "heuristic_strip";
+	if (mainOrArticleMatch && mainOrArticleMatch[1].trim().length > 300) {
+		articleContent = mainOrArticleMatch[1];
+		method = "article_dom";
+	} else articleContent = processed;
+	const headings = [];
+	const headingTexts = [...articleContent.matchAll(/<h[1-6]\b[^>]*>([\s\S]*?)<\/h[1-6]>/gi)].map((m) => m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean);
+	headings.push(...headingTexts.slice(0, 50));
+	const links = [...articleContent.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)].map((m) => ({
+		href: m[1].trim(),
+		text: m[2].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200)
+	})).filter((l) => l.href && /^https?:\/\//i.test(l.href)).slice(0, 100);
+	const tables = [...articleContent.matchAll(/<table\b[^>]*>([\s\S]*?)<\/table>/gi)].slice(0, 10).flatMap((m) => [...m[1].matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)].slice(0, 30).map((row) => [...row[1].matchAll(/<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]>/gi)].map((cell) => cell[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300)).filter(Boolean).join(" | ")).filter((row) => row.length > 0));
+	articleContent = articleContent.replace(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gi, "\n\n# $1\n\n");
+	articleContent = articleContent.replace(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi, "\n\n## $1\n\n");
+	articleContent = articleContent.replace(/<h3\b[^>]*>([\s\S]*?)<\/h3>/gi, "\n\n### $1\n\n");
+	articleContent = articleContent.replace(/<h[4-6]\b[^>]*>([\s\S]*?)<\/h[4-6]>/gi, "\n\n#### $1\n\n");
+	articleContent = articleContent.replace(/<p\b[^>]*>([\s\S]*?)<\/p>/gi, "\n\n$1\n\n");
+	articleContent = articleContent.replace(/<br\s*\/?>/gi, "\n");
+	articleContent = articleContent.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, "\n- $1");
+	articleContent = articleContent.replace(/<th\b[^>]*>([\s\S]*?)<\/th>/gi, " | $1");
+	articleContent = articleContent.replace(/<td\b[^>]*>([\s\S]*?)<\/td>/gi, " | $1");
+	articleContent = articleContent.replace(/<\/tr>/gi, " |\n");
+	let text = articleContent.replace(/<[^>]+>/g, " ");
+	text = text.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, "\"").replace(/&#39;/gi, "'").replace(/&#x27;/gi, "'").replace(/&mdash;/gi, "—").replace(/&ndash;/gi, "–");
+	let cleanText = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0).join("\n\n");
+	if (meta.articleBody && meta.articleBody.length > 200 && (cleanText.length < 500 || meta.articleBody.length > cleanText.length)) {
+		cleanText = meta.articleBody;
+		method = "article_dom";
+	}
+	const confidence = cleanText.length > 500 ? method === "article_dom" ? .95 : .85 : .6;
+	return {
+		title: meta.title || fallbackTitle,
+		author: meta.author,
+		publishedAt: meta.publishedAt,
+		canonicalUrl: meta.canonicalUrl,
+		description: meta.description,
+		text: cleanText,
+		contentHash: computeContentHash(cleanText),
+		characters: cleanText.length,
+		confidence,
+		method,
+		headings,
+		links,
+		tables
+	};
+}
+//#endregion
+//#region src/web/search/searxng_provider.ts
+/**
+* Normalize SearXNG's version-varying meta fields into SearchMeta. Answers may
+* be plain strings or {answer,url} objects; infoboxes expose `infobox`/`content`
+* with optional `urls`. Empty entries are dropped.
+*/
+function normalizeSearxMeta(data) {
+	const meta = emptySearchMeta();
+	if (Array.isArray(data?.answers)) meta.answers = data.answers.map((a) => typeof a === "string" ? { answer: a } : {
+		answer: String(a?.answer ?? a?.content ?? ""),
+		url: a?.url ? String(a.url) : void 0
+	}).filter((a) => a.answer.trim().length > 0).slice(0, 5);
+	if (Array.isArray(data?.infoboxes)) meta.infoboxes = data.infoboxes.map((ib) => ({
+		title: String(ib?.infobox ?? ib?.title ?? ""),
+		content: String(ib?.content ?? ""),
+		url: ib?.urls?.[0]?.url ? String(ib.urls[0].url) : void 0
+	})).filter((ib) => ib.title.trim().length > 0 || ib.content.trim().length > 0).slice(0, 3);
+	if (Array.isArray(data?.corrections)) meta.corrections = data.corrections.map((c) => typeof c === "string" ? c : String(c?.title ?? "")).filter((c) => c.trim().length > 0).slice(0, 3);
+	if (Array.isArray(data?.suggestions)) meta.suggestions = data.suggestions.filter((s) => typeof s === "string" && s.trim().length > 0).slice(0, 8);
+	return meta;
+}
+/** Engines that require credentials stay off in the default configuration. */
+var KEYFREE_CREDENTIAL_ENGINES = [
+	"google",
+	"bing",
+	"yandex",
+	"brave",
+	"mojeek"
+];
+var resultMeta = /* @__PURE__ */ new WeakMap();
+/** Meta attached to a `search()` return value so concurrent queries cannot clobber each other. */
+function metaForResults(results) {
+	return resultMeta.get(results);
+}
+function parseSearxngBaseUrls(baseUrl) {
+	const urls = baseUrl.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+	return urls.length > 0 ? urls : ["http://127.0.0.1:8080"];
+}
+/** Instant answers and infoboxes become evidence documents for small local models. */
+function documentsFromSearchMeta(meta, retrievedAt = (/* @__PURE__ */ new Date()).toISOString()) {
+	const docs = [];
+	meta.answers.forEach((answer, i) => {
+		const url = usableMetaUrl(answer.url) || `https://answer.invalid/searxng/${i + 1}`;
+		const text = answer.answer.trim();
+		if (!text) return;
+		docs.push({
+			id: `searx-answer-${i + 1}`,
+			url,
+			domain: hostnameOf(url),
+			title: "Instant answer",
+			text,
+			contentHash: computeContentHash(text),
+			retrievedAt,
+			searchResultIds: [],
+			metadata: { extractionMethod: "searxng_answer" }
+		});
+	});
+	meta.infoboxes.forEach((box, i) => {
+		const url = usableMetaUrl(box.url) || `https://infobox.invalid/searxng/${i + 1}`;
+		const text = [box.title, box.content].filter(Boolean).join("\n\n").trim();
+		if (!text) return;
+		docs.push({
+			id: `searx-infobox-${i + 1}`,
+			url,
+			domain: hostnameOf(url),
+			title: box.title || "Infobox",
+			text,
+			contentHash: computeContentHash(text),
+			retrievedAt,
+			searchResultIds: [],
+			metadata: { extractionMethod: "searxng_infobox" }
+		});
+	});
+	return docs;
+}
+function usableMetaUrl(url) {
+	if (!url) return void 0;
+	try {
+		const parsed = new URL(url);
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return void 0;
+		return parsed.href;
+	} catch {
+		return;
+	}
+}
+function hostnameOf(url) {
+	try {
+		return new URL(url).hostname;
+	} catch {
+		return "searxng";
+	}
+}
+var SearXNGProvider = class {
+	baseUrl;
+	timeoutMs;
+	engines;
+	disabledEngines;
+	retryAfter = 0;
+	lastDiagnostics = null;
+	/** Instant answers / infoboxes / corrections / suggestions from the last successful search. */
+	lastMeta = null;
+	constructor(baseUrl = "http://127.0.0.1:8080", timeoutMs = 8e3, engines = [
+		"duckduckgo",
+		"wikipedia",
+		"stackoverflow",
+		"github",
+		"arxiv",
+		"openstreetmap"
+	], disabledEngines = [...KEYFREE_CREDENTIAL_ENGINES]) {
+		this.baseUrl = baseUrl;
+		this.timeoutMs = timeoutMs;
+		this.engines = engines;
+		this.disabledEngines = disabledEngines;
+	}
+	/** Verify which configured engines answer instead of assuming they work. */
+	async checkEngineHealth() {
+		const working = [];
+		const failing = {};
+		await Promise.all(this.engines.map(async (engine) => {
+			try {
+				const url = new URL("/search", parseSearxngBaseUrls(this.baseUrl)[0]);
+				url.searchParams.set("q", "health check");
+				url.searchParams.set("format", "json");
+				url.searchParams.set("engines", engine);
+				const controller = new AbortController();
+				const timer = setTimeout(() => controller.abort(), Math.min(this.timeoutMs, 5e3));
+				try {
+					const res = await fetch(url.toString(), {
+						headers: { Accept: "application/json" },
+						signal: controller.signal,
+						redirect: "error"
+					});
+					if (!res.ok) failing[engine] = `HTTP ${res.status}`;
+					else working.push(engine);
+				} finally {
+					clearTimeout(timer);
+				}
+			} catch (err) {
+				failing[engine] = err?.name === "AbortError" ? "timeout" : String(err?.message || err);
+			}
+		}));
+		return {
+			working,
+			failing
+		};
+	}
+	async search(request) {
+		if (Date.now() < this.retryAfter) throw new Error("SearXNG Retry-After cooldown active");
+		const bases = parseSearxngBaseUrls(this.baseUrl);
+		const deadline = Date.now() + this.timeoutMs;
+		let lastError;
+		let cooldownUntil = 0;
+		for (let i = 0; i < bases.length; i++) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
+			try {
+				return await this.searchAgainst(bases[i], request, remaining);
+			} catch (err) {
+				lastError = err;
+				if (typeof err?.cooldownUntil === "number") cooldownUntil = Math.max(cooldownUntil, err.cooldownUntil);
+				if (bases.length === 1) {
+					if (cooldownUntil) this.retryAfter = cooldownUntil;
+					throw err;
+				}
+			}
+		}
+		if (cooldownUntil) this.retryAfter = cooldownUntil;
+		throw lastError instanceof Error ? lastError : /* @__PURE__ */ new Error("SearXNG request failed");
+	}
+	async searchAgainst(baseUrl, request, timeoutMs) {
+		const page = Math.max(1, Math.min(5, Math.floor(request.page ?? 1) || 1));
+		const url = new URL("/search", baseUrl);
+		url.searchParams.set("q", request.query);
+		url.searchParams.set("format", "json");
+		url.searchParams.set("pageno", String(page));
+		if (this.engines.length > 0) url.searchParams.set("engines", this.engines.join(","));
+		if (this.disabledEngines.length > 0) url.searchParams.set("disabled_engines", this.disabledEngines.join(","));
+		if (request.language) url.searchParams.set("language", request.language);
+		if (request.category) url.searchParams.set("categories", request.category);
+		if (request.freshness && request.freshness !== "any" && request.freshness !== "realtime") url.searchParams.set("time_range", request.freshness === "week" ? "month" : request.freshness);
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), Math.max(50, timeoutMs));
+		try {
+			const res = await fetch(url.toString(), {
+				headers: { Accept: "application/json" },
+				signal: controller.signal,
+				redirect: "error"
+			});
+			if (!res.ok) {
+				this.lastDiagnostics = {
+					httpStatus: res.status,
+					page,
+					error: `HTTP ${res.status}`
+				};
+				const error = /* @__PURE__ */ new Error(`SearXNG returned HTTP ${res.status}: ${res.statusText}`);
+				if (res.status === 429 || res.status === 503) {
+					const value = res.headers.get("Retry-After") || "";
+					const parsed = /^\d+$/.test(value) ? Date.now() + Number(value) * 1e3 : Date.parse(value);
+					error.cooldownUntil = Math.max(Date.now() + 3e4, Number.isFinite(parsed) ? parsed : 0);
+				}
+				throw error;
+			}
+			const data = await res.json();
+			clearTimeout(timer);
+			const engines = data?.engines && typeof data.engines === "object" ? data.engines : void 0;
+			const unresponsive = Array.isArray(data?.unresponsive_engines) ? data.unresponsive_engines.map((e) => String(e)) : [];
+			const engineFailures = {};
+			if (engines) {
+				for (const [name, info] of Object.entries(engines)) if (info && typeof info === "object" && ("error" in info || typeof info.timed_out !== "undefined" && info.timed_out)) engineFailures[name] = String(info.error || "engine failed");
+			}
+			this.lastDiagnostics = {
+				httpStatus: res.status,
+				engines: engineFailures,
+				unresponsiveEngines: unresponsive,
+				page
+			};
+			const meta = normalizeSearxMeta(data);
+			this.lastMeta = this.lastMeta ? mergeSearchMeta(this.lastMeta, meta) : meta;
+			if (!data || !Array.isArray(data.results)) {
+				const empty = [];
+				resultMeta.set(empty, meta);
+				return empty;
+			}
+			const limit = request.maxResults ?? 10;
+			const results = [];
+			for (let i = 0; i < Math.min(data.results.length, limit); i++) results.push(normalizeRawSearchResult(data.results[i], request.query, i + 1, page));
+			resultMeta.set(results, meta);
+			return results;
+		} catch (err) {
+			clearTimeout(timer);
+			if (err.name === "AbortError") {
+				this.lastDiagnostics = {
+					page,
+					error: "timeout"
+				};
+				throw new Error(`SearXNG request timed out after ${this.timeoutMs}ms`);
+			}
+			if (!this.lastDiagnostics) this.lastDiagnostics = {
+				page,
+				error: String(err?.message || err)
+			};
+			throw err;
+		}
+	}
+};
+//#endregion
 //#region src/web/search/search_service.ts
 var SearchService = class {
 	provider;
@@ -972,11 +1420,13 @@ var SearchService = class {
 			results: [],
 			rawCount: 0,
 			failureCount: 0,
-			failures: []
+			failures: [],
+			meta: emptySearchMeta()
 		};
 		const successfulGroups = [];
 		const failures = [];
 		let rawCount = 0;
+		let meta = emptySearchMeta();
 		const queue = [...queries];
 		const workers = Array.from({ length: Math.min(this.maxConcurrent, queue.length) }, async () => {
 			while (queue.length > 0) {
@@ -988,6 +1438,8 @@ var SearchService = class {
 						results: hits
 					});
 					rawCount += hits.length;
+					const attached = metaForResults(hits);
+					if (attached) meta = mergeSearchMeta(meta, attached);
 				} catch (err) {
 					failures.push({
 						query: q.query,
@@ -1001,176 +1453,25 @@ var SearchService = class {
 			results: fuseSearchResults(successfulGroups),
 			rawCount,
 			failureCount: failures.length,
-			failures
+			failures,
+			meta
 		};
 	}
 	async fetchAdditionalPage(query, page, maxResultsPerQuery = 10) {
 		try {
-			return { results: await this.searchOnce({
+			const hits = await this.searchOnce({
 				...query,
 				page
-			}, maxResultsPerQuery) };
+			}, maxResultsPerQuery);
+			return {
+				results: hits,
+				meta: metaForResults(hits)
+			};
 		} catch (err) {
 			return {
 				results: [],
 				error: String(err?.message || err)
 			};
-		}
-	}
-};
-//#endregion
-//#region src/web/search/result_normalizer.ts
-function normalizeRawSearchResult(raw, queryId, rank, page = 1) {
-	const url = String(raw.url || raw.link || "").trim();
-	const title = String(raw.title || "Untitled").trim();
-	const snippet = String(raw.content || raw.snippet || raw.body || "").trim();
-	const domain = extractDomain(url);
-	const publishedAt = raw.publishedDate || raw.publishedAt || raw.date;
-	return {
-		id: page > 1 ? `${queryId}-P${page}-R${rank}` : `${queryId}-R${rank}`,
-		queryId,
-		title,
-		url,
-		snippet,
-		domain,
-		publishedAt: publishedAt ? String(publishedAt) : void 0,
-		engine: raw.engine ? String(raw.engine) : void 0,
-		rank: (page - 1) * 10 + rank,
-		score: typeof raw.score === "number" ? raw.score : void 0,
-		metadata: {
-			...raw.metadata || {},
-			...page > 1 ? { searxngPage: page } : {}
-		}
-	};
-}
-//#endregion
-//#region src/web/search/searxng_provider.ts
-/** Engines that require credentials stay off in the default configuration. */
-var KEYFREE_CREDENTIAL_ENGINES = [
-	"google",
-	"bing",
-	"yandex",
-	"brave",
-	"mojeek"
-];
-var SearXNGProvider = class {
-	baseUrl;
-	timeoutMs;
-	engines;
-	disabledEngines;
-	retryAfter = 0;
-	lastDiagnostics = null;
-	constructor(baseUrl = "http://127.0.0.1:8080", timeoutMs = 8e3, engines = [
-		"duckduckgo",
-		"wikipedia",
-		"stackoverflow",
-		"github",
-		"arxiv",
-		"openstreetmap"
-	], disabledEngines = [...KEYFREE_CREDENTIAL_ENGINES]) {
-		this.baseUrl = baseUrl;
-		this.timeoutMs = timeoutMs;
-		this.engines = engines;
-		this.disabledEngines = disabledEngines;
-	}
-	/** Verify which configured engines answer instead of assuming they work. */
-	async checkEngineHealth() {
-		const working = [];
-		const failing = {};
-		await Promise.all(this.engines.map(async (engine) => {
-			try {
-				const url = new URL("/search", this.baseUrl);
-				url.searchParams.set("q", "health check");
-				url.searchParams.set("format", "json");
-				url.searchParams.set("engines", engine);
-				const controller = new AbortController();
-				const timer = setTimeout(() => controller.abort(), Math.min(this.timeoutMs, 5e3));
-				try {
-					const res = await fetch(url.toString(), {
-						headers: { Accept: "application/json" },
-						signal: controller.signal,
-						redirect: "error"
-					});
-					if (!res.ok) failing[engine] = `HTTP ${res.status}`;
-					else working.push(engine);
-				} finally {
-					clearTimeout(timer);
-				}
-			} catch (err) {
-				failing[engine] = err?.name === "AbortError" ? "timeout" : String(err?.message || err);
-			}
-		}));
-		return {
-			working,
-			failing
-		};
-	}
-	async search(request) {
-		if (Date.now() < this.retryAfter) throw new Error("SearXNG Retry-After cooldown active");
-		const page = Math.max(1, Math.min(5, Math.floor(request.page ?? 1) || 1));
-		const url = new URL("/search", this.baseUrl);
-		url.searchParams.set("q", request.query);
-		url.searchParams.set("format", "json");
-		url.searchParams.set("pageno", String(page));
-		if (this.engines.length > 0) url.searchParams.set("engines", this.engines.join(","));
-		if (this.disabledEngines.length > 0) url.searchParams.set("disabled_engines", this.disabledEngines.join(","));
-		if (request.language) url.searchParams.set("language", request.language);
-		if (request.category) url.searchParams.set("categories", request.category);
-		if (request.freshness && request.freshness !== "any" && request.freshness !== "realtime") url.searchParams.set("time_range", request.freshness === "week" ? "month" : request.freshness);
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-		try {
-			const res = await fetch(url.toString(), {
-				headers: { Accept: "application/json" },
-				signal: controller.signal,
-				redirect: "error"
-			});
-			if (!res.ok) {
-				if (res.status === 429 || res.status === 503) {
-					const value = res.headers.get("Retry-After") || "";
-					const deadline = /^\d+$/.test(value) ? Date.now() + Number(value) * 1e3 : Date.parse(value);
-					this.retryAfter = Math.max(Date.now() + 3e4, Number.isFinite(deadline) ? deadline : 0);
-				}
-				this.lastDiagnostics = {
-					httpStatus: res.status,
-					page,
-					error: `HTTP ${res.status}`
-				};
-				throw new Error(`SearXNG returned HTTP ${res.status}: ${res.statusText}`);
-			}
-			const data = await res.json();
-			clearTimeout(timer);
-			const engines = data?.engines && typeof data.engines === "object" ? data.engines : void 0;
-			const unresponsive = Array.isArray(data?.unresponsive_engines) ? data.unresponsive_engines.map((e) => String(e)) : [];
-			const engineFailures = {};
-			if (engines) {
-				for (const [name, info] of Object.entries(engines)) if (info && typeof info === "object" && ("error" in info || typeof info.timed_out !== "undefined" && info.timed_out)) engineFailures[name] = String(info.error || "engine failed");
-			}
-			this.lastDiagnostics = {
-				httpStatus: res.status,
-				engines: engineFailures,
-				unresponsiveEngines: unresponsive,
-				page
-			};
-			if (!data || !Array.isArray(data.results)) return [];
-			const limit = request.maxResults ?? 10;
-			const results = [];
-			for (let i = 0; i < Math.min(data.results.length, limit); i++) results.push(normalizeRawSearchResult(data.results[i], request.query, i + 1, page));
-			return results;
-		} catch (err) {
-			clearTimeout(timer);
-			if (err.name === "AbortError") {
-				this.lastDiagnostics = {
-					page,
-					error: "timeout"
-				};
-				throw new Error(`SearXNG request timed out after ${this.timeoutMs}ms`);
-			}
-			if (!this.lastDiagnostics) this.lastDiagnostics = {
-				page,
-				error: String(err?.message || err)
-			};
-			throw err;
 		}
 	}
 };
@@ -1594,140 +1895,390 @@ var HttpFetcher = class {
 	}
 };
 //#endregion
-//#region src/web/extraction/metadata.ts
-function extractPageMetadata(html) {
-	const meta = {};
-	const canonicalMatch = html.match(/<link\s+[^>]*rel=["']canonical["'][^>]*href=["']([^"']+)["']/i) || html.match(/<link\s+[^>]*href=["']([^"']+)["'][^>]*rel=["']canonical["']/i);
-	if (canonicalMatch) meta.canonicalUrl = canonicalMatch[1].trim();
-	const ogTitleMatch = html.match(/<meta\s+[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*content=["']([^"']+)["'][^>]*property=["']og:title["']/i);
-	if (ogTitleMatch) meta.title = ogTitleMatch[1].trim();
-	else {
-		const titleTagMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-		if (titleTagMatch) meta.title = titleTagMatch[1].replace(/\s+/g, " ").trim();
-		else {
-			const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-			if (h1Match) meta.title = h1Match[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-		}
+//#region src/web/fetch/github_fast_path.ts
+/**
+* GitHub fast path: github.com pages are heavy JS shells that the raw,
+* no-render fetcher extracts poorly, while the underlying content is freely
+* available as plain text. Blob URLs map deterministically onto
+* raw.githubusercontent.com; repository roots map onto the README at the
+* default branch. Failures fall back to the ordinary HTML fetch, so the fast
+* path can only add content, never remove it.
+*/
+var GITHUB_HOST = "github.com";
+var RAW_HOST = "https://raw.githubusercontent.com";
+function safeSegment(value) {
+	return value.length > 0 && !value.includes("\\") && !/^\.+$/.test(value);
+}
+/** Map a github.com URL onto its raw content URL(s); null when not applicable. */
+function toGitHubRawCandidates(url) {
+	let parsed;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return null;
 	}
-	const descMatch = html.match(/<meta\s+[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*property=["']og:description["'][^>]*content=["']([^"']+)["']/i);
-	if (descMatch) meta.description = descMatch[1].trim();
-	const authorMatch = html.match(/<meta\s+[^>]*name=["']author["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*property=["']article:author["'][^>]*content=["']([^"']+)["']/i);
-	if (authorMatch) meta.author = authorMatch[1].trim();
-	const dateMatch = html.match(/<meta\s+[^>]*property=["']article:published_time["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*name=["']publish-date["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*name=["']date["'][^>]*content=["']([^"']+)["']/i) || html.match(/<meta\s+[^>]*itemprop=["']datePublished["'][^>]*content=["']([^"']+)["']/i);
-	if (dateMatch) meta.publishedAt = dateMatch[1].trim();
-	const jsonLdMatches = html.matchAll(/<script\s+[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
-	for (const match of jsonLdMatches) try {
-		const parsed = JSON.parse(match[1]);
-		const items = Array.isArray(parsed) ? parsed : [parsed];
-		for (const item of items) {
-			if (!meta.publishedAt && item.datePublished) meta.publishedAt = String(item.datePublished);
-			if (!meta.author && item.author) {
-				if (typeof item.author === "string") meta.author = item.author;
-				else if (item.author.name) meta.author = item.author.name;
-			}
-			if (!meta.title && item.headline) meta.title = String(item.headline);
+	if (parsed.hostname !== GITHUB_HOST || parsed.protocol !== "https:") return null;
+	const segments = parsed.pathname.split("/").filter((s) => s.length > 0);
+	if (segments.length < 2 || !segments.every(safeSegment)) return null;
+	if ((/* @__PURE__ */ new Set([
+		"settings",
+		"topics",
+		"orgs",
+		"organizations",
+		"marketplace",
+		"pulls",
+		"issues",
+		"notifications",
+		"explore",
+		"trending",
+		"features",
+		"security",
+		"pricing",
+		"sponsors",
+		"collections"
+	])).has(segments[0].toLowerCase())) return null;
+	const [owner, repo, third, fourth, ...rest] = segments;
+	if (segments.length === 2) return [
+		{
+			rawUrl: `${RAW_HOST}/${owner}/${repo}/HEAD/README.md`,
+			kind: "readme"
+		},
+		{
+			rawUrl: `${RAW_HOST}/${owner}/${repo}/main/README.md`,
+			kind: "readme"
+		},
+		{
+			rawUrl: `${RAW_HOST}/${owner}/${repo}/master/README.md`,
+			kind: "readme"
 		}
-	} catch {}
-	return meta;
+	];
+	if (third === "blob" && fourth && rest.length >= 0) return [{
+		rawUrl: `${RAW_HOST}/${owner}/${repo}/${[fourth, ...rest].map(encodeURIComponent).join("/")}`,
+		kind: "blob"
+	}];
+	return null;
+}
+/** True when a fast-path candidate response actually carries usable content. */
+function isUsableRawResponse(status, mime, body, kind) {
+	if (status !== 200 || !body) return false;
+	if (kind === "blob") return body.trim().length > 0;
+	return (!mime || /^(text\/(plain|markdown)|application\/octet-stream)/.test(mime)) && body.trim().length > 60;
 }
 //#endregion
-//#region src/web/extraction/main_content.ts
+//#region src/web/fetch/wayback.ts
 /**
-* Main Content Extractor: Extracts readable article/page text, strips boilerplate
-* (nav, ads, cookie notices, scripts, footers), preserves heading structure,
-* and generates content fingerprints.
+* Wayback Machine fallback: recovers a failed page fetch from the Internet
+* Archive. Only consulted after a live fetch fails or returns no usable body,
+* so it costs nothing on healthy pages. The CDX availability lookup and the
+* snapshot download both travel through the same pinned, SSRF-checked fetcher;
+* archive.org permits automated fetching (its robots.txt only disallows
+* /control/ and /report/) and web.archive.org publishes no robots.txt.
 */
-/**
-* Computes a fast deterministic SHA-256 or djb2 hash string.
-*/
-function computeContentHash(text) {
-	let h1 = 3735928559;
-	let h2 = 1103547991;
-	for (let i = 0; i < text.length; i++) {
-		const ch = text.charCodeAt(i);
-		h1 = Math.imul(h1 ^ ch, 2654435761);
-		h2 = Math.imul(h2 ^ ch, 1597334677);
+var CDX_URL = "https://archive.org/wayback/available";
+var CDX_TIMEOUT_MS = 8e3;
+function isHttpUrl(url) {
+	try {
+		return /^https?:$/.test(new URL(url).protocol);
+	} catch {
+		return false;
 	}
-	h1 = Math.imul(h1 ^ h1 >>> 16, 2246822507) ^ Math.imul(h2 ^ h2 >>> 13, 3266489909);
-	h2 = Math.imul(h2 ^ h2 >>> 16, 2246822507) ^ Math.imul(h1 ^ h1 >>> 13, 3266489909);
-	return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
 }
-function extractMainContent(html, fallbackTitle = "") {
-	const meta = extractPageMetadata(html);
-	if (!/<[a-z][\s\S]*>/i.test(html)) {
-		const clean = html.trim();
+/** Look up the closest archived snapshot for a URL. Returns null on any miss. */
+async function queryWaybackSnapshot(url, fetcher) {
+	if (!isHttpUrl(url)) return null;
+	try {
+		const res = await fetcher.fetch(`${CDX_URL}?url=${encodeURIComponent(url)}`, {
+			timeoutSeconds: Math.ceil(CDX_TIMEOUT_MS / 1e3),
+			maxBytes: 262144
+		});
+		if (!res.success || !res.body) return null;
+		const closest = JSON.parse(res.body).archived_snapshots?.closest;
+		if (!closest?.url || closest.available === false) return null;
+		if (!closest.url.startsWith("https://web.archive.org/")) return null;
+		const ts = closest.timestamp ?? "";
+		const archivedAt = /^\d{8}/.test(ts) ? `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}` : "unknown date";
 		return {
-			title: meta.title || fallbackTitle,
-			author: meta.author,
-			publishedAt: meta.publishedAt,
-			canonicalUrl: meta.canonicalUrl,
-			description: meta.description,
-			text: clean,
-			contentHash: computeContentHash(clean),
-			characters: clean.length,
-			confidence: .9,
-			method: "plain_text",
-			headings: [],
-			links: [],
-			tables: []
+			snapshotUrl: closest.url,
+			archivedAt
+		};
+	} catch {
+		return null;
+	}
+}
+/**
+* Attempt full recovery of a URL from the Wayback Machine: snapshot lookup,
+* bounded download, main-content extraction, and an explicit provenance line
+* prepended to the text so downstream synthesis knows this is an archived copy.
+*/
+async function fetchViaWayback(originalUrl, fetcher, options = {}) {
+	const snapshot = await queryWaybackSnapshot(originalUrl, fetcher);
+	if (!snapshot) return null;
+	try {
+		const res = await fetcher.fetch(snapshot.snapshotUrl, {
+			timeoutSeconds: options.timeoutSeconds,
+			maxBytes: options.maxBytes
+		});
+		if (!res.success || !res.body || res.body.length < 150) return null;
+		const extraction = extractMainContent(res.body, options.titleHint || originalUrl);
+		if (!extraction.text || extraction.text.trim().length < 50) return null;
+		const provenance = `> [via Wayback Machine, archived ${snapshot.archivedAt}] — live page was unavailable\n\n`;
+		return {
+			originalUrl,
+			title: `[Archived] ${extraction.title || options.titleHint || originalUrl}`,
+			text: provenance + extraction.text,
+			snapshotUrl: res.finalUrl || snapshot.snapshotUrl,
+			archivedAt: snapshot.archivedAt
+		};
+	} catch {
+		return null;
+	}
+}
+//#endregion
+//#region src/web/fetch/challenge.ts
+var CHALLENGE_MISS_REASON = "challenge_detected";
+var BODY_SCAN_LIMIT = 65536;
+var BODY_MARKERS = [
+	{
+		marker: "title:just-a-moment",
+		re: /<title[^>]*>\s*just a moment/i
+	},
+	{
+		marker: "cf-chl",
+		re: /cf-chl/i
+	},
+	{
+		marker: "challenge-platform",
+		re: /challenge-platform/i
+	},
+	{
+		marker: "_cf_chl_opt",
+		re: /_cf_chl_opt/i
+	}
+];
+function detectChallenge(status, body) {
+	if (status === 403 || status === 503) {
+		if (body) {
+			const head = body.slice(0, BODY_SCAN_LIMIT);
+			for (const { marker, re } of BODY_MARKERS) if (re.test(head)) return {
+				kind: "status_headers",
+				marker: `status_${status}:${marker}`
+			};
+		}
+	}
+	if (body) {
+		const head = body.slice(0, BODY_SCAN_LIMIT);
+		for (const { marker, re } of BODY_MARKERS) if (re.test(head)) return {
+			kind: "interstitial_body",
+			marker
 		};
 	}
-	let processed = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "").replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "").replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, "").replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, "").replace(/<!--[\s\S]*?-->/g, "");
-	for (const tag of [
-		"nav",
-		"header",
-		"footer",
-		"aside",
-		"form",
-		"dialog"
-	]) {
-		const regex = new RegExp(`<${tag}\\b[^<]*(?:(?!<\\/${tag}>)<[^<]*)*<\\/${tag}>`, "gi");
-		processed = processed.replace(regex, "");
+	return null;
+}
+//#endregion
+//#region src/web/fetch/cascade.ts
+/**
+* In-process fetch cascade modeled on self-hosted SearXNG stacks:
+* GitHub raw content → live HTML fetch → Wayback Machine.
+*
+* No headless browser, Firecrawl, or Crawl4AI: those need extra containers
+* and RAM that a local-model desktop harness should not require. Each stage
+* is optional and fail-soft. Challenge interstitials are treated as misses.
+*/
+function domainOf(url) {
+	try {
+		return new URL(url).hostname.toLowerCase();
+	} catch {
+		return "";
 	}
-	processed = processed.replace(/<div[^>]*(id|class)=["'][^"']*(cookie|banner|advertisement|sponsor|popup|modal|consent)[^"']*["'][^<]*(?:(?!<\/div>)<[^<]*)*<\/div>/gi, "");
-	let articleContent = "";
-	const mainOrArticleMatch = processed.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i) || processed.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i);
-	let method = "heuristic_strip";
-	if (mainOrArticleMatch && mainOrArticleMatch[1].trim().length > 300) {
-		articleContent = mainOrArticleMatch[1];
-		method = "article_dom";
-	} else articleContent = processed;
-	const headings = [];
-	const headingTexts = [...articleContent.matchAll(/<h[1-6]\b[^>]*>([\s\S]*?)<\/h[1-6]>/gi)].map((m) => m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean);
-	headings.push(...headingTexts.slice(0, 50));
-	const links = [...articleContent.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi)].map((m) => ({
-		href: m[1].trim(),
-		text: m[2].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200)
-	})).filter((l) => l.href && /^https?:\/\//i.test(l.href)).slice(0, 100);
-	const tables = [...articleContent.matchAll(/<table\b[^>]*>([\s\S]*?)<\/table>/gi)].slice(0, 10).flatMap((m) => [...m[1].matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)].slice(0, 30).map((row) => [...row[1].matchAll(/<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]>/gi)].map((cell) => cell[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300)).filter(Boolean).join(" | ")).filter((row) => row.length > 0));
-	articleContent = articleContent.replace(/<h1\b[^>]*>([\s\S]*?)<\/h1>/gi, "\n\n# $1\n\n");
-	articleContent = articleContent.replace(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi, "\n\n## $1\n\n");
-	articleContent = articleContent.replace(/<h3\b[^>]*>([\s\S]*?)<\/h3>/gi, "\n\n### $1\n\n");
-	articleContent = articleContent.replace(/<h[4-6]\b[^>]*>([\s\S]*?)<\/h[4-6]>/gi, "\n\n#### $1\n\n");
-	articleContent = articleContent.replace(/<p\b[^>]*>([\s\S]*?)<\/p>/gi, "\n\n$1\n\n");
-	articleContent = articleContent.replace(/<br\s*\/?>/gi, "\n");
-	articleContent = articleContent.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, "\n- $1");
-	articleContent = articleContent.replace(/<th\b[^>]*>([\s\S]*?)<\/th>/gi, " | $1");
-	articleContent = articleContent.replace(/<td\b[^>]*>([\s\S]*?)<\/td>/gi, " | $1");
-	articleContent = articleContent.replace(/<\/tr>/gi, " |\n");
-	let text = articleContent.replace(/<[^>]+>/g, " ");
-	text = text.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, "\"").replace(/&#39;/gi, "'").replace(/&#x27;/gi, "'").replace(/&mdash;/gi, "—").replace(/&ndash;/gi, "–");
-	const cleanText = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0).join("\n\n");
-	const confidence = cleanText.length > 500 ? method === "article_dom" ? .95 : .85 : .6;
+}
+function isPdf(res, url) {
+	return (res.mimeType || "").split(";")[0].trim().toLowerCase() === "application/pdf" || /\.pdf(\?|#|$)/i.test(res.finalUrl || url);
+}
+function fromHtml(body, titleHint, finalUrl, method) {
+	const extraction = extractMainContent(body, titleHint);
 	return {
-		title: meta.title || fallbackTitle,
-		author: meta.author,
-		publishedAt: meta.publishedAt,
-		canonicalUrl: meta.canonicalUrl,
-		description: meta.description,
-		text: cleanText,
-		contentHash: computeContentHash(cleanText),
-		characters: cleanText.length,
-		confidence,
+		title: extraction.title || titleHint,
+		text: extraction.text,
+		finalUrl,
 		method,
-		headings,
-		links,
-		tables
+		publishedAt: extraction.publishedAt,
+		author: extraction.author,
+		canonicalUrl: extraction.canonicalUrl,
+		headings: extraction.headings,
+		links: extraction.links,
+		contentHash: extraction.contentHash
+	};
+}
+async function fetchPageCascade(url, fetcher, options = {}) {
+	const domain = domainOf(url);
+	const fetchOpts = {
+		timeoutSeconds: options.timeoutSeconds,
+		maxBytes: options.maxBytes,
+		userAgent: options.userAgent
+	};
+	const titleHint = options.titleHint || url;
+	let skippedLive = false;
+	if (options.domainStats && domain) {
+		if ((await options.domainStats.status(domain)).chronic) skippedLive = true;
+	}
+	const record = async (ok, error) => {
+		if (options.domainStats && domain) await options.domainStats.record(domain, ok, error);
+	};
+	if (!skippedLive) {
+		const github = toGitHubRawCandidates(url);
+		if (github) for (const candidate of github) {
+			const res = await fetcher.fetch(candidate.rawUrl, fetchOpts);
+			if (isUsableRawResponse(res.status, res.mimeType, res.body, candidate.kind)) {
+				await record(true);
+				return {
+					document: fromHtml(res.body, titleHint, res.finalUrl || candidate.rawUrl, "github_raw"),
+					raw: res,
+					method: "github_raw"
+				};
+			}
+		}
+		const live = await fetcher.fetch(url, fetchOpts);
+		if (live.success && live.body && live.body.length >= 150) {
+			if (isPdf(live, url)) {
+				await record(true);
+				return {
+					document: null,
+					raw: live,
+					method: "live"
+				};
+			}
+			const challenge = detectChallenge(live.status ?? 200, live.body);
+			if (challenge) await record(false, `${CHALLENGE_MISS_REASON}:${challenge.marker}`);
+			else {
+				await record(true);
+				return {
+					document: fromHtml(live.body, titleHint, live.finalUrl || url, "live"),
+					raw: live,
+					method: "live"
+				};
+			}
+		} else await record(false, live.error);
+	}
+	if (options.waybackFallback !== false) {
+		const recovered = await fetchViaWayback(url, fetcher, {
+			timeoutSeconds: options.timeoutSeconds,
+			maxBytes: options.maxBytes,
+			titleHint
+		});
+		if (recovered) return {
+			document: {
+				title: recovered.title,
+				text: recovered.text,
+				finalUrl: recovered.snapshotUrl,
+				method: "wayback",
+				contentHash: computeContentHash(recovered.text),
+				archivedAt: recovered.archivedAt
+			},
+			method: "wayback",
+			skippedLive
+		};
+	}
+	return {
+		document: null,
+		method: "failed",
+		skippedLive,
+		error: skippedLive ? "chronic domain skipped live fetch" : "fetch failed"
+	};
+}
+//#endregion
+//#region src/web/fetch/domain_stats.ts
+var DOMAIN_RECORD_TTL_SECONDS = 7776e3;
+var DomainStatsStore = class {
+	storage;
+	options;
+	constructor(storage, options = {}) {
+		this.storage = storage;
+		this.options = options;
+	}
+	get windowMs() {
+		return this.options.windowMs ?? 2592e6;
+	}
+	get minAttempts() {
+		return Math.max(2, this.options.minAttempts ?? 4);
+	}
+	get chronicFailRate() {
+		return this.options.chronicFailRate ?? .7;
+	}
+	/** Current-window view of a stored stat: an expired window reads as empty. */
+	currentWindow(stat) {
+		if (!stat || typeof stat.attempts !== "number") return {
+			attempts: 0,
+			ok: 0,
+			fail: 0,
+			windowStartMs: Date.now()
+		};
+		if (Date.now() - stat.windowStartMs <= this.windowMs) return stat;
+		return {
+			attempts: 0,
+			ok: 0,
+			fail: 0,
+			windowStartMs: stat.windowStartMs
+		};
+	}
+	async record(domain, ok, error) {
+		const key = domain.toLowerCase();
+		if (!key) return;
+		try {
+			const stored = await this.storage.get("domain_stats", key);
+			const stat = this.currentWindow(stored);
+			stat.attempts += 1;
+			if (ok) stat.ok += 1;
+			else {
+				stat.fail += 1;
+				if (error) stat.lastError = String(error).slice(0, 200);
+			}
+			stat.lastAttemptAt = (/* @__PURE__ */ new Date()).toISOString();
+			await this.storage.set("domain_stats", key, stat, DOMAIN_RECORD_TTL_SECONDS);
+		} catch {}
+	}
+	async status(domain) {
+		const key = domain.toLowerCase();
+		try {
+			const stat = this.currentWindow(await this.storage.get("domain_stats", key));
+			const failureRate = stat.attempts > 0 ? stat.fail / stat.attempts : null;
+			return {
+				attempts: stat.attempts,
+				ok: stat.ok,
+				fail: stat.fail,
+				failureRate,
+				chronic: stat.attempts >= this.minAttempts && failureRate !== null && failureRate >= this.chronicFailRate
+			};
+		} catch {
+			return {
+				attempts: 0,
+				ok: 0,
+				fail: 0,
+				failureRate: null,
+				chronic: false
+			};
+		}
+	}
+};
+/**
+* Keep chronic failing domains in the fetch list (Wayback may still recover
+* them) but move them behind hosts that have been working, so a small page
+* budget is spent on pages the live fetcher can actually read.
+*/
+async function orderByDomainHealth(results, stats) {
+	if (results.length <= 1) return {
+		ordered: results,
+		deprioritized: []
+	};
+	const healthy = [];
+	const chronic = [];
+	const deprioritized = [];
+	for (const result of results) if ((await stats.status(result.domain)).chronic) {
+		chronic.push(result);
+		if (!deprioritized.includes(result.domain)) deprioritized.push(result.domain);
+	} else healthy.push(result);
+	return {
+		ordered: [...healthy, ...chronic],
+		deprioritized
 	};
 }
 //#endregion
@@ -2041,16 +2592,77 @@ var LocalCrossEncoderReranker = class {
 };
 //#endregion
 //#region src/web/reranking/reranker.ts
+/** Exponential recency decay over a 90-day scale; 0 for missing or future dates. */
+function recencyScore(publishedAt) {
+	if (!publishedAt) return 0;
+	const ms = Date.parse(publishedAt);
+	if (Number.isNaN(ms)) return 0;
+	const ageDays = (Date.now() - ms) / 864e5;
+	if (ageDays < 0) return 0;
+	return Math.exp(-ageDays / 90);
+}
+/**
+* Adds `weight * recencyScore` to each chunk's rerank score and re-sorts.
+* Undated chunks keep their raw score — they are neither punished nor boosted.
+*/
+function applyRecencyBlend(chunks, weight) {
+	if (!weight || weight <= 0 || chunks.length <= 1) return chunks;
+	return chunks.map((c) => {
+		const recency = recencyScore(c.publishedAt);
+		if (recency === 0) return c;
+		return {
+			...c,
+			rerankScore: Math.min(1.15, (c.rerankScore ?? 0) + weight * recency)
+		};
+	}).sort((a, b) => (b.rerankScore ?? 0) - (a.rerankScore ?? 0));
+}
 var RerankerService = class {
 	crossEncoder;
 	enabled;
-	constructor(enabled = true) {
+	recencyWeight;
+	constructor(enabled = true, recencyWeight = 0) {
 		this.enabled = enabled;
+		this.recencyWeight = recencyWeight;
 		this.crossEncoder = new LocalCrossEncoderReranker();
 	}
 	async rerank(query, chunks, limit = 8) {
 		if (!this.enabled) return chunks.slice(0, limit);
-		return this.crossEncoder.rerank(query, chunks, limit);
+		return applyRecencyBlend(await this.crossEncoder.rerank(query, chunks, Number.MAX_SAFE_INTEGER), this.recencyWeight).slice(0, limit);
+	}
+};
+/**
+* Wraps a model-backed reranker (e.g. a llama.cpp /reranking cross-encoder)
+* with the lexical fallback: an unavailable or erroring reranker degrades to
+* heuristic ordering instead of failing the whole research turn. A single
+* throttled notice marks the degradation so ranking-quality drops stay
+* answerable from logs.
+*/
+var ResilientReranker = class {
+	primary;
+	recencyWeight;
+	onDegrade;
+	warned = false;
+	heuristic;
+	constructor(primary, recencyWeight = 0, onDegrade) {
+		this.primary = primary;
+		this.recencyWeight = recencyWeight;
+		this.onDegrade = onDegrade;
+		this.heuristic = new LocalCrossEncoderReranker();
+	}
+	async rerank(query, chunks, limit) {
+		if (chunks.length === 0) return [];
+		let ranked;
+		try {
+			ranked = await this.primary.rerank(query, chunks, Number.MAX_SAFE_INTEGER);
+			if (!Array.isArray(ranked) || ranked.length === 0) throw new Error("reranker returned no results");
+		} catch (error) {
+			if (!this.warned) {
+				this.warned = true;
+				this.onDegrade?.(error);
+			}
+			ranked = await this.heuristic.rerank(query, chunks, Number.MAX_SAFE_INTEGER);
+		}
+		return applyRecencyBlend(ranked, this.recencyWeight).slice(0, limit);
 	}
 };
 //#endregion
@@ -3045,6 +3657,13 @@ var SearchCache = class {
 		const key = this.makeKey(provider, query, freshness);
 		await this.storage.set("search_cache", key, results, ttlSeconds);
 	}
+	/** SearXNG answers/infoboxes/corrections/suggestions cached beside the organic results. */
+	async getMeta(provider, query, freshness = "any") {
+		return this.storage.get("search_cache", `${this.makeKey(provider, query, freshness)}::meta`);
+	}
+	async setMeta(provider, query, meta, freshness = "any", ttlSeconds = 86400) {
+		if (meta.answers.length || meta.infoboxes.length || meta.corrections.length || meta.suggestions.length) await this.storage.set("search_cache", `${this.makeKey(provider, query, freshness)}::meta`, meta, ttlSeconds);
+	}
 };
 //#endregion
 //#region src/web/cache/document_cache.ts
@@ -3277,6 +3896,7 @@ var WebSearchEngine = class {
 	fetcher;
 	searchCache;
 	documentCache;
+	domainStats;
 	weatherProvider;
 	currencyProvider;
 	timeProvider;
@@ -3296,11 +3916,13 @@ var WebSearchEngine = class {
 		}
 		this.llmProvider = deps.llmProvider;
 		this.embeddingProvider = deps.embeddingProvider || (this.config.localEmbedding ? new LocalEmbeddingProvider(this.config.localEmbedding, deps.storage) : new LocalHashingEmbeddingProvider());
-		this.reranker = deps.reranker || (this.config.localReranker && this.config.reranking.enabled ? new LocalModelReranker(this.config.localReranker) : new RerankerService(this.config.reranking.enabled));
+		const recencyWeight = this.config.reranking.recencyWeight ?? 0;
+		this.reranker = deps.reranker || (this.config.localReranker && this.config.reranking.enabled ? new ResilientReranker(new LocalModelReranker(this.config.localReranker), recencyWeight) : new RerankerService(this.config.reranking.enabled, recencyWeight));
 		this.fetcher = deps.fetcher || new HttpFetcher(this.config.fetch.globalConcurrency, this.config.fetch.perDomainConcurrency);
 		this.searchCache = new SearchCache(deps.storage);
 		this.documentCache = new DocumentCache(deps.storage);
 		this.searchStorage = deps.storage;
+		this.domainStats = this.config.fetch.domainLearning ? new DomainStatsStore(deps.storage ?? new InMemoryStorageAdapter()) : void 0;
 		this.weatherProvider = new WeatherProvider();
 		this.currencyProvider = new CurrencyProvider();
 		this.timeProvider = new TimeProvider();
@@ -3356,14 +3978,36 @@ var WebSearchEngine = class {
 	* intentionally NOT bundled: JS-dependent pages surface as snippet-only
 	* evidence with an explicit limitation (see docs).
 	*/
+	/** Direct search for agent-controlled research; no nested planning/synthesis. */
+	async searchQueries(queries) {
+		if (!Array.isArray(queries) || queries.length < 1 || queries.length > 4 || queries.some((q) => typeof q !== "string" || !q.trim() || new TextEncoder().encode(q).length > 8e3)) throw new Error("search requires 1-4 nonempty queries, at most 8000 bytes each");
+		const planned = [...new Set(queries.map((q) => q.trim()))].map((query) => ({
+			query,
+			purpose: "agent research",
+			freshness: "any"
+		}));
+		if (this.searchProvider instanceof GoogleSearchProvider && !await this.claimGoogleQuota(planned.length)) throw new Error("Google daily quota exhausted");
+		const options = {
+			maxConcurrentQueries: this.config.maxConcurrentQueries,
+			retries: this.config.searchRetries,
+			retryDelayMs: this.config.searchRetryDelayMs
+		};
+		const result = await new SearchService(this.searchProvider, options).executeSearches(planned, 10);
+		if (result.results.length || !this.fallbackProvider) return result;
+		if (this.fallbackProvider instanceof GoogleSearchProvider && !await this.claimGoogleQuota(planned.length)) return result;
+		return new SearchService(this.fallbackProvider, options).executeSearches(planned, 10);
+	}
 	async fetchUrl(rawUrl) {
-		const res = await this.fetcher.fetch(rawUrl, {
+		const outcome = await fetchPageCascade(rawUrl, this.fetcher, {
 			timeoutSeconds: this.config.fetch.timeoutSeconds,
 			maxBytes: this.config.fetch.maxBytes,
-			userAgent: this.config.fetch.userAgent
+			userAgent: this.config.fetch.userAgent,
+			waybackFallback: this.config.fetch.waybackFallback,
+			domainStats: this.domainStats
 		});
-		if (!res.success || !res.body) throw new Error(`Fetch failed: ${res.error || "unknown error"}`);
-		if ((res.mimeType || "").split(";")[0].trim().toLowerCase() === "application/pdf" || /\.pdf(\?|#|$)/i.test(res.finalUrl || rawUrl)) {
+		const res = outcome.raw;
+		const mime = (res?.mimeType || "").split(";")[0].trim().toLowerCase();
+		if (res?.success && res.body && (mime === "application/pdf" || /\.pdf(\?|#|$)/i.test(res.finalUrl || rawUrl))) {
 			const latin1 = res.body || "";
 			const pdf = extractPdfText(Uint8Array.from(latin1, (ch) => ch.charCodeAt(0) & 255), rawUrl);
 			if (pdf.needsOcr) throw new Error("OCR required: this PDF has no extractable text (scanned document). No OCR engine is bundled; install an OCR tool or supply the text directly.");
@@ -3382,18 +4026,99 @@ var WebSearchEngine = class {
 				}
 			};
 		}
-		const extraction = extractMainContent(res.body, rawUrl);
-		return {
+		if (outcome.document) return {
 			id: `fetch-${Date.now()}`,
-			url: res.finalUrl || rawUrl,
-			domain: new URL(res.finalUrl || rawUrl).hostname,
-			title: extraction.title || rawUrl,
-			text: extraction.text,
-			headings: extraction.headings,
-			links: extraction.links,
+			url: outcome.document.finalUrl || rawUrl,
+			domain: new URL(outcome.document.finalUrl || rawUrl).hostname,
+			title: outcome.document.title || rawUrl,
+			text: outcome.document.text,
+			headings: outcome.document.headings,
+			links: outcome.document.links,
+			author: outcome.document.author,
+			publishedAt: outcome.document.publishedAt,
 			retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
 			searchResultIds: [],
-			metadata: { extractionMethod: "main_content" }
+			metadata: {
+				extractionMethod: outcome.method === "github_raw" ? "github_raw" : outcome.method === "wayback" ? "wayback" : "main_content",
+				archivedAt: outcome.document.archivedAt
+			}
+		};
+		throw new Error(`Fetch failed: ${outcome.error || res?.error || "unknown error"}`);
+	}
+	async retrieveCandidate(candidate, index, freshness) {
+		if (this.config.cache.enabled) {
+			const cached = await this.documentCache.get(candidate.url);
+			if (cached) return {
+				doc: {
+					...cached,
+					id: `doc-${index + 1}`
+				},
+				method: "cache"
+			};
+		}
+		const outcome = await fetchPageCascade(candidate.url, this.fetcher, {
+			timeoutSeconds: this.config.fetch.timeoutSeconds,
+			maxBytes: this.config.fetch.maxBytes,
+			userAgent: this.config.fetch.userAgent,
+			titleHint: candidate.title,
+			waybackFallback: this.config.fetch.waybackFallback,
+			domainStats: this.domainStats
+		});
+		if (outcome.document && outcome.document.text.trim().length > 0) {
+			const doc = {
+				id: `doc-${index + 1}`,
+				url: outcome.document.finalUrl || candidate.url,
+				canonicalUrl: outcome.document.canonicalUrl || candidate.canonicalUrl,
+				domain: candidate.domain,
+				title: outcome.document.title || candidate.title,
+				author: outcome.document.author || candidate.metadata?.author,
+				publishedAt: outcome.document.publishedAt || candidate.publishedAt,
+				text: outcome.document.text,
+				headings: outcome.document.headings,
+				links: outcome.document.links,
+				contentHash: outcome.document.contentHash,
+				retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
+				searchResultIds: [candidate.id],
+				metadata: {
+					extractionMethod: outcome.method === "github_raw" ? "github_raw" : outcome.method === "wayback" ? "wayback" : "main_content",
+					archivedAt: outcome.document.archivedAt
+				}
+			};
+			if (this.config.cache.enabled && outcome.method !== "wayback") await this.documentCache.set(doc, freshness === "any" ? 86400 : 900);
+			return {
+				doc,
+				method: outcome.method,
+				skippedLive: outcome.skippedLive
+			};
+		}
+		if (candidate.snippet && candidate.snippet.trim().length > 0) {
+			const fallbackExt = fallbackSnippetExtraction(candidate.title, candidate.snippet, candidate.url);
+			return {
+				doc: {
+					id: `doc-${index + 1}`,
+					url: candidate.url,
+					canonicalUrl: candidate.canonicalUrl,
+					domain: candidate.domain,
+					title: fallbackExt.title || candidate.title,
+					author: candidate.metadata?.author,
+					publishedAt: candidate.publishedAt,
+					text: fallbackExt.text,
+					contentHash: fallbackExt.contentHash,
+					retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
+					searchResultIds: [candidate.id],
+					metadata: {
+						extractionMethod: "search_snippet",
+						fetchError: outcome.error || "fetch failed"
+					}
+				},
+				method: "search_snippet",
+				skippedLive: outcome.skippedLive
+			};
+		}
+		return {
+			doc: null,
+			method: "failed",
+			skippedLive: outcome.skippedLive
 		};
 	}
 	/**
@@ -3549,12 +4274,15 @@ var WebSearchEngine = class {
 		let searchOutcome;
 		const primaryName = this.searchProvider instanceof GoogleSearchProvider ? "google" : "searxng";
 		const cacheKey = plannedQueries.map((q) => q.query).join(";");
+		const cacheTtl = ttlForFreshness(route.freshness, this.config.cache.searchTtlSeconds.default);
 		const cachedHits = this.config.cache.enabled ? await this.searchCache.get(primaryName, cacheKey, route.freshness) : null;
+		const cachedMeta = this.config.cache.enabled ? await this.searchCache.getMeta(primaryName, cacheKey, route.freshness) : null;
 		if (cachedHits && cachedHits.length > 0) {
 			searchOutcome = {
 				results: cachedHits,
 				rawCount: cachedHits.length,
-				failureCount: 0
+				failureCount: 0,
+				meta: cachedMeta ?? emptySearchMeta()
 			};
 			trace.update({
 				providerUsed: primaryName,
@@ -3572,7 +4300,10 @@ var WebSearchEngine = class {
 				searchFailureCount: searchOutcome.failureCount
 			});
 			if (this.searchProvider instanceof SearXNGProvider && this.searchProvider.lastDiagnostics) trace.update({ searxngDiagnostics: { ...this.searchProvider.lastDiagnostics } });
-			if (this.config.cache.enabled && searchOutcome.results.length > 0) await this.searchCache.set(primaryName, cacheKey, searchOutcome.results, route.freshness, ttlForFreshness(route.freshness, this.config.cache.searchTtlSeconds.default));
+			if (this.config.cache.enabled && searchOutcome.results.length > 0) {
+				await this.searchCache.set(primaryName, cacheKey, searchOutcome.results, route.freshness, cacheTtl);
+				if (hasSearchMeta(searchOutcome.meta)) await this.searchCache.setMeta(primaryName, cacheKey, searchOutcome.meta, route.freshness, cacheTtl);
+			}
 			trace.update({
 				providerUsed: primaryName,
 				fallbackUsed: false,
@@ -3631,6 +4362,7 @@ var WebSearchEngine = class {
 						page: 2,
 						purpose: `${q.purpose} (page 2)`
 					});
+					if (extra.meta) searchOutcome.meta = mergeSearchMeta(searchOutcome.meta, extra.meta);
 				}
 			}
 			if (pagedResults.length > 0) {
@@ -3654,6 +4386,40 @@ var WebSearchEngine = class {
 				});
 			}
 		}
+		if (searchOutcome.meta.suggestions.length > 0 && searchOutcome.results.length < 3 && plannedQueries.length < totalQueryBudget) {
+			const suggestion = searchOutcome.meta.suggestions.find((s) => s.trim().length > 0 && !plannedQueries.some((q) => q.query.toLowerCase() === s.toLowerCase()));
+			if (suggestion) {
+				const extra = await new SearchService(this.searchProvider, { retries: 0 }).executeSearches([{
+					query: suggestion,
+					purpose: "SearXNG related-search suggestion",
+					freshness: route.freshness
+				}], this.config.resultsPerQuery);
+				if (extra.results.length > 0) {
+					plannedQueries.push({
+						query: suggestion,
+						purpose: "SearXNG related-search suggestion",
+						freshness: route.freshness
+					});
+					const fused = fuseSearchResults([{
+						query: "primary",
+						results: searchOutcome.results
+					}, {
+						query: suggestion,
+						results: extra.results
+					}]);
+					searchOutcome = {
+						...searchOutcome,
+						results: fused,
+						rawCount: searchOutcome.rawCount + extra.rawCount,
+						meta: mergeSearchMeta(searchOutcome.meta, extra.meta)
+					};
+					this.logger.log("search_suggestion", {
+						suggestion,
+						recovered: extra.results.length
+					});
+				}
+			}
+		}
 		trace.startTimer("ranking");
 		const rankedResults = rankSearchResults(searchOutcome.results.filter((r) => isSafeUrl(r.url)), {
 			query: question,
@@ -3664,87 +4430,48 @@ var WebSearchEngine = class {
 		});
 		trace.endTimer("ranking");
 		const pageBudget = mode === "fast" ? this.config.fetch.fastPages : mode === "deep" ? this.config.fetch.deepPages : this.config.fetch.normalPages;
-		const pagesToFetch = selectPagesToFetch(rankedResults, mode, this.config.fetch).slice(0, Math.max(1, pageBudget - retryReserve * 2));
+		let fetchPool = selectPagesToFetch(rankedResults, mode, this.config.fetch).slice(0, Math.max(1, pageBudget - retryReserve * 2));
+		let domainsDeprioritized = [];
+		if (this.domainStats) {
+			const ordered = await orderByDomainHealth(fetchPool, this.domainStats);
+			fetchPool = ordered.ordered;
+			domainsDeprioritized = ordered.deprioritized;
+		}
+		const pagesToFetch = fetchPool;
 		let pagesAttempted = pagesToFetch.length;
-		trace.update({ pagesSelected: pagesToFetch.length });
+		trace.update({
+			pagesSelected: pagesToFetch.length,
+			domainsDeprioritized
+		});
 		this.logger.log("pages_selected", { count: pagesToFetch.length });
+		const documents = documentsFromSearchMeta(searchOutcome.meta);
 		trace.startTimer("fetch_extract");
-		const documents = [];
 		let fetchFailures = 0;
 		let successfulFetches = 0;
-		let extractedTokens = 0;
+		let extractedTokens = documents.reduce((sum, d) => sum + defaultTokenCounter.count(d.text), 0);
+		let waybackRecoveries = 0;
+		const domainsChronicSkipped = [];
 		const fetchPromises = pagesToFetch.map(async (candidate, index) => {
-			if (this.config.cache.enabled) {
-				const cached = await this.documentCache.get(candidate.url);
-				if (cached) {
-					successfulFetches++;
-					return {
-						...cached,
-						id: `doc-${index + 1}`
-					};
-				}
-			}
-			const fetchRes = await this.fetcher.fetch(candidate.url, {
-				timeoutSeconds: this.config.fetch.timeoutSeconds,
-				maxBytes: this.config.fetch.maxBytes,
-				userAgent: this.config.fetch.userAgent
-			});
-			let doc = null;
-			if (!fetchRes.success || !fetchRes.body || fetchRes.body.length < 150) {
-				fetchFailures++;
-				if (candidate.snippet && candidate.snippet.trim().length > 0) {
-					const fallbackExt = fallbackSnippetExtraction(candidate.title, candidate.snippet, candidate.url);
-					doc = {
-						id: `doc-${index + 1}`,
-						url: candidate.url,
-						canonicalUrl: candidate.canonicalUrl,
-						domain: candidate.domain,
-						title: fallbackExt.title || candidate.title,
-						author: candidate.metadata?.author,
-						publishedAt: candidate.publishedAt,
-						text: fallbackExt.text,
-						contentHash: fallbackExt.contentHash,
-						retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
-						searchResultIds: [candidate.id],
-						metadata: {
-							extractionMethod: "search_snippet",
-							fetchError: fetchRes.error
-						}
-					};
-				}
-			} else {
-				successfulFetches++;
-				const extraction = extractMainContent(fetchRes.body, candidate.title);
-				doc = {
-					id: `doc-${index + 1}`,
-					url: fetchRes.finalUrl || candidate.url,
-					canonicalUrl: extraction.canonicalUrl || candidate.canonicalUrl,
-					domain: candidate.domain,
-					title: extraction.title || candidate.title,
-					author: extraction.author,
-					publishedAt: extraction.publishedAt || candidate.publishedAt,
-					text: extraction.text,
-					headings: extraction.headings,
-					links: extraction.links,
-					contentHash: extraction.contentHash,
-					retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
-					searchResultIds: [candidate.id],
-					metadata: { extractionMethod: "main_content" }
-				};
-			}
-			if (doc && this.config.cache.enabled && fetchRes.success) await this.documentCache.set(doc, route.freshness === "any" ? 86400 : 900);
-			return doc;
+			return this.retrieveCandidate(candidate, index + documents.length, route.freshness);
 		});
 		const settledDocs = await Promise.allSettled(fetchPromises);
-		for (const res of settledDocs) if (res.status === "fulfilled" && res.value) {
-			extractedTokens += defaultTokenCounter.count(res.value.text);
-			if (!documents.some((d) => d.contentHash && d.contentHash === res.value?.contentHash)) documents.push(res.value);
+		for (const res of settledDocs) if (res.status === "fulfilled" && res.value.doc) {
+			const { doc, method, skippedLive } = res.value;
+			if (method === "wayback") waybackRecoveries++;
+			if (method === "live" || method === "github_raw" || method === "wayback" || method === "cache") successfulFetches++;
+			else fetchFailures++;
+			if (skippedLive && !domainsChronicSkipped.includes(doc.domain)) domainsChronicSkipped.push(doc.domain);
+			extractedTokens += defaultTokenCounter.count(doc.text);
+			if (!documents.some((d) => d.contentHash && d.contentHash === doc.contentHash)) documents.push(doc);
 		} else if (res.status === "rejected") fetchFailures++;
+		else fetchFailures++;
 		trace.endTimer("fetch_extract");
 		trace.update({
 			pagesFetched: successfulFetches,
 			fetchFailures,
-			extractedTokens
+			extractedTokens,
+			waybackRecoveries,
+			domainsChronicSkipped
 		});
 		this.logger.log("fetch_completed", {
 			fetched: documents.length,
@@ -3869,41 +4596,12 @@ var WebSearchEngine = class {
 				rankedResults.push(...newRanked.filter((r) => !rankedResults.some((old) => old.url === r.url)));
 				const retryChunks = [];
 				for (const candidate of retryPages) {
-					let retryDoc = null;
-					const fetchRes = await this.fetcher.fetch(candidate.url, {
-						timeoutSeconds: this.config.fetch.timeoutSeconds,
-						maxBytes: this.config.fetch.maxBytes
-					});
-					if (fetchRes.success && fetchRes.body && fetchRes.body.length >= 150) {
+					const retrieved = await this.retrieveCandidate(candidate, documents.length, route.freshness);
+					const retryDoc = retrieved.doc;
+					if (retrieved.method === "live" || retrieved.method === "github_raw" || retrieved.method === "wayback" || retrieved.method === "cache") {
 						successfulFetches++;
-						const ext = extractMainContent(fetchRes.body, candidate.title);
-						retryDoc = {
-							id: `doc-${crypto.randomUUID()}`,
-							url: fetchRes.finalUrl || candidate.url,
-							canonicalUrl: ext.canonicalUrl || candidate.canonicalUrl,
-							domain: candidate.domain,
-							title: ext.title || candidate.title,
-							text: ext.text,
-							headings: ext.headings,
-							links: ext.links,
-							contentHash: ext.contentHash,
-							retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
-							searchResultIds: [candidate.id]
-						};
-					} else if (candidate.snippet && candidate.snippet.trim().length > 0) {
-						fetchFailures++;
-						const ext = fallbackSnippetExtraction(candidate.title, candidate.snippet, candidate.url);
-						retryDoc = {
-							id: `doc-${crypto.randomUUID()}`,
-							url: candidate.url,
-							domain: candidate.domain,
-							title: candidate.title,
-							text: ext.text,
-							contentHash: ext.contentHash,
-							retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
-							searchResultIds: [candidate.id]
-						};
-					}
+						if (retrieved.method === "wayback") waybackRecoveries++;
+					} else fetchFailures++;
 					if (retryDoc) {
 						extractedTokens += defaultTokenCounter.count(retryDoc.text);
 						documents.push(retryDoc);
@@ -3993,6 +4691,7 @@ var WebSearchEngine = class {
 			route,
 			queries: plannedQueries,
 			results: rankedResults,
+			searchMeta: searchOutcome.meta,
 			documents,
 			chunks: allChunks,
 			retrievedChunks: candidateChunks,
@@ -4510,7 +5209,8 @@ try {
 				passages
 			};
 		}
-	} else if (request.action === "fetch-url") {
+	} else if (request.action === "search") result = await engine.searchQueries(request.query);
+	else if (request.action === "fetch-url") {
 		const doc = await engine.fetchUrl(request.url);
 		result = {
 			id: doc.id,

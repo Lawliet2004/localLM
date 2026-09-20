@@ -64,6 +64,58 @@ export interface SearchResult {
   metadata?: Record<string, unknown>;
 }
 
+/** SearXNG direct answer from an instant-answer plugin. */
+export interface SearchAnswer {
+  answer: string;
+  url?: string;
+}
+
+/** SearXNG infobox (Wikipedia/Wikidata side panel content). */
+export interface SearchInfobox {
+  title: string;
+  content: string;
+  url?: string;
+}
+
+/**
+ * Structured SearXNG response fields beyond organic results: instant answers,
+ * infoboxes, spelling corrections and related-search suggestions.
+ */
+export interface SearchMeta {
+  answers: SearchAnswer[];
+  infoboxes: SearchInfobox[];
+  corrections: string[];
+  suggestions: string[];
+}
+
+export function emptySearchMeta(): SearchMeta {
+  return { answers: [], infoboxes: [], corrections: [], suggestions: [] };
+}
+
+export function hasSearchMeta(meta: SearchMeta): boolean {
+  return meta.answers.length > 0 || meta.infoboxes.length > 0
+    || meta.corrections.length > 0 || meta.suggestions.length > 0;
+}
+
+/** Merge SearXNG meta from concurrent/paginated queries; first-seen wins. */
+export function mergeSearchMeta(base: SearchMeta, extra: SearchMeta): SearchMeta {
+  const answers = [...base.answers];
+  for (const a of extra.answers) {
+    if (!answers.some((x) => x.answer === a.answer)) answers.push(a);
+  }
+  const infoboxes = [...base.infoboxes];
+  for (const ib of extra.infoboxes) {
+    if (!infoboxes.some((x) => x.title === ib.title && x.content === ib.content)) infoboxes.push(ib);
+  }
+  const uniq = (items: string[]) => [...new Set(items.map((s) => s.trim()).filter(Boolean))];
+  return {
+    answers: answers.slice(0, 5),
+    infoboxes: infoboxes.slice(0, 3),
+    corrections: uniq([...base.corrections, ...extra.corrections]).slice(0, 3),
+    suggestions: uniq([...base.suggestions, ...extra.suggestions]).slice(0, 8),
+  };
+}
+
 export interface RetrievedDocument {
   id: string;
   url: string;
@@ -194,6 +246,12 @@ export interface ResearchTrace {
   searchFailureCount?: number;
   searxngDiagnostics?: Record<string, unknown>;
   paginationPages?: number[];
+  /** Pages recovered from the Wayback Machine after a failed live fetch. */
+  waybackRecoveries?: number;
+  /** Chronic failing domains whose live fetch was skipped in favor of Wayback/snippets. */
+  domainsChronicSkipped?: string[];
+  /** Domains reordered to the back of the fetch queue due to past failures. */
+  domainsDeprioritized?: string[];
   extractedTokens: number;
   chunksCreated: number;
   chunksAfterRetrieval: number;
@@ -228,6 +286,8 @@ export interface ResearchSession {
   route: RouteResult;
   queries: PlannedQuery[];
   results: SearchResult[];
+  /** SearXNG direct answers / infoboxes / corrections / suggestions for this session. */
+  searchMeta?: SearchMeta;
   documents: RetrievedDocument[];
   chunks: EvidenceChunk[];
   retrievedChunks: EvidenceChunk[];

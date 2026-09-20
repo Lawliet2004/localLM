@@ -293,7 +293,7 @@ h1 { font-weight: 450; font-size: 38px; line-height: 1.22; letter-spacing: -1.3p
 /* Composer controls stay with the draft; expanded tools float above it. */
 .composer-region { max-width: 960px; }
 .composer { position: relative; border-radius: 20px; padding: 16px; }
-.composer textarea { min-height: 72px; font-size: 14px; }
+.composer textarea { min-height: 36px; font-size: 14px; }
 .composer-bottom { margin-top: 12px; flex-wrap: wrap; }
 .composer-bottom > .composer-actions { gap: 8px; flex: 1; min-width: 0; justify-content: flex-start; }
 .composer-bottom > .composer-send { gap: 12px; margin-left: auto; }

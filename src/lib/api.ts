@@ -1,10 +1,11 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import type {
-  Project, TaskMeta, WorkspaceIndex, Schedule, InstalledPlugin,
+  Project, TaskMeta, WorkspaceIndex,
   ArtifactRecord,
   Bootstrap,
   Capability,
   ChatEvent,
+  TodoItem,
   ConnectorView,
   Conversation,
   ConversationTools,
@@ -75,16 +76,6 @@ export const api = {
     const channel = new Channel<{stream: string; chunk: string}>(); channel.onmessage = onChunk;
     return invoke<{stdout: string; stderr: string; exitCode: number | null; error?: string; durationMs: number}>('workspace_command', { command, channel });
   },
-  listSchedules: () => invoke<Schedule[]>('list_schedules'),
-  saveSchedule: (schedule: Schedule) => invoke<Schedule>('save_schedule', { schedule }),
-  deleteSchedule: (id: string) => invoke<boolean>('delete_schedule', { id }),
-  runScheduleNow: (id: string) => invoke<string>('run_schedule_now', { id }),
-  listPlugins: () => invoke<InstalledPlugin[]>('list_plugins'),
-  installPlugin: (path: string) => invoke<InstalledPlugin>('install_plugin', { path }),
-  setPluginEnabled: (name: string, enabled: boolean) => invoke<InstalledPlugin[]>('set_plugin_enabled', { name, enabled }),
-  removePlugin: (name: string) => invoke<boolean>('remove_plugin', { name }),
-  testPlugin: (path: string) => invoke<Record<string, unknown>>('test_plugin', { path }),
-  scanPlugin: (path: string) => invoke<{verdict: string; findings: string[]}>('scan_plugin', { path }),
   readLocalConnector: (id: string) => invoke<LocalServerConfig>('read_local_connector', { id }),
   saveLocalConnector: (server: LocalServerConfig) => invoke<void>('save_local_connector', { server }),
   removeLocalConnector: (id: string) => invoke<void>('remove_local_connector', { id }),
@@ -186,6 +177,8 @@ export const api = {
   cancelGeneration: () => invoke<void>('cancel_generation'),
   resolveToolApproval: (id: string, allow: boolean) => invoke<void>('resolve_tool_approval', { id, allow }),
   resolveAskUser: (id: string, choice: string | null) => invoke<void>('resolve_ask_user', { id, choice }),
+  getTodos: (conversationId: string) => invoke<TodoItem[]>('get_todos', { conversationId }),
+  getGoal: (conversationId: string) => invoke<string | null>('get_goal', { conversationId }),
   getSessionEvents: (conversationId: string, fromSeq?: number | null, limit?: number | null) =>
     invoke<SessionEvent[]>('get_session_events', { conversationId, fromSeq, limit }),
   forkSession: (conversationId: string, fromSeq: number) =>

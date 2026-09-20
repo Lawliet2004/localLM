@@ -41,6 +41,8 @@ export const DEFAULT_CONFIG: WebSearchConfig = {
     globalConcurrency: 8,
     perDomainConcurrency: 2,
     userAgent: 'LocalLM-Research/1.0 (+https://github.com/locallm/desktop)',
+    waybackFallback: true,
+    domainLearning: true,
     userAgents: [
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -63,6 +65,7 @@ export const DEFAULT_CONFIG: WebSearchConfig = {
   },
   reranking: {
     enabled: false,
+    recencyWeight: 0.15,
   },
   ranking: {
     semanticWeight: 0.35,
@@ -137,6 +140,7 @@ export function createConfig(overrides?: Partial<WebSearchConfig>): WebSearchCon
         maxChunksPerDoc: 2,
       },
       reranking: {
+        ...base.reranking,
         enabled: false, // disable cross-encoder on low RAM
       },
       context: {

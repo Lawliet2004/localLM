@@ -7,8 +7,10 @@
  * reported per query instead of failing the whole batch.
  */
 
-import type { PlannedQuery, SearchProvider, SearchResult } from '../types';
+import type { PlannedQuery, SearchMeta, SearchProvider, SearchResult } from '../types';
+import { emptySearchMeta, mergeSearchMeta } from '../types';
 import { fuseSearchResults } from './result_fusion';
+import { metaForResults } from './searxng_provider';
 
 export interface SearchServiceOptions {
   maxConcurrentQueries?: number;
@@ -56,14 +58,15 @@ export class SearchService {
   async executeSearches(
     queries: PlannedQuery[],
     maxResultsPerQuery: number = 10
-  ): Promise<{ results: SearchResult[]; rawCount: number; failureCount: number; failures: QueryFailure[] }> {
+  ): Promise<{ results: SearchResult[]; rawCount: number; failureCount: number; failures: QueryFailure[]; meta: SearchMeta }> {
     if (queries.length === 0) {
-      return { results: [], rawCount: 0, failureCount: 0, failures: [] };
+      return { results: [], rawCount: 0, failureCount: 0, failures: [], meta: emptySearchMeta() };
     }
 
     const successfulGroups: Array<{ query: string; results: SearchResult[] }> = [];
     const failures: QueryFailure[] = [];
     let rawCount = 0;
+    let meta = emptySearchMeta();
 
     const queue = [...queries];
     const workers = Array.from({ length: Math.min(this.maxConcurrent, queue.length) }, async () => {
@@ -73,6 +76,8 @@ export class SearchService {
           const hits = await this.searchOnce(q, maxResultsPerQuery);
           successfulGroups.push({ query: q.query, results: hits });
           rawCount += hits.length;
+          const attached = metaForResults(hits);
+          if (attached) meta = mergeSearchMeta(meta, attached);
         } catch (err: any) {
           failures.push({ query: q.query, error: String(err?.message || err) });
         }
@@ -87,6 +92,7 @@ export class SearchService {
       rawCount,
       failureCount: failures.length,
       failures,
+      meta,
     };
   }
 
@@ -94,10 +100,10 @@ export class SearchService {
     query: PlannedQuery,
     page: number,
     maxResultsPerQuery: number = 10,
-  ): Promise<{ results: SearchResult[]; error?: string }> {
+  ): Promise<{ results: SearchResult[]; meta?: SearchMeta; error?: string }> {
     try {
       const hits = await this.searchOnce({ ...query, page }, maxResultsPerQuery);
-      return { results: hits };
+      return { results: hits, meta: metaForResults(hits) };
     } catch (err: any) {
       return { results: [], error: String(err?.message || err) };
     }

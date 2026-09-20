@@ -19,7 +19,10 @@ import type {
   ExtractedFact,
   EvidenceClaim,
   TokenStats,
+  SearchMeta,
+  SearchResult,
 } from './types';
+import { emptySearchMeta, hasSearchMeta, mergeSearchMeta } from './types';
 import { createConfig } from './config/defaults';
 import type { WebSearchConfig } from './config/schema';
 import { fuseSearchResults } from './search/result_fusion';
@@ -28,17 +31,18 @@ import { normalizeRequest } from './router/request_normalizer';
 import { routeRequest } from './router/intent_router';
 import { QueryPlanner } from './planning/query_planner';
 import { SearchService } from './search/search_service';
-import { SearXNGProvider } from './search/searxng_provider';
+import { SearXNGProvider, documentsFromSearchMeta } from './search/searxng_provider';
 import { GoogleSearchProvider } from './search/google_provider';
 import { rankSearchResults } from './ranking/search_ranker';
 import { selectPagesToFetch } from './fetch/fetch_policy';
 import { HttpFetcher } from './fetch/http_fetcher';
-import { extractMainContent } from './extraction/main_content';
+import { fetchPageCascade } from './fetch/cascade';
+import { DomainStatsStore, orderByDomainHealth } from './fetch/domain_stats';
 import { fallbackSnippetExtraction } from './extraction/extraction_fallback';
 import { chunkDocument } from './chunking/semantic_chunker';
 import { LocalHashingEmbeddingProvider } from './retrieval/embeddings';
 import { HybridRetriever } from './retrieval/hybrid_retriever';
-import { RerankerService } from './reranking/reranker';
+import { RerankerService, ResilientReranker } from './reranking/reranker';
 import { SourceManager } from './evidence/source_registry';
 import { EvidenceExtractor } from './evidence/extractor';
 import { deduplicateFacts } from './evidence/deduplicator';
@@ -58,7 +62,7 @@ import { DocumentCache } from './cache/document_cache';
 import { PipelineLogger } from './observability/logger';
 import { TraceCollector } from './observability/trace';
 import { defaultTokenCounter } from './chunking/tokenizer';
-import type { StorageAdapter } from './cache/sqlite';
+import { InMemoryStorageAdapter, type StorageAdapter } from './cache/sqlite';
 import { LocalEmbeddingProvider, LocalModelReranker } from './models/retrieval_providers';
 import { coverageMatrix } from './planning/coverage';
 import { isSafeUrl } from './security/ssrf_guard';
@@ -89,6 +93,7 @@ export class WebSearchEngine {
   private fetcher: Pick<HttpFetcher, 'fetch'>;
   private searchCache: SearchCache;
   private documentCache: DocumentCache;
+  private domainStats?: DomainStatsStore;
   private weatherProvider: WeatherProvider;
   private currencyProvider: CurrencyProvider;
   private timeProvider: TimeProvider;
@@ -111,7 +116,12 @@ export class WebSearchEngine {
     }
     this.llmProvider = deps.llmProvider;
     this.embeddingProvider = deps.embeddingProvider || (this.config.localEmbedding ? new LocalEmbeddingProvider(this.config.localEmbedding, deps.storage) : new LocalHashingEmbeddingProvider());
-    this.reranker = deps.reranker || (this.config.localReranker && this.config.reranking.enabled ? new LocalModelReranker(this.config.localReranker) : new RerankerService(this.config.reranking.enabled));
+    const recencyWeight = this.config.reranking.recencyWeight ?? 0;
+    this.reranker = deps.reranker || (
+      this.config.localReranker && this.config.reranking.enabled
+        ? new ResilientReranker(new LocalModelReranker(this.config.localReranker), recencyWeight)
+        : new RerankerService(this.config.reranking.enabled, recencyWeight)
+    );
     this.fetcher =
       deps.fetcher ||
       new HttpFetcher(
@@ -121,6 +131,9 @@ export class WebSearchEngine {
     this.searchCache = new SearchCache(deps.storage);
     this.documentCache = new DocumentCache(deps.storage);
     this.searchStorage = deps.storage;
+    this.domainStats = this.config.fetch.domainLearning
+      ? new DomainStatsStore(deps.storage ?? new InMemoryStorageAdapter())
+      : undefined;
     this.weatherProvider = new WeatherProvider();
     this.currencyProvider = new CurrencyProvider();
     this.timeProvider = new TimeProvider();
@@ -189,17 +202,34 @@ export class WebSearchEngine {
    * intentionally NOT bundled: JS-dependent pages surface as snippet-only
    * evidence with an explicit limitation (see docs).
    */
+  /** Direct search for agent-controlled research; no nested planning/synthesis. */
+  async searchQueries(queries: string[]) {
+    if (!Array.isArray(queries) || queries.length < 1 || queries.length > 4 ||
+        queries.some(q => typeof q !== 'string' || !q.trim() || new TextEncoder().encode(q).length > 8000)) {
+      throw new Error('search requires 1-4 nonempty queries, at most 8000 bytes each');
+    }
+    const planned = [...new Set(queries.map(q => q.trim()))].map(query => ({ query, purpose: 'agent research', freshness: 'any' as const }));
+    if (this.searchProvider instanceof GoogleSearchProvider && !(await this.claimGoogleQuota(planned.length))) {
+      throw new Error('Google daily quota exhausted');
+    }
+    const options = { maxConcurrentQueries: this.config.maxConcurrentQueries, retries: this.config.searchRetries, retryDelayMs: this.config.searchRetryDelayMs };
+    const result = await new SearchService(this.searchProvider, options).executeSearches(planned, 10);
+    if (result.results.length || !this.fallbackProvider) return result;
+    if (this.fallbackProvider instanceof GoogleSearchProvider && !(await this.claimGoogleQuota(planned.length))) return result;
+    return new SearchService(this.fallbackProvider, options).executeSearches(planned, 10);
+  }
+
   async fetchUrl(rawUrl: string): Promise<RetrievedDocument> {
-    const res = await this.fetcher.fetch(rawUrl, {
+    const outcome = await fetchPageCascade(rawUrl, this.fetcher, {
       timeoutSeconds: this.config.fetch.timeoutSeconds,
       maxBytes: this.config.fetch.maxBytes,
       userAgent: this.config.fetch.userAgent,
+      waybackFallback: this.config.fetch.waybackFallback,
+      domainStats: this.domainStats,
     });
-    if (!res.success || !res.body) {
-      throw new Error(`Fetch failed: ${res.error || 'unknown error'}`);
-    }
-    const mime = (res.mimeType || '').split(';')[0].trim().toLowerCase();
-    if (mime === 'application/pdf' || /\.pdf(\?|#|$)/i.test(res.finalUrl || rawUrl)) {
+    const res = outcome.raw;
+    const mime = (res?.mimeType || '').split(';')[0].trim().toLowerCase();
+    if (res?.success && res.body && (mime === 'application/pdf' || /\.pdf(\?|#|$)/i.test(res.finalUrl || rawUrl))) {
       const latin1 = res.body || '';
       const bytes = Uint8Array.from(latin1, (ch) => ch.charCodeAt(0) & 0xff);
       const pdf = extractPdfText(bytes, rawUrl);
@@ -221,19 +251,98 @@ export class WebSearchEngine {
         metadata: { extractionMethod: 'pdf_text', pageCount: pdf.pages.length },
       };
     }
-    const extraction = extractMainContent(res.body, rawUrl);
-    return {
-      id: `fetch-${Date.now()}`,
-      url: res.finalUrl || rawUrl,
-      domain: new URL(res.finalUrl || rawUrl).hostname,
-      title: extraction.title || rawUrl,
-      text: extraction.text,
-      headings: extraction.headings,
-      links: extraction.links,
-      retrievedAt: new Date().toISOString(),
-      searchResultIds: [],
-      metadata: { extractionMethod: 'main_content' },
-    };
+    if (outcome.document) {
+      return {
+        id: `fetch-${Date.now()}`,
+        url: outcome.document.finalUrl || rawUrl,
+        domain: new URL(outcome.document.finalUrl || rawUrl).hostname,
+        title: outcome.document.title || rawUrl,
+        text: outcome.document.text,
+        headings: outcome.document.headings,
+        links: outcome.document.links,
+        author: outcome.document.author,
+        publishedAt: outcome.document.publishedAt,
+        retrievedAt: new Date().toISOString(),
+        searchResultIds: [],
+        metadata: {
+          extractionMethod: outcome.method === 'github_raw' ? 'github_raw'
+            : outcome.method === 'wayback' ? 'wayback' : 'main_content',
+          archivedAt: outcome.document.archivedAt,
+        },
+      };
+    }
+    throw new Error(`Fetch failed: ${outcome.error || res?.error || 'unknown error'}`);
+  }
+
+  private async retrieveCandidate(
+    candidate: SearchResult,
+    index: number,
+    freshness: string,
+  ): Promise<{ doc: RetrievedDocument | null; method: string; skippedLive?: boolean }> {
+    if (this.config.cache.enabled) {
+      const cached = await this.documentCache.get(candidate.url);
+      if (cached) return { doc: { ...cached, id: `doc-${index + 1}` }, method: 'cache' };
+    }
+
+    const outcome = await fetchPageCascade(candidate.url, this.fetcher, {
+      timeoutSeconds: this.config.fetch.timeoutSeconds,
+      maxBytes: this.config.fetch.maxBytes,
+      userAgent: this.config.fetch.userAgent,
+      titleHint: candidate.title,
+      waybackFallback: this.config.fetch.waybackFallback,
+      domainStats: this.domainStats,
+    });
+
+    if (outcome.document && outcome.document.text.trim().length > 0) {
+      const doc: RetrievedDocument = {
+        id: `doc-${index + 1}`,
+        url: outcome.document.finalUrl || candidate.url,
+        canonicalUrl: outcome.document.canonicalUrl || candidate.canonicalUrl,
+        domain: candidate.domain,
+        title: outcome.document.title || candidate.title,
+        author: outcome.document.author || (candidate.metadata?.author as string | undefined),
+        publishedAt: outcome.document.publishedAt || candidate.publishedAt,
+        text: outcome.document.text,
+        headings: outcome.document.headings,
+        links: outcome.document.links,
+        contentHash: outcome.document.contentHash,
+        retrievedAt: new Date().toISOString(),
+        searchResultIds: [candidate.id],
+        metadata: {
+          extractionMethod: outcome.method === 'github_raw' ? 'github_raw'
+            : outcome.method === 'wayback' ? 'wayback' : 'main_content',
+          archivedAt: outcome.document.archivedAt,
+        },
+      };
+      if (this.config.cache.enabled && outcome.method !== 'wayback') {
+        await this.documentCache.set(doc, freshness === 'any' ? 86400 : 900);
+      }
+      return { doc, method: outcome.method, skippedLive: outcome.skippedLive };
+    }
+
+    if (candidate.snippet && candidate.snippet.trim().length > 0) {
+      const fallbackExt = fallbackSnippetExtraction(candidate.title, candidate.snippet, candidate.url);
+      return {
+        doc: {
+          id: `doc-${index + 1}`,
+          url: candidate.url,
+          canonicalUrl: candidate.canonicalUrl,
+          domain: candidate.domain,
+          title: fallbackExt.title || candidate.title,
+          author: candidate.metadata?.author as string | undefined,
+          publishedAt: candidate.publishedAt,
+          text: fallbackExt.text,
+          contentHash: fallbackExt.contentHash,
+          retrievedAt: new Date().toISOString(),
+          searchResultIds: [candidate.id],
+          metadata: { extractionMethod: 'search_snippet', fetchError: outcome.error || 'fetch failed' },
+        },
+        method: 'search_snippet',
+        skippedLive: outcome.skippedLive,
+      };
+    }
+
+    return { doc: null, method: 'failed', skippedLive: outcome.skippedLive };
   }
 
   /**
@@ -428,15 +537,19 @@ export class WebSearchEngine {
 
     // Step 3: Concurrent Search Execution with Caching
     trace.startTimer('search');
-    let searchOutcome;
+    let searchOutcome: { results: SearchResult[]; rawCount: number; failureCount: number; failures?: Array<{ query: string; error: string }>; meta: SearchMeta };
     const primaryName = this.searchProvider instanceof GoogleSearchProvider ? 'google' : 'searxng';
     const cacheKey = plannedQueries.map((q) => q.query).join(';');
+    const cacheTtl = ttlForFreshness(route.freshness, this.config.cache.searchTtlSeconds.default);
     const cachedHits = this.config.cache.enabled
       ? await this.searchCache.get(primaryName, cacheKey, route.freshness)
       : null;
+    const cachedMeta = this.config.cache.enabled
+      ? await this.searchCache.getMeta(primaryName, cacheKey, route.freshness)
+      : null;
 
     if (cachedHits && cachedHits.length > 0) {
-      searchOutcome = { results: cachedHits, rawCount: cachedHits.length, failureCount: 0 };
+      searchOutcome = { results: cachedHits, rawCount: cachedHits.length, failureCount: 0, meta: cachedMeta ?? emptySearchMeta() };
       trace.update({ providerUsed: primaryName, fallbackUsed: false, fallbackReason: '' });
     } else {
       const searchService = new SearchService(this.searchProvider, {
@@ -456,13 +569,10 @@ export class WebSearchEngine {
         trace.update({ searxngDiagnostics: { ...this.searchProvider.lastDiagnostics } });
       }
       if (this.config.cache.enabled && searchOutcome.results.length > 0) {
-        await this.searchCache.set(
-          primaryName,
-          cacheKey,
-          searchOutcome.results,
-          route.freshness,
-          ttlForFreshness(route.freshness, this.config.cache.searchTtlSeconds.default)
-        );
+        await this.searchCache.set(primaryName, cacheKey, searchOutcome.results, route.freshness, cacheTtl);
+        if (hasSearchMeta(searchOutcome.meta)) {
+          await this.searchCache.setMeta(primaryName, cacheKey, searchOutcome.meta, route.freshness, cacheTtl);
+        }
       }
       trace.update({ providerUsed: primaryName, fallbackUsed: false, fallbackReason: '' });
       // Automatic fallback: primary empty + fallback configured + quota remains.
@@ -517,6 +627,7 @@ export class WebSearchEngine {
           pagedRaw += extra.results.length;
           pagedPages.push(2);
           plannedQueries.push({ ...q, page: 2, purpose: `${q.purpose} (page 2)` });
+          if (extra.meta) searchOutcome.meta = mergeSearchMeta(searchOutcome.meta, extra.meta);
         }
       }
       if (pagedResults.length > 0) {
@@ -528,6 +639,38 @@ export class WebSearchEngine {
           paginationPages: pagedPages,
         });
         this.logger.log('search_pagination', { pages: pagedPages, recovered: fused.length });
+      }
+    }
+
+    // SearXNG related-search suggestions: one extra query when the first pass
+    // is thin, without another LLM round-trip. Cheap recall for small models.
+    if (
+      searchOutcome.meta.suggestions.length > 0 &&
+      searchOutcome.results.length < 3 &&
+      plannedQueries.length < totalQueryBudget
+    ) {
+      const suggestion = searchOutcome.meta.suggestions.find(
+        (s) => s.trim().length > 0 && !plannedQueries.some((q) => q.query.toLowerCase() === s.toLowerCase()),
+      );
+      if (suggestion) {
+        const extra = await new SearchService(this.searchProvider, { retries: 0 }).executeSearches(
+          [{ query: suggestion, purpose: 'SearXNG related-search suggestion', freshness: route.freshness }],
+          this.config.resultsPerQuery,
+        );
+        if (extra.results.length > 0) {
+          plannedQueries.push({ query: suggestion, purpose: 'SearXNG related-search suggestion', freshness: route.freshness });
+          const fused = fuseSearchResults([
+            { query: 'primary', results: searchOutcome.results },
+            { query: suggestion, results: extra.results },
+          ]);
+          searchOutcome = {
+            ...searchOutcome,
+            results: fused,
+            rawCount: searchOutcome.rawCount + extra.rawCount,
+            meta: mergeSearchMeta(searchOutcome.meta, extra.meta),
+          };
+          this.logger.log('search_suggestion', { suggestion, recovered: extra.results.length });
+        }
       }
     }
 
@@ -544,87 +687,48 @@ export class WebSearchEngine {
 
     // Step 5: Page Fetch Selection
     const pageBudget = mode === 'fast' ? this.config.fetch.fastPages : mode === 'deep' ? this.config.fetch.deepPages : this.config.fetch.normalPages;
-    const pagesToFetch = selectPagesToFetch(rankedResults, mode, this.config.fetch).slice(0, Math.max(1, pageBudget - retryReserve * 2));
+    let fetchPool = selectPagesToFetch(rankedResults, mode, this.config.fetch).slice(0, Math.max(1, pageBudget - retryReserve * 2));
+    let domainsDeprioritized: string[] = [];
+    if (this.domainStats) {
+      const ordered = await orderByDomainHealth(fetchPool, this.domainStats);
+      fetchPool = ordered.ordered;
+      domainsDeprioritized = ordered.deprioritized;
+    }
+    const pagesToFetch = fetchPool;
     let pagesAttempted = pagesToFetch.length;
-    trace.update({ pagesSelected: pagesToFetch.length });
+    trace.update({ pagesSelected: pagesToFetch.length, domainsDeprioritized });
     this.logger.log('pages_selected', { count: pagesToFetch.length });
+
+    // Instant answers / Wikipedia infoboxes are already the answer for many
+    // factoid questions. Inject them before page fetches so small models see
+    // structured evidence even when HTML extraction fails.
+    const documents: RetrievedDocument[] = documentsFromSearchMeta(searchOutcome.meta);
 
     // Step 6: Safe Page Fetching & Main Content Extraction
     trace.startTimer('fetch_extract');
-    const documents: RetrievedDocument[] = [];
     let fetchFailures = 0;
     let successfulFetches = 0;
-    let extractedTokens = 0;
+    let extractedTokens = documents.reduce((sum, d) => sum + defaultTokenCounter.count(d.text), 0);
+    let waybackRecoveries = 0;
+    const domainsChronicSkipped: string[] = [];
 
     const fetchPromises = pagesToFetch.map(async (candidate, index) => {
-      // Check document cache
-      if (this.config.cache.enabled) {
-        const cached = await this.documentCache.get(candidate.url);
-        if (cached) { successfulFetches++; return { ...cached, id: `doc-${index + 1}` }; }
-      }
-
-      const fetchRes = await this.fetcher.fetch(candidate.url, {
-        timeoutSeconds: this.config.fetch.timeoutSeconds,
-        maxBytes: this.config.fetch.maxBytes,
-        userAgent: this.config.fetch.userAgent,
-      });
-
-      let doc: RetrievedDocument | null = null;
-
-      if (!fetchRes.success || !fetchRes.body || fetchRes.body.length < 150) {
-        fetchFailures++;
-        // Section 115 & Section 26: If page fetch fails or yields insufficient body, fall back to snippet evidence
-        if (candidate.snippet && candidate.snippet.trim().length > 0) {
-          const fallbackExt = fallbackSnippetExtraction(candidate.title, candidate.snippet, candidate.url);
-          doc = {
-            id: `doc-${index + 1}`,
-            url: candidate.url,
-            canonicalUrl: candidate.canonicalUrl,
-            domain: candidate.domain,
-            title: fallbackExt.title || candidate.title,
-            author: candidate.metadata?.author as string | undefined,
-            publishedAt: candidate.publishedAt,
-            text: fallbackExt.text,
-            contentHash: fallbackExt.contentHash,
-            retrievedAt: new Date().toISOString(),
-            searchResultIds: [candidate.id],
-            metadata: { extractionMethod: 'search_snippet', fetchError: fetchRes.error },
-          };
-        }
-      } else {
-        successfulFetches++;
-        const extraction = extractMainContent(fetchRes.body, candidate.title);
-        doc = {
-          id: `doc-${index + 1}`,
-          url: fetchRes.finalUrl || candidate.url,
-          canonicalUrl: extraction.canonicalUrl || candidate.canonicalUrl,
-          domain: candidate.domain,
-          title: extraction.title || candidate.title,
-          author: extraction.author,
-          publishedAt: extraction.publishedAt || candidate.publishedAt,
-          text: extraction.text,
-          headings: extraction.headings,
-          links: extraction.links,
-          contentHash: extraction.contentHash,
-          retrievedAt: new Date().toISOString(),
-          searchResultIds: [candidate.id],
-          metadata: { extractionMethod: 'main_content' },
-        };
-      }
-
-      if (doc && this.config.cache.enabled && fetchRes.success) {
-        await this.documentCache.set(doc, route.freshness === 'any' ? 86400 : 900);
-      }
-
-      return doc;
+      return this.retrieveCandidate(candidate, index + documents.length, route.freshness);
     });
 
     const settledDocs = await Promise.allSettled(fetchPromises);
     for (const res of settledDocs) {
-      if (res.status === 'fulfilled' && res.value) {
-        extractedTokens += defaultTokenCounter.count(res.value.text);
-        if (!documents.some(d => d.contentHash && d.contentHash === res.value?.contentHash)) documents.push(res.value);
+      if (res.status === 'fulfilled' && res.value.doc) {
+        const { doc, method, skippedLive } = res.value;
+        if (method === 'wayback') waybackRecoveries++;
+        if (method === 'live' || method === 'github_raw' || method === 'wayback' || method === 'cache') successfulFetches++;
+        else fetchFailures++;
+        if (skippedLive && !domainsChronicSkipped.includes(doc.domain)) domainsChronicSkipped.push(doc.domain);
+        extractedTokens += defaultTokenCounter.count(doc.text);
+        if (!documents.some(d => d.contentHash && d.contentHash === doc.contentHash)) documents.push(doc);
       } else if (res.status === 'rejected') {
+        fetchFailures++;
+      } else {
         fetchFailures++;
       }
     }
@@ -633,6 +737,8 @@ export class WebSearchEngine {
       pagesFetched: successfulFetches,
       fetchFailures,
       extractedTokens,
+      waybackRecoveries,
+      domainsChronicSkipped,
     });
     this.logger.log('fetch_completed', { fetched: documents.length, failures: fetchFailures });
 
@@ -818,41 +924,13 @@ export class WebSearchEngine {
         const retryChunks: EvidenceChunk[] = [];
 
         for (const candidate of retryPages) {
-          let retryDoc: RetrievedDocument | null = null;
-          const fetchRes = await this.fetcher.fetch(candidate.url, {
-            timeoutSeconds: this.config.fetch.timeoutSeconds,
-            maxBytes: this.config.fetch.maxBytes,
-          });
-
-          if (fetchRes.success && fetchRes.body && fetchRes.body.length >= 150) {
+          const retrieved = await this.retrieveCandidate(candidate, documents.length, route.freshness);
+          const retryDoc = retrieved.doc;
+          if (retrieved.method === 'live' || retrieved.method === 'github_raw' || retrieved.method === 'wayback' || retrieved.method === 'cache') {
             successfulFetches++;
-            const ext = extractMainContent(fetchRes.body, candidate.title);
-            retryDoc = {
-              id: `doc-${crypto.randomUUID()}`,
-              url: fetchRes.finalUrl || candidate.url,
-              canonicalUrl: ext.canonicalUrl || candidate.canonicalUrl,
-              domain: candidate.domain,
-              title: ext.title || candidate.title,
-              text: ext.text,
-              headings: ext.headings,
-              links: ext.links,
-              contentHash: ext.contentHash,
-              retrievedAt: new Date().toISOString(),
-              searchResultIds: [candidate.id],
-            };
-          } else if (candidate.snippet && candidate.snippet.trim().length > 0) {
+            if (retrieved.method === 'wayback') waybackRecoveries++;
+          } else {
             fetchFailures++;
-            const ext = fallbackSnippetExtraction(candidate.title, candidate.snippet, candidate.url);
-            retryDoc = {
-              id: `doc-${crypto.randomUUID()}`,
-              url: candidate.url,
-              domain: candidate.domain,
-              title: candidate.title,
-              text: ext.text,
-              contentHash: ext.contentHash,
-              retrievedAt: new Date().toISOString(),
-              searchResultIds: [candidate.id],
-            };
           }
 
           if (retryDoc) {
@@ -973,6 +1051,7 @@ export class WebSearchEngine {
       route,
       queries: plannedQueries,
       results: rankedResults,
+      searchMeta: searchOutcome.meta,
       documents,
       chunks: allChunks,
       retrievedChunks: candidateChunks,

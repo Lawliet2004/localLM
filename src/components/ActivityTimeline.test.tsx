@@ -3,6 +3,20 @@ import { expect, it } from 'vitest';
 import { ActivityTimeline } from './ActivityTimeline';
 import type { Message, SessionEvent } from '../lib/types';
 
+it('keeps todo harness updates out of the activity feed', () => {
+  const event = (seq: number, eventType: string, payload: unknown, toolCallId?: string): SessionEvent => ({ id: String(seq), conversationId: 'chat', runId: 'run', seq, eventType, payload, toolCallId, createdAt: seq, ignorable: false });
+  const messages: Message[] = [{ id: 'answer', conversationId: 'chat', role: 'assistant', status: 'complete', content: 'Working.', reasoning: '', createdAt: 1 }];
+  const { container } = render(<ActivityTimeline messages={messages} events={[
+    event(1, 'tool_call', { name: 'todo_write', arguments: { todos: [{ text: 'Search', status: 'in_progress' }] } }, 'todo'),
+    event(2, 'tool_result', { name: 'todo_write', decision: 'allowed', result: { saved: 1 } }, 'todo'),
+    event(3, 'tool_call', { name: 'web_search', arguments: { question: 'fusion yield' } }, 'search'),
+    event(4, 'tool_result', { name: 'web_search', decision: 'allowed', result: { answer: 'ok' } }, 'search'),
+    event(5, 'model_response', { content: 'Working.' }),
+  ]} renderMessage={m => <p>{m.content}</p>} renderTool={m => <p>{JSON.parse(m.content).request.name}</p>} />);
+  expect(container.textContent).toContain('web_search');
+  expect(container.textContent).not.toContain('todo_write');
+});
+
 it('interleaves commentary, tool results, compaction and final text without replaying aggregate text', () => {
   const event = (seq: number, eventType: string, payload: unknown, toolCallId?: string): SessionEvent => ({ id: String(seq), conversationId: 'chat', runId: 'run', seq, eventType, payload, toolCallId, createdAt: seq, ignorable: false });
   const messages: Message[] = [{ id: 'answer', conversationId: 'chat', role: 'assistant', status: 'complete', content: 'Checking.Done.', reasoning: '', createdAt: 1 }];

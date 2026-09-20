@@ -4,7 +4,7 @@
 
 LocalLM incorporates DeepSeek Harness's plugin microkernel model (adapted from Cordis `ctx.effect()` and `ctx.on()`) into idiomatic Rust:
 
-- **`CapabilityKind`**: Categorizes capabilities into `Model`, `Tool`, `Skill`, `Session`, `Sandbox`, `Storage`, `Loop`, `Scheduling`, `Ui`.
+- **`CapabilityKind`**: Categorizes capabilities into `Model`, `Tool`, `Skill`, `Session`, `Sandbox`, `Storage`, `Loop`, `Ui`.
 - **`Capability`**: Typed record holding `id`, `kind`, `version`, `enabled`, `description`, and `config: serde_json::Value`.
 - **`Registry`**: In-memory registry tracking registered capabilities, dependencies (`requires`), lifecycle hooks (`effects`), presets, and defaults.
 - **`capabilities.json`**: Static authority declaring the full capability tree, default configurations, and presets (`standard`, `code_ptc`, `minimal`, `creator`).

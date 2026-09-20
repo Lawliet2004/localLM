@@ -55,6 +55,8 @@ pub struct ConnectorView {
     pub connected: bool,
     pub has_credential: bool,
     pub tools: Vec<ToolView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_error: Option<String>,
 }
 struct Connection {
     service: ConnectorSession,
@@ -110,6 +112,7 @@ fn local_view(server: &crate::local_mcp_config::LocalServer) -> ConnectorView {
         connected: false,
         has_credential: false,
         tools: Vec::new(),
+        connection_error: None,
     }
 }
 fn stage(value: bool) -> &'static str {
@@ -122,6 +125,35 @@ fn stage(value: bool) -> &'static str {
 pub struct McpHub {
     connections: HashMap<String, Connection>,
     vault: Arc<crate::vault::Vault>,
+    restore_errors: HashMap<String, String>,
+}
+
+const CONNECTED_KEY: &str = "connected_connectors";
+
+fn remembered_connections(store: &crate::store::Store) -> Result<Vec<String>, String> {
+    if let Some(ids) = store.setting::<Option<Vec<String>>>(CONNECTED_KEY)? {
+        return Ok(ids);
+    }
+    // Older versions remembered selected tools, but not their live connections.
+    let ids: std::collections::BTreeSet<_> = store.remembered_tools()?.unwrap_or_default()
+        .tools.into_iter().map(|tool| tool.connector_id).collect();
+    let ids: Vec<_> = ids.into_iter().collect();
+    store.save_setting(CONNECTED_KEY, &ids)?;
+    Ok(ids)
+}
+
+fn remember_connection(store: &crate::store::Store, id: &str, connected: bool) -> Result<(), String> {
+    let mut ids = remembered_connections(store)?;
+    ids.retain(|saved| saved != id);
+    if connected { ids.push(id.into()); }
+    store.save_setting(CONNECTED_KEY, &ids)
+}
+
+pub async fn restore_connections(state: &crate::AppState) -> Result<(), String> {
+    let mut hub = state.connectors.lock().await;
+    let ids = remembered_connections(&*state.database()?)?;
+    hub.restore_saved(&ids).await;
+    Ok(())
 }
 
 pub struct AgentTool {
@@ -384,6 +416,7 @@ fn presets() -> Vec<ConnectorView> {
             connected: false,
             has_credential: false,
             tools: Vec::new(),
+            connection_error: None,
         })
         .collect()
 }
@@ -496,6 +529,15 @@ impl McpHub {
         Self {
             connections: HashMap::new(),
             vault,
+            restore_errors: HashMap::new(),
+        }
+    }
+    async fn restore_saved(&mut self, ids: &[String]) {
+        for id in ids {
+            if self.active_connector_ids().contains(id) { continue; }
+            if let Err(error) = self.connect(id).await {
+                self.restore_errors.insert(id.clone(), error);
+            }
         }
     }
     fn token(&self, id: &str) -> Result<Option<String>, String> {
@@ -521,6 +563,7 @@ impl McpHub {
                 .map(local_view),
         );
         for item in &mut items {
+            item.connection_error = self.restore_errors.get(&item.id).cloned();
             item.has_credential = if item.auth_type == "local" {
                 false
             } else if item.auth_type == "oauth" {
@@ -732,9 +775,11 @@ impl McpHub {
         item.connected = true;
         item.has_credential = secret.is_some() || item.auth_type == "oauth";
         item.tools = views;
+        self.restore_errors.remove(id);
         Ok(item)
     }
     pub async fn disconnect(&mut self, id: &str, forget: bool) -> Result<(), String> {
+        self.restore_errors.remove(id);
         let local = crate::local_mcp_config::load(&self.vault)?
             .iter()
             .any(|server| server.id == id);
@@ -795,7 +840,9 @@ pub async fn remove_local_connector(
         .operation
         .try_lock()
         .map_err(|_| "Wait for the current model operation before editing connectors.")?;
-    state.connectors.lock().await.remove_local(&id)
+    let hub = state.connectors.lock().await;
+    hub.remove_local(&id)?;
+    remember_connection(&*state.database()?, &id, false)
 }
 #[tauri::command]
 pub async fn connect_connector(
@@ -807,7 +854,13 @@ pub async fn connect_connector(
     if let Some(secret) = api_token {
         hub.save_token(&id, &secret)?;
     }
-    hub.connect(&id).await
+    let connected = hub.connect(&id).await?;
+    let saved = remember_connection(&*state.database()?, &id, true);
+    if let Err(error) = saved {
+        let _ = hub.disconnect(&id, false).await;
+        return Err(format!("Could not remember this connection: {error}"));
+    }
+    Ok(connected)
 }
 #[tauri::command]
 pub async fn disconnect_connector(
@@ -815,7 +868,9 @@ pub async fn disconnect_connector(
     id: String,
     forget: bool,
 ) -> Result<(), String> {
-    state.connectors.lock().await.disconnect(&id, forget).await
+    let mut hub = state.connectors.lock().await;
+    remember_connection(&*state.database()?, &id, false)?;
+    hub.disconnect(&id, forget).await
 }
 
 #[tauri::command]
@@ -835,7 +890,7 @@ pub async fn sign_in_connector(
     let vault = state.connectors.lock().await.vault.clone();
     state.oauth_cancel.send_replace(false);
     crate::oauth::sign_in(&app, &id, &item.url, vault, state.oauth_cancel.subscribe()).await?;
-    state.connectors.lock().await.connect(&id).await
+    connect_connector(state.clone(), id, None).await
 }
 #[tauri::command]
 pub fn cancel_connector_sign_in(state: tauri::State<'_, crate::AppState>) {
@@ -1025,6 +1080,40 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
                 .unwrap()
                 .connected
         );
+        // Simulate shutting down and reopening the app: configurations and
+        // enabled IDs survive, live MCP sessions do not.
+        let db_path = temp.path().join("settings.sqlite");
+        {
+            let store = crate::store::Store::open(&db_path).unwrap();
+            super::remember_connection(&store, "tavily", true).unwrap();
+            super::remember_connection(&store, &server.id, true).unwrap();
+        }
+        let vault = hub.vault.clone();
+        drop(hub);
+        let store = crate::store::Store::open(&db_path).unwrap();
+        let mut hub = super::McpHub::new(vault.clone());
+        hub.restore_saved(&super::remembered_connections(&store).unwrap()).await;
+        let views = hub.list().unwrap();
+        let restored = views.iter().find(|item| item.id == server.id).unwrap();
+        assert!(restored.connected);
+        assert_eq!(restored.tools.len(), 1);
+        let unauthenticated = views.iter().find(|item| item.id == "tavily").unwrap();
+        assert!(!unauthenticated.connected);
+        assert!(unauthenticated.connection_error.as_deref().unwrap().contains("API token"));
+        // Repeated restoration must not launch a second local process.
+        hub.restore_saved(&[server.id.clone()]).await;
+        assert!(hub.restore_errors.get(&server.id).is_none());
+        super::remember_connection(&store, &server.id, false).unwrap();
+        super::remember_connection(&store, "tavily", false).unwrap();
+        hub.disconnect(&server.id, false).await.unwrap();
+        drop(store);
+        drop(hub);
+        let store = crate::store::Store::open(&db_path).unwrap();
+        let mut hub = super::McpHub::new(vault);
+        let saved = super::remembered_connections(&store).unwrap();
+        assert!(saved.is_empty());
+        hub.restore_saved(&saved).await;
+        assert!(hub.active_connector_ids().is_empty());
         hub.remove_local(&server.id).unwrap();
     }
     #[test]

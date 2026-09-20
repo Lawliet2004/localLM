@@ -347,16 +347,12 @@ describe('Sidebar project folders and actions', () => {
     const toolsBtn = screen.getByRole('button', { name: 'Tools' });
     const modelsBtn = screen.getByRole('button', { name: 'Models & runtime' });
     const executionBtn = screen.getByRole('button', { name: 'Execution' });
-    const scheduledBtn = screen.getByRole('button', { name: 'Scheduled' });
-    const pluginsBtn = screen.getByRole('button', { name: 'Plugins' });
 
     expect(connectorsBtn).toBeInTheDocument();
     expect(skillsBtn).toBeInTheDocument();
     expect(toolsBtn).toBeInTheDocument();
     expect(modelsBtn).toBeInTheDocument();
     expect(executionBtn).toBeInTheDocument();
-    expect(scheduledBtn).toBeInTheDocument();
-    expect(pluginsBtn).toBeInTheDocument();
 
     await userEvent.click(connectorsBtn);
     expect(onPage).toHaveBeenCalledWith('connectors');

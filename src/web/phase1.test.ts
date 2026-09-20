@@ -1,6 +1,9 @@
-import { expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { WebSearchEngine, DEFAULT_CONFIG } from './index';
 import type { GenerationRequest } from './types';
+import { SearXNGProvider } from './search/searxng_provider';
+
+afterEach(() => vi.unstubAllGlobals());
 
 it('uses only separate planning and synthesis calls with compressed, cited evidence', async () => {
   const calls: GenerationRequest[] = [];
@@ -27,4 +30,27 @@ it('uses only separate planning and synthesis calls with compressed, cited evide
   expect(session.answer).toContain('https://react.dev/blog/release');
   expect(session.trace.finalEvidenceTokens).toBeLessThanOrEqual(2500);
   expect(session.trace.finalPromptTokens).toBeLessThanOrEqual(6000);
+});
+
+it('injects SearXNG infoboxes as evidence so small models see structured facts first', async () => {
+  vi.stubGlobal('fetch', async (input: any) => {
+    const url = String(input);
+    if (url.includes('/search')) {
+      return new Response(JSON.stringify({
+        results: [{ title: 'Paris', url: 'https://en.wikipedia.org/wiki/Paris', content: 'Capital city' }],
+        infoboxes: [{ infobox: 'Paris', content: 'Paris is the capital of France.', urls: [{ url: 'https://en.wikipedia.org/wiki/Paris' }] }],
+        answers: ['Paris is the capital of France'],
+      }));
+    }
+    return new Response('Unavailable', { status: 404 });
+  });
+  const engine = new WebSearchEngine({
+    searchProvider: new SearXNGProvider('http://127.0.0.1:8080', 8000),
+    fetcher: { fetch: async (url) => ({ url, finalUrl: url, success: false, error: 'blocked', durationMs: 0 }) },
+    config: { cache: { ...DEFAULT_CONFIG.cache, enabled: false }, fetch: { ...DEFAULT_CONFIG.fetch, waybackFallback: false, domainLearning: false } },
+  });
+  const session = await engine.research('What is the capital of France?');
+  expect(session.searchMeta?.infoboxes[0].content).toContain('capital of France');
+  expect(session.documents.some((d) => d.metadata?.extractionMethod === 'searxng_infobox')).toBe(true);
+  expect(session.answer).toMatch(/Paris|capital of France/i);
 });

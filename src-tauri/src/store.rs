@@ -124,6 +124,8 @@ pub struct PromptFreeze {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RememberedTools {
+    #[serde(default)]
+    pub access_mode: crate::permissions::AccessMode,
     pub sources: Vec<String>,
     pub tools: Vec<crate::connectors::ToolSelection>,
 }
@@ -275,12 +277,6 @@ impl Store {
             CREATE TABLE IF NOT EXISTS memory_facts(id TEXT PRIMARY KEY, scope TEXT NOT NULL, fact TEXT NOT NULL,
                 origin TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS memory_facts_scope ON memory_facts(scope, updated_at);
-            CREATE TABLE IF NOT EXISTS schedules(id TEXT PRIMARY KEY, name TEXT NOT NULL, cron TEXT NOT NULL, task TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1, run_once INTEGER NOT NULL DEFAULT 0,
-                last_run_at INTEGER, last_result TEXT, created_at INTEGER NOT NULL,
-                conversation_id TEXT, allow_write INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS plugins(name TEXT PRIMARY KEY, version TEXT NOT NULL, path TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1, sha256 TEXT NOT NULL, installed_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS compaction(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
                 cutoff INTEGER NOT NULL, artifact_id TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS conversation_prompt_freeze (
@@ -372,16 +368,18 @@ impl Store {
     /// including an explicitly empty selection. Conversation records are never
     /// modified; an unusable stored row leaves the preference unset.
     fn seed_remembered_tools(&self) -> Result<()> {
-        let exists: bool = self
+        let existing: Option<String> = self
             .connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1)",
+                "SELECT value FROM settings WHERE key=?1",
                 [REMEMBERED_TOOLS_KEY],
                 |row| row.get(0),
             )
-            .map_err(db_error)?;
-        if exists {
-            return Ok(());
+            .optional().map_err(db_error)?;
+        if let Some(text) = &existing {
+            let value: serde_json::Value = serde_json::from_str(text)
+                .map_err(|_| "Saved remembered tool selection is invalid.")?;
+            if value.get("accessMode").is_some() { return Ok(()); }
         }
         let saved: Option<String> = self
             .connection
@@ -393,9 +391,18 @@ impl Store {
             )
             .optional()
             .map_err(db_error)?;
-        if let Some(text) = saved {
+        if let Some(existing) = existing {
+            let mut remembered: RememberedTools = serde_json::from_str(&existing)
+                .map_err(|_| "Saved remembered tool selection is invalid.")?;
+            // Upgrade pre-permission defaults without replacing the saved tools.
+            remembered.access_mode = saved.as_deref()
+                .and_then(|text| serde_json::from_str::<ConversationTools>(text).ok())
+                .map(|tools| tools.access_mode).unwrap_or_default();
+            self.save_remembered_tools(&remembered)?;
+        } else if let Some(text) = saved {
             if let Ok(settings) = serde_json::from_str::<ConversationTools>(&text) {
                 let remembered = RememberedTools {
+                    access_mode: settings.access_mode,
                     sources: settings.sources,
                     tools: settings.tools,
                 };
@@ -608,7 +615,7 @@ impl Store {
             .map_err(db_error)?;
         Ok(())
     }
-        // ---- Harness extensions (presets, subagents, plans, memory, schedules, plugins) ----
+        // ---- Harness extensions (presets, subagents, plans, memory) ----
     pub fn conversation_preset(&self, id: &str) -> Result<String> {
         let preset: Option<String> = self
             .connection
@@ -915,99 +922,6 @@ impl Store {
         let changed = self
             .connection
             .execute("DELETE FROM memory_facts WHERE id=?1", [id])
-            .map_err(db_error)?;
-        Ok(changed > 0)
-    }
-    pub fn save_schedule(&self, schedule: &crate::scheduling::Schedule) -> Result<()> {
-        crate::scheduling::validate_schedule(schedule)?;
-        self.connection
-            .execute(
-                "INSERT INTO schedules(id, name, cron, task, enabled, run_once, last_run_at, last_result, created_at, conversation_id, allow_write)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(id) DO UPDATE SET name=excluded.name, cron=excluded.cron, task=excluded.task,
-                 enabled=excluded.enabled, run_once=excluded.run_once, conversation_id=excluded.conversation_id, allow_write=excluded.allow_write",
-                params![schedule.id, schedule.name, schedule.cron, schedule.task, schedule.enabled, schedule.run_once, schedule.last_run_at, schedule.last_result, schedule.created_at, schedule.conversation_id, schedule.allow_write as i64],
-            )
-            .map_err(db_error)?;
-        Ok(())
-    }
-    pub fn schedules(&self) -> Result<Vec<crate::scheduling::Schedule>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, name, cron, task, enabled, run_once, last_run_at, last_result, created_at, conversation_id, allow_write FROM schedules ORDER BY created_at")
-            .map_err(db_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                let allow_write_i64: i64 = row.get(10).unwrap_or(0);
-                Ok(crate::scheduling::Schedule {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    cron: row.get(2)?,
-                    task: row.get(3)?,
-                    enabled: row.get(4)?,
-                    run_once: row.get(5)?,
-                    last_run_at: row.get(6)?,
-                    last_result: row.get(7)?,
-                    created_at: row.get(8)?,
-                    conversation_id: row.get(9)?,
-                    allow_write: allow_write_i64 != 0,
-                })
-            })
-            .map_err(db_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db_error)
-    }
-    pub fn delete_schedule(&self, id: &str) -> Result<bool> {
-        let changed = self
-            .connection
-            .execute("DELETE FROM schedules WHERE id=?1", [id])
-            .map_err(db_error)?;
-        Ok(changed > 0)
-    }
-    pub fn record_schedule_result(&self, id: &str, result: &str) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE schedules SET last_run_at=?1, last_result=?2 WHERE id=?3",
-                params![now(), result, id],
-            )
-            .map_err(db_error)?;
-        Ok(())
-    }
-    pub fn save_plugin(&self, plugin: &crate::plugins::Plugin) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO plugins(name, version, path, enabled, sha256, installed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(name) DO UPDATE SET version=excluded.version, path=excluded.path,
-                 enabled=excluded.enabled, sha256=excluded.sha256",
-                params![plugin.name, plugin.version, plugin.path, plugin.enabled, plugin.sha256, plugin.installed_at],
-            )
-            .map_err(db_error)?;
-        Ok(())
-    }
-    pub fn plugins(&self) -> Result<Vec<crate::plugins::Plugin>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT name, version, path, enabled, sha256, installed_at FROM plugins ORDER BY name")
-            .map_err(db_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(crate::plugins::Plugin {
-                    name: row.get(0)?,
-                    version: row.get(1)?,
-                    path: row.get(2)?,
-                    enabled: row.get(3)?,
-                    sha256: row.get(4)?,
-                    installed_at: row.get(5)?,
-                })
-            })
-            .map_err(db_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db_error)
-    }
-    pub fn delete_plugin(&self, name: &str) -> Result<bool> {
-        let changed = self
-            .connection
-            .execute("DELETE FROM plugins WHERE name=?1", [name])
             .map_err(db_error)?;
         Ok(changed > 0)
     }
@@ -2314,6 +2228,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("remembered.sqlite");
         let selection = RememberedTools {
+            access_mode: crate::permissions::AccessMode::Ask,
             sources: vec!["__workspace".into()],
             tools: vec![crate::connectors::ToolSelection {
                 connector_id: "deepwiki".into(),
@@ -2368,6 +2283,79 @@ mod tests {
     }
 
     #[test]
+    fn remembered_permission_modes_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remembered-permissions.sqlite");
+        for mode in ["fullAccess", "autoApprove", "ask"] {
+            let expected = serde_json::json!({
+                "accessMode": mode,
+                "sources": [],
+                "tools": [{ "connectorId": "deepwiki", "toolName": "read_wiki_structure" }]
+            });
+            {
+                let store = Store::open(&path).unwrap();
+                let selection: RememberedTools = serde_json::from_value(expected.clone()).unwrap();
+                store.save_remembered_tools(&selection).unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            assert_eq!(serde_json::to_value(store.remembered_tools().unwrap().unwrap()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn active_skill_selection_survives_new_chats_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active-skills.sqlite");
+        {
+            let store = Store::open(&path).unwrap();
+            store.save_active_skills(&["wiki-qa".into()]).unwrap();
+            store.create_conversation().unwrap();
+            store.create_conversation().unwrap();
+            assert_eq!(store.active_skills().unwrap(), vec!["wiki-qa"]);
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.active_skills().unwrap(), vec!["wiki-qa"]);
+            store.save_active_skills(&[]).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert!(store.active_skills().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_remembered_tools_default_to_asking() {
+        let selection: RememberedTools = serde_json::from_value(serde_json::json!({
+            "sources": [], "tools": []
+        })).unwrap();
+        assert_eq!(serde_json::to_value(selection).unwrap()["accessMode"], "ask");
+    }
+
+    #[test]
+    fn legacy_defaults_inherit_saved_mode_once_without_overwriting_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-defaults.sqlite");
+        {
+            let store = Store::open(&path).unwrap();
+            let conversation = store.create_conversation().unwrap();
+            store.save_conversation_tools(&conversation.id, &ConversationTools {
+                access_mode: crate::permissions::AccessMode::FullAccess,
+                ..Default::default()
+            }).unwrap();
+            store.save_setting("remembered_tools", &serde_json::json!({"sources":["__execution"],"tools":[]})).unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            let mut remembered = store.remembered_tools().unwrap().unwrap();
+            assert_eq!(remembered.access_mode, crate::permissions::AccessMode::FullAccess);
+            assert_eq!(remembered.sources, ["__execution"]);
+            remembered.access_mode = crate::permissions::AccessMode::Ask;
+            store.save_remembered_tools(&remembered).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.remembered_tools().unwrap().unwrap().access_mode, crate::permissions::AccessMode::Ask);
+    }
+
+    #[test]
     fn first_startup_seeds_remembered_tools_from_the_latest_conversation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seed.sqlite");
@@ -2406,6 +2394,7 @@ mod tests {
         // The preference is a snapshot: later restarts must not re-seed it from
         // conversations after the user changed it.
         let replaced = RememberedTools {
+            access_mode: crate::permissions::AccessMode::Ask,
             sources: vec!["__daytona".into()],
             tools: vec![],
         };

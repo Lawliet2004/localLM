@@ -25,6 +25,14 @@ export interface WebSearchFetchConfig {
   perDomainConcurrency: number;
   userAgent: string;
   userAgents: string[];
+  /**
+   * Retry failed page fetches through the Wayback Machine before falling back
+   * to snippet-only evidence. Snapshot provenance is marked in document text
+   * and metadata. Only triggered on failure, so it costs nothing when pages load.
+   */
+  waybackFallback: boolean;
+  /** Learn per-domain fetch success rates and skip chronic failing domains. */
+  domainLearning: boolean;
 }
 
 export interface WebSearchChunkingConfig {
@@ -98,6 +106,13 @@ export interface WebSearchConfig {
   retrieval: WebSearchRetrievalConfig;
   reranking: {
     enabled: boolean;
+    /**
+     * Blends published-date recency into rerank scores: exp decay with a
+     * 90-day half-life scale, added as weight * recencyScore. Applied only
+     * when the route has no explicit freshness window (the window already
+     * filters for recency at the search stage).
+     */
+    recencyWeight: number;
   };
   ranking: WebSearchRankingConfig;
   context: WebSearchContextConfig;

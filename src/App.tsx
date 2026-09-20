@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, Download, PanelLeftOpen, Pencil, Trash2, X, ArrowLeft, ArrowRight, Folder, MoreHorizontal, Cpu, Plug, BookOpen, Wrench, Terminal, Clock, AtSign, Settings } from 'lucide-react';
+import { Check, ChevronDown, Download, PanelLeftOpen, Pencil, Trash2, X, ArrowLeft, ArrowRight, Folder, MoreHorizontal, Cpu, Plug, BookOpen, Wrench, Terminal, Settings } from 'lucide-react';
 
 import { confirm, save } from '@tauri-apps/plugin-dialog';
 
@@ -26,10 +26,6 @@ import { Connectors } from './components/Connectors';
 import { ApprovalDialog, ToolsSettings, PermissionSelector } from './components/ToolControls';
 
 import { Trajectory } from './components/Trajectory';
-
-import { Automations } from './components/Automations';
-
-import { Plugins } from './components/Plugins';
 
 import { WindowControls } from './components/WindowControls';
 import { WorkspacePanel } from './components/WorkspacePanel';
@@ -249,7 +245,7 @@ export default function App() {
 
     selection.current++; setActiveId(null); setMessages([]); setPage('chat'); setError(''); setChatError(''); setLiveActivity(null); setRenaming(false);
 
-    setAccessMode('ask');
+    setAccessMode(rememberedTools.current.accessMode ?? 'ask');
 
     setPlanMode(false);
 
@@ -299,9 +295,9 @@ export default function App() {
 
       if (nativeAvailable) {
 
-        await api.saveRememberedTools({ sources, tools });
+        await api.saveRememberedTools({ sources, tools, accessMode: mode });
 
-        rememberedTools.current = { sources, tools };
+        rememberedTools.current = { sources, tools, accessMode: mode };
 
       }
 
@@ -446,6 +442,7 @@ export default function App() {
         setSelectedConnectors(sourcesForNewConversation(rememberedTools.current.sources, null));
 
         setSelectedTools(rememberedTools.current.tools);
+        setAccessMode(rememberedTools.current.accessMode ?? 'ask');
 
       }
 
@@ -529,7 +526,7 @@ export default function App() {
 
     }
 
-    catch (e) { if (version === selection.current) { setError(errorMessage(e)); setActiveId(null); switchDraft(null); setSelectedConnectors(sourcesForNewConversation(rememberedTools.current.sources, null)); setSelectedTools(rememberedTools.current.tools); } }
+    catch (e) { if (version === selection.current) { setError(errorMessage(e)); setActiveId(null); switchDraft(null); setSelectedConnectors(sourcesForNewConversation(rememberedTools.current.sources, null)); setSelectedTools(rememberedTools.current.tools); setAccessMode(rememberedTools.current.accessMode ?? 'ask'); } }
 
     finally { if (version === selection.current) setLoading(false); }
 
@@ -958,7 +955,7 @@ export default function App() {
 
       <details className="app-menu" name="application-menu"><summary>Edit</summary><div><button disabled={!active || busy} onClick={event => { if (active) { setTitle(active.title); setRenaming(true); } event.currentTarget.closest('details')?.removeAttribute('open'); }}>Rename task</button><button onClick={event => { setCollapsed(false); setTimeout(() => document.querySelector<HTMLInputElement>('[aria-label="Search conversations"]')?.focus(), 0); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Search tasks <kbd>Ctrl+K</kbd></button></div></details>
 
-      <details className="app-menu" name="application-menu"><summary>View</summary><div><button onClick={() => setCollapsed(!collapsed)}>Toggle sidebar</button><button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>Switch to {theme === 'dark' ? 'light' : 'dark'} theme</button><button onClick={event => { navigate('models'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Models &amp; runtime</button><button onClick={event => { navigate('connectors'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Connectors</button><button onClick={event => { navigate('skills'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Skills</button><button onClick={event => { navigate('tools'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Tools &amp; permissions</button><button onClick={event => { navigate('execution'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Execution</button><button onClick={event => { navigate('automations'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Scheduled tasks</button><button onClick={event => { navigate('plugins'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Plugins</button></div></details>
+      <details className="app-menu" name="application-menu"><summary>View</summary><div><button onClick={() => setCollapsed(!collapsed)}>Toggle sidebar</button><button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>Switch to {theme === 'dark' ? 'light' : 'dark'} theme</button><button onClick={event => { navigate('models'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Models &amp; runtime</button><button onClick={event => { navigate('connectors'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Connectors</button><button onClick={event => { navigate('skills'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Skills</button><button onClick={event => { navigate('tools'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Tools &amp; permissions</button><button onClick={event => { navigate('execution'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Execution</button></div></details>
 
       <details className="app-menu" name="application-menu"><summary>Help</summary><div className="shortcut-help"><strong>Workspace shortcuts</strong><span>Review <kbd>Ctrl+Shift+G</kbd></span><span>Terminal <kbd>Ctrl+`</kbd></span><span>Browser <kbd>Ctrl+T</kbd></span><span>Files <kbd>Ctrl+P</kbd></span></div></details>
 
@@ -971,7 +968,7 @@ export default function App() {
 
     {approval && <ApprovalDialog key={approval.id} request={approval} onResolve={allow => api.resolveToolApproval(approval.id, allow)} onResolveAskUser={(choice) => api.resolveAskUser(approval.id, choice)} />}
 
-    <main className="workspace"><header className={`workspace-header ${page === 'chat' && !messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead">{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{page === 'chat' ? <><button className="icon-button" aria-label="Back" disabled={busy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={busy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</> : <><Settings className="task-folder-icon" size={18} /><span className="workspace-title">{page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : page === 'tools' ? 'Tools' : page === 'automations' ? 'Automations' : page === 'plugins' ? 'Plugin Marketplace' : 'Skills'}</span></>}</div><div className="header-actions">{page === 'chat' && workspaceIndex.projects.length > 0 && <select aria-label="Task project" value={projectId ?? ''} disabled={busy} onChange={e => void selectProject(e.target.value || null)}><option value="">No project</option>{workspaceIndex.projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}{page === 'chat' && <div className="workspace-layout-controls"><button className="icon-button workspace-layout-btn" aria-label="Toggle split view" title="Toggle split view" onClick={() => setCollapsed(!collapsed)}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="8" y1="2" x2="8" y2="14" /></svg></button><button className="icon-button workspace-layout-btn" aria-label="Toggle panel" title="Toggle panel" onClick={() => { const toggleBtn = document.querySelector<HTMLButtonElement>('[aria-label="Toggle files panel"]'); toggleBtn?.click(); }}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="11" y1="2" x2="11" y2="14" /></svg></button></div>}{page === 'chat' && <WorkspacePanel busy={busy} onBusy={setCommandBusy} conversationId={activeId} revision={`${projectId}:${activeId}`} />}<button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header><DownloadActivity />
+    <main className="workspace"><header className={`workspace-header ${page === 'chat' && !messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead">{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{page === 'chat' ? <><button className="icon-button" aria-label="Back" disabled={busy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={busy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</> : <><Settings className="task-folder-icon" size={18} /><span className="workspace-title">{page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : page === 'tools' ? 'Tools' : 'Skills'}</span></>}</div><div className="header-actions">{page === 'chat' && workspaceIndex.projects.length > 0 && <select aria-label="Task project" value={projectId ?? ''} disabled={busy} onChange={e => void selectProject(e.target.value || null)}><option value="">No project</option>{workspaceIndex.projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}{page === 'chat' && <div className="workspace-layout-controls"><button className="icon-button workspace-layout-btn" aria-label="Toggle split view" title="Toggle split view" onClick={() => setCollapsed(!collapsed)}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="8" y1="2" x2="8" y2="14" /></svg></button><button className="icon-button workspace-layout-btn" aria-label="Toggle panel" title="Toggle panel" onClick={() => { const toggleBtn = document.querySelector<HTMLButtonElement>('[aria-label="Toggle files panel"]'); toggleBtn?.click(); }}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="11" y1="2" x2="11" y2="14" /></svg></button></div>}{page === 'chat' && <WorkspacePanel busy={busy} onBusy={setCommandBusy} conversationId={activeId} revision={`${projectId}:${activeId}`} />}<button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header><DownloadActivity />
 
       {page !== 'chat' && (
         <nav className="settings-nav-bar" aria-label="Settings navigation">
@@ -1020,24 +1017,6 @@ export default function App() {
             >
               <Terminal size={14} />
               <span>Execution</span>
-            </button>
-            <button
-              className={`settings-nav-tab ${page === 'automations' ? 'active' : ''}`}
-              aria-label="Settings: Scheduled"
-              onClick={() => navigate('automations')}
-              title="Scheduled tasks"
-            >
-              <Clock size={14} />
-              <span>Scheduled</span>
-            </button>
-            <button
-              className={`settings-nav-tab ${page === 'plugins' ? 'active' : ''}`}
-              aria-label="Settings: Plugins"
-              onClick={() => navigate('plugins')}
-              title="Plugins"
-            >
-              <AtSign size={14} />
-              <span>Plugins</span>
             </button>
           </div>
           <button
@@ -1144,7 +1123,7 @@ export default function App() {
 
         }}
 
-      /></> : page === 'automations' ? <Automations conversationId={activeId} /> : page === 'plugins' ? <Plugins /> : page === 'tools' ? <ToolsSettings accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} preset={preset} onPresetChange={changePreset} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} scopeLabel={active?.title} onBack={() => navigate('chat')} busy={busy} loading={loading} saving={savingTools} onNavigate={target => navigate(target)} /> : page === 'models' ? <Models onRefresh={async () => { setData(normalizeBootstrap(await api.bootstrap())); }} requestedModel={requestedModel} onRequestedModelHandled={() => setRequestedModel(undefined)} config={data.config} preferences={data.preferences} runtime={data.runtime} providers={data.providers} selection={modelSelection} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveSelection={saveModelSelection} onProvidersChanged={refreshProviders} onSaveConfig={async config => { try { await api.saveConfig(config); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
+      /></> : page === 'tools' ? <ToolsSettings accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} preset={preset} onPresetChange={changePreset} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} scopeLabel={active?.title} onBack={() => navigate('chat')} busy={busy} loading={loading} saving={savingTools} onNavigate={target => navigate(target)} /> : page === 'models' ? <Models onRefresh={async () => { setData(normalizeBootstrap(await api.bootstrap())); }} requestedModel={requestedModel} onRequestedModelHandled={() => setRequestedModel(undefined)} config={data.config} preferences={data.preferences} runtime={data.runtime} providers={data.providers} selection={modelSelection} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveSelection={saveModelSelection} onProvidersChanged={refreshProviders} onSaveConfig={async config => { try { await api.saveConfig(config); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
 
     </main>
 

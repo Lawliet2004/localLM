@@ -10,7 +10,9 @@ Each conversation has a **Permissions** selector above the chat:
 
 Denying a request blocks further tool use for the remainder of that turn, including other calls in the same batch. The model may still give a written response. A new message starts a fresh turn.
 
-New conversations start in Ask for approval. A saved conversation remembers its own mode. Older saved conversations also default to Ask. Changing modes during generation is disabled: stop the response before changing permissions.
+New conversations inherit your last explicitly selected permission mode and tools, including after restarting the app. A saved conversation keeps its own mode. With no saved preference, the default is Ask for approval. On upgrade, older remembered tool defaults inherit the most recently saved conversation's mode once. Changing modes during generation is disabled: stop the response before changing permissions.
+
+Successfully connected services are remembered and reconnected at startup. Disconnecting keeps a service off on later restarts. Reconnection uses existing credentials without opening a sign-in flow; expired authorization or an unavailable service leaves it disconnected with an explanation in Connectors. Active skill selections also persist across chats and restarts.
 
 Full access changes approval behavior, not tool selection. It does not install tools, enable connectors, supply account credentials, or remove tool argument checks, workspace file boundaries, output limits, cancellation and timeouts. Local execution runs with your Windows account's filesystem and network permissions and is not sandboxed. In Full access it runs without a code-review prompt.
 

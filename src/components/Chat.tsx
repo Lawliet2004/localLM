@@ -11,6 +11,7 @@ import { WorkSummary } from './WorkSummary';
 import { ActivityTimeline, useSessionActivity } from './ActivityTimeline';
 import { ContextControl } from './ContextControl';
 import { CommandRunCard } from './CommandRunCard';
+import { PlanChecklist, isPlanStateTool, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
 import type { RunRecord } from '../lib/types';
 
 interface Props {
@@ -63,7 +64,11 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
   const resultRecord = result !== null && typeof result === 'object' && !Array.isArray(result) ? (result as Record<string, unknown>) : null;
   const dataRecord = resultRecord && resultRecord.data && typeof resultRecord.data === 'object' && !Array.isArray(resultRecord.data) ? (resultRecord.data as Record<string, unknown>) : null;
   const logsRecord = dataRecord && dataRecord.logs && typeof dataRecord.logs === 'object' && !Array.isArray(dataRecord.logs) ? (dataRecord.logs as Record<string, unknown>) : null;
-  const structuredResult = dataRecord && 'result' in dataRecord ? dataRecord.result : undefined;
+  const structuredResult = dataRecord && 'result' in dataRecord
+    ? dataRecord.result
+    : resultRecord && (typeof resultRecord.answer === 'string' || resultRecord.sources !== undefined || resultRecord.documents !== undefined)
+    ? resultRecord
+    : undefined;
   const resultStatus = dataRecord && typeof dataRecord.resultStatus === 'string' ? dataRecord.resultStatus : undefined;
   const diff = resultRecord && typeof resultRecord.diff === 'string' ? (resultRecord.diff as string) : null;
   const stdout = typeof logsRecord?.stdout === 'string' ? logsRecord.stdout : resultRecord && typeof resultRecord.stdout === 'string' ? resultRecord.stdout : '';
@@ -104,7 +109,7 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
   const originalBytes = resultRecord && typeof resultRecord._originalBytes === 'number' ? resultRecord._originalBytes : null;
   const authorization = typeof request.authorization === 'string' ? request.authorization : undefined;
 
-  const fallbackStdout = stdout || (!resultRecord && typeof result === 'string' ? result : (resultRecord ? JSON.stringify(resultRecord, null, 2) : message.content));
+  const fallbackStdout = stdout || (!resultRecord && typeof result === 'string' ? result : (structuredResult ? '' : (resultRecord ? JSON.stringify(resultRecord, null, 2) : message.content)));
   const structuredJson = structuredResult !== undefined && structuredResult !== null
     ? (() => { try { return JSON.stringify(structuredResult, null, 2); } catch { return String(structuredResult); } })()
     : null;
@@ -141,8 +146,19 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
   );
 }
 
+function toolNameOf(message: Message): string {
+  try {
+    const value = JSON.parse(message.content);
+    const request = value.request || value;
+    return typeof request.name === 'string' ? request.name : '';
+  } catch {
+    return '';
+  }
+}
+
 function TurnTools({ tools, onCancel }: { tools: Message[]; onCancel: () => void }) {
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
+  tools = tools.filter(message => !isPlanStateTool(toolNameOf(message)));
   if (!tools.length) return null;
 
   // Segment tools into edits vs non-edits
@@ -383,7 +399,7 @@ function MessageBody({ message }: { message: Message }) {
           <div className="reasoning-content trace-thought-content">{message.reasoning}</div>
         </details>
       )}
-      <div className="markdown">
+      <div className={`markdown ${message.status === 'streaming' && displayContent ? 'is-streaming' : ''}`}>
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={{
@@ -467,6 +483,8 @@ export function Chat({
   gitBranch,
 }: Props) {
   const sessionActivity = useSessionActivity(conversationKey, generating);
+  const planFallback = todosFromPlanEvents(sessionActivity);
+  const todos = useConversationTodos(conversationKey, generating, planFallback);
   const [localAttachments, setLocalAttachments] = useState<Record<string, Attachment[]>>({});
   const [latestRun, setLatestRun] = useState<RunRecord | null>(null);
   useEffect(() => {
@@ -661,18 +679,7 @@ export function Chat({
             })}
           </div>
         ) : (
-          <div className="welcome codex-welcome">
-            <div className="codex-cloud-icon-wrapper">
-              <svg width="56" height="50" viewBox="0 0 64 60" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="codex-cloud-icon">
-                <path d="M 21 44 C 15 44 11 39 11 34 C 11 29 15 25 20 24 C 20 17 26 12 34 12 C 42 12 48 17 48 23 C 53 25 56 29 56 34 C 56 39 52 44 46 44 C 43 48 39 50 34 50 C 28 50 24 47 21 44 Z" />
-                <path d="M 26 28 L 31 32 L 26 36" />
-                <line x1="34" y1="36" x2="40" y2="36" />
-              </svg>
-            </div>
-            <h1 className="codex-welcome-heading">
-              {projectName ? <>What should we build in <u className="project-highlight">{projectName}</u>?</> : 'What should we work on?'}
-            </h1>
-            <div className="sr-only">
+          <div className="sr-only">
               <div className="welcome-mark"><span /> <span /> <span /></div>
               <p className="eyebrow">YOUR LOCAL WORKSPACE</p>
               <h1>A little model.<br />Room for big ideas.</h1>
@@ -699,7 +706,6 @@ export function Chat({
                 ))}
               </div>
             </div>
-          </div>
         )}
       </div>
 
@@ -753,6 +759,11 @@ export function Chat({
           </div>
         )}
         <div className="codex-composer-wrapper">
+          <PlanChecklist
+            todos={todos}
+            generating={generating}
+            drafting={planMode && generating && todos.length === 0}
+          />
           <div className="composer-meta-bar">
             {projectName ? <><div className="composer-meta-item">
               <Folder size={13} className="composer-meta-icon" />
@@ -832,7 +843,7 @@ export function Chat({
           <textarea
             ref={input}
             aria-label="Message"
-            placeholder="Do anything"
+            placeholder={planMode ? 'Describe the task to plan…' : 'Do anything'}
             value={draft}
             rows={2}
             maxLength={100000}
@@ -869,7 +880,7 @@ export function Chat({
                 className={`icon-button plan-toggle ${planMode ? 'active' : ''}`}
                 aria-pressed={planMode}
                 aria-label="Plan mode"
-                title={planMode ? 'Plan mode is on: write a step-by-step plan, then implement it with tools' : 'Plan mode: for complex tasks, create a plan first, then implement it step by step'}
+                title={planMode ? 'Plan mode is on: write a checklist, then complete one task at a time' : 'Plan mode: write a checklist first, then complete one task at a time'}
                 disabled={generating || loading || disabled}
                 onClick={() => onPlanModeChange?.(!planMode)}
               >

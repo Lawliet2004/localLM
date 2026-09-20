@@ -214,7 +214,7 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
           <div className="library-actions">
             <button className="primary" type="button" disabled={locked || !model.complete} onClick={() => void run(async () => { await onUse(model); setNotice(`${modelLabel(model.filename)} is ready to use.`); })}><Play size={14} />Use model</button>
             {!model.complete && <button type="button" className="secondary" disabled={downloadLocked} onClick={() => {
-              if (model.repo && model.revision) void download(model.repo, model.revision, model.filename);
+              if (model.repo && model.revision) void download(model.repo, model.revision, model.filename, model.projectorFilename ?? undefined);
               else if (model.repo) void run(() => openRepo(model.repo!));
               else { setNotice('Enter the Hugging Face repository in Discover to finish this download.'); setView('discover'); }
             }}><Download size={14} />{activeDownload ? 'Downloading…' : downloadedBytes(model) > 0 ? 'Resume download' : 'Retry download'}</button>}

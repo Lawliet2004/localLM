@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState, type ReactNode } from 'react';
 import { Archive, ChevronRight, ChevronDown } from 'lucide-react';
 import { api, nativeAvailable } from '../lib/api';
 import type { Message, SessionEvent } from '../lib/types';
+import { isPlanStateTool } from './PlanChecklist';
 
 export function useSessionActivity(conversationId: string, generating: boolean) {
   const [events, setEvents] = useState<SessionEvent[]>([]);
@@ -92,6 +93,7 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
           args = req.arguments || {};
           res = parsed.result || {};
         } catch { /* ignore */ }
+        if (isPlanStateTool(toolName)) continue;
 
         const diff = res?.diff;
         const path = (args.path ?? args.AbsolutePath ?? args.TargetFile ?? args.file) as string | undefined;
@@ -180,6 +182,8 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
       }
 
       if (event.eventType === 'tool_call') {
+        const callName = String((payload as { name?: string }).name ?? '');
+        if (isPlanStateTool(callName)) continue;
         const result = events.find(e => e.eventType === 'tool_result' && e.runId === event.runId && e.toolCallId === event.toolCallId)?.payload as Record<string, any> | undefined;
         const live = messages.find(m => m.id === `tool-${event.toolCallId}`);
         const ended = events.some(e => e.eventType === 'turn_end' && e.runId === event.runId);

@@ -18,7 +18,7 @@ export interface StoredDocument extends RetrievedDocument {
   pages?: string[];
   headings?: string[];
   links?: Array<{ text: string; href: string }>;
-  extractionMethod: 'main_content' | 'search_snippet' | 'snippet_salvage' | 'pdf_text' | 'pdf_snippet';
+  extractionMethod: 'main_content' | 'search_snippet' | 'snippet_salvage' | 'pdf_text' | 'pdf_snippet' | 'github_raw' | 'wayback' | 'searxng_answer' | 'searxng_infobox';
   ocrRequired?: boolean;
 }
 

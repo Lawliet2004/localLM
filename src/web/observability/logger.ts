@@ -9,6 +9,7 @@ export type PipelineStage =
   | 'queries_generated'
   | 'search_completed'
   | 'search_pagination'
+  | 'search_suggestion'
   | 'results_deduplicated'
   | 'pages_selected'
   | 'fetch_completed'

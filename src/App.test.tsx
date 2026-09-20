@@ -65,7 +65,7 @@ describe('desktop conversation export', () => {
   });
 });
 describe('conversation permission modes', () => {
-  it('shows full access clearly and resets a new conversation to asking', async () => {
+  it('shows full access clearly and carries it into a new conversation', async () => {
     render(<App />);
     await screen.findByRole('button', { name: 'Saved chat' });
     const mode = screen.getByRole('combobox', { name: 'Permission mode' });
@@ -74,9 +74,27 @@ describe('conversation permission modes', () => {
     expect(mode).toHaveValue('fullAccess');
     expect(screen.getByText('Selected tools run without prompts, including code and external changes.')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
-    expect(mode).toHaveValue('ask');
+    expect(mode).toHaveValue('fullAccess');
     await userEvent.selectOptions(mode, 'autoApprove');
     expect(screen.getByText('Workspace reads run automatically. Other actions ask.')).toBeInTheDocument();
+  });
+  it.each(['ask', 'autoApprove', 'fullAccess'])('restores saved %s permission mode after restarting', async accessMode => {
+    mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: [], tools: [], accessMode } });
+    render(<App />);
+    await screen.findByRole('button', { name: 'Saved chat' });
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Permission mode' })).toHaveValue(accessMode));
+    expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
+  });
+  it('persists permission-only changes and an explicit return to asking', async () => {
+    render(<App />);
+    await screen.findByRole('button', { name: 'Saved chat' });
+    const mode = screen.getByRole('combobox', { name: 'Permission mode' });
+    for (const accessMode of ['fullAccess', 'autoApprove', 'ask']) {
+      await userEvent.selectOptions(mode, accessMode);
+      await waitFor(() => expect(mocks.saveRememberedTools).toHaveBeenLastCalledWith({ sources: [], tools: [], accessMode }));
+      await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
+      expect(mode).toHaveValue(accessMode);
+    }
   });
 });
 
@@ -96,7 +114,7 @@ describe('remembered tool selection', () => {
     const workspace = await screen.findByRole('checkbox', { name: 'Workspace files' });
     await waitFor(() => expect(workspace).toBeEnabled());
     await userEvent.click(workspace);
-    await waitFor(() => expect(mocks.saveRememberedTools).toHaveBeenCalledWith({ sources: ['__workspace'], tools: [] }));
+    await waitFor(() => expect(mocks.saveRememberedTools).toHaveBeenCalledWith({ sources: ['__workspace'], tools: [], accessMode: 'ask' }));
     expect(screen.getByText('Tools · 5 selected')).toBeInTheDocument();
     // No conversation exists before the first message, so nothing is written per conversation.
     expect(mocks.saveConversationTools).not.toHaveBeenCalled();
@@ -125,7 +143,7 @@ describe('remembered tool selection', () => {
   it('leaves workspace-only tools off for an unscoped new conversation', async () => {
     mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: ['__workspace', '__execution'], tools: [] } });
     render(<App />);
-    expect(await screen.findByRole('heading', { name: 'What should we work on?' })).toBeVisible();
+    expect(await screen.findByRole('textbox', { name: 'Message' })).toBeVisible();
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
     expect(await screen.findByRole('checkbox', { name: 'Workspace files' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'Local code' })).not.toBeChecked();
@@ -163,7 +181,7 @@ describe('remembered tool selection', () => {
     await screen.findByText('Tools · 5 selected');
     await userEvent.click(screen.getByRole('checkbox', { name: 'Workspace files' }));
     await waitFor(() => expect(mocks.saveConversationTools).toHaveBeenCalledWith('chat', { sources: [], tools: [], accessMode: 'ask' }));
-    expect(mocks.saveRememberedTools).toHaveBeenCalledWith({ sources: [], tools: [] });
+    expect(mocks.saveRememberedTools).toHaveBeenCalledWith({ sources: [], tools: [], accessMode: 'ask' });
     expect(screen.getByText('Tools · Off')).toBeInTheDocument();
   });
 });
