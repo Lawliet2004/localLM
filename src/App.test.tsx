@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   save: vi.fn(), exportConversation: vi.fn(), bootstrap: vi.fn(),
   saveRememberedTools: vi.fn(), saveConversationTools: vi.fn(), conversationTools: vi.fn(),
   setWorkspace: vi.fn(), workspaceIndex: vi.fn(), removeProject: vi.fn(), confirm: vi.fn(),
+  saveTaskMeta: vi.fn(), deleteConversation: vi.fn(),
 }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: mocks.save, open: vi.fn(), confirm: mocks.confirm }));
 vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) => e instanceof Error ? e.message : String(e), api: {
@@ -15,6 +16,7 @@ vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) 
   compactionStatus: async () => ({ auto: true, keepLast: 10, checkpoint: null }),
   saveRememberedTools: mocks.saveRememberedTools, saveConversationTools: mocks.saveConversationTools, conversationTools: mocks.conversationTools,
   setWorkspace: mocks.setWorkspace, workspaceIndex: mocks.workspaceIndex, removeProject: mocks.removeProject,
+  saveTaskMeta: mocks.saveTaskMeta, deleteConversation: mocks.deleteConversation,
   listConnectors: async () => [{ id: 'example', description: 'Example service', url: '', authType: 'apiKey', connected: true, hasCredential: true, tools: [{ name: 'kept_tool', description: 'Kept for new chats', inputSchema: {} }] }],
   listSkills: async () => [], getWorkspace: async () => ({ path: 'C:/workspace' }), hasDaytonaKey: async () => false,
   messages: async () => [{ id: 'message', conversationId: 'chat', role: 'user', content: 'Export this message', reasoning: '', status: 'complete', createdAt: 0 }],
@@ -28,6 +30,10 @@ beforeEach(() => {
   mocks.workspaceIndex.mockResolvedValue({ projects: [], tasks: {} });
   mocks.setWorkspace.mockResolvedValue(undefined);
   mocks.removeProject.mockResolvedValue({ projects: [], tasks: {} });
+  mocks.saveTaskMeta.mockImplementation(async (id: string, meta: unknown) => {
+    const index = await mocks.workspaceIndex();
+    return { projects: index.projects, tasks: { ...index.tasks, [id]: meta } };
+  });
   mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: [], tools: [] } });
   mocks.conversationTools.mockResolvedValue({ sources: [], tools: [], accessMode: 'ask' });
   mocks.saveRememberedTools.mockResolvedValue(undefined);
@@ -155,6 +161,10 @@ describe('remembered tool selection', () => {
     expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
   });
   it('existing conversations keep their own selections and leave the remembered one alone', async () => {
+    mocks.workspaceIndex.mockResolvedValue({
+      projects: [{ id: 'proj-1', name: 'Web Engine', path: 'C:/web-engine' }],
+      tasks: {},
+    });
     mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: [], tools: [{ connectorId: 'example', toolName: 'kept_tool' }] } });
     mocks.conversationTools.mockResolvedValue({ sources: ['__workspace'], tools: [], accessMode: 'ask' });
     render(<App />);

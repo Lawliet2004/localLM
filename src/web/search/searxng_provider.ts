@@ -55,8 +55,8 @@ export function normalizeSearxMeta(data: any): SearchMeta {
   return meta;
 }
 
-/** Engines that require credentials stay off in the default configuration. */
-export const KEYFREE_CREDENTIAL_ENGINES = ['google', 'bing', 'yandex', 'brave', 'mojeek'];
+/** Engines that require credentials or are unreliable without them stay off in the default configuration. */
+export const KEYFREE_CREDENTIAL_ENGINES = ['google', 'bing', 'yandex', 'brave', 'qwant'];
 
 const resultMeta = new WeakMap<SearchResult[], SearchMeta>();
 
@@ -135,7 +135,7 @@ export class SearXNGProvider implements SearchProvider {
   constructor(
     private baseUrl: string = 'http://127.0.0.1:8080',
     private timeoutMs: number = 8000,
-    private engines: string[] = ['duckduckgo', 'wikipedia', 'stackoverflow', 'github', 'arxiv', 'openstreetmap'],
+    private engines: string[] = ['google cse', 'yep', 'duckduckgo', 'google news', 'reuters', 'wikipedia', 'wikinews', 'stackoverflow', 'github', 'arxiv', 'openstreetmap'],
     private disabledEngines: string[] = [...KEYFREE_CREDENTIAL_ENGINES],
   ) {}
 

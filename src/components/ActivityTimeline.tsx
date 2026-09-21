@@ -1,8 +1,9 @@
 import { Fragment, useEffect, useState, type ReactNode } from 'react';
-import { Archive, ChevronRight, ChevronDown } from 'lucide-react';
+import { ChevronRight } from 'lucide-react';
 import { api, nativeAvailable } from '../lib/api';
 import type { Message, SessionEvent } from '../lib/types';
 import { isPlanStateTool } from './PlanChecklist';
+import { TraceIcon, groupKindOf, toolKindOf, type TraceKind } from './TraceIcon';
 
 export function useSessionActivity(conversationId: string, generating: boolean) {
   const [events, setEvents] = useState<SessionEvent[]>([]);
@@ -32,6 +33,7 @@ export function useSessionActivity(conversationId: string, generating: boolean) 
 interface TimelineItem {
   id: string;
   kind: 'model_response' | 'compaction' | 'edit' | 'tool' | 'thought';
+  icon?: TraceKind;
   rawEvent?: SessionEvent;
   toolMessage?: Message;
   content?: string;
@@ -52,6 +54,7 @@ interface ActivityBlock {
   items?: TimelineItem[];
   item?: TimelineItem;
   title?: string;
+  icon?: TraceKind;
 }
 
 export function ActivityTimeline({ events, messages, renderMessage, renderTool }: {
@@ -107,6 +110,7 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         timelineItems.push({
           id: msg.id,
           kind: isEdit ? 'edit' : 'tool',
+          icon: toolKindOf(toolName, args, res),
           toolMessage: msg,
           toolName,
           filename,
@@ -208,6 +212,7 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         timelineItems.push({
           id: event.id,
           kind: isEdit ? 'edit' : 'tool',
+          icon: toolKindOf(toolName, args, res),
           rawEvent: event,
           toolMessage,
           toolName,
@@ -254,11 +259,16 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
       title = `${prefix} ${parts.join(', ')}`;
     }
 
+    const icon = items.every(it => it.kind === 'thought')
+      ? 'thought'
+      : groupKindOf(items.flatMap(it => (it.icon ? [it.icon] : [])));
+
     blocks.push({
       key,
       type: 'group',
       items,
       title,
+      icon,
     });
     pendingGroup = [];
   };
@@ -300,7 +310,10 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         if (block.type === 'compaction' && block.item) {
           return (
             <details key={block.key} className="activity-reasoning activity-compaction">
-              <summary><Archive size={14} /> Context compacted · continuing</summary>
+              <summary>
+                <TraceIcon kind="system" size={12} />
+                <span>Context compacted · continuing</span>
+              </summary>
               <p>Older activity archived at the 80% threshold. Artifact: {block.item.artifact}</p>
             </details>
           );
@@ -316,19 +329,22 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
 
         if (block.type === 'group' && block.items) {
           const isLastGroup = blockIndex === blocks.length - 1;
+          const isLive = isStreaming && isLastGroup;
           const defaultExpanded = isStreaming || isLastGroup || block.items.length <= 1;
           const isExpanded = openGroups[block.key] ?? defaultExpanded;
 
           return (
-            <div key={block.key} className="activity-group">
+            <div key={block.key} className={`activity-group ${isLive ? 'is-live' : ''}`}>
               <button
                 type="button"
                 className={`activity-group-header ${isExpanded ? 'expanded' : ''}`}
                 onClick={() => setOpenGroups(curr => ({ ...curr, [block.key]: !isExpanded }))}
                 aria-expanded={isExpanded}
               >
-                <span>{block.title}</span>
-                {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                <TraceIcon kind={block.icon ?? 'explore'} size={13} />
+                <span className="activity-group-title">{block.title}</span>
+                <span className="activity-group-count">{block.items.length}</span>
+                <ChevronRight size={13} className="activity-group-chevron" />
               </button>
               <div
                 className="activity-group-items"
@@ -339,7 +355,8 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
                     return (
                       <details key={item.id} className="trace-thought-details">
                         <summary className="trace-thought-pill">
-                          <span>Thought for {item.duration ?? '8s'}</span>
+                          <TraceIcon kind="thought" size={12} />
+                          <span className="trace-thought-label">Thought for {item.duration ?? '8s'}</span>
                           <ChevronRight size={13} className="thought-chevron" />
                         </summary>
                         <div className="trace-thought-content">{item.thoughtText}</div>

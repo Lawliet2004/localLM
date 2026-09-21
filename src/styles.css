@@ -1381,16 +1381,6 @@ h1 { font-weight: 450; font-size: 38px; line-height: 1.22; letter-spacing: -1.3p
   min-width: 0;
 }
 
-.command-run-card .collapse-btn {
-  background: none;
-  border: none;
-  color: var(--secondary);
-  padding: 2px;
-  display: flex;
-  align-items: center;
-  cursor: pointer;
-}
-
 .command-run-card .cmd-icon {
   color: var(--accent);
   flex-shrink: 0;

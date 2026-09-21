@@ -179,6 +179,7 @@ export const api = {
   resolveAskUser: (id: string, choice: string | null) => invoke<void>('resolve_ask_user', { id, choice }),
   getTodos: (conversationId: string) => invoke<TodoItem[]>('get_todos', { conversationId }),
   getGoal: (conversationId: string) => invoke<string | null>('get_goal', { conversationId }),
+  clearTodos: (conversationId: string) => invoke<void>('clear_todos', { conversationId }),
   getSessionEvents: (conversationId: string, fromSeq?: number | null, limit?: number | null) =>
     invoke<SessionEvent[]>('get_session_events', { conversationId, fromSeq, limit }),
   forkSession: (conversationId: string, fromSeq: number) =>

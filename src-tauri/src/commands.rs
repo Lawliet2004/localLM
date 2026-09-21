@@ -181,7 +181,9 @@ pub async fn delete_conversation(state: State<'_, AppState>, id: String) -> Resu
         .operation
         .try_lock()
         .map_err(|_| "Stop the active operation before deleting a conversation.")?;
-    state.database()?.delete_conversation(&id)
+    let store = state.database()?;
+    store.delete_conversation(&id)?;
+    crate::workspace_ui::remove_task_meta(&store, &id)
 }
 #[tauri::command]
 pub fn get_messages(state: State<'_, AppState>, id: String) -> Result<Vec<Message>, String> {
@@ -263,11 +265,11 @@ pub(crate) async fn load_selected_model(state: &AppState) -> Result<RuntimeStatu
         (store.preferences()?, store.runtime_config()?)
     };
     // Resolve model-specific runtime requirements before starting a process.
-    // The three catalog models are not interchangeable: ZAYA needs its custom
-    // build, Bonsai needs the legacy Prism build, and MiniCPM uses standard
-    // llama.cpp. Reading the architecture is a best-effort enhancement; the
-    // catalog filename still identifies the managed models when metadata cannot
-    // be parsed.
+    // Catalog models are not interchangeable: ZAYA needs its custom build,
+    // legacy Bonsai 8B Q2_0 needs prism-b9601, Ternary Bonsai 2 needs
+    // prism-b10709+, and MiniCPM uses standard llama.cpp. Reading the
+    // architecture is a best-effort enhancement; the catalog filename still
+    // identifies the managed models when metadata cannot be parsed.
     let architecture = crate::gguf::read_architecture(std::path::Path::new(&preferences.model_path))
         .ok()
         .flatten();
@@ -293,6 +295,13 @@ fn is_prism_runtime(runtime_path: &str) -> bool {
         .replace('\\', "/")
         .to_ascii_lowercase()
         .contains("runtime-prism-b9601-68faa14")
+}
+
+fn is_bonsai2_runtime(runtime_path: &str) -> bool {
+    runtime_path
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("runtime-prism-b10709-9a9394a")
 }
 
 fn is_standard_runtime(runtime_path: &str, data_dir: &Path, project_root: &Path) -> bool {
@@ -331,6 +340,11 @@ fn find_prism_runtime(project_root: &Path) -> Option<std::path::PathBuf> {
     runtime.is_file().then_some(runtime)
 }
 
+fn find_bonsai2_runtime(project_root: &Path) -> Option<std::path::PathBuf> {
+    let runtime = project_root.join(crate::model_catalog::BONSAI2_RUNTIME_RELATIVE);
+    runtime.is_file().then_some(runtime)
+}
+
 /// Select the correct local runtime for a managed model and repair settings
 /// inherited from a different model. User-selected custom executables remain
 /// untouched unless they are one of the app's known incompatible profiles.
@@ -352,6 +366,14 @@ fn configure_local_model_runtime(
         return Ok(());
     }
 
+    let is_bonsai2 = filename.is_some_and(crate::model_catalog::is_bonsai2_filename);
+    if is_bonsai2 {
+        if !is_bonsai2_runtime(&preferences.runtime_path) {
+            bonsai2_auto_configure(preferences, config, state, project_root)?;
+        }
+        return Ok(());
+    }
+
     let is_bonsai = filename == Some(crate::model_catalog::BONSAI_FILENAME);
     if is_bonsai {
         if normalize_bonsai_context(config) {
@@ -362,6 +384,7 @@ fn configure_local_model_runtime(
         }
         let incompatible = preferences.runtime_path.is_empty()
             || is_zaya_runtime(&preferences.runtime_path)
+            || is_bonsai2_runtime(&preferences.runtime_path)
             || is_standard_runtime(&preferences.runtime_path, &state.data_dir, project_root);
         if !is_prism_runtime(&preferences.runtime_path) && incompatible {
             let Some(runtime) = find_prism_runtime(project_root) else {
@@ -378,7 +401,8 @@ fn configure_local_model_runtime(
     {
         let needs_standard = preferences.runtime_path.is_empty()
             || is_zaya_runtime(&preferences.runtime_path)
-            || is_prism_runtime(&preferences.runtime_path);
+            || is_prism_runtime(&preferences.runtime_path)
+            || is_bonsai2_runtime(&preferences.runtime_path);
         if needs_standard {
             let Some(runtime) = find_standard_runtime(&state.data_dir, project_root) else {
                 return Err("Install a standard llama.cpp runtime or select a compatible llama-server.exe in Models, then load the model.".into());
@@ -449,8 +473,8 @@ fn zaya_auto_configure(
     let canonical = std::fs::canonicalize(&custom_runtime)
         .map_err(|error| format!("Custom ZAYA runtime exists but cannot be resolved: {error}"))?;
     // Apply the custom runtime path and ZAYA-optimal placement. Keep a
-    // user-chosen context unless it is still the generic MiniCPM default,
-    // which would try to allocate a 131k KV cache on this CPU-only path.
+    // user-chosen context unless it is still the generic default, which would
+    // allocate a 32k KV cache this CPU-only path does not need.
     preferences.runtime_path = canonical.to_string_lossy().into_owned();
     apply_zaya_recommended(config);
     // Persist so the UI reflects the changes and subsequent loads reuse them.
@@ -466,6 +490,34 @@ fn apply_zaya_recommended(config: &mut crate::runtime_config::RuntimeConfig) {
     if keep_context != crate::runtime_config::RuntimeConfig::default().context_length {
         config.context_length = keep_context;
     }
+}
+
+fn bonsai2_auto_configure(
+    preferences: &mut crate::store::Preferences,
+    config: &mut crate::runtime_config::RuntimeConfig,
+    state: &AppState,
+    project_root: &Path,
+) -> Result<(), String> {
+    let Some(runtime) = find_bonsai2_runtime(project_root) else {
+        return Err(
+            "Ternary Bonsai 2 (PTQ1_0 / PQ2_0) requires the PrismML llama.cpp fork prism-b10709 or newer. \
+             Stock llama.cpp refuses these files (invalid ggml type 143). Install it with:\n  \
+             powershell -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1 -Bonsai2\n\
+             Then click Use model again. The older prism-b9601 runtime is only for Ternary Bonsai 8B Q2_0."
+                .into(),
+        );
+    };
+    let canonical = std::fs::canonicalize(&runtime)
+        .map_err(|error| format!("Prism Bonsai 2 runtime exists but cannot be resolved: {error}"))?;
+    preferences.runtime_path = canonical.to_string_lossy().into_owned();
+    // First switch onto this runtime: drop a leftover projector from another
+    // model so a 4 GB GPU is not asked to hold a 0.6 GB vision tower as well.
+    preferences.projector_path.clear();
+    *config = crate::runtime_config::RuntimeConfig::bonsai2_recommended();
+    let store = state.database()?;
+    store.save_preferences(preferences)?;
+    store.save_runtime_config(config)?;
+    Ok(())
 }
 
 /// True when the selected runtime executable lives in the app-managed
@@ -492,13 +544,17 @@ mod model_runtime_tests {
     fn identifies_catalog_models_and_runtime_profiles() {
         assert_eq!(selected_model_filename(r"C:\models\MiniCPM5-2B.Q6_K.gguf"), Some(crate::model_catalog::MODEL_FILENAME));
         assert_eq!(selected_model_filename("/models/Ternary-Bonsai-8B-Q2_0.gguf"), Some(crate::model_catalog::BONSAI_FILENAME));
+        assert!(crate::model_catalog::is_bonsai2_filename("Ternary-Bonsai-2-27B-PTQ1_0.gguf"));
         assert!(is_prism_runtime(r"C:\LocalLM\.local\runtime-prism-b9601-68faa14\llama-server.exe"));
         assert!(!is_prism_runtime(r"C:\LocalLM\.local\runtime\llama-server.exe"));
+        assert!(is_bonsai2_runtime(r"C:\LocalLM\.local\runtime-prism-b10709-9a9394a\llama-server.exe"));
+        assert!(!is_bonsai2_runtime(r"C:\LocalLM\.local\runtime-prism-b9601-68faa14\llama-server.exe"));
+        assert!(!is_prism_runtime(r"C:\LocalLM\.local\runtime-prism-b10709-9a9394a\llama-server.exe"));
     }
 
     #[test]
     fn normalizes_bonsai_to_its_full_model_context() {
-        let mut config = RuntimeConfig::default();
+        let mut config = RuntimeConfig { context_length: 131_072, ..RuntimeConfig::default() };
         assert!(normalize_bonsai_context(&mut config));
         assert_eq!(config.context_length, crate::model_catalog::BONSAI_CONTEXT_LENGTH);
 
@@ -514,13 +570,13 @@ mod model_runtime_tests {
     #[test]
     fn zaya_auto_config_keeps_a_saved_context_and_replaces_the_generic_default() {
         let mut custom = RuntimeConfig {
-            context_length: 32_768,
+            context_length: 65_536,
             gpu_layers: -1,
             flash_attention: true,
             ..RuntimeConfig::default()
         };
         apply_zaya_recommended(&mut custom);
-        assert_eq!(custom.context_length, 32_768);
+        assert_eq!(custom.context_length, 65_536);
         assert_eq!(custom.gpu_layers, 0);
         assert!(!custom.flash_attention);
 

@@ -87,8 +87,7 @@ fn step_text(line: &str) -> Option<&str> {
 
 fn strip_md(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
+    for ch in text.chars() {
         if ch == '*' || ch == '_' {
             continue;
         }
@@ -156,7 +155,9 @@ fn make_todo(text: &str) -> Result<Todo, String> {
 }
 
 /// One-line open-work summary injected into the turn context (logged).
-pub fn summary_line(todos: &[Todo], goal: Option<&str>) -> Option<String> {
+/// `todo_tools` is the subset of todo mutators actually offered this turn —
+/// naming tools the model cannot see just teaches it to emit dead calls.
+pub fn summary_line(todos: &[Todo], goal: Option<&str>, todo_tools: &[&str]) -> Option<String> {
     let open: Vec<&str> = todos
         .iter()
         .filter(|todo| todo.status != COMPLETED)
@@ -167,7 +168,12 @@ pub fn summary_line(todos: &[Todo], goal: Option<&str>) -> Option<String> {
     }
     let total = todos.len();
     let done = todos.iter().filter(|todo| todo.status == COMPLETED).count();
-    let mut line = String::from("Tracked plan state (update via todo_add/todo_update; do not edit silently): ");
+    let hint = if todo_tools.is_empty() {
+        "no todo tools are offered this turn".to_string()
+    } else {
+        format!("update via {}; do not edit silently", todo_tools.join("/"))
+    };
+    let mut line = format!("Tracked plan state ({hint}): ");
     if let Some(objective) = goal {
         line.push_str(&format!("goal: {objective}. "));
     }
@@ -193,6 +199,11 @@ pub fn get_goal(state: tauri::State<'_, crate::AppState>, conversation_id: Strin
     state.database()?.goal(&conversation_id)
 }
 
+#[tauri::command]
+pub fn clear_todos(state: tauri::State<'_, crate::AppState>, conversation_id: String) -> Result<(), String> {
+    state.database()?.save_todos(&conversation_id, &[])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,10 +221,13 @@ mod tests {
             Todo { text: "done thing".into(), status: COMPLETED.into(), updated_at: 0 },
             Todo { text: "next thing".into(), status: IN_PROGRESS.into(), updated_at: 0 },
         ];
-        let line = summary_line(&todos, Some("ship it")).unwrap();
+        let line = summary_line(&todos, Some("ship it"), &["todo_add", "todo_update"]).unwrap();
         assert!(line.contains("ship it") && line.contains("next thing") && !line.contains("done thing"));
         assert!(line.contains("todo_add/todo_update"));
-        assert!(summary_line(&[], None).is_none());
+        let write_only = summary_line(&todos, None, &["todo_write"]).unwrap();
+        assert!(write_only.contains("todo_write") && !write_only.contains("todo_update"));
+        assert!(summary_line(&todos, None, &[]).unwrap().contains("no todo tools"));
+        assert!(summary_line(&[], None, &["todo_write"]).is_none());
     }
     #[test]
     fn todo_factory_rejects_blank_and_oversize_text() {

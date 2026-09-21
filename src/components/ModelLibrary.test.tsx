@@ -138,8 +138,8 @@ it('allows a text-only download when a repository has multiple projectors', asyn
   fireEvent.click(screen.getByRole('button', { name: 'Search' }));
   await screen.findByLabelText('Vision projector');
   expect(screen.getByLabelText('Vision projector')).toHaveValue('');
-  expect(screen.getByLabelText('Download Q1_0')).toBeEnabled();
-  fireEvent.click(screen.getByLabelText('Download Q1_0'));
+  expect(screen.getByLabelText('Download PTQ1_0')).toBeEnabled();
+  fireEvent.click(screen.getByLabelText('Download PTQ1_0'));
   await waitFor(() => expect(mock.downloadHuggingFaceModel).toHaveBeenCalledWith('owner/multi-GGUF', model.revision, 'Ternary-Bonsai-2-27B-PTQ1_0.gguf', undefined, null));
 });
 it('retries an incomplete download from saved Hugging Face provenance', async () => {

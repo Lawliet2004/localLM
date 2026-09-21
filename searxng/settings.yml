@@ -27,21 +27,15 @@ outgoing:
   max_request_timeout: 12.0
   useragent_suffix: "LocalLM/1.0"
 
-# Key-free default: only engines that need no credentials. The client sends
-# matching `engines`/`disabled_engines` params and verifies health at runtime
-# instead of assuming an enabled engine works.
+# With use_default_settings the full upstream engine catalogue loads (~260
+# engines, many enabled by default). The client sends an `engines` whitelist
+# per query, so this section only pins overrides. General web results ride on
+# `google cse` (key-free, enabled by default) plus `duckduckgo` (intermittent
+# CAPTCHA), `google news`, `reuters`, `wikipedia`/`wikinews`, and the niche
+# engines. `mojeek`/`startpage` are `inactive` upstream (proof-of-work
+# CAPTCHA) and cannot be enabled here.
 engines:
-  - name: duckduckgo
-    disabled: false
-  - name: wikipedia
-    disabled: false
-  - name: stackoverflow
-    disabled: false
-  - name: github
-    disabled: false
-  - name: arxiv
-    disabled: false
-  - name: openstreetmap
+  - name: yep
     disabled: false
   - name: google
     disabled: true
@@ -51,7 +45,7 @@ engines:
     disabled: true
   - name: brave
     disabled: true
-  - name: mojeek
+  - name: qwant
     disabled: true
 
 enabled_plugins:

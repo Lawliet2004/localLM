@@ -32,3 +32,5 @@ dist-ssr
 *.sw?
 .vitest
 .commandcode
+.localqa-*.txt
+nul

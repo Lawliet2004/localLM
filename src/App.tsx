@@ -32,6 +32,8 @@ import { WorkspacePanel } from './components/WorkspacePanel';
 
 import type { WorkspaceIndex } from './lib/types';
 
+import { allProjects, conversationProjectId, findProject } from './lib/projects';
+
 import './styles.css';
 
 import './workspace.css';
@@ -62,9 +64,9 @@ function normalizeBootstrap(value: Bootstrap): Bootstrap {
 
 }
 
-function sourcesForNewConversation(sources: string[], projectId: string | null) {
+function sourcesForNewConversation(sources: string[], hasWorkspace: boolean) {
 
-  return projectId ? sources : sources.filter(source => source !== '__workspace' && source !== '__execution');
+  return hasWorkspace ? sources : sources.filter(source => source !== '__workspace' && source !== '__execution');
 
 }
 
@@ -81,27 +83,22 @@ export default function App() {
   const [navigation, setNavigation] = useState<{ ids: string[]; cursor: number }>({ ids: [], cursor: -1 });
 
   const [hitId, setHitId] = useState<string | null>(null);
-  const [gitBranch, setGitBranch] = useState('feature/locallm');
-
-  useEffect(() => {
-    if (nativeAvailable && api.workspaceGit) {
-      api.workspaceGit().then(g => { if (g?.branch) setGitBranch(g.branch); }).catch(() => {});
-    }
-  }, []);
 
   useEffect(() => { if (nativeAvailable && api.workspaceIndex) api.workspaceIndex().then(setWorkspaceIndex).catch(e => setError(errorMessage(e))); }, []);
 
   async function selectProject(id: string | null) {
 
+    const target = id || null;
+
     try {
 
-      const project = workspaceIndex.projects.find(p => p.id === id);
+      const project = findProject(workspaceIndex, target);
 
-      await api.setWorkspace(project?.path ?? '');
+      if (nativeAvailable && api.setWorkspace) await api.setWorkspace(project?.path ?? '');
 
-      if (activeId) setWorkspaceIndex(await api.saveTaskMeta(activeId, { ...(workspaceIndex.tasks[activeId] ?? { archived: false, pinned: false }), projectId: id }));
+      if (activeId) setWorkspaceIndex(await api.saveTaskMeta(activeId, { ...(workspaceIndex.tasks[activeId] ?? { archived: false, pinned: false }), projectId: target }));
 
-      setProjectId(id);
+      setProjectId(target);
 
     } catch (e) { setError(errorMessage(e)); }
 
@@ -241,6 +238,23 @@ export default function App() {
 
     setChatNotice('');
 
+    const index = nativeAvailable && api.workspaceIndex
+      ? await api.workspaceIndex().catch(() => workspaceIndex)
+      : workspaceIndex;
+
+    const resolvedProject = [targetProjectId, projectId]
+      .map(id => (id ? findProject(index, id) : undefined))
+      .find(Boolean)?.id ?? null;
+
+    if (!resolvedProject) {
+      setError('Add a project folder first, then start a chat.');
+      return;
+    }
+
+    const resolvedFolder = findProject(index, resolvedProject);
+
+    setWorkspaceIndex(index);
+
     switchDraft(null);
 
     selection.current++; setActiveId(null); setMessages([]); setPage('chat'); setError(''); setChatError(''); setLiveActivity(null); setRenaming(false);
@@ -251,19 +265,14 @@ export default function App() {
 
     setPreset('standard');
 
-    setSelectedConnectors(sourcesForNewConversation(rememberedTools.current.sources, targetProjectId));
+    setSelectedConnectors(sourcesForNewConversation(rememberedTools.current.sources, Boolean(resolvedFolder?.path)));
     setSelectedTools(rememberedTools.current.tools);
 
-    setProjectId(targetProjectId);
+    setProjectId(resolvedProject);
 
     try {
-      if (targetProjectId) {
-        const project = workspaceIndex.projects.find(p => p.id === targetProjectId);
-        if (project?.path && api.setWorkspace) {
-          await api.setWorkspace(project.path);
-        }
-      } else if (api.setWorkspace) {
-        await api.setWorkspace('');
+      if (nativeAvailable && api.setWorkspace) {
+        await api.setWorkspace(resolvedFolder?.path ?? '');
       }
     } catch (e) {
       setError(errorMessage(e));
@@ -439,7 +448,7 @@ export default function App() {
 
         rememberedTools.current = value.rememberedTools ?? { sources: [], tools: [] };
 
-        setSelectedConnectors(sourcesForNewConversation(rememberedTools.current.sources, null));
+        setSelectedConnectors(sourcesForNewConversation(rememberedTools.current.sources, false));
 
         setSelectedTools(rememberedTools.current.tools);
         setAccessMode(rememberedTools.current.accessMode ?? 'ask');
@@ -490,11 +499,11 @@ export default function App() {
 
     try {
 
-      const nextProject = workspaceIndex.tasks[id]?.projectId ?? null;
+      const nextProject = conversationProjectId(workspaceIndex, id);
 
-      const project = workspaceIndex.projects.find(p => p.id === nextProject);
-
-      if (project) await api.setWorkspace(project.path);
+      if (nativeAvailable && api.setWorkspace) {
+        await api.setWorkspace(findProject(workspaceIndex, nextProject)?.path ?? '');
+      }
 
       setProjectId(nextProject);
 
@@ -526,7 +535,7 @@ export default function App() {
 
     }
 
-    catch (e) { if (version === selection.current) { setError(errorMessage(e)); setActiveId(null); switchDraft(null); setSelectedConnectors(sourcesForNewConversation(rememberedTools.current.sources, null)); setSelectedTools(rememberedTools.current.tools); setAccessMode(rememberedTools.current.accessMode ?? 'ask'); } }
+    catch (e) { if (version === selection.current) { setError(errorMessage(e)); setActiveId(null); switchDraft(null); setSelectedConnectors(sourcesForNewConversation(rememberedTools.current.sources, false)); setSelectedTools(rememberedTools.current.tools); setAccessMode(rememberedTools.current.accessMode ?? 'ask'); } }
 
     finally { if (version === selection.current) setLoading(false); }
 
@@ -538,9 +547,18 @@ export default function App() {
 
     setChatNotice('');
 
-    setGenerating(true); setChatError(''); setLiveActivity({ state: 'Preparing', activity: 'Preparing request…' });
-
     let id = activeId;
+
+    // Chats live under a folder: a brand-new conversation needs one up front.
+    const folderId = id ? projectId
+      : (projectId && findProject(workspaceIndex, projectId) ? projectId : allProjects(workspaceIndex)[0]?.id) ?? null;
+
+    if (!id && !folderId) {
+      setChatError('Add a project folder first, then send.');
+      return;
+    }
+
+    setGenerating(true); setChatError(''); setLiveActivity({ state: 'Preparing', activity: 'Preparing request…' });
 
     const previousIds = new Set(messages.map(message => message.id));
 
@@ -550,7 +568,9 @@ export default function App() {
 
         const conversation = await api.createConversation(); id = conversation.id;
 
-        if (projectId) setWorkspaceIndex(await api.saveTaskMeta(id, { projectId, archived: false, pinned: false }));
+        setProjectId(folderId);
+
+        setWorkspaceIndex(await api.saveTaskMeta(id, { projectId: folderId, archived: false, pinned: false }));
 
         try { moveNewDraft(id); } catch (e) { setError(errorMessage(e)); }
 
@@ -874,6 +894,23 @@ export default function App() {
 
   }
 
+  async function removeConversations(ids: string[]) {
+
+    if (!ids.length) return;
+
+    try {
+      for (const id of ids) await api.deleteConversation(id);
+      setData(current => ({ ...current, conversations: current.conversations.filter(item => !ids.includes(item.id)) }));
+      if (activeId && ids.includes(activeId)) {
+        selection.current++; setActiveId(null); setMessages([]); setRenaming(false);
+        await newConversation();
+      }
+    }
+
+    catch (e) { setError(errorMessage(e)); }
+
+  }
+
   async function rename() {
 
     if (!activeId) return;
@@ -906,8 +943,8 @@ export default function App() {
 
   }
 
-  const activeProject = workspaceIndex.projects.find(p => p.id === projectId);
-  const activeProjectName = activeProject?.name;
+  const activeProject = allProjects(workspaceIndex).find(p => p.id === projectId);
+  const activeProjectName = activeProject?.name ?? '';
 
   return <div className={`app ${collapsed ? 'sidebar-collapsed' : ''}`}>
 
@@ -964,11 +1001,11 @@ export default function App() {
       <WindowControls onError={setError} />
     </div>
 
-    {!collapsed && <Sidebar workspace={workspaceIndex} onWorkspace={setWorkspaceIndex} projectId={projectId} onProject={id => void selectProject(id)} onHit={(id, messageId) => { setHitId(messageId); void selectConversation(id); }} page={page} onPage={navigate} conversations={data.conversations} activeId={activeId} onSelect={id => void selectConversation(id)} onNew={targetProjectId => void newConversation(targetProjectId)} busy={busy} search={search} onSearch={setSearch} theme={theme} onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')} onCollapse={() => setCollapsed(true)} />}
+    {!collapsed && <Sidebar workspace={workspaceIndex} onWorkspace={setWorkspaceIndex} projectId={projectId} onProject={id => void selectProject(id)} onDeleteConversations={ids => void removeConversations(ids)} onHit={(id, messageId) => { setHitId(messageId); void selectConversation(id); }} page={page} onPage={navigate} conversations={data.conversations} activeId={activeId} onSelect={id => void selectConversation(id)} onNew={targetProjectId => void newConversation(targetProjectId)} busy={busy} search={search} onSearch={setSearch} theme={theme} onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')} onCollapse={() => setCollapsed(true)} />}
 
     {approval && <ApprovalDialog key={approval.id} request={approval} onResolve={allow => api.resolveToolApproval(approval.id, allow)} onResolveAskUser={(choice) => api.resolveAskUser(approval.id, choice)} />}
 
-    <main className="workspace"><header className={`workspace-header ${page === 'chat' && !messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead">{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{page === 'chat' ? <><button className="icon-button" aria-label="Back" disabled={busy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={busy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</> : <><Settings className="task-folder-icon" size={18} /><span className="workspace-title">{page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : page === 'tools' ? 'Tools' : 'Skills'}</span></>}</div><div className="header-actions">{page === 'chat' && workspaceIndex.projects.length > 0 && <select aria-label="Task project" value={projectId ?? ''} disabled={busy} onChange={e => void selectProject(e.target.value || null)}><option value="">No project</option>{workspaceIndex.projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}{page === 'chat' && <div className="workspace-layout-controls"><button className="icon-button workspace-layout-btn" aria-label="Toggle split view" title="Toggle split view" onClick={() => setCollapsed(!collapsed)}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="8" y1="2" x2="8" y2="14" /></svg></button><button className="icon-button workspace-layout-btn" aria-label="Toggle panel" title="Toggle panel" onClick={() => { const toggleBtn = document.querySelector<HTMLButtonElement>('[aria-label="Toggle files panel"]'); toggleBtn?.click(); }}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="11" y1="2" x2="11" y2="14" /></svg></button></div>}{page === 'chat' && <WorkspacePanel busy={busy} onBusy={setCommandBusy} conversationId={activeId} revision={`${projectId}:${activeId}`} />}<button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header><DownloadActivity />
+    <main className="workspace"><header className={`workspace-header ${page === 'chat' && !messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead">{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{page === 'chat' ? <><button className="icon-button" aria-label="Back" disabled={busy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={busy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</> : <><Settings className="task-folder-icon" size={18} /><span className="workspace-title">{page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : page === 'tools' ? 'Tools' : 'Skills'}</span></>}</div><div className="header-actions">{page === 'chat' && allProjects(workspaceIndex).length > 0 && <select aria-label="Task project" value={projectId ?? allProjects(workspaceIndex)[0]?.id} disabled={busy} onChange={e => void selectProject(e.target.value)}>{allProjects(workspaceIndex).map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}{page === 'chat' && <div className="workspace-layout-controls"><button className="icon-button workspace-layout-btn" aria-label="Toggle split view" title="Toggle split view" onClick={() => setCollapsed(!collapsed)}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="8" y1="2" x2="8" y2="14" /></svg></button><button className="icon-button workspace-layout-btn" aria-label="Toggle panel" title="Toggle panel" onClick={() => { const toggleBtn = document.querySelector<HTMLButtonElement>('[aria-label="Toggle files panel"]'); toggleBtn?.click(); }}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="11" y1="2" x2="11" y2="14" /></svg></button></div>}{page === 'chat' && <WorkspacePanel busy={busy} onBusy={setCommandBusy} conversationId={activeId} revision={`${projectId}:${activeId}`} />}<button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header><DownloadActivity />
 
       {page !== 'chat' && (
         <nav className="settings-nav-bar" aria-label="Settings navigation">
@@ -1040,8 +1077,6 @@ export default function App() {
       {page === 'chat' ? <><Chat
 
         projectName={activeProjectName}
-
-        gitBranch={activeProject ? gitBranch : undefined}
 
         attachmentDrafts={attachmentDrafts}
 

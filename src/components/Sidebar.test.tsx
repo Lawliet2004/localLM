@@ -55,7 +55,7 @@ describe('Sidebar project folders and actions', () => {
     }));
   });
 
-  it('renders registered projects and general localLM bucket', () => {
+  it('renders only registered projects with no built-in folder', () => {
     render(
       <Sidebar
         page="chat"
@@ -76,7 +76,7 @@ describe('Sidebar project folders and actions', () => {
 
     expect(screen.getByText('Alpha Project')).toBeInTheDocument();
     expect(screen.getByText('Beta Project')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'New chat in localLM' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'New chat in localLM' })).not.toBeInTheDocument();
     expect(screen.queryByText('Documents')).not.toBeInTheDocument();
   });
 
@@ -139,6 +139,7 @@ describe('Sidebar project folders and actions', () => {
   it('deletes a folder from the project section after confirmation', async () => {
     const onWorkspace = vi.fn();
     const onProject = vi.fn();
+    const onDeleteConversations = vi.fn();
 
     render(
       <Sidebar
@@ -158,6 +159,7 @@ describe('Sidebar project folders and actions', () => {
         workspace={sampleWorkspace}
         onWorkspace={onWorkspace}
         onProject={onProject}
+        onDeleteConversations={onDeleteConversations}
       />
     );
 
@@ -176,6 +178,7 @@ describe('Sidebar project folders and actions', () => {
     expect(onWorkspace).toHaveBeenCalledWith(expect.objectContaining({
       projects: [{ id: 'beta-proj', name: 'Beta Project', path: 'C:/projects/beta' }],
     }));
+    expect(onDeleteConversations).toHaveBeenCalledWith(['chat-1']);
     expect(onProject).toHaveBeenCalledWith(null);
   });
 
@@ -213,16 +216,14 @@ describe('Sidebar project folders and actions', () => {
     expect(onWorkspace).not.toHaveBeenCalled();
   });
 
-  it('allows deleting the localLM project folder with confirmation and saves to localStorage', async () => {
-    localStorage.clear();
-    const onProject = vi.fn();
+  it('offers delete and options controls on every folder', () => {
     render(
       <Sidebar
         page="chat"
         onPage={vi.fn()}
         conversations={sampleConversations}
         activeId={null}
-        projectId="locallm"
+        projectId="alpha-proj"
         onSelect={vi.fn()}
         onNew={vi.fn()}
         busy={false}
@@ -232,20 +233,119 @@ describe('Sidebar project folders and actions', () => {
         onTheme={vi.fn()}
         onCollapse={vi.fn()}
         workspace={sampleWorkspace}
-        onProject={onProject}
       />
     );
 
-    const deleteBtn = screen.getByRole('button', { name: 'Delete folder localLM' });
-    await userEvent.click(deleteBtn);
+    for (const name of ['Alpha Project', 'Beta Project']) {
+      expect(screen.getByRole('button', { name: `Delete folder ${name}` })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: `Options for ${name}` })).toBeInTheDocument();
+    }
+    expect(screen.queryByRole('button', { name: 'Delete folder localLM' })).not.toBeInTheDocument();
+  });
 
-    expect(mocks.confirm).toHaveBeenCalledWith(
-      expect.stringContaining('Remove "localLM" from the project section?'),
-      expect.objectContaining({ title: 'Remove project folder?', kind: 'warning' })
+  it('renders unassigned chats flat without a folder', () => {
+    render(
+      <Sidebar
+        page="chat"
+        onPage={vi.fn()}
+        conversations={sampleConversations}
+        activeId={null}
+        onSelect={vi.fn()}
+        onNew={vi.fn()}
+        busy={false}
+        search=""
+        onSearch={vi.fn()}
+        theme="dark"
+        onTheme={vi.fn()}
+        onCollapse={vi.fn()}
+        workspace={sampleWorkspace}
+      />
     );
 
-    expect(onProject).toHaveBeenCalledWith(null);
-    expect(localStorage.getItem('locallm-deleted-default-projects')).toContain('locallm');
+    // chat-2 has projectId: null — it appears flat, outside any folder
+    expect(screen.getByText('General unfiled chat')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'New chat in localLM' })).not.toBeInTheDocument();
+  });
+
+  it('scopes the top New chat button to the active folder', async () => {
+    const onNew = vi.fn();
+    render(
+      <Sidebar
+        page="chat"
+        onPage={vi.fn()}
+        conversations={sampleConversations}
+        activeId={null}
+        projectId="beta-proj"
+        onSelect={vi.fn()}
+        onNew={onNew}
+        busy={false}
+        search=""
+        onSearch={vi.fn()}
+        theme="dark"
+        onTheme={vi.fn()}
+        onCollapse={vi.fn()}
+        workspace={sampleWorkspace}
+      />
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+    expect(onNew).toHaveBeenCalledWith('beta-proj');
+  });
+
+  it('scopes the top New chat button to the first folder when none is active', async () => {
+    const onNew = vi.fn();
+    render(
+      <Sidebar
+        page="chat"
+        onPage={vi.fn()}
+        conversations={sampleConversations}
+        activeId={null}
+        onSelect={vi.fn()}
+        onNew={onNew}
+        busy={false}
+        search=""
+        onSearch={vi.fn()}
+        theme="dark"
+        onTheme={vi.fn()}
+        onCollapse={vi.fn()}
+        workspace={sampleWorkspace}
+      />
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+    expect(onNew).toHaveBeenCalledWith('alpha-proj');
+  });
+
+  it('opens the folder picker then starts a chat inside it when no folders exist', async () => {
+    const onNew = vi.fn();
+    mocks.open.mockResolvedValue('C:/projects/gamma');
+    mocks.saveProject.mockImplementation(async (project: { id: string; name: string; path: string }) => ({
+      projects: [project],
+      tasks: {},
+    }));
+    render(
+      <Sidebar
+        page="chat"
+        onPage={vi.fn()}
+        conversations={[]}
+        activeId={null}
+        onSelect={vi.fn()}
+        onNew={onNew}
+        busy={false}
+        search=""
+        onSearch={vi.fn()}
+        theme="dark"
+        onTheme={vi.fn()}
+        onCollapse={vi.fn()}
+        workspace={{ projects: [], tasks: {} }}
+      />
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+
+    expect(mocks.open).toHaveBeenCalled();
+    await waitFor(() => expect(mocks.saveProject).toHaveBeenCalledWith({ id: 'gamma', name: 'gamma', path: 'C:/projects/gamma' }));
+    await waitFor(() => expect(onNew).toHaveBeenCalledWith('gamma'));
   });
 
   it('allows deleting custom project folders directly via the trash icon button', async () => {

@@ -20,14 +20,44 @@ Verified on 2026-09-11 with an RTX 2050 (4 GB), driver 592.82, context 4,096, al
 
 Follow-up verification on 2026-09-11 increased the saved and loaded context to 8,192 after another GPU inference test passed (37/37 layers; approximately 2,665 MiB GPU memory after a short chat). MCP selection now includes only requested live connector tools. Saved disconnected connectors are omitted for the reply, with a visible notice and a model-visible explanation; selections remain saved. `scripts/context-tools-smoke.mjs` verified a native request with 4,647 input + 512 reserved response tokens and five disconnected selections, returning `42` without a blocking error. Context preflight remains enforced; automatic compaction is enabled at 80% of the loaded context and can be disabled per conversation. Further work is planned in [ZAYA1 and FreeToken plan](ZAYA1-FREETOKEN-PLAN.md).
 
+## Ternary Bonsai 2 27B PTQ1_0
+
+Ternary Bonsai 2 stores rotated ternary g128 weights as `PTQ1_0` (or `PQ2_0`).
+Those ggml type ids sit past upstream `GGML_TYPE_COUNT`, so stock llama.cpp
+b10855 refuses the file (`tensor 'output.weight' has invalid ggml type 143`).
+The activation-side Walsh–Hadamard transform is not upstream yet, so every
+backend needs the [PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp)
+at **prism-b10658 or newer**. The legacy `prism-b9601` runtime used by Bonsai
+8B Q2_0 cannot load these files either.
+
+Install [prism-b10709-9a9394a](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10709-9a9394a) with:
+
+```
+powershell -ExecutionPolicy Bypass -File scripts/prepare-runtime.ps1 -Bonsai2
+```
+
+That extracts the Windows CUDA 12.4 runtime and matching CUDA DLLs into
+`.local/runtime-prism-b10709-9a9394a`. Clicking **Use model** on a `PTQ1_0` or
+Bonsai-2 `PQ2_0` GGUF selects that `llama-server.exe`, applies a 4,096-token
+first-load profile (automatic GPU fit, Flash Attention, Q8 KV, mmap, no vision
+projector), and raises the startup poll window to 10 minutes for the 5.5 GiB
+weights. Attach `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` later from Model files
+if you want image input; leave it off on a 4 GB GPU. `node scripts/bonsai2-runtime-smoke.mjs`
+loads the managed PTQ1_0 file against this runtime.
+
+Do not point stock llama.cpp, Ollama, or the b10855 CUDA installer at these
+files. `PQ2_0` / `PTQ1_0` fail closed; a Bonsai 2 `Q2_0` file would load on
+mainline and emit garbage.
+
 ## Switching between catalog models
 
 The Models page saves the selected GGUF path immediately when its verified file
 is present. Saving a Runtime context while that model is loaded reloads it;
 clicking Use on the already-selected model keeps the saved context instead of
 resetting to the first-load 8,192-token default. Loading then resolves the matching runtime profile: ZAYA uses its
-custom runtime, Bonsai uses the Prism `prism-b9601-68faa14` build, and MiniCPM
-uses standard llama.cpp b10855. In development, the two special runtimes are
+custom runtime, Bonsai 8B Q2_0 uses the Prism `prism-b9601-68faa14` build,
+Ternary Bonsai 2 uses `prism-b10709-9a9394a`, and MiniCPM
+uses standard llama.cpp b10855. In development, the special runtimes are
 found under `.local`; packaged installs keep the standard runtime in the
 app-managed `runtimes` directory. A legacy saved Bonsai profile at 8,192, or
 any value above 65,536, is clamped to the model's 65,536-token maximum before

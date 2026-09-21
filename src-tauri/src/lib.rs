@@ -254,6 +254,7 @@ pub fn run() {
             sessions::search_sessions,
             plans::get_todos,
             plans::get_goal,
+            plans::clear_todos,
             subagents::list_subagent_runs,
             subagents::interrupt_subagent,
             subagents::list_subagent_models,

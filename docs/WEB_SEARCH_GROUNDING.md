@@ -274,7 +274,7 @@ Verify SearXNG is healthy:
 curl "http://127.0.0.1:8080/search?q=test&format=json"
 ```
 
-The bundled `searxng/settings.yml` pins `google`, `bing` and `duckduckgo` as enabled engines (on top of `use_default_settings: true`). The smoke test above should return a non-empty `results` array with multiple engine names in the response. After editing `settings.yml`, restart with `docker compose up -d`.
+With `use_default_settings: true`, SearXNG's full upstream catalogue (~260 engines) loads and the client sends an `engines` whitelist per query (see `searxngEngines` in `src/web/config/defaults.ts`). The bundled `searxng/settings.yml` only pins overrides: it enables `yep` and disables `google`, `bing`, `yandex`, `brave`, `qwant`. General results ride on `google cse` (key-free, enabled by default upstream), `yep`, `duckduckgo` (intermittent CAPTCHA), `google news`, `reuters`, `wikipedia`/`wikinews`, plus the niche engines. `mojeek`/`startpage` are `inactive` upstream (proof-of-work CAPTCHA) and cannot be enabled. The smoke test above should return a non-empty `results` array with multiple engine names in the response. After editing `settings.yml`, restart the SearXNG process/container (`docker compose up -d` when using Docker).
 
 ---
 

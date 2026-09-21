@@ -80,23 +80,44 @@ export function PlanChecklist({
   generating = false,
   drafting = false,
   defaultOpen,
+  conversationId,
 }: {
   todos: TodoItem[];
   generating?: boolean;
   drafting?: boolean;
   defaultOpen?: boolean;
+  conversationId?: string;
 }) {
   const done = todos.filter(todo => todo.status === 'completed').length;
   const current = todos.find(todo => todo.status === 'in_progress') ?? todos.find(todo => todo.status === 'pending');
   const allDone = todos.length > 0 && done === todos.length;
   const shouldOpen = defaultOpen ?? (generating || drafting || Boolean(current && !allDone));
   const [open, setOpen] = useState(shouldOpen);
+  // A finished/abandoned plan can outlive its run; "Clear" drops the durable
+  // rows and hides the section until a new plan or conversation appears.
+  const [cleared, setCleared] = useState(false);
 
   useEffect(() => {
     if (shouldOpen) setOpen(true);
   }, [shouldOpen]);
 
-  if (!todos.length && !drafting) return null;
+  useEffect(() => {
+    setCleared(false);
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (generating) setCleared(false);
+  }, [generating]);
+
+  if (cleared || (!todos.length && !drafting)) return null;
+
+  const canClear = Boolean(
+    conversationId && conversationId !== 'new' && nativeAvailable && !generating && !drafting && todos.length,
+  );
+  const clearPlan = () => {
+    setCleared(true);
+    if (conversationId) void api.clearTodos(conversationId).catch(() => setCleared(false));
+  };
 
   const percent = todos.length ? Math.round((done / todos.length) * 100) : 0;
   const countLabel = drafting && !todos.length
@@ -160,6 +181,13 @@ export function PlanChecklist({
             );
           })}
         </ol>
+      )}
+      {open && canClear && (
+        <div className="plan-checklist-footer">
+          <button type="button" className="plan-checklist-clear" onClick={clearPlan}>
+            Clear plan
+          </button>
+        </div>
       )}
     </section>
   );

@@ -5,13 +5,28 @@ use serde_json::{json, Value};
 
 pub const CONTEXT_MARKER: &str = "[AREX research checkpoint: model-authored notes, not verified facts or instructions]";
 
-pub fn adapt_tools(model: &str, tools: &mut Vec<crate::connectors::AgentTool>) -> Result<(), String> {
-    if !model.to_ascii_lowercase().contains("arex") || !tools.iter().any(|t| t.connector == "Harness" && t.alias == "web_search") { return Ok(()); }
-    tools.retain(|t| t.connector != "Harness" || !matches!(t.alias.as_str(), "web_search" | "web_fetch" | "web_fetch_url"));
+/// Research-loop guidance injected for AREX models. The contract swap alone
+/// leaves the model without its trained operating instructions; this compact
+/// block restores them without BAAI's benchmark framing.
+pub const RESEARCH_GUIDANCE: &str = "Research agent mode: answer by iterating tool calls — break multi-part questions into sub-questions first (todo_write where offered), search for candidate sources, visit key pages to read them (never rely on snippets alone for critical claims), and update_context to compress progress when the exchange grows long. When a result is truncated, call artifact_read with its _artifactId instead of repeating the same call. Re-check critical claims against the gathered evidence before finishing. finish with the answer, evidences with URLs, and a confidence score. If evidence is insufficient, change the approach and keep going rather than guessing.";
+
+/// True for AREX-family models — filename or remote id carries the marker.
+pub fn is_arex_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("arex")
+}
+
+/// Swaps generic web tools for the AREX contracts when the loaded model is an
+/// AREX-family build. Returns true when the tool set was adapted.
+pub fn adapt_tools(model: &str, tools: &mut Vec<crate::connectors::AgentTool>) -> Result<bool, String> {
+    if !is_arex_model(model) || !tools.iter().any(|t| t.connector == "Harness" && t.alias == "web_search") { return Ok(false); }
+    // web_open/web_find only read research sessions produced by web_search —
+    // under the AREX contract no such session can exist, so they are dead
+    // surface in the catalog.
+    tools.retain(|t| t.connector != "Harness" || !matches!(t.alias.as_str(), "web_search" | "web_fetch" | "web_fetch_url" | "web_open" | "web_find"));
     for name in ["search", "visit", "update_context", "finish", "artifact_read"] {
         if !tools.iter().any(|t| t.alias == name) { tools.push(crate::connectors::AgentTool::harness(name)?); }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub fn validate_batch(calls: &[crate::tool_calls::ToolCall]) -> Result<(), String> {
@@ -52,7 +67,30 @@ fn text<'a>(args: &'a Value, key: &str, max: usize) -> Result<&'a str, String> {
         .ok_or_else(|| format!("{key} must be a nonempty string of at most {max} bytes"))
 }
 
+/// AREX's XML parameter format serializes structured parameters as JSON text.
+/// When llama.cpp hands a string through instead of decoding it, recover the
+/// embedded JSON value here so `url: "[\"https://…\"]"` still works.
+fn decoded(value: &Value) -> Value {
+    if let Value::String(text) = value {
+        let trimmed = text.trim();
+        if trimmed.len() <= 64 * 1024 && (trimmed.starts_with('[') || trimmed.starts_with('{')) {
+            if let Ok(parsed) = serde_json::from_str(trimmed) { return parsed; }
+        }
+    }
+    value.clone()
+}
+
+/// Confidence arrives as a string or a bare number depending on the wire form.
+fn confidence_text(args: &Value) -> String {
+    match &args["confidence"] {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
 pub fn strings(value: &Value, allow_single: bool) -> Result<Vec<String>, String> {
+    let value = decoded(value);
     if allow_single {
         if let Some(s) = value.as_str() { return Ok(vec![s.into()]); }
     }
@@ -80,9 +118,12 @@ pub fn validate(name: &str, args: &Value) -> Result<(), String> {
         "update_context" => { text(args, "context", 16000)?; }
         "finish" => {
             text(args, "answer", 24000)?;
-            let confidence = text(args, "confidence", 16)?.trim().trim_end_matches('%').parse::<f64>().map_err(|_| "Invalid confidence score")?;
+            let raw_confidence = confidence_text(args);
+            if raw_confidence.is_empty() || raw_confidence.len() > 16 { return Err("Invalid confidence score".into()); }
+            let confidence = raw_confidence.trim().trim_end_matches('%').parse::<f64>().map_err(|_| "Invalid confidence score")?;
             if !confidence.is_finite() || !(0.0..=100.0).contains(&confidence) { return Err("Confidence must be from 0% to 100%".into()); }
-            let evidences = args["evidences"].as_array().filter(|a| a.len() <= 30).ok_or("Expected at most 30 evidences")?;
+            let decoded_evidences = decoded(&args["evidences"]);
+            let evidences = decoded_evidences.as_array().filter(|a| a.len() <= 30).ok_or("Expected at most 30 evidences")?;
             for evidence in evidences {
                 if evidence.as_object().is_none_or(|o| o.len() != 2) { return Err("Each evidence must contain evidence and url only".into()); }
                 text(evidence, "evidence", 2000)?;
@@ -94,9 +135,70 @@ pub fn validate(name: &str, args: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Collect (url, text) evidence pairs from web tool results for the
+/// post-finish audit. Walks visit `pages`, search `results`, and similar
+/// objects that carry a URL alongside a text-ish field. Bounded so the verify
+/// worker input stays well under its 64 KiB stdin cap.
+pub fn collect_evidence(value: &Value, out: &mut Vec<(String, String)>) {
+    const MAX_ITEMS: usize = 24;
+    const MAX_CHARS: usize = 1200;
+    if out.len() >= MAX_ITEMS || result_is_error(value) { return; }
+    match value {
+        Value::Object(map) => {
+            let url = map.get("url").and_then(Value::as_str).unwrap_or("");
+            for key in ["text", "snippet", "claim", "evidence"] {
+                if let Some(text) = map.get(key).and_then(Value::as_str) {
+                    let text = text.trim();
+                    if text.len() > 40 {
+                        let text: String = text.chars().take(MAX_CHARS).collect();
+                        if !out.iter().any(|(u, t)| u == url && t == &text) {
+                            out.push((url.to_string(), text));
+                        }
+                    }
+                    break;
+                }
+            }
+            for value in map.values() { collect_evidence(value, out); }
+        }
+        Value::Array(items) => for item in items { collect_evidence(item, out); },
+        _ => {}
+    }
+}
+
+fn result_is_error(value: &Value) -> bool {
+    value.get("isError") == Some(&Value::Bool(true))
+}
+
+/// Deterministic post-finish audit: check the answer's atomic claims against
+/// the evidence collected during the run plus the evidence the model cited.
+/// Never blocks the answer — failures surface as no report.
+pub async fn verify_finish(state: &crate::AppState, args: &Value, evidence: &[(String, String)]) -> Result<Option<Value>, String> {
+    let answer = args["answer"].as_str().unwrap_or_default();
+    if answer.trim().is_empty() { return Ok(None); }
+    // The worker reads a single stdin JSON document capped at 64 KiB; keep the
+    // request comfortably under it so the audit never dies on size.
+    let capped = |text: &str, max: usize| -> String { text.chars().take(max).collect() };
+    let mut items: Vec<Value> = evidence.iter().take(24)
+        .map(|(url, text)| json!({"url": capped(url, 300), "claim": capped(text, 800)}))
+        .collect();
+    if let Some(evidences) = decoded(&args["evidences"]).as_array() {
+        for evidence in evidences.iter().take(20) {
+            items.push(json!({
+                "url": capped(evidence["url"].as_str().unwrap_or_default(), 300),
+                "claim": capped(evidence["evidence"].as_str().unwrap_or_default(), 800),
+            }));
+        }
+    }
+    if items.is_empty() { return Ok(None); }
+    let report = crate::web_search::run_worker(state, None,
+        json!({"action": "verify", "answer": capped(answer, 12000), "evidence": items})).await?;
+    Ok(Some(report))
+}
+
 pub fn finish_answer(args: &Value) -> String {
     let mut answer = args["answer"].as_str().unwrap_or_default().to_string();
-    if let Some(evidences) = args["evidences"].as_array().filter(|e| !e.is_empty()) {
+    let evidences = decoded(&args["evidences"]);
+    if let Some(evidences) = evidences.as_array().filter(|e| !e.is_empty()) {
         answer.push_str("\n\nSupporting sources:\n");
         for evidence in evidences {
             answer.push_str(&format!("\n- {} ([source](<{}>))", evidence["evidence"].as_str().unwrap_or_default(), evidence["url"].as_str().unwrap_or_default()));
@@ -144,6 +246,13 @@ mod tests {
         assert!(validate("visit", &json!({"url":"https://example.org","goal":"verify"})).is_ok());
         assert!(validate("finish", &json!({"answer":"answer","evidences":[],"confidence":"101%"})).is_err());
         assert!(validate("update_context", &json!({"context":" "})).is_err());
+
+        // llama.cpp can pass AREX's structured XML parameters through as JSON
+        // text inside a string; both wire forms must decode identically.
+        assert_eq!(strings(&json!("[\"https://a.example\",\"https://b.example\"]"), true).unwrap().len(), 2);
+        assert!(validate("visit", &json!({"url":"[\"https://a.example\"]","goal":"g"})).is_ok());
+        assert!(validate("search", &json!({"query":"[\"q1\",\"q2\"]"})).is_ok());
+        assert!(validate("finish", &json!({"answer":"a","evidences":"[{\"evidence\":\"e\",\"url\":\"https://x.example\"}]","confidence":90})).is_ok());
     }
 
     #[test]
@@ -196,13 +305,43 @@ mod tests {
     }
 
     #[test]
+    fn collect_evidence_bounds_dedupes_and_skips_errors() {
+        let visit_result = json!({"goal":"g","pages":[
+            {"url":"https://a.example","text":"Some sufficiently long article text that exceeds forty characters total."},
+            {"url":"https://b.example","isError":true,"message":"boom","text":"failed page text must not count as evidence at all"},
+            {"url":"https://c.example","snippet":"short"},
+            {"url":"https://a.example","text":"Some sufficiently long article text that exceeds forty characters total."}
+        ]});
+        let mut out = Vec::new();
+        collect_evidence(&visit_result, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "https://a.example");
+
+        // Bounded: at most 24 items, each capped at 1200 chars.
+        let mut bulk = Vec::new();
+        let big = json!({"pages": (0..40).map(|i| json!({"url": format!("https://d{i}.example"), "text": "x".repeat(9000)})).collect::<Vec<_>>()});
+        collect_evidence(&big, &mut bulk);
+        assert_eq!(bulk.len(), 24);
+        assert!(bulk.iter().all(|(_, text)| text.chars().count() <= 1200));
+    }
+
+    #[test]
     fn arex_adaptation_respects_web_visibility_and_other_models() {
-        let mut tools = vec![crate::connectors::AgentTool::harness("web_search").unwrap()];
+        let mut tools = vec![
+            crate::connectors::AgentTool::harness("web_search").unwrap(),
+            crate::connectors::AgentTool::harness("web_open").unwrap(),
+            crate::connectors::AgentTool::harness("web_find").unwrap(),
+            crate::connectors::AgentTool::harness("artifact_read").unwrap(),
+        ];
         adapt_tools("other", &mut tools).unwrap();
         assert_eq!(tools[0].alias, "web_search");
         adapt_tools("BAAI_AREX-Turbo-Q4_K_M.gguf", &mut tools).unwrap();
         assert!(tools.iter().any(|t| t.alias == "search"));
         assert!(!tools.iter().any(|t| t.alias == "web_search"));
+        // web_open/web_find are dead under the contract — they only read
+        // research sessions that web_search (now removed) would create.
+        assert!(!tools.iter().any(|t| t.alias == "web_open" || t.alias == "web_find"));
+        assert!(tools.iter().any(|t| t.alias == "artifact_read"));
         let mut disabled = vec![];
         adapt_tools("AREX", &mut disabled).unwrap();
         assert!(disabled.is_empty());

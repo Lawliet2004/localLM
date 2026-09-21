@@ -71,7 +71,8 @@ pub fn bound_tool_result(
         let mut bounded_obj = serde_json::Map::new();
         // Preserve critical metadata fields
         for (k, v) in obj {
-            if matches!(k.as_str(), "isError" | "status" | "code" | "error" | "title" | "url" | "source") {
+            if matches!(k.as_str(), "isError" | "status" | "code" | "error" | "title" | "url" | "source"
+                | "failures" | "failureCount" | "rawCount" | "goal" | "instruction") {
                 bounded_obj.insert(k.clone(), v.clone());
             }
         }
@@ -128,6 +129,102 @@ pub fn bound_tool_result(
         }
 
         if !handled {
+            if let Some(results) = obj.get("results").and_then(Value::as_array) {
+                // Search-style hit lists ({results:[{title,url,snippet,…}]}):
+                // keep every item's identity inside the budget instead of a
+                // raw-JSON prefix that only ever shows the first result.
+                let total = results.len();
+                let mut kept: Vec<Value> = Vec::new();
+                let mut budget = max_chars.saturating_sub(700);
+                for item in results {
+                    let mut slim = serde_json::Map::new();
+                    for key in ["title", "url", "publishedAt", "domain", "engine"] {
+                        if let Some(v) = item.get(key) {
+                            slim.insert(key.into(), v.clone());
+                        }
+                    }
+                    let snippet = item
+                        .get("snippet")
+                        .or_else(|| item.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let collapsed: String = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let clipped: String = collapsed.chars().take(280).collect();
+                    if !clipped.is_empty() {
+                        slim.insert("snippet".into(), Value::String(clipped));
+                    }
+                    if slim.is_empty() {
+                        continue;
+                    }
+                    let size = serde_json::to_string(&slim).map_or(0, |s| s.len());
+                    if size > budget {
+                        break;
+                    }
+                    budget -= size;
+                    kept.push(Value::Object(slim));
+                }
+                if !kept.is_empty() {
+                    bounded_obj.insert("_resultsKept".into(), json!(format!("{} of {}", kept.len(), total)));
+                    bounded_obj.insert("results".into(), Value::Array(kept));
+                    handled = true;
+                }
+            }
+        }
+
+        if !handled {
+            if let Some(pages) = obj.get("pages").and_then(Value::as_array) {
+                // Visit-style page lists: per-page text gets a share of the
+                // budget; failed pages stay visible as small error entries.
+                let total = pages.len();
+                let per_page = (max_chars.saturating_sub(700) / total.max(1)).clamp(400, 4000);
+                let mut kept: Vec<Value> = Vec::new();
+                let mut budget = max_chars.saturating_sub(700);
+                for page in pages {
+                    let mut slim = serde_json::Map::new();
+                    if page.get("isError") == Some(&Value::Bool(true)) {
+                        for key in ["isError", "message", "url"] {
+                            if let Some(v) = page.get(key) {
+                                slim.insert(key.into(), v.clone());
+                            }
+                        }
+                    } else {
+                        for key in ["url", "title", "publishedAt", "extractionMethod", "archivedAt"] {
+                            if let Some(v) = page.get(key) {
+                                slim.insert(key.into(), v.clone());
+                            }
+                        }
+                        if let Some(headings) = page.get("headings").and_then(Value::as_array) {
+                            slim.insert(
+                                "headings".into(),
+                                Value::Array(headings.iter().take(12).cloned().collect()),
+                            );
+                        }
+                        if let Some(text) = page.get("text").and_then(Value::as_str) {
+                            let clipped: String = text.chars().take(per_page).collect();
+                            if !clipped.is_empty() {
+                                slim.insert("text".into(), Value::String(clipped));
+                            }
+                        }
+                    }
+                    if slim.is_empty() {
+                        continue;
+                    }
+                    let size = serde_json::to_string(&slim).map_or(0, |s| s.len());
+                    if size > budget {
+                        break;
+                    }
+                    budget -= size;
+                    kept.push(Value::Object(slim));
+                }
+                if !kept.is_empty() {
+                    bounded_obj.insert("_pagesKept".into(), json!(format!("{} of {}", kept.len(), total)));
+                    bounded_obj.insert("pages".into(), Value::Array(kept));
+                    handled = true;
+                }
+            }
+        }
+
+        if !handled {
             if let Some(content_str) = obj.get("content").and_then(Value::as_str) {
                 let take_len = max_chars.min(1500);
                 let slice: String = content_str.chars().take(take_len).collect();
@@ -150,33 +247,45 @@ pub fn bound_tool_result(
         bounded_obj.insert(
             "_notice".into(),
             Value::String(format!(
-                "Output was truncated (original size: {size_bytes} bytes) to protect context budget. Complete artifact saved as '{id}'."
+                "Output was truncated (original size: {size_bytes} bytes) to protect context budget. Complete artifact saved as '{id}'. To read more, call artifact_read with id '{id}' and an offset/limit — do not repeat the same call."
             )),
         );
 
-        // Enforce strict max_chars boundary on the final serialized object
+        // Enforce strict max_chars boundary on the final serialized object:
+        // shrink list fields first (they carry the most weight), then the
+        // excerpt strings, then any oversized preserved metadata.
         let mut cur_len = serde_json::to_string(&bounded_obj).map_or(0, |s| s.len());
         while cur_len > max_chars {
-            let has_search_results = bounded_obj.get("search_results")
-                .and_then(Value::as_array)
-                .is_some_and(|a| a.len() > 1);
-            if has_search_results {
-                if let Some(Value::Array(arr)) = bounded_obj.get_mut("search_results") {
-                    arr.pop();
+            let mut shrunk = false;
+            for key in ["results", "pages", "search_results", "failures"] {
+                let over = bounded_obj
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty());
+                if over {
+                    if let Some(Value::Array(arr)) = bounded_obj.get_mut(key) {
+                        arr.pop();
+                    }
+                    shrunk = true;
+                    break;
                 }
-                cur_len = serde_json::to_string(&bounded_obj).map_or(0, |s| s.len());
-            } else {
+            }
+            if !shrunk {
                 break;
             }
+            cur_len = serde_json::to_string(&bounded_obj).map_or(0, |s| s.len());
         }
         if cur_len > max_chars {
-            for key in ["content_excerpt", "text_excerpt", "body_excerpt", "preview"] {
+            for key in ["content_excerpt", "text_excerpt", "body_excerpt", "preview", "goal", "instruction"] {
                 if let Some(Value::String(s)) = bounded_obj.get(key) {
                     let excess = cur_len.saturating_sub(max_chars);
                     let new_take = s.len().saturating_sub(excess + 32);
                     let trimmed: String = s.chars().take(new_take).collect();
                     bounded_obj.insert(key.into(), Value::String(trimmed));
-                    break;
+                    cur_len = serde_json::to_string(&bounded_obj).map_or(0, |s| s.len());
+                    if cur_len <= max_chars {
+                        break;
+                    }
                 }
             }
         }
@@ -191,7 +300,7 @@ pub fn bound_tool_result(
             "_originalBytes": size_bytes,
             "_sha256": sha256,
             "preview": preview,
-            "_notice": format!("Output was truncated ({size_bytes} bytes). Complete artifact saved as '{id}'.")
+            "_notice": format!("Output was truncated ({size_bytes} bytes). Complete artifact saved as '{id}'. To read more, call artifact_read with id '{id}' and an offset/limit.")
         })
     };
 

@@ -7,5 +7,7 @@ export const bonsaiFilename = localModels[1].filename;
 export const zaya1Filename = localModels[2].filename;
 export function modelLabel(filename: string) {
   const base = filename.split(/[\\/]/).pop() ?? filename;
+  if (/PTQ1_0/i.test(base) && /bonsai-2/i.test(base)) return 'Ternary Bonsai 2 27B · PTQ1_0';
+  if (/PQ2_0/i.test(base) && /bonsai-2/i.test(base)) return 'Ternary Bonsai 2 27B · PQ2_0';
   return localModels.find(model => model.filename === base)?.label ?? base;
 }

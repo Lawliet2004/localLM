@@ -1101,8 +1101,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         assert!(!unauthenticated.connected);
         assert!(unauthenticated.connection_error.as_deref().unwrap().contains("API token"));
         // Repeated restoration must not launch a second local process.
-        hub.restore_saved(&[server.id.clone()]).await;
-        assert!(hub.restore_errors.get(&server.id).is_none());
+        hub.restore_saved(std::slice::from_ref(&server.id)).await;
+        assert!(!hub.restore_errors.contains_key(&server.id));
         super::remember_connection(&store, &server.id, false).unwrap();
         super::remember_connection(&store, "tavily", false).unwrap();
         hub.disconnect(&server.id, false).await.unwrap();
@@ -1231,7 +1231,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
     #[test]
     fn bundled_presets_have_unique_ids_and_secure_endpoints() {
         let items = presets();
-        assert_eq!(items.len(), 14);
+        assert_eq!(items.len(), 15);
         let mut ids = std::collections::HashSet::new();
         for item in items {
             assert!(ids.insert(item.id));
@@ -1276,6 +1276,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             ("confluence", "https://mcp.atlassian.com/v1/mcp", "dcr"),
             ("jira", "https://mcp.atlassian.com/v1/mcp", "dcr"),
             ("posthog", "https://mcp.posthog.com/mcp", "dcr"),
+            ("firecrawl", "https://mcp.firecrawl.dev/v2/mcp", "header"),
         ];
         assert_eq!(bundled.len(), expected.len());
         for (index, (name, url, auth)) in expected.iter().enumerate() {

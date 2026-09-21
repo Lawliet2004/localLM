@@ -43,11 +43,13 @@ build. Safetensors/PyTorch weights require external conversion. Projectors,
 adapters, embedding-only models, and other companion files are not standalone
 chat models. The harness does not execute downloaded model code.
 
-The existing runtime overrides remain: Bonsai Q2_0 uses Prism; ZAYA1 uses its
-custom build. Switching back to ordinary GGUF models resolves the standard
-runtime instead of retaining an incompatible special build. A missing required
-runtime produces an actionable error. **Model files** retains manual model and
-runtime paths, runtime installation, and the original pinned download controls.
+The existing runtime overrides remain: Bonsai Q2_0 uses Prism prism-b9601;
+Ternary Bonsai 2 (`PTQ1_0` / `PQ2_0`) uses Prism prism-b10709 or newer;
+ZAYA1 uses its custom build. Switching back to ordinary GGUF models resolves
+the standard runtime instead of retaining an incompatible special build. A
+missing required runtime produces an actionable error. **Model files** retains
+manual model and runtime paths, runtime installation, and the original pinned
+download controls.
 
 ## Runtime guidance
 

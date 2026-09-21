@@ -101,6 +101,7 @@ const RESEARCH_STALLED_FALLBACK: &str = "Research stopped after repeated unprodu
 #[derive(Default)]
 struct ResearchProgress {
     evidence: std::collections::HashSet<u64>,
+    domains: std::collections::HashSet<String>,
     calls: usize,
     stagnant: usize,
 }
@@ -111,13 +112,27 @@ impl ResearchProgress {
         if !matches!(name, "web_search" | "web_open" | "web_fetch" | "web_fetch_url" | "web_find" | "search" | "visit" | "update_context") { return; }
         self.calls += 1;
         let before = self.evidence.len();
+        let domains_before = self.domains.len();
         if name != "update_context" && result["isError"] != true {
-            Self::collect(result, &mut self.evidence, false);
+            Self::collect(result, &mut self.evidence, &mut self.domains, false);
         }
-        self.stagnant = if self.evidence.len() > before { 0 } else { self.stagnant + 1 };
+        // Discovery calls only make progress by surfacing a new domain.
+        // Junk-but-novel hits on the same engines (e.g. fresh arxiv papers for
+        // a weather query) used to reset the counter forever.
+        let progressed = if matches!(name, "web_search" | "search") {
+            self.domains.len() > domains_before
+        } else {
+            self.evidence.len() > before
+        };
+        self.stagnant = if progressed { 0 } else { self.stagnant + 1 };
     }
 
-    fn collect(value: &Value, seen: &mut std::collections::HashSet<u64>, evidence: bool) {
+    fn collect(
+        value: &Value,
+        seen: &mut std::collections::HashSet<u64>,
+        domains: &mut std::collections::HashSet<String>,
+        evidence: bool,
+    ) {
         use std::hash::{Hash, Hasher};
         match value {
             Value::Object(fields) => {
@@ -125,15 +140,20 @@ impl ResearchProgress {
                 for (key, value) in fields {
                     // ponytail: explicit evidence fields ignore query IDs/timing; extend for new web result schemas.
                     let evidence = matches!(key.as_str(), "url" | "text" | "content" | "snippet" | "excerpt" | "excerpts" | "answer" | "markdown" | "passage" | "body");
-                    Self::collect(value, seen, evidence);
+                    if matches!(key.as_str(), "url" | "canonicalUrl" | "source_url") {
+                        if let Some(host) = value.as_str().and_then(Self::host_of) {
+                            domains.insert(host);
+                        }
+                    }
+                    Self::collect(value, seen, domains, evidence);
                 }
             }
-            Value::Array(values) => for value in values { Self::collect(value, seen, evidence); },
+            Value::Array(values) => for value in values { Self::collect(value, seen, domains, evidence); },
             Value::String(text) if evidence => {
                 // MCP servers can wrap structured results in a text content block.
                 if let Ok(nested) = serde_json::from_str::<Value>(text) {
                     if nested.is_object() || nested.is_array() {
-                        Self::collect(&nested, seen, false);
+                        Self::collect(&nested, seen, domains, false);
                         return;
                     }
                 }
@@ -148,11 +168,16 @@ impl ResearchProgress {
         }
     }
 
-    fn stopped(&self) -> bool { self.stagnant >= 4 || self.calls >= 24 }
+    fn host_of(url: &str) -> Option<String> {
+        let host = url.split("://").nth(1)?.split('/').next()?.split(':').next()?.trim();
+        (!host.is_empty()).then(|| host.to_lowercase())
+    }
+
+    fn stopped(&self) -> bool { self.stagnant >= 3 || self.calls >= 16 }
 }
 const PLAN_MODE_INSTRUCTION: &str = "Plan mode is on. Phase 1 of 2: write a concise numbered checklist of the work, then stop. Each step is one action (search, open a source, calculate with local_run_code, edit a file, compare, verify). 3–12 steps. Do not call tools and do not implement yet.";
 const PLAN_MODE_ACTIVE: &str = "Plan mode is on. Phase 1 is done. Phase 2: execute the checklist one task at a time.";
-const PLAN_IMPLEMENT_INSTRUCTION: &str = "The plan above is ready. Implement it in order, one task at a time. Work only on the current in_progress task. When it is done, mark it completed with todo_update (or todo_write) and start the next pending task. Do not skip ahead or start two tasks at once. Use the offered web tools (search/visit or web_search/web_open) for facts, and local_run_code when offered for exact math or science. Continue through the plan while making progress, then summarize the answer or call finish when offered. If evidence remains unavailable, report the unresolved steps honestly.";
+const PLAN_IMPLEMENT_INSTRUCTION: &str = "The plan above is ready. Implement it in order, one task at a time. Work only on the current in_progress task. When it is done, mark it completed with the offered todo tools (todo_write saves the whole list) and start the next pending task. Do not skip ahead or start two tasks at once. Use the offered web tools (search/visit or web_search/web_open) for facts, and local_run_code when offered for exact math or science. Continue through the plan while making progress, then summarize the answer or call finish when offered. If evidence remains unavailable, report the unresolved steps honestly.";
 const PLAN_FOCUS_MARKER: &str = "The plan above is ready.";
 const PLAN_SEPARATOR: &str = "\n\n---\n\n";
 const EMPTY_PLAN_ERROR: &str =
@@ -277,12 +302,23 @@ fn inject_plan_mode(plan: &mut TurnPlan, plan_mode: bool) {
     }
 }
 
+/// A research answer that cites no source is narration, not a result — small
+/// models emit "Let me synthesize…" process talk that reads like an answer
+/// but carries no grounded claim. Only enforced on stalled turns: ordinary
+/// completions keep their text regardless of citation shape.
+fn answer_cites_evidence(text: &str) -> bool {
+    text.contains("http://") || text.contains("https://")
+}
+
 fn finalization_action(
     round_answer: &str,
     fallback: Option<&str>,
     retried: bool,
+    stalled: bool,
 ) -> FinalizationAction {
-    if !round_answer.trim().is_empty() && !is_text_tool_call(round_answer) {
+    if !round_answer.trim().is_empty() && !is_text_tool_call(round_answer)
+        && !(stalled && !answer_cites_evidence(round_answer))
+    {
         return FinalizationAction::Complete;
     }
     if !retried {
@@ -300,7 +336,161 @@ fn needs_final_answer(finalizing: bool, has_calls: bool, round_answer: &str) -> 
 
 fn is_text_tool_call(text: &str) -> bool {
     let text = text.trim_start();
-    text.starts_with("<function=") || text.starts_with("<tool_call>")
+    if text.starts_with("<function=") || text.starts_with("<tool_call>") {
+        return true;
+    }
+    // A call embedded after prose still counts. `<tool_call>` is unambiguous
+    // markup even when left unterminated; a mid-text `<function=` needs its
+    // closing tag so a literal mention in the answer is not misread as a call.
+    let mut rest = text;
+    while let Some(start) = [rest.find("<tool_call>"), rest.find("<function=")]
+        .into_iter().flatten().min()
+    {
+        let after = &rest[start..];
+        if after.starts_with("<tool_call>") {
+            return true;
+        }
+        rest = &after["<function=".len()..];
+        if rest.contains("</function>") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Visible text left behind by a suppressed text-form call: complete blocks
+/// are stripped, then any leftover unterminated markup truncates the rest —
+/// raw call markup never reaches the stored answer.
+fn strip_call_markup(text: &str) -> String {
+    let stripped = crate::tool_calls::strip_text_tool_calls(text);
+    let end = ["<tool_call", "<function="]
+        .iter()
+        .filter_map(|tag| stripped.find(tag))
+        .min()
+        .unwrap_or(stripped.len());
+    stripped[..end].trim().to_string()
+}
+
+/// Deterministic claim audit shared by the `finish` path and plain-text
+/// research completions. `args` carries the answer plus any model-cited
+/// evidences. Returns the formatted footer and logs the report; failures
+/// surface as no footer — the audit never blocks or rewrites text.
+async fn claim_audit_footer(
+    state: &AppState,
+    args: &Value,
+    research_evidence: &[(String, String)],
+    run: &crate::agent_run::RunRecord,
+    step_id: &str,
+    conversation_id: &str,
+    seq: &mut u32,
+) -> Option<String> {
+    let report = crate::arex::verify_finish(state, args, research_evidence).await.ok().flatten()?;
+    let claims = report["claims"].as_array().map(|c| c.len()).unwrap_or(0);
+    if claims == 0 {
+        return None;
+    }
+    let supported = report["supportedCount"].as_u64().unwrap_or(0);
+    let conflicting = report["conflictingCount"].as_u64().unwrap_or(0);
+    *seq += 1;
+    if let Ok(store) = state.database() {
+        let _ = store.append_run_event(&crate::agent_run::RunEvent {
+            run_id: run.id.clone(),
+            seq: *seq as u64,
+            step_id: step_id.to_string(),
+            tool_call_id: None,
+            event_type: "verification".into(),
+            payload: report.clone(),
+            created_at: crate::store::now(),
+        });
+        emit_session_event(&store, conversation_id, Some(&run.id), Some(step_id), None,
+            "verification", report, false);
+    }
+    Some(format!(
+        "\n\n_Claim audit: {supported} of {claims} answer claims match the collected evidence ({conflicting} conflicting). Deterministic lexical check, not independent verification._"
+    ))
+}
+
+/// Shared tail of the AREX `finish` path — deterministic claim audit against
+/// the evidence collected this run, then append and emit the answer. The
+/// audit annotates the answer but never blocks or rewrites it.
+#[allow(clippy::too_many_arguments)]
+async fn present_research_answer(
+    state: &AppState,
+    channel: &Channel<ChatEvent>,
+    run: &crate::agent_run::RunRecord,
+    step_id: &str,
+    conversation_id: &str,
+    assistant_id: &str,
+    seq: &mut u32,
+    answer: &mut String,
+    final_answer: &str,
+    finish_args: Option<&Value>,
+    research_evidence: &[(String, String)],
+) -> Result<(), String> {
+    let mut display = final_answer.to_string();
+    if let Some(args) = finish_args {
+        if let Some(footer) = claim_audit_footer(
+            state,
+            args,
+            research_evidence,
+            run,
+            step_id,
+            conversation_id,
+            seq,
+        ).await {
+            display.push_str(&footer);
+        }
+    }
+    if !answer.trim().is_empty() { answer.push_str("\n\n"); }
+    answer.push_str(&display);
+    *seq += 1;
+    channel.send(ChatEvent::new(run, Some(step_id), *seq, "Research answer ready", assistant_id, &display, "", None, None)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Runs a `finish` call that arrived outside the permissioned tool loop — as
+/// literal markup on a suppressed-choice round or as a structured call on a
+/// finalizing round. Records the same audit trail a dispatched call would,
+/// then delivers the answer through the shared finish tail. Returns true
+/// when the answer was delivered.
+#[allow(clippy::too_many_arguments)]
+async fn run_finish_call(
+    state: &AppState,
+    channel: &Channel<ChatEvent>,
+    run: &crate::agent_run::RunRecord,
+    step_id: &str,
+    conversation_id: &str,
+    assistant_id: &str,
+    seq: &mut u32,
+    answer: &mut String,
+    research_evidence: &[(String, String)],
+    access_mode: crate::permissions::AccessMode,
+    call: &crate::tool_calls::ToolCall,
+    round_answer: &str,
+) -> Result<bool, String> {
+    if crate::arex::validate("finish", &call.arguments).is_err() {
+        return Ok(false);
+    }
+    // Same result shape the harness dispatch produces for finish.
+    let result = json!({
+        "answer": crate::arex::finish_answer(&call.arguments),
+        "evidences": call.arguments["evidences"],
+        "confidence": call.arguments["confidence"],
+    });
+    let audit = json!({"connector":"Harness","localServerName":null,"name":"finish","arguments":call.arguments,"decision":"allowed","accessMode":access_mode,"authorization":"finish is the model's answer channel on a finalizing round","callId":call.id,"stepId":step_id,"assistantContent":round_answer});
+    state.database()?.append_message(conversation_id, "tool", &json!({"request":audit,"result":result}).to_string(), "complete")?;
+    if let Ok(store) = state.database() {
+        emit_session_event(&store, conversation_id, Some(&run.id), Some(step_id), Some(&call.id),
+            "tool_call", json!({"callId": call.id, "name": "finish", "arguments": call.arguments}), false);
+        emit_session_event(&store, conversation_id, Some(&run.id), Some(step_id), Some(&call.id),
+            "tool_result", json!({"callId": call.id, "name": "finish", "decision": "allowed", "result": result, "artifactId": null}), false);
+    }
+    let mut sink = Vec::new();
+    let Some(final_answer) = crate::arex::apply_control("finish", &result, &*state.database()?, conversation_id, &run.id, &mut sink)? else {
+        return Ok(false);
+    };
+    present_research_answer(state, channel, run, step_id, conversation_id, assistant_id, seq, answer, &final_answer, Some(&call.arguments), research_evidence).await?;
+    Ok(true)
 }
 
 #[derive(Clone, Serialize)]
@@ -424,7 +614,8 @@ pub struct TurnPlan {
     /// Frozen model-visible tool schemas (stable bytes for prompt cache).
     pub tool_definitions: Vec<Value>,
     pub tool_notice: Option<String>,
-    /// Volatile injections only (memory, plan, unavailable tools).
+    /// Injections logged as context_injection events; only kinds listed in
+    /// `prompt::VOLATILE_KINDS` actually reach the model on the user draft.
     pub injections: Vec<(String, String)>,
     pub skill_instructions: String,
     pub ptc_sdk: Option<String>,
@@ -438,6 +629,19 @@ pub struct TurnPlan {
     pub context_length: u32,
     /// llama.cpp slot for this conversation (parent = 0). None for remote.
     pub id_slot: Option<i64>,
+    /// The AREX research contract was applied to this turn's tool set — the
+    /// model answers through its `finish` tool, which must stay reachable on
+    /// finalizing rounds.
+    pub arex_tools: bool,
+}
+
+impl TurnPlan {
+    /// AREX contract on the local llama.cpp runtime — the only backend where
+    /// tool_choice suppression removes the model's trained answer path and
+    /// literal call markup leaks into the answer text.
+    fn local_arex(&self) -> bool {
+        self.arex_tools && matches!(self.backend, Backend::Local { .. })
+    }
 }
 
 fn add_tool_notice(notice: &mut Option<String>, next: String) {
@@ -649,7 +853,11 @@ async fn assemble_turn(
             }
             if let Ok(todos) = store.todos(conversation_id) {
                 if let Ok(goal) = store.goal(conversation_id) {
-                    if let Some(line) = crate::plans::summary_line(&todos, goal.as_deref()) {
+                    let todo_tools: Vec<&str> = ["todo_write", "todo_add", "todo_update"]
+                        .into_iter()
+                        .filter(|alias| tools.iter().any(|tool| tool.alias.as_str() == *alias))
+                        .collect();
+                    if let Some(line) = crate::plans::summary_line(&todos, goal.as_deref(), &todo_tools) {
                         injections.push(("plan".into(), line));
                     }
                 }
@@ -702,14 +910,24 @@ async fn assemble_turn(
             });
         }
     }
+    let system_time_enabled = state
+        .database()
+        .and_then(|store| crate::capabilities::is_enabled(&store, "system_time"))
+        .unwrap_or(true);
     let system_time_on = if backend.supports_tools() {
-        state
-            .database()
-            .and_then(|store| crate::capabilities::is_enabled(&store, "system_time"))
-            .unwrap_or(true)
+        system_time_enabled
     } else {
         false
     };
+    if system_time_enabled {
+        // Small models cannot infer "today" and rarely call the clock tool
+        // unprompted; ground date-sensitive questions directly. Rides on the
+        // user draft, so the frozen cache prefix is untouched.
+        injections.push(("system_time".into(), format!(
+            "Current local date and time: {}.",
+            chrono::Local::now().format("%A, %d %B %Y, %H:%M (%:z)")
+        )));
+    }
     if backend.supports_tools() {
         if system_time_on && !tool_schemas_suppressed && !tools.iter().any(|tool| tool.alias == "system_time") {
             tools.push(crate::connectors::AgentTool::system_time());
@@ -717,7 +935,10 @@ async fn assemble_turn(
     } else if !tools.is_empty() {
         return Err("The selected remote model is configured without tool-calling support. Deselect tools or choose a model that supports tool calling.".into());
     }
-    crate::arex::adapt_tools(if selection.provider_id.is_some() { &selection.model_id } else { &preferences.model_path }, &mut tools)?;
+    let arex_tools = crate::arex::adapt_tools(if selection.provider_id.is_some() { &selection.model_id } else { &preferences.model_path }, &mut tools)?;
+    if arex_tools {
+        injections.push(("arex_research".into(), crate::arex::RESEARCH_GUIDANCE.into()));
+    }
     if tools.len() > 64 { return Err("Select fewer tool sources: at most 64 tools can be offered in a turn.".into()); }
     crate::prompt::sort_tools_by_alias(&mut tools);
     let ptc_sdk = if preset.id == crate::presets::CODE {
@@ -763,6 +984,7 @@ async fn assemble_turn(
         access_mode,
         context_length,
         id_slot,
+        arex_tools,
     })
 }
 
@@ -847,7 +1069,7 @@ async fn prepare_context(
     state: &AppState, plan: &TurnPlan, conversation_id: &str,
     messages: &mut Vec<Value>, denied: bool, finalizing: bool,
 ) -> Result<(u64, Option<String>), String> {
-    let payload = plan.backend.payload(&request_payload(messages, &plan.tool_definitions, &plan.preferences, denied, finalizing, false, plan.id_slot));
+    let payload = plan.backend.payload(&request_payload(messages, &plan.tool_definitions, &plan.preferences, denied, finalizing, false, plan.id_slot, plan.local_arex()));
     let mut tokens = plan.backend.count_tokens(&payload).await?;
     let mut artifact = None;
     let auto = {
@@ -858,7 +1080,7 @@ async fn prepare_context(
     if auto && crate::compaction::should_compact(tokens, plan.preferences.max_tokens, plan.context_length) {
         artifact = crate::compaction::compact_model_messages(&*state.database()?, conversation_id, messages)?;
         if artifact.is_some() {
-            let payload = plan.backend.payload(&request_payload(messages, &plan.tool_definitions, &plan.preferences, denied, finalizing, false, plan.id_slot));
+            let payload = plan.backend.payload(&request_payload(messages, &plan.tool_definitions, &plan.preferences, denied, finalizing, false, plan.id_slot, plan.local_arex()));
             tokens = plan.backend.count_tokens(&payload).await?;
         }
     }
@@ -1043,6 +1265,7 @@ pub async fn send_message(
         // Loop-hygiene streaks: consecutive identical calls, guarded centrally.
         let mut recent_calls: Vec<(String, String)> = Vec::new();
         let mut research_progress = ResearchProgress::default();
+        let mut research_evidence: Vec<(String, String)> = Vec::new();
         for round in 0..64 {
             if *cancellation.borrow() { return Ok(false); }
             let step_id = format!("step-{round}");
@@ -1099,7 +1322,7 @@ pub async fn send_message(
                 event.notice = Some("Context reached 80%. Older activity was archived; continuing this response.".into());
                 let _ = channel.send(event);
             }
-            let payload = plan.backend.payload(&request_payload(&messages, &plan.tool_definitions, &plan.preferences, tool_use_denied, finalizing, planning, plan.id_slot));
+            let payload = plan.backend.payload(&request_payload(&messages, &plan.tool_definitions, &plan.preferences, tool_use_denied, finalizing, planning, plan.id_slot, plan.local_arex()));
             seq += 1;
             let _ = channel.send(ChatEvent::new(
                 &run,
@@ -1125,6 +1348,9 @@ pub async fn send_message(
             let mut round_reasoning = String::new();
             let mut finish_reason = String::new();
             let mut think_filter = ThinkFilter::new();
+            // A call attempt on a no-tool round is not a visible answer — but
+            // its markup is stripped from the answer text all the same.
+            let mut suppressed_call = false;
             let round_start_time = Instant::now();
             'stream: loop {
                 let next = tokio::select! {
@@ -1268,24 +1494,74 @@ pub async fn send_message(
                 continue;
             }
             if !finalizing && calls.is_empty() && is_text_tool_call(&round_answer) {
-                if matches!(&plan.backend, Backend::Local { .. }) {
-                    state.database()?.record_local_tool_calling_support(
-                        &plan.preferences.runtime_path,
-                        &plan.preferences.model_path,
-                        false,
-                    )?;
+                match crate::tool_calls::parse_text_tool_calls(&round_answer) {
+                    // Some templates (AREX-family) emit literal tool-call text;
+                    // execute it through the normal permissioned dispatch.
+                    Some(parsed) => {
+                        calls = crate::tool_calls::ToolCalls::from_parsed(parsed);
+                        let stripped = crate::tool_calls::strip_text_tool_calls(&round_answer);
+                        if answer.ends_with(&round_answer) {
+                            answer.truncate(answer.len() - round_answer.len());
+                            answer.push_str(&stripped);
+                        }
+                        round_answer = stripped;
+                    }
+                    None => {
+                        if matches!(&plan.backend, Backend::Local { .. }) {
+                            state.database()?.record_local_tool_calling_support(
+                                &plan.preferences.runtime_path,
+                                &plan.preferences.model_path,
+                                false,
+                            )?;
+                        }
+                        return Err("The model emitted a text-form tool call that this runtime cannot execute. Tool use is unavailable for this model response; retry without tools or use a runtime with structured tool-call support.".into());
+                    }
                 }
-                return Err("The model emitted a text-form tool call that this runtime cannot execute. Tool use is unavailable for this model response; retry without tools or use a runtime with structured tool-call support.".into());
             }
             // A thinking-only token limit may recover with a tool-free answer pass.
             // Other runtime failures (including content filtering) must still fail.
             if finish_reason != "length" { check_finish_reason(&finish_reason)?; }
+            if finalizing {
+                // AREX answers through its finish tool; the finalizing payload
+                // keeps that channel open for local AREX, but a call can still
+                // arrive as literal markup or a structured delta. A finish call
+                // runs through the same control path as the tool loop; any
+                // other call is suppressed — stripped from the answer and still
+                // judged "no visible answer" for the retry/fallback decision.
+                let has_markup = is_text_tool_call(&round_answer)
+                    || round_answer.contains("<tool_call")
+                    || round_answer.contains("<function=");
+                if has_markup {
+                    let stripped = strip_call_markup(&round_answer);
+                    if answer.ends_with(&round_answer) {
+                        answer.truncate(answer.len() - round_answer.len());
+                        answer.push_str(&stripped);
+                    }
+                    if let Some(parsed) = crate::tool_calls::parse_text_tool_calls(&round_answer) {
+                        if let Some(call) = parsed.iter().find(|call| call.name == "finish") {
+                            if run_finish_call(&state, &channel, &run, &step_id, &conversation_id, &assistant.id, &mut seq, &mut answer, &research_evidence, plan.access_mode, call, &round_answer).await? {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    round_answer = stripped;
+                    suppressed_call = true;
+                }
+                if !calls.is_empty() {
+                    suppressed_call = true;
+                    let finished = std::mem::take(&mut calls).finish().unwrap_or_default();
+                    if let Some(call) = finished.iter().find(|call| call.name == "finish") {
+                        if run_finish_call(&state, &channel, &run, &step_id, &conversation_id, &assistant.id, &mut seq, &mut answer, &research_evidence, plan.access_mode, call, &round_answer).await? {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
             if needs_final_answer(finalizing, !calls.is_empty(), &round_answer) {
-                // A finalization request intentionally has no tool definitions. If a
-                // model ignores that and emits a call anyway, do not execute it or
-                // enter another tool loop; retry once, then use the grounded result.
-                let final_answer = if calls.is_empty() { &round_answer } else { "" };
-                match finalization_action(final_answer, research_fallback.as_deref(), finalization_retried) {
+                // On a finalizing round a suppressed call attempt still counts
+                // as no visible answer; retry once, then use the grounded result.
+                let final_answer = if calls.is_empty() && !suppressed_call { &round_answer } else { "" };
+                match finalization_action(final_answer, research_fallback.as_deref(), finalization_retried, research_progress.stopped()) {
                     FinalizationAction::Complete => {}
                     FinalizationAction::Retry => {
                         finalization_retried = true;
@@ -1312,6 +1588,7 @@ pub async fn send_message(
                         continue;
                     }
                     FinalizationAction::Fallback(fallback) => {
+                        answer = strip_call_markup(&answer);
                         if !answer.trim().is_empty() {
                             answer.push_str("\n\n");
                         }
@@ -1397,6 +1674,34 @@ pub async fn send_message(
                 if round_answer.trim().is_empty() {
                     return Err(EMPTY_FINAL_ANSWER_ERROR.into());
                 }
+                // Plain-text completions skip `finish`, so the claim audit
+                // would never run — apply it here when the turn did research.
+                if plan.local_arex() && !research_evidence.is_empty() {
+                    let audit_args = json!({"answer": answer, "evidences": []});
+                    if let Some(footer) = claim_audit_footer(
+                        &state,
+                        &audit_args,
+                        &research_evidence,
+                        &run,
+                        &step_id,
+                        &conversation_id,
+                        &mut seq,
+                    ).await {
+                        answer.push_str(&footer);
+                        seq += 1;
+                        channel.send(ChatEvent::new(
+                            &run,
+                            Some(&step_id),
+                            seq,
+                            "Claim audit",
+                            &assistant.id,
+                            &footer,
+                            "",
+                            None,
+                            None,
+                        )).map_err(|error| error.to_string())?;
+                    }
+                }
                 let _ = run.transition_to(crate::agent_run::RunState::Completed);
                 let _ = state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id));
                 if let Ok(store) = state.database() {
@@ -1436,6 +1741,7 @@ pub async fn send_message(
             }
             let tool_calls_count = calls.len();
             let mut explicit_finish = None;
+            let mut finish_args: Option<Value> = None;
             let research_calls_before = research_progress.calls;
             for call in calls {
                 let Some(tool) = plan.tools.iter().find(|tool| tool.alias == call.name) else {
@@ -1681,6 +1987,9 @@ pub async fn send_message(
                 };
 
                 research_progress.observe(&tool.tool.name, &result);
+                if matches!(tool.tool.name.as_str(), "search" | "visit" | "web_search" | "web_open" | "web_find" | "web_fetch" | "web_fetch_url") {
+                    crate::arex::collect_evidence(&result, &mut research_evidence);
+                }
                 let control = if tool.connector == "Harness" && matches!(call.name.as_str(), "update_context" | "finish") { Some(result.clone()) } else { None };
                 if let Some(fallback) = arm_research_finalization(plan_mode, &call.name, &result) {
                     research_fallback = Some(fallback);
@@ -1708,6 +2017,9 @@ pub async fn send_message(
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":bounded_val.to_string()}));
                 if let Some(control) = control {
                     explicit_finish = crate::arex::apply_control(&call.name, &control, &*state.database()?, &conversation_id, &run.id, &mut messages)?;
+                    if explicit_finish.is_some() {
+                        finish_args = Some(call.arguments.clone());
+                    }
                 }
                 if let Ok(store) = state.database() {
                     emit_session_event(
@@ -1729,10 +2041,8 @@ pub async fn send_message(
                 }
             }
             if let Some(final_answer) = explicit_finish {
-                if !answer.trim().is_empty() { answer.push_str("\n\n"); }
-                answer.push_str(&final_answer);
-                seq += 1;
-                channel.send(ChatEvent::new(&run, Some(&step_id), seq, "Research answer ready", &assistant.id, &final_answer, "", None, None)).map_err(|e| e.to_string())?;
+                let finish_args = finish_args.take();
+                present_research_answer(&state, &channel, &run, &step_id, &conversation_id, &assistant.id, &mut seq, &mut answer, &final_answer, finish_args.as_ref(), &research_evidence).await?;
                 return Ok(true);
             }
             if !tool_use_denied && research_progress.stopped() {
@@ -1766,6 +2076,36 @@ pub async fn send_message(
         Ok(false) => "interrupted",
         Err(_) => "error",
     };
+    // A delivered answer means nothing is still in progress. Models routinely
+    // finish without todo bookkeeping, so close out open items here — the
+    // checklist must not sit on a stale "Now" badge after the turn ends.
+    if matches!(result, Ok(true)) {
+        if let Ok(store) = state.database() {
+            if let Ok(mut todos) = store.todos(&conversation_id) {
+                if todos.iter().any(|todo| todo.status != crate::plans::COMPLETED) {
+                    let now = crate::store::now();
+                    for todo in &mut todos {
+                        if todo.status != crate::plans::COMPLETED {
+                            todo.status = crate::plans::COMPLETED.into();
+                            todo.updated_at = now;
+                        }
+                    }
+                    if store.save_todos(&conversation_id, &todos).is_ok() {
+                        emit_session_event(
+                            &store,
+                            &conversation_id,
+                            Some(&run.id),
+                            None,
+                            None,
+                            "plan",
+                            json!({"kind": "todos", "count": todos.len(), "closed": true}),
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+    }
     state.database()?.finish_message(
         &assistant.id,
         &answer,
@@ -1908,7 +2248,7 @@ pub async fn context_preflight(
     ) -> Result<u64, String> {
         let messages = crate::prompt::with_user_turn(messages);
         plan.backend
-            .count_tokens(&plan.backend.payload(&request_payload(&messages, tools, &plan.preferences, false, false, false, None)))
+            .count_tokens(&plan.backend.payload(&request_payload(&messages, tools, &plan.preferences, false, false, false, None, false)))
             .await
     }
 
@@ -1945,6 +2285,7 @@ pub async fn context_preflight(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn request_payload(
     messages: &[Value],
     tools: &[Value],
@@ -1953,21 +2294,33 @@ fn request_payload(
     finalizing: bool,
     planning: bool,
     id_slot: Option<i64>,
+    arex: bool,
 ) -> Value {
     let mut payload = json!({"messages":messages,"temperature":preferences.temperature,"top_p":preferences.top_p,"max_tokens":preferences.max_tokens,"stream":true,"cache_prompt":true});
     // ZAYA's hybrid reasoning loop can otherwise consume the entire response
     // reserve without emitting an answer. Its runtime supports this field and
     // treats it as a separate thinking budget; other local models are unchanged.
+    // (For AREX a forced budget close spills the thinking into visible content
+    // instead — verified on llama.cpp b10855 — so it gets enable_thinking only.)
     if preferences.model_path.ends_with(crate::model_catalog::ZAYA1_FILENAME) {
         payload["reasoning_budget_tokens"] = json!(if finalizing { 0 } else { 2048.min(preferences.max_tokens / 2) });
     }
-    if !finalizing && !planning && !tools.is_empty() {
+    // Keep the tools array identical on every round — including finalizing and
+    // planning rounds. Strict templates (AREX) render <tools> at the very top of
+    // the prompt, so omitting it shifts the token stream at position ~3 and
+    // forces a full reprocess. tool_choice:none still prevents actual calls.
+    if !tools.is_empty() {
         payload["tools"] = json!(tools);
     }
-    if denied || finalizing || planning {
+    // …except local AREX: its trained answer path is the finish tool, so the
+    // finalizing round leaves tool_choice at auto. A structured finish is then
+    // executed like any finish call; stray markup is stripped by the loop.
+    if denied || planning || (finalizing && !arex) {
         payload["tool_choice"] = json!("none");
     }
-    if finalizing && preferences.model_path.ends_with(crate::model_catalog::MODEL_FILENAME) {
+    // On a finalizing round thinking only competes with the answer for the
+    // response reserve — disable it for the templates that honor the kwarg.
+    if finalizing && (arex || preferences.model_path.ends_with(crate::model_catalog::MODEL_FILENAME)) {
         payload["chat_template_kwargs"] = json!({"enable_thinking": false});
     }
     if let Some(slot) = id_slot {
@@ -1990,7 +2343,14 @@ mod finish_tests {
 
     #[test]
     fn text_tool_markup_is_not_a_final_answer() {
-        assert_eq!(super::finalization_action("<tool_call>{}</tool_call>", None, false), super::FinalizationAction::Retry);
+        assert_eq!(super::finalization_action("<tool_call>{}</tool_call>", None, false, false), super::FinalizationAction::Retry);
+        // A call appended after commentary is still not an answer: retry once,
+        // then fall back to the grounded research result.
+        assert_eq!(super::finalization_action("Let me search.\n<tool_call>{}</tool_call>", None, false, false), super::FinalizationAction::Retry);
+        assert_eq!(
+            super::finalization_action("Let me search.\n<tool_call>{}</tool_call>", Some("verified answer"), true, false),
+            super::FinalizationAction::Fallback("Research result:\n\nverified answer".into()),
+        );
     }
 
     #[test]
@@ -2000,14 +2360,16 @@ mod finish_tests {
         assert!(answer.is_empty());
         assert!(!reasoning.is_empty());
         assert!(super::needs_final_answer(false, false, &answer));
-        assert_eq!(super::finalization_action(&answer, None, false), super::FinalizationAction::Retry);
+        assert_eq!(super::finalization_action(&answer, None, false, false), super::FinalizationAction::Retry);
         let prefs = crate::store::Preferences { model_path: crate::model_catalog::ZAYA1_FILENAME.into(), ..Default::default() };
-        let payload = super::request_payload(&[], &[serde_json::json!({"type":"function"})], &prefs, false, true, false, None);
-        assert!(payload.get("tools").is_none());
+        let payload = super::request_payload(&[], &[serde_json::json!({"type":"function"})], &prefs, false, true, false, None, false);
+        // Tools stay rendered on finalizing rounds so the prompt prefix (and
+        // llama.cpp cache) is identical to tool-call rounds.
+        assert!(payload.get("tools").is_some());
         assert_eq!(payload["tool_choice"], "none");
         assert_eq!(payload["reasoning_budget_tokens"], 0);
-        assert_eq!(super::finalization_action("", None, true), super::FinalizationAction::Error);
-        assert_eq!(super::finalization_action("The result is 42.", None, true), super::FinalizationAction::Complete);
+        assert_eq!(super::finalization_action("", None, true, false), super::FinalizationAction::Error);
+        assert_eq!(super::finalization_action("The result is 42.", None, true, false), super::FinalizationAction::Complete);
         assert!(super::check_finish_reason("length").is_err(), "incomplete tool calls must still fail");
     }
     #[test]
@@ -2030,17 +2392,20 @@ mod finish_tests {
         assert!(progress.stopped());
         progress.observe("web_open", &serde_json::json!({"text":"late new evidence"}));
         assert!(progress.stopped());
-        let payload = super::request_payload(&[], &[serde_json::json!({"type":"function"})], &crate::store::Preferences::default(), false, true, false, None);
-        assert!(payload.get("tools").is_none());
+        let payload = super::request_payload(&[], &[serde_json::json!({"type":"function"})], &crate::store::Preferences::default(), false, true, false, None, false);
+        assert!(payload.get("tools").is_some());
         assert_eq!(payload["tool_choice"], "none");
     }
 
     #[test]
     fn research_progress_has_a_budget_even_when_results_keep_changing() {
         let mut progress = super::ResearchProgress::default();
-        for i in 0..24 {
-            progress.observe("web_search", &serde_json::json!({"text":format!("result {i}")}));
-            assert_eq!(progress.stopped(), i == 23);
+        for i in 0..16 {
+            // Each hit on a genuinely new domain is progress; the call budget
+            // is the only brake left once domains keep changing.
+            let result = serde_json::json!({"results":[{"url":format!("https://site{i}.example.com/page"),"text":format!("result {i}")}]});
+            progress.observe("web_search", &result);
+            assert_eq!(progress.stopped(), i == 15);
         }
     }
 
@@ -2050,8 +2415,25 @@ mod finish_tests {
         for i in 0..5 {
             let result = serde_json::json!({"requestId":i,"query":format!("query {i}"),"results":[{"url":"https://example.org","text":"same evidence"}]});
             progress.observe("web_search", &result);
-            assert_eq!(progress.stopped(), i == 4);
+            assert_eq!(progress.stopped(), i >= 3);
         }
+    }
+
+    #[test]
+    fn research_progress_stops_searches_recycling_seen_domains() {
+        // Different snippets on already-seen domains are not progress for a
+        // discovery call — this is the junk-but-novel failure mode.
+        let mut progress = super::ResearchProgress::default();
+        for i in 0..4 {
+            let result = serde_json::json!({"results":[{"url":format!("https://arxiv.org/abs/{i}"),"text":format!("novel snippet {i}")},{"url":format!("https://github.com/x/{i}"),"text":format!("other {i}")}]});
+            progress.observe("search", &result);
+            assert_eq!(progress.stopped(), i == 3);
+        }
+        // A search that surfaces a new domain still counts as progress.
+        let mut fresh = super::ResearchProgress::default();
+        fresh.observe("search", &serde_json::json!({"results":[{"url":"https://a.example.com/1","text":"x"}]}));
+        fresh.observe("search", &serde_json::json!({"results":[{"url":"https://b.example.com/2","text":"y"}]}));
+        assert!(!fresh.stopped());
     }
 
     #[test]
@@ -2072,11 +2454,11 @@ mod finish_tests {
         let messages = vec![serde_json::json!({"role":"user","content":"Hello"})];
         let zaya = crate::store::Preferences { model_path: "ZAYA1-8B-Q4_K_M.gguf".into(), max_tokens: 8192, ..Default::default() };
         let regular = crate::store::Preferences::default();
-        assert_eq!(super::request_payload(&messages, &[], &zaya, false, false, false, None)["reasoning_budget_tokens"], 2048);
+        assert_eq!(super::request_payload(&messages, &[], &zaya, false, false, false, None, false)["reasoning_budget_tokens"], 2048);
         let small_budget = crate::store::Preferences { max_tokens: 512, ..zaya.clone() };
-        assert_eq!(super::request_payload(&messages, &[], &small_budget, false, false, false, None)["reasoning_budget_tokens"], 256);
-        assert!(super::request_payload(&messages, &[], &regular, false, false, false, None).get("reasoning_budget_tokens").is_none());
-        let slotted = super::request_payload(&messages, &[], &regular, false, false, false, Some(0));
+        assert_eq!(super::request_payload(&messages, &[], &small_budget, false, false, false, None, false)["reasoning_budget_tokens"], 256);
+        assert!(super::request_payload(&messages, &[], &regular, false, false, false, None, false).get("reasoning_budget_tokens").is_none());
+        let slotted = super::request_payload(&messages, &[], &regular, false, false, false, Some(0), false);
         assert_eq!(slotted["id_slot"], 0);
         assert_eq!(slotted["cache_prompt"], true);
     }
@@ -2099,11 +2481,11 @@ mod finish_tests {
         let fallback = super::research_answer_fallback("web_search", &result);
         assert_eq!(fallback.as_deref(), Some("The verified answer is 42. [S1](https://example.com)"));
         assert_eq!(
-            super::finalization_action("", fallback.as_deref(), false),
+            super::finalization_action("", fallback.as_deref(), false, false),
             super::FinalizationAction::Retry,
         );
         assert_eq!(
-            super::finalization_action("", fallback.as_deref(), true),
+            super::finalization_action("", fallback.as_deref(), true, false),
             super::FinalizationAction::Fallback("Research result:\n\nThe verified answer is 42. [S1](https://example.com)".into()),
         );
     }
@@ -2111,33 +2493,104 @@ mod finish_tests {
     #[test]
     fn empty_final_synthesis_without_research_fails_loudly() {
         assert_eq!(
-            super::finalization_action("\n  ", None, true),
+            super::finalization_action("\n  ", None, true, false),
             super::FinalizationAction::Error,
         );
         assert_eq!(
-            super::finalization_action("A visible answer", Some("research"), false),
+            super::finalization_action("A visible answer", Some("research"), false, false),
             super::FinalizationAction::Complete,
         );
     }
 
     #[test]
-    fn finalization_disables_tools_and_minicpm_thinking() {
+    fn stalled_turn_rejects_uncited_narration_as_an_answer() {
+        // The failure mode: a stalled research loop emits "Let me synthesize…"
+        // process talk that reads like an answer but cites nothing collected.
+        let narration = "Let me synthesize what I've gathered so far. Based on my research, I need to identify a candidate.";
+        assert_eq!(
+            super::finalization_action(narration, Some("best collected answer"), false, true),
+            super::FinalizationAction::Retry,
+        );
+        assert_eq!(
+            super::finalization_action(narration, Some("best collected answer"), true, true),
+            super::FinalizationAction::Fallback("Research result:\n\nbest collected answer".into()),
+        );
+        // A stalled answer that does cite a source still completes.
+        assert_eq!(
+            super::finalization_action("Per https://a.example/report, X is Y.", Some("fallback"), true, true),
+            super::FinalizationAction::Complete,
+        );
+        // Non-stalled turns keep accepting citation-free answers.
+        assert_eq!(
+            super::finalization_action(narration, Some("fallback"), true, false),
+            super::FinalizationAction::Complete,
+        );
+    }
+
+    #[test]
+    fn finalization_forces_tool_choice_none_and_minicpm_thinking_off() {
         let messages = vec![serde_json::json!({"role":"user","content":"Hello"})];
         let preferences = crate::store::Preferences {
             model_path: crate::model_catalog::MODEL_FILENAME.into(),
             ..Default::default()
         };
         let tools = vec![serde_json::json!({"type":"function","function":{"name":"web_search"}})];
-        let payload = super::request_payload(&messages, &tools, &preferences, false, true, false, None);
-        assert!(payload.get("tools").is_none());
+        let payload = super::request_payload(&messages, &tools, &preferences, false, true, false, None, false);
+        // Tools stay in the payload: templates render them at the prompt head,
+        // so removing them would invalidate the whole KV cache prefix.
+        assert!(payload.get("tools").is_some());
         assert_eq!(payload["tool_choice"], "none");
         assert_eq!(payload["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn arex_finalization_keeps_tool_channel_and_disables_thinking() {
+        // AREX's trained answer path is the finish tool — pinning
+        // tool_choice:none removes it and the model leaks call markup instead.
+        // The round loop executes a finish call and strips other call markup.
+        let messages = vec![serde_json::json!({"role":"user","content":"Hello"})];
+        let preferences = crate::store::Preferences {
+            model_path: "BAAI_AREX-Turbo-Q4_K_M.gguf".into(),
+            ..Default::default()
+        };
+        let tools = vec![serde_json::json!({"type":"function","function":{"name":"finish"}})];
+        let payload = super::request_payload(&messages, &tools, &preferences, false, true, false, None, true);
+        assert!(payload.get("tools").is_some());
+        assert!(payload.get("tool_choice").is_none());
+        assert_eq!(payload["chat_template_kwargs"]["enable_thinking"], false);
+        // Only the finalizing round opens the channel — normal rounds and
+        // denied/planning rounds are unchanged.
+        let normal = super::request_payload(&messages, &tools, &preferences, false, false, false, None, true);
+        assert!(normal.get("tool_choice").is_none());
+        assert!(normal.get("chat_template_kwargs").is_none());
+        let denied = super::request_payload(&messages, &tools, &preferences, true, true, false, None, true);
+        assert_eq!(denied["tool_choice"], "none");
+        let planning = super::request_payload(&messages, &tools, &preferences, false, false, true, None, true);
+        assert_eq!(planning["tool_choice"], "none");
+    }
+
+    #[test]
+    fn suppressed_call_markup_never_reaches_the_answer() {
+        assert_eq!(
+            super::strip_call_markup("Notes.\n<tool_call><function=search><parameter=query>[\"x\"]</parameter></function></tool_call>"),
+            "Notes."
+        );
+        // Unterminated markup (finish_reason=length mid-call) truncates too.
+        assert_eq!(super::strip_call_markup("prose <tool_call>{\"name\":"), "prose");
+        assert_eq!(super::strip_call_markup("prose <function=search>{\"q\":"), "prose");
+        assert_eq!(super::strip_call_markup("clean answer"), "clean answer");
     }
 
     #[test]
     fn text_form_tool_markup_is_not_treated_as_an_answer() {
         assert!(super::is_text_tool_call("<function=web_search>"));
         assert!(super::is_text_tool_call("  <tool_call>{}"));
+        // Calls embedded after commentary count too — the model's intent is
+        // unambiguous once a block exists or `<tool_call>` markup appears.
+        assert!(super::is_text_tool_call("Let me search first.\n<tool_call>{}</tool_call>"));
+        assert!(super::is_text_tool_call("Checking: <tool_call>{\"name\":"));
+        assert!(super::is_text_tool_call("prose <function=search>{}</function>"));
+        // A stray `<function=` mention without a closing tag stays prose.
         assert!(!super::is_text_tool_call("Here is an example: <function=search>."));
     }
 
@@ -2262,17 +2715,19 @@ mod finish_tests {
     }
 
     #[test]
-    fn planning_payload_omits_tools_and_forces_tool_choice_none() {
+    fn planning_payload_keeps_tools_and_forces_tool_choice_none() {
         let messages = vec![serde_json::json!({"role":"user","content":"Build a thing"})];
         let preferences = crate::store::Preferences::default();
         let tools = vec![serde_json::json!({"type":"function","function":{"name":"web_search"}})];
-        let planning = super::request_payload(&messages, &tools, &preferences, false, false, true, None);
-        assert!(planning.get("tools").is_none());
+        let planning = super::request_payload(&messages, &tools, &preferences, false, false, true, None, false);
+        // Same rendered prefix as tool-call rounds — cache survives the
+        // plan→implement transition; tool_choice:none blocks calls.
+        assert!(planning.get("tools").is_some());
         assert_eq!(planning["tool_choice"], "none");
-        let implementing = super::request_payload(&messages, &tools, &preferences, false, false, false, None);
+        let implementing = super::request_payload(&messages, &tools, &preferences, false, false, false, None, false);
         assert!(implementing.get("tools").is_some());
         assert!(implementing.get("tool_choice").is_none());
-        let slotted = super::request_payload(&messages, &[], &preferences, false, false, true, Some(0));
+        let slotted = super::request_payload(&messages, &[], &preferences, false, false, true, Some(0), false);
         assert_eq!(slotted["id_slot"], 0);
         assert_eq!(slotted["cache_prompt"], true);
     }

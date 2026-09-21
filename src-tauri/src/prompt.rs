@@ -3,8 +3,9 @@
 //! Frozen system + frozen tool schemas + prior history must be byte-identical
 //! across turns. Strict chat templates (AREX and similar) allow only one
 //! system message, and only as the first message, and they require a user
-//! turn. Volatile injections (memory, plan, unavailable tools) therefore ride
-//! on the current user draft so they miss only the suffix.
+//! turn. Volatile injections (memory, plan, unavailable tools, AREX research
+//! guidance, system clock) therefore ride on the current user draft so they
+//! miss only the suffix.
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -17,7 +18,17 @@ pub const CONTINUE_INSTRUCTION: &str = "Continue the interrupted answer from its
 /// local models need a nudge to actually call the tool instead of guessing.
 pub const CODE_EXECUTION_GUIDANCE: &str = "When the question needs exact arithmetic, dates, conversions, parsing, or data work, call local_run_code with Python. Do not compute by hand and do not guess. Write plain Python — no markdown fences. The last expression, last assignment, or printed output is the answer; locallm_result(value) is optional. math, json, datetime, decimal, fractions, statistics, and re are already available.";
 
-pub const VOLATILE_KINDS: [&str; 4] = ["unavailable_tools", "memory", "plan", "plan_mode"];
+/// Injection kinds that ride on the current user draft. Anything pushed into
+/// `TurnPlan.injections` under a kind absent from this list is logged as a
+/// context_injection but silently never reaches the model.
+pub const VOLATILE_KINDS: [&str; 6] = [
+    "unavailable_tools",
+    "memory",
+    "plan",
+    "plan_mode",
+    "arex_research",
+    "system_time",
+];
 
 pub fn frozen_system(system_prompt: &str, skill_instructions: &str, ptc_sdk: Option<&str>) -> String {
     frozen_system_with_guidance(system_prompt, skill_instructions, ptc_sdk, None)

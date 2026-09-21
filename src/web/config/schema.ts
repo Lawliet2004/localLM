@@ -33,6 +33,14 @@ export interface WebSearchFetchConfig {
   waybackFallback: boolean;
   /** Learn per-domain fetch success rates and skip chronic failing domains. */
   domainLearning: boolean;
+  /**
+   * Optional last-resort headless-browser render (Edge `--dump-dom`) for
+   * challenge interstitials and JS-dependent pages whose static extraction is
+   * too thin to use. Runs inside the research worker on desktop only.
+   */
+  jsRenderFallback: boolean;
+  /** Hard timeout for the render subprocess, milliseconds. */
+  jsRenderTimeoutMs: number;
 }
 
 export interface WebSearchChunkingConfig {

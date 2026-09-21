@@ -10,9 +10,11 @@ export const DEFAULT_CONFIG: WebSearchConfig = {
   mode: 'normal',
   profile: 'standard',
   searxngBaseUrl: 'http://127.0.0.1:8080',
-  searxngTimeoutMs: 8000,
-  searxngEngines: ['duckduckgo', 'wikipedia', 'stackoverflow', 'github', 'arxiv', 'openstreetmap'],
-  searxngDisabledEngines: ['google', 'bing', 'yandex', 'brave', 'mojeek'],
+  // Fan-out to ~11 engines under parallel AREX queries regularly exceeds 8s;
+  // a 15s budget keeps whole query batches from timing out together.
+  searxngTimeoutMs: 15000,
+  searxngEngines: ['google cse', 'yep', 'duckduckgo', 'google news', 'reuters', 'wikipedia', 'wikinews', 'stackoverflow', 'github', 'arxiv', 'openstreetmap'],
+  searxngDisabledEngines: ['google', 'bing', 'yandex', 'brave', 'qwant'],
   searchProvider: 'searxng',
   googleApiKey: '',
   googleCxId: '',
@@ -43,6 +45,8 @@ export const DEFAULT_CONFIG: WebSearchConfig = {
     userAgent: 'LocalLM-Research/1.0 (+https://github.com/locallm/desktop)',
     waybackFallback: true,
     domainLearning: true,
+    jsRenderFallback: false,
+    jsRenderTimeoutMs: 20000,
     userAgents: [
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',

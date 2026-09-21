@@ -352,8 +352,11 @@ pub async fn snapshot_for_conversation(
 }
 
 pub fn max_depth(store: &crate::store::Store) -> i64 {
-    let configured: i64 = store.setting(MAX_DEPTH_KEY).unwrap_or(3);
-    configured.clamp(0, 8)
+    // `setting::<i64>` returns i64::default() (0) for a missing key, so a
+    // scalar read silently caps depth at 0 and every delegation fails.
+    // Option distinguishes "never configured" from an explicit 0.
+    let configured: Option<i64> = store.setting(MAX_DEPTH_KEY).unwrap_or_default();
+    configured.unwrap_or(3).clamp(0, 8)
 }
 
 pub struct SubagentRegistry {

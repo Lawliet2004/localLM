@@ -26,13 +26,15 @@ pub async fn run_worker(state: &AppState, snapshot: Option<&BackendSnapshot>, mu
     }
     input["databasePath"] = json!(state.data_dir.join("web-research.sqlite"));
     let provider = if provider.is_empty() { "searxng" } else { &provider };
-    input["config"] = json!({
-        "searxngBaseUrl": if searxng.is_empty() { "http://127.0.0.1:8080" } else { &searxng },
-        "searchProvider": provider,
-        "googleApiKey": google_key,
-        "googleCxId": google_cx,
-        "searchFallback": { "enabled": fallback_enabled, "googleDailyLimit": 90 },
-    });
+    // Caller-supplied config (e.g. per-call fetch options) merges under the
+    // app-managed keys; web-search.json overrides still win last.
+    let mut config = input.get("config").and_then(Value::as_object).cloned().unwrap_or_default();
+    config.insert("searxngBaseUrl".into(), json!(if searxng.is_empty() { "http://127.0.0.1:8080" } else { &searxng }));
+    config.insert("searchProvider".into(), json!(provider));
+    config.insert("googleApiKey".into(), json!(google_key));
+    config.insert("googleCxId".into(), json!(google_cx));
+    config.insert("searchFallback".into(), json!({ "enabled": fallback_enabled, "googleDailyLimit": 90 }));
+    input["config"] = Value::Object(config);
     let config_path = state.data_dir.join("web-search.json");
     if config_path.is_file() {
         let bytes = std::fs::read(&config_path).map_err(|e| e.to_string())?;

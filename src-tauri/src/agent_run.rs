@@ -71,6 +71,10 @@ impl RunState {
             (RunState::ExecutingTools, RunState::ExecutingTools) => true, // Batch: multiple calls in one turn
             (RunState::ExecutingTools, RunState::AwaitingApproval) => true, // Batch: later call needs approval
             (RunState::ExecutingTools, RunState::PreparingNextRound) => true,
+            // An in-loop `finish` returns straight to completion while the run
+            // is still in ExecutingTools — without this edge the record stays
+            // "executing_tools" forever and active_run reports it as live.
+            (RunState::ExecutingTools, RunState::Completed) => true,
             (RunState::PreparingNextRound, RunState::Generating) => true,
             (RunState::PreparingNextRound, RunState::Completed) => true,
             _ => false,
@@ -134,6 +138,7 @@ mod tests {
         assert!(RunState::ExecutingTools.can_transition_to(RunState::ExecutingTools));
         assert!(RunState::ExecutingTools.can_transition_to(RunState::AwaitingApproval));
         assert!(RunState::ExecutingTools.can_transition_to(RunState::PreparingNextRound));
+        assert!(RunState::ExecutingTools.can_transition_to(RunState::Completed));
         assert!(RunState::PreparingNextRound.can_transition_to(RunState::Generating));
         assert!(RunState::Generating.can_transition_to(RunState::Completed));
     }

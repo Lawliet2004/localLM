@@ -189,16 +189,46 @@ pub async fn execute(ctx: &HarnessCtx<'_>, alias: &str, args: Value) -> Result<H
     if matches!(alias, "search" | "visit" | "update_context" | "finish") {
         crate::arex::validate(alias, &args)?;
         let value = match alias {
-            "search" => crate::web_search::run_worker(ctx.state, None, json!({"action":"search","query":args["query"]})).await?,
-            "visit" => {
-                let mut pages = Vec::new();
-                for url in crate::arex::strings(&args["url"], true)? {
-                    let result = crate::web_search::run_worker(ctx.state, None, json!({"action":"fetch-url","url":url})).await;
-                    pages.push(match result {
-                        Ok(page) => page,
-                        Err(error) => json!({"url":url,"isError":true,"message":error}),
-                    });
+            "search" => {
+                // Same-repeat guard + empty-result hint that web_search gets —
+                // a raw passthrough let the model burn the whole research
+                // budget on reworded queries with no feedback.
+                let mut queries = crate::arex::strings(&args["query"], false)?;
+                for q in &mut queries {
+                    *q = q.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
                 }
+                queries.sort();
+                let cache_key = format!("arex|{}|{}|{}", ctx.conversation_id, ctx.run_id, queries.join("|"));
+                if let Ok(cache) = ctx.state.web_search_cache.lock() {
+                    if let Some(cached) = cache.get(&cache_key) {
+                        let kept = cached["results"].as_array().map(|r| r.len()).unwrap_or(0);
+                        return Ok(HarnessOutcome::value(json!({
+                            "repeated": true,
+                            "resultsCount": kept,
+                            "hint": "This exact query set already ran this run — its results are above. Reformulate, visit a found source, or answer from gathered evidence."
+                        })));
+                    }
+                }
+                let mut value = crate::web_search::run_worker(ctx.state, None, json!({"action":"search","query":args["query"]})).await?;
+                let empty = value["results"].as_array().map(|r| r.is_empty()).unwrap_or(true)
+                    && value["rawCount"].as_u64().unwrap_or(0) == 0;
+                if empty {
+                    value["hint"] = json!("No results returned. Reformulate with simpler or broader terms, split multi-part questions into separate queries, or answer from evidence already gathered.");
+                }
+                if let Ok(mut cache) = ctx.state.web_search_cache.lock() {
+                    if cache.len() > 512 { cache.clear(); }
+                    cache.insert(cache_key, value.clone());
+                }
+                value
+            }
+            "visit" => {
+                // One worker serves the whole URL batch in parallel; per-page
+                // failures come back isolated as isError entries. Wayback and
+                // the headless-Edge render are on: for a research read an
+                // archived or rendered copy beats a dead-end fetch error.
+                let urls = crate::arex::strings(&args["url"], true)?;
+                let result = crate::web_search::run_worker(ctx.state, None, json!({"action":"fetch-urls","urls":urls,"config":{"fetch":{"waybackFallback":true,"jsRenderFallback":true}}})).await?;
+                let pages = result["pages"].as_array().ok_or("Visit worker returned no page results")?;
                 json!({"goal":args["goal"],"pages":pages,"instruction":"Read the returned content against the goal. These are bounded extracts, not automatically verified evidence."})
             }
             "update_context" => json!({"context":args["context"]}),
@@ -275,7 +305,10 @@ pub async fn execute(ctx: &HarnessCtx<'_>, alias: &str, args: Value) -> Result<H
         }
         "web_fetch_url" => {
             let url = arg_str(&args, "url", 1, 2048, "web_fetch_url")?;
-            let result = crate::web_search::run_worker(ctx.state, None, json!({"action":"fetch-url","url":url})).await?;
+            // Rendered DOM is still the live page — use it to get past
+            // challenge interstitials and JS-only pages; keep wayback off so
+            // an explicit fetch never silently returns a stale archive.
+            let result = crate::web_search::run_worker(ctx.state, None, json!({"action":"fetch-url","url":url,"config":{"fetch":{"waybackFallback":false,"jsRenderFallback":true}}})).await?;
             Ok(HarnessOutcome::value(result))
         }
         "todo_write" => {

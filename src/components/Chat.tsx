@@ -1,5 +1,5 @@
 import { type Dispatch, type SetStateAction, type ReactNode, useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, Copy, Cpu, FileText, Folder, GitBranch, Laptop, ListTodo, MessageSquare, Mic, Plus, Square, Terminal, WandSparkles, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, Copy, Cpu, FileText, Folder, ListTodo, MessageSquare, Mic, Plus, Square, Terminal, WandSparkles, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { attachmentAccept, composeMessage, readAttachment, type Attachment } from '../lib/attachments';
@@ -9,6 +9,7 @@ import type { Message, ContextUsage, ModelSelection, ProviderConnection, Preflig
 import type { InstalledModel } from '../lib/types';
 import { WorkSummary } from './WorkSummary';
 import { ActivityTimeline, useSessionActivity } from './ActivityTimeline';
+import { TraceIcon, groupKindOf, toolKindOf, type TraceKind } from './TraceIcon';
 import { ContextControl } from './ContextControl';
 import { CommandRunCard } from './CommandRunCard';
 import { PlanChecklist, isPlanStateTool, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
@@ -45,7 +46,6 @@ interface Props {
   chatNotice?: string;
   onDismissError?: () => void;
   projectName?: string;
-  gitBranch?: string;
 }
 
 function ToolMessage({ message, onStop }: { message: Message; onStop?: () => void }) {
@@ -162,7 +162,7 @@ function TurnTools({ tools, onCancel }: { tools: Message[]; onCancel: () => void
   if (!tools.length) return null;
 
   // Segment tools into edits vs non-edits
-  const segments: { type: 'edit' | 'group'; tools: Message[]; title?: string; key: string }[] = [];
+  const segments: { type: 'edit' | 'group'; tools: Message[]; title?: string; icon?: TraceKind; key: string }[] = [];
   let currentGroup: Message[] = [];
 
   const flushGroup = () => {
@@ -173,14 +173,17 @@ function TurnTools({ tools, onCancel }: { tools: Message[]; onCancel: () => void
     let folderCount = 0;
     let taskCount = 0;
     let commandCount = 0;
+    const kinds: TraceKind[] = [];
     const isStreaming = groupTools.some(t => t.status === 'streaming');
 
     for (const msg of groupTools) {
       try {
         const val = JSON.parse(msg.content);
         const req = val.request || val;
+        const res = val.result || {};
         const name = req.name || '';
         const args = req.arguments || {};
+        kinds.push(toolKindOf(name, args, res));
         if (/search|grep|find|locate/.test(name)) searchCount++;
         else if (/list_dir|list_files|browse_dir/.test(name)) folderCount++;
         else if (name === 'manage_task') taskCount++;
@@ -211,6 +214,7 @@ function TurnTools({ tools, onCancel }: { tools: Message[]; onCancel: () => void
       type: 'group',
       tools: groupTools,
       title,
+      icon: groupKindOf(kinds),
       key: `grp-${groupTools[0].id}`,
     });
     currentGroup = [];
@@ -246,15 +250,17 @@ function TurnTools({ tools, onCancel }: { tools: Message[]; onCancel: () => void
         const defaultExpanded = isStreaming || isLast || seg.tools.length <= 1;
         const isExpanded = openGroups[seg.key] ?? defaultExpanded;
         return (
-          <div key={seg.key} className="activity-group">
+          <div key={seg.key} className={`activity-group ${isStreaming && isLast ? 'is-live' : ''}`}>
             <button
               type="button"
               className={`activity-group-header ${isExpanded ? 'expanded' : ''}`}
               onClick={() => setOpenGroups(curr => ({ ...curr, [seg.key]: !isExpanded }))}
               aria-expanded={isExpanded}
             >
-              <span>{seg.title}</span>
-              {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              <TraceIcon kind={seg.icon ?? 'explore'} size={13} />
+              <span className="activity-group-title">{seg.title}</span>
+              <span className="activity-group-count">{seg.tools.length}</span>
+              <ChevronRight size={13} className="activity-group-chevron" />
             </button>
             <div className="activity-group-items" style={{ display: isExpanded ? 'flex' : 'none' }}>
               {seg.tools.map(tool => (
@@ -392,9 +398,11 @@ function MessageBody({ message }: { message: Message }) {
           }}
         >
           <summary className="trace-thought-pill">
-            {message.status === 'streaming' && <span className="thinking-pulsar" />}
-            <span>{thoughtSummary}</span>
-            {isOpen ? <ChevronDown size={13} className="thought-chevron" /> : <ChevronRight size={13} className="thought-chevron" />}
+            <TraceIcon kind="thought" size={12}>
+              {message.status === 'streaming' ? <span className="thinking-pulsar" /> : undefined}
+            </TraceIcon>
+            <span className="trace-thought-label">{thoughtSummary}</span>
+            <ChevronRight size={13} className="thought-chevron" />
           </summary>
           <div className="reasoning-content trace-thought-content">{message.reasoning}</div>
         </details>
@@ -480,7 +488,6 @@ export function Chat({
   chatNotice,
   onDismissError,
   projectName,
-  gitBranch,
 }: Props) {
   const sessionActivity = useSessionActivity(conversationKey, generating);
   const planFallback = todosFromPlanEvents(sessionActivity);
@@ -763,21 +770,13 @@ export function Chat({
             todos={todos}
             generating={generating}
             drafting={planMode && generating && todos.length === 0}
+            conversationId={conversationKey}
           />
           <div className="composer-meta-bar">
-            {projectName ? <><div className="composer-meta-item">
+            <div className="composer-meta-item">
               <Folder size={13} className="composer-meta-icon" />
-              <span>{projectName}</span>
-            </div><div className="composer-meta-item">
-              <Laptop size={13} className="composer-meta-icon" />
-              <span>Local</span>
-            </div>{gitBranch && <div className="composer-meta-item">
-              <GitBranch size={13} className="composer-meta-icon" />
-              <span>{gitBranch}</span>
-            </div>}</> : <div className="composer-meta-item">
-              <Folder size={13} className="composer-meta-icon" />
-              <span>No workspace</span>
-            </div>}
+              <span>{projectName || 'No workspace'}</span>
+            </div>
           </div>
           <form
             className={`composer codex-composer-body ${dragging ? 'composer-dragging' : ''}`}

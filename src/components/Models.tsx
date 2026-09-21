@@ -11,6 +11,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { ModelSelectorPanel } from './ModelSelectorPanel';
 import { ProviderManager } from './ProviderManager';
 import { bonsaiFilename, localModels, modelLabel } from '../lib/localModels';
+import { isBonsai2Filename } from '../lib/modelStudio';
 import { api, nativeAvailable } from '../lib/api';
 import { ModelLibrary } from './ModelLibrary';
 import { samePath } from '../lib/pathUtils';
@@ -149,6 +150,7 @@ export function Models({ config, preferences, runtime, busy, providers = [], sel
     }} localOptions={nativeAvailable ? installed.map(m => ({ filename: m.id, label: modelLabel(m.filename) })) : undefined} localFilename={installed.find(m => samePath(m.path, preferences.modelPath))?.id ?? localFilename} onLocalModelChange={filename => void selectLocalModel(filename)} /><ProviderManager providers={providers} busy={busy} onChanged={onProvidersChanged} /></div> : <>
     {tab === 'model' && localModels.some(m => m.filename === localFilename) && <ModelDownload key={localFilename} filename={localFilename} busy={busy} onSelect={path => { updateDraft(current => ({ ...current, modelPath: path })); setNotice('Verified model selected. Save settings to apply it, then load the model.'); }} />}
     {draft.modelPath.endsWith(bonsaiFilename) && <p className="selection-warning">Bonsai Q2_0 needs Prism build prism-b9601-68faa14 with its CUDA DLLs. The standard CUDA installer below is for MiniCPM. Bonsai supports up to 65,536 context tokens; use that value for the full model context, or choose a smaller value if memory is limited.</p>}
+    {isBonsai2Filename(draft.modelPath) && <p className="selection-warning">Ternary Bonsai 2 needs PrismML llama.cpp prism-b10709 or newer (scripts/prepare-runtime.ps1 -Bonsai2). The standard CUDA installer and the older prism-b9601 Bonsai 8B runtime cannot load PTQ1_0. First load uses 4,096 context, automatic GPU fit, and no vision projector. Attach the mmproj later from Model files if you want image input.</p>}
     {tab === 'model' && <RuntimeDownload busy={busy} onSelect={path => { updateDraft(current => ({ ...current, runtimePath: path })); setNotice('Installed runtime selected. Save settings to apply it.'); }} />}
     {tab === 'diagnostics' ? <RuntimeDiagnostics /> : tab === 'runtime' ? <RuntimeForm key={preferences.modelPath} modelPath={preferences.modelPath} runtime={runtime} initial={config} busy={busy || switching} onSave={async value => { try { setError(''); await onSaveConfig(value); if (runtime.phase === 'ready' || runtime.phase === 'error') { setNotice('Runtime configuration saved. Reloading the model so the new context applies.'); onLoad(); } else { setNotice('Runtime configuration saved. Load the model to use it.'); } } catch (e) { setError(String(e)); } }} /> :
       <form className="runtime-form" onSubmit={async event => { event.preventDefault(); try { setError(''); await onSavePreferences(draft); setNotice('Settings saved.'); } catch (e) { setError(String(e)); } }}>

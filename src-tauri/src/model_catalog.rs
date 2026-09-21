@@ -11,6 +11,14 @@ pub const MODEL: Asset<'static> = Asset {
 };
 pub const BONSAI_FILENAME: &str = "Ternary-Bonsai-8B-Q2_0.gguf";
 pub const BONSAI_CONTEXT_LENGTH: u32 = 65_536;
+/// Ternary Bonsai 2 27B dense-trit packing. Stock llama.cpp refuses the
+/// custom PTQ1_0 / PQ2_0 tensor types (ggml type 143+); the PrismML fork
+/// (prism-b10658 or newer) is required. Not interchangeable with the
+/// legacy 8B Q2_0 file or its prism-b9601 runtime.
+#[allow(dead_code)]
+pub const BONSAI2_FILENAME: &str = "Ternary-Bonsai-2-27B-PTQ1_0.gguf";
+#[allow(dead_code)]
+pub const BONSAI2_CONTEXT_LENGTH: u32 = 262_144;
 pub const BONSAI: Asset<'static> = Asset {
     url: "https://huggingface.co/prism-ml/Ternary-Bonsai-8B-gguf/resolve/c2aefbeb4b24469cd11579c3384b990404c17a30/Ternary-Bonsai-8B-Q2_0.gguf",
     bytes: 2_182_184_672,
@@ -41,6 +49,15 @@ pub const ZAYA1_RUNTIME_RELATIVE: &str =
 /// standard runtime and require the user to select a Prism build for Bonsai.
 pub const STANDARD_RUNTIME_RELATIVE: &str = ".local/runtime/llama-server.exe";
 pub const BONSAI_RUNTIME_RELATIVE: &str = ".local/runtime-prism-b9601-68faa14/llama-server.exe";
+pub const BONSAI2_RUNTIME_RELATIVE: &str =
+    ".local/runtime-prism-b10709-9a9394a/llama-server.exe";
+
+/// True for Ternary Bonsai 2 GGUF weights (`PTQ1_0` or Bonsai-2 `PQ2_0`).
+/// Companion mmproj files do not match.
+pub fn is_bonsai2_filename(filename: &str) -> bool {
+    let name = filename.to_ascii_uppercase();
+    name.contains("PTQ1_0") || (name.contains("BONSAI-2") && name.contains("PQ2_0"))
+}
 
 pub fn model(filename: Option<&str>) -> Result<(&'static str, Asset<'static>), String> {
     match filename.unwrap_or(MODEL_FILENAME) {
@@ -62,6 +79,12 @@ mod tests {
         assert_eq!(asset.bytes, 2_182_184_672);
         assert_eq!(asset.sha256.len(), 64);
         assert!(model(Some("../../other.gguf")).is_err());
+        assert!(is_bonsai2_filename(BONSAI2_FILENAME));
+        assert_eq!(BONSAI2_CONTEXT_LENGTH, 262_144);
+        assert!(is_bonsai2_filename("Ternary-Bonsai-2-27B-PQ2_0.gguf"));
+        assert!(!is_bonsai2_filename(BONSAI_FILENAME));
+        assert!(!is_bonsai2_filename("Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"));
+        assert!(!is_bonsai2_filename(MODEL_FILENAME));
     }
     #[test]
     fn catalog_includes_zaya1_reference_entry() {

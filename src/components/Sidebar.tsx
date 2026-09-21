@@ -7,7 +7,6 @@ import {
   Cpu,
   Folder,
   MessageCircle,
-  MessageSquare,
   MoreHorizontal,
   PenSquare,
   Pin,
@@ -21,6 +20,7 @@ import {
 } from 'lucide-react';
 import { confirm, open } from '@tauri-apps/plugin-dialog';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
+import { allProjects, conversationProjectId, groupByProject } from '../lib/projects';
 import type { Conversation, Hit, Project, WorkspaceIndex } from '../lib/types';
 
 export type Page = 'chat' | 'models' | 'connectors' | 'skills' | 'execution' | 'tools';
@@ -41,13 +41,10 @@ interface Props {
   workspace?: WorkspaceIndex;
   onWorkspace?: (index: WorkspaceIndex) => void;
   onProject?: (id: string | null) => void;
+  onDeleteConversations?: (ids: string[]) => void;
   projectId?: string | null;
   onHit?: (id: string, messageId: string) => void;
 }
-
-const DEFAULT_PROJECTS = [
-  { id: 'locallm', name: 'localLM', path: '' },
-];
 
 function formatRelativeTime(timestamp: number, fallback = '2d'): string {
   if (!timestamp || timestamp <= 0) return fallback;
@@ -73,6 +70,7 @@ export function Sidebar(props: Props) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
+  const [unfiledExpanded, setUnfiledExpanded] = useState(false);
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
   const [projectMenuOpenId, setProjectMenuOpenId] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -106,15 +104,6 @@ export function Sidebar(props: Props) {
     };
   }, []);
 
-  const [deletedDefaultProjects, setDeletedDefaultProjects] = useState<string[]>(() => {
-    try {
-      const stored = localStorage.getItem('locallm-deleted-default-projects');
-      return stored ? JSON.parse(stored) : [];
-    } catch {
-      return [];
-    }
-  });
-
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
   const workspace = props.workspace ?? { projects: [], tasks: {} };
@@ -123,7 +112,8 @@ export function Sidebar(props: Props) {
     setSaving(true);
     setError('');
     try {
-      props.onWorkspace?.(await action());
+      const next = await action();
+      props.onWorkspace?.(next);
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -131,55 +121,38 @@ export function Sidebar(props: Props) {
     }
   }
 
-  async function addProject() {
-    if (!nativeAvailable) return;
+  async function addProject(): Promise<string | null> {
+    if (!nativeAvailable) return null;
     try {
       const selected = await open({ directory: true, multiple: false, title: 'Select Project Folder' });
       if (selected && typeof selected === 'string') {
         const parts = selected.replace(/\\/g, '/').split('/');
         const name = parts[parts.length - 1] || 'New Project';
         const id = name.toLowerCase().replace(/[^a-z0-9]/g, '-');
-        if (deletedDefaultProjects.includes(id)) {
-          setDeletedDefaultProjects(prev => {
-            const next = prev.filter(p => p !== id);
-            try {
-              localStorage.setItem('locallm-deleted-default-projects', JSON.stringify(next));
-            } catch {
-              // ignore
-            }
-            return next;
-          });
-        }
         await change(() => api.saveProject({ id, name, path: selected }));
+        return id;
       }
     } catch (e) {
       setError(errorMessage(e));
     }
+    return null;
   }
 
   async function handleDeleteProject(project: Project) {
     if (saving || props.busy) return;
-    const confirmMessage = `Remove "${project.name}" from the project section?\n\nYour files on disk will not be deleted. Any chats in this folder will remain in general chats.`;
+    const chatIds = props.conversations
+      .filter(c => conversationProjectId(workspace, c.id) === project.id)
+      .map(c => c.id);
+    const confirmMessage = `Remove "${project.name}" from the project section?\n\nYour files on disk will not be deleted.${chatIds.length ? `\n\nThe ${chatIds.length} chat${chatIds.length === 1 ? '' : 's'} inside will be permanently deleted.` : ''}`;
     const confirmed = nativeAvailable
       ? await confirm(confirmMessage, { title: 'Remove project folder?', kind: 'warning' })
       : window.confirm(confirmMessage);
     if (!confirmed) return;
 
-    if (DEFAULT_PROJECTS.some(dp => dp.id === project.id)) {
-      setDeletedDefaultProjects(prev => {
-        const next = Array.from(new Set([...prev, project.id]));
-        try {
-          localStorage.setItem('locallm-deleted-default-projects', JSON.stringify(next));
-        } catch {
-          // ignore
-        }
-        return next;
-      });
-    }
-
     if (workspace.projects.some(rp => rp.id === project.id)) {
       await change(async () => {
         const updated = await api.removeProject(project.id);
+        props.onDeleteConversations?.(chatIds);
         if (props.projectId === project.id) {
           props.onProject?.(null);
         }
@@ -232,23 +205,21 @@ export function Sidebar(props: Props) {
     Number(workspace.tasks[b.id]?.pinned ?? false) - Number(workspace.tasks[a.id]?.pinned ?? false) || b.updatedAt - a.updatedAt
   );
 
-  const filteredDefaultProjects = DEFAULT_PROJECTS.filter(dp => !deletedDefaultProjects.includes(dp.id));
-  const registeredProjects = workspace.projects.length > 0 ? workspace.projects : [];
-  const hasUnassigned = matchingTitleConversations.some(c => {
-    const pId = workspace.tasks[c.id]?.projectId;
-    return !pId || !registeredProjects.some(rp => rp.id === pId);
-  });
-  const showDefaultProject = (registeredProjects.length === 0 || hasUnassigned) && filteredDefaultProjects.length > 0;
-  const effectiveProjects = [
-    ...registeredProjects,
-    ...(showDefaultProject ? filteredDefaultProjects.filter(dp => !registeredProjects.some(rp => rp.id.toLowerCase() === dp.id.toLowerCase() || rp.name.toLowerCase() === dp.name.toLowerCase())) : []),
-  ];
+  const effectiveProjects = allProjects(workspace);
+  const conversationsByProject = groupByProject(workspace, matchingTitleConversations);
+  const unfiledConversations = conversationsByProject.get(null) ?? [];
+  const newChatTarget = props.projectId && effectiveProjects.some(p => p.id === props.projectId)
+    ? props.projectId
+    : effectiveProjects[0]?.id ?? null;
+  const newChatTargetName = effectiveProjects.find(p => p.id === newChatTarget)?.name;
 
-  const isLocallmActive = effectiveProjects.some(p => p.id === 'locallm');
-  const unassignedConversations = matchingTitleConversations.filter(c => {
-    const taskMeta = workspace.tasks[c.id];
-    return !taskMeta?.projectId || !effectiveProjects.some(p => p.id === taskMeta.projectId);
-  });
+  function handleNewChat() {
+    if (newChatTarget) {
+      props.onNew(newChatTarget);
+      return;
+    }
+    void addProject().then(id => { if (id) props.onNew(id); });
+  }
 
   const isChatActive = (id: string) => {
     if (props.page !== 'chat') return false;
@@ -273,7 +244,7 @@ export function Sidebar(props: Props) {
           title={c.title}
         >
           <span className="codex-chat-title">
-            {meta.pinned && <span className="pinned-indicator">⌁ </span>}
+            {meta.pinned && <Pin size={10} className="chat-pin-icon" aria-hidden="true" />}
             {c.title}
           </span>
         </button>
@@ -357,9 +328,9 @@ export function Sidebar(props: Props) {
           >
             <div className="sidebar-brand-mark" aria-hidden="true">
               <svg viewBox="0 0 512 512" width="14" height="14">
-                <rect width="512" height="512" rx="112" fill="#1c1d1f" />
-                <path d="M154 126h64v230h146v58H154z" fill="#e9e9e5" />
-                <circle cx="339" cy="155" r="42" fill="#10b981" />
+                <rect width="512" height="512" rx="112" fill="#191b22" />
+                <path d="M154 126h64v230h146v58H154z" fill="#eceef2" />
+                <circle cx="339" cy="155" r="42" fill="#3ec98d" />
               </svg>
             </div>
             <span className="sidebar-brand-title">localLM</span>
@@ -463,8 +434,9 @@ export function Sidebar(props: Props) {
       <button
         className="sidebar-action-item new-chat"
         aria-label="New conversation"
+        title={newChatTargetName ? `New chat in ${newChatTargetName}` : 'New chat — add a project folder first'}
         disabled={props.busy}
-        onClick={() => props.onNew(null)}
+        onClick={handleNewChat}
       >
         <PenSquare size={15} className="new-chat-icon" />
         <span>New chat</span>
@@ -574,10 +546,7 @@ export function Sidebar(props: Props) {
         ) : (
           <>
             {effectiveProjects.map(project => {
-              const projectConversations = matchingTitleConversations.filter(c => {
-                const taskMeta = workspace.tasks[c.id];
-                return taskMeta?.projectId ? taskMeta.projectId === project.id : (project.id === 'locallm');
-              });
+              const projectConversations = conversationsByProject.get(project.id) ?? [];
 
               const isCollapsed = Boolean(collapsedFolders[project.id]);
               const isExpanded = Boolean(expandedProjects[project.id]);
@@ -602,9 +571,13 @@ export function Sidebar(props: Props) {
                         size={13}
                         className={`codex-folder-chevron ${isCollapsed ? 'collapsed' : ''}`}
                       />
-                      <Folder size={15} className="codex-folder-icon" />
+                      <Folder size={14} className="codex-folder-icon" />
                       <span className="codex-folder-name">{project.name}</span>
                     </div>
+
+                    {totalCount > 0 && (
+                      <span className="codex-folder-count" aria-hidden="true">{totalCount}</span>
+                    )}
 
                     <div className="codex-folder-actions" onClick={e => e.stopPropagation()}>
                       <button
@@ -615,7 +588,7 @@ export function Sidebar(props: Props) {
                         onClick={e => {
                           e.stopPropagation();
                           setCollapsedFolders(prev => ({ ...prev, [project.id]: false }));
-                          props.onNew(project.id === 'locallm' ? null : project.id);
+                          props.onNew(project.id);
                         }}
                       >
                         <Plus size={13} />
@@ -661,7 +634,7 @@ export function Sidebar(props: Props) {
                             onClick={() => {
                               setProjectMenuOpenId(null);
                               setCollapsedFolders(prev => ({ ...prev, [project.id]: false }));
-                              props.onNew(project.id === 'locallm' ? null : project.id);
+                              props.onNew(project.id);
                             }}
                           >
                             <Plus size={13} />
@@ -687,6 +660,10 @@ export function Sidebar(props: Props) {
 
                   {!isCollapsed && (
                     <div className="codex-nested-tasks">
+                      {totalCount === 0 && (
+                        <p className="codex-folder-empty">No chats yet</p>
+                      )}
+
                       {displayConversations.map(c => renderChatItem(c))}
 
                       {hasMore && (
@@ -703,57 +680,30 @@ export function Sidebar(props: Props) {
               );
             })}
 
-            {!isLocallmActive && unassignedConversations.length > 0 && (
-              <div className="codex-project-group" key="_unassigned">
-                <div
-                  className="codex-folder-header codex-general-header"
-                  onClick={() => toggleFolder('_unassigned')}
-                  title="General chats (not assigned to any folder)"
-                >
-                  <div className="codex-folder-label">
-                    <ChevronDown
-                      size={13}
-                      className={`codex-folder-chevron ${collapsedFolders['_unassigned'] ? 'collapsed' : ''}`}
-                    />
-                    <MessageSquare size={14} className="codex-folder-icon" />
-                    <span className="codex-folder-name">General chats</span>
-                  </div>
-                  <div className="codex-folder-actions" onClick={e => e.stopPropagation()}>
-                    <button
-                      className="codex-folder-action-btn"
-                      aria-label="New general chat"
-                      title="New general chat"
-                      disabled={props.busy}
-                      onClick={e => {
-                        e.stopPropagation();
-                        props.onNew(null);
-                      }}
-                    >
-                      <Plus size={13} />
-                    </button>
-                  </div>
-                </div>
-                {!collapsedFolders['_unassigned'] && (
-                  <div className="codex-nested-tasks">
-                    {unassignedConversations.map(c => renderChatItem(c))}
-                  </div>
+            {unfiledConversations.length > 0 && (
+              <div className="codex-project-group">
+                {(unfiledExpanded ? unfiledConversations : unfiledConversations.slice(0, 6)).map(c => renderChatItem(c))}
+                {unfiledConversations.length > 6 && (
+                  <button
+                    className="codex-see-all-btn"
+                    onClick={() => setUnfiledExpanded(v => !v)}
+                  >
+                    {unfiledExpanded ? 'Show less' : `See all (${unfiledConversations.length})`}
+                  </button>
                 )}
               </div>
             )}
 
-            {effectiveProjects.length === 0 && unassignedConversations.length === 0 && (
-              <div className="codex-empty-folders">
-                <p className="codex-empty-folders-text">No project folders</p>
-                <button
-                  className="codex-empty-add-btn"
-                  onClick={() => void addProject()}
-                  disabled={props.busy || saving || !nativeAvailable}
-                >
-                  <Plus size={12} />
-                  <span>Add project folder</span>
-                </button>
-              </div>
-            )}
+            <div className="codex-project-list-footer">
+              <button
+                className="codex-empty-add-btn"
+                onClick={() => void addProject()}
+                disabled={props.busy || saving || !nativeAvailable}
+              >
+                <Plus size={12} />
+                <span>Add project folder</span>
+              </button>
+            </div>
           </>
         )}
       </div>

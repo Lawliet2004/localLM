@@ -15,7 +15,7 @@ Sources and citation IDs are application-owned. `web_open` and `web_find` expose
 ## Run from the app
 
 1. Configure Node.js 22.13+ in Execution settings and load a local model.
-2. Run your self-hosted SearXNG with JSON output enabled. The default endpoint is `http://127.0.0.1:8080`; use another port if the model occupies it.
+2. Run your self-hosted SearXNG with JSON output enabled. The default endpoint is `http://127.0.0.1:8080`; use another port if the model occupies it. No Docker? SearXNG also runs inside WSL without it: `git clone --depth 1 https://github.com/searxng/searxng && uv venv ~/sxng-venv && uv pip install --python ~/sxng-venv/bin/python -r ~/searxng/requirements.txt`, then `cd ~/searxng && SEARXNG_SETTINGS_PATH=/mnt/c/…/LocalLM/searxng/settings.yml PYTHONPATH=~/searxng ~/sxng-venv/bin/python -m searx.webapp`. WSL forwards it to `127.0.0.1:8080` on Windows.
 3. Select Research (or another preset offering `web_search`) and ask a current-information question. Normal harness tool permission settings apply.
 
 For overrides, create `%APPDATA%/app.locallm.desktop/web-search.json`. Example:
@@ -28,7 +28,7 @@ For overrides, create `%APPDATA%/app.locallm.desktop/web-search.json`. Example:
   "googleCxId": "",
   "searchFallback": { "enabled": true, "googleDailyLimit": 90 },
   "queries": { "fast": 2, "normal": 4, "deep": 6 },
-  "fetch": { "normalPages": 8, "deepPages": 20, "deepTimeoutSeconds": 20, "deepMaxBytes": 10485760, "globalConcurrency": 4, "perDomainConcurrency": 2, "userAgents": [] },
+  "fetch": { "normalPages": 8, "deepPages": 20, "deepTimeoutSeconds": 20, "deepMaxBytes": 10485760, "globalConcurrency": 4, "perDomainConcurrency": 2, "userAgents": [], "jsRenderFallback": false, "jsRenderTimeoutMs": 20000 },
   "chunking": { "targetTokens": 600, "overlapTokens": 80 },
   "context": { "evidenceTokenBudget": 2500, "totalInputBudget": 6000 },
   "extractEvidenceWithModel": false,
@@ -70,7 +70,7 @@ Recorded fixture run on 2026-09-17: 2 queries, 10 raw results, 3 unique public r
 
 ## Security and measurement boundaries
 
-Public pages use DNS resolution plus socket address pinning, reject non-public addresses, validate every redirect and respect robots policies. Configured SearXNG and local inference are explicit trusted service endpoints, separate from public-page fetching; they do not follow redirects. HTTP 429/503 Retry-After establishes a cooldown. Failed pages are isolated; available search snippets can be used as fallback evidence and are marked in document metadata.
+Public pages use DNS resolution plus socket address pinning, reject non-public addresses, validate every redirect and respect robots policies. Configured SearXNG and local inference are explicit trusted service endpoints, separate from public-page fetching; they do not follow redirects. HTTP 429/503 Retry-After establishes a cooldown. Failed pages are isolated; available search snippets can be used as fallback evidence and are marked in document metadata. The opt-in `jsRenderFallback` renders failed, challenged or thin pages with headless Edge in the worker (temporary profile, bounded DOM output, hard timeout); it repeats the public-address check before spawning because browser DNS bypasses the pinned fetch path, and it never runs for robots.txt refusals.
 
 Web text is untrusted data. Known directives are neutralized, model output is checked against supplied evidence and application-owned citations, and research model calls have no tools or credentials in their prompts. Pattern matching and lexical verification do not prove immunity to every prompt injection or prove semantic truth. Source claims may themselves be wrong, stale or incomplete.
 

@@ -14,7 +14,10 @@ import { fetchViaWayback } from './wayback';
 import { detectChallenge, CHALLENGE_MISS_REASON } from './challenge';
 import type { DomainStatsStore } from './domain_stats';
 
-export type FetchMethod = 'github_raw' | 'live' | 'wayback' | 'failed';
+export type FetchMethod = 'github_raw' | 'live' | 'js_render' | 'wayback' | 'failed';
+
+/** Rendered-DOM provider (headless Edge in the desktop worker). */
+export type JsRenderer = (url: string) => Promise<{ html: string; finalUrl?: string } | null>;
 
 export interface CascadeDocument {
   title: string;
@@ -46,6 +49,14 @@ export interface CascadeOptions {
   titleHint?: string;
   waybackFallback?: boolean;
   domainStats?: DomainStatsStore;
+  /**
+   * Optional headless-render fallback for pages the static fetch cannot read:
+   * challenge interstitials, failed live fetches, and extractions thinner than
+   * jsRenderMinChars. Not attempted when robots.txt disallows the page.
+   */
+  jsRender?: JsRenderer;
+  /** Extracted text shorter than this marks the page JS-dependent. */
+  jsRenderMinChars?: number;
 }
 
 function domainOf(url: string): string {
@@ -100,6 +111,24 @@ export async function fetchPageCascade(
     if (options.domainStats && domain) await options.domainStats.record(domain, ok, error);
   };
 
+  // The real failure reason (HTTP status, robots refusal, challenge marker)
+  // reaches the caller — a bare "fetch failed" teaches the model nothing and
+  // invites blind retries.
+  let failureDetail: string | undefined;
+
+  // Rendered output is untrusted page markup; it goes through the same
+  // extraction and challenge checks as a static body before it counts.
+  const tryRender = async (): Promise<CascadeOutcome | null> => {
+    if (!options.jsRender) return null;
+    const rendered = await options.jsRender(url).catch(() => null);
+    if (!rendered?.html || detectChallenge(200, rendered.html)) return null;
+    const document = fromHtml(rendered.html, titleHint, rendered.finalUrl || url, 'js_render');
+    if (!document.text.trim()) return null;
+    return { document, method: 'js_render' };
+  };
+
+  const minUsefulChars = options.jsRenderMinChars ?? 280;
+
   if (!skippedLive) {
     const github = toGitHubRawCandidates(url);
     if (github) {
@@ -124,17 +153,45 @@ export async function fetchPageCascade(
       }
       const challenge = detectChallenge(live.status ?? 200, live.body);
       if (challenge) {
-        await record(false, `${CHALLENGE_MISS_REASON}:${challenge.marker}`);
+        failureDetail = `${CHALLENGE_MISS_REASON}:${challenge.marker}`;
+        await record(false, failureDetail);
+        const rendered = await tryRender();
+        if (rendered) {
+          await record(true);
+          return rendered;
+        }
       } else {
+        const document = fromHtml(live.body, titleHint, live.finalUrl || url, 'live');
+        if (options.jsRender && document.text.trim().length < minUsefulChars) {
+          const rendered = await tryRender();
+          if (rendered && rendered.document!.text.trim().length > document.text.trim().length) {
+            await record(true);
+            return rendered;
+          }
+        }
         await record(true);
-        return {
-          document: fromHtml(live.body, titleHint, live.finalUrl || url, 'live'),
-          raw: live,
-          method: 'live',
-        };
+        return { document, raw: live, method: 'live' };
       }
     } else {
+      failureDetail = live.error || 'empty or thin response';
       await record(false, live.error);
+      // A browser render can outlive plain HTTP failures (TLS fingerprints,
+      // transient errors) but must never bypass a robots.txt refusal.
+      if (!/robots\.txt/i.test(live.error || '')) {
+        const rendered = await tryRender();
+        if (rendered) {
+          await record(true);
+          return rendered;
+        }
+      }
+    }
+  } else {
+    // Chronic static-fetch failures are usually bot walls; a render attempt is
+    // the one mechanism that can still reach the page and heal the domain.
+    const rendered = await tryRender();
+    if (rendered) {
+      await record(true);
+      return rendered;
     }
   }
 
@@ -164,6 +221,6 @@ export async function fetchPageCascade(
     document: null,
     method: 'failed',
     skippedLive,
-    error: skippedLive ? 'chronic domain skipped live fetch' : 'fetch failed',
+    error: skippedLive ? 'chronic domain skipped live fetch' : (failureDetail || 'fetch failed'),
   };
 }

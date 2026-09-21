@@ -4,6 +4,10 @@ import { BlockList, isIP } from "node:net";
 import http from "node:http";
 import https from "node:https";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 //#region src/web/types.ts
 function emptySearchMeta() {
 	return {
@@ -38,10 +42,15 @@ var DEFAULT_CONFIG = {
 	mode: "normal",
 	profile: "standard",
 	searxngBaseUrl: "http://127.0.0.1:8080",
-	searxngTimeoutMs: 8e3,
+	searxngTimeoutMs: 15e3,
 	searxngEngines: [
+		"google cse",
+		"yep",
 		"duckduckgo",
+		"google news",
+		"reuters",
 		"wikipedia",
+		"wikinews",
 		"stackoverflow",
 		"github",
 		"arxiv",
@@ -52,7 +61,7 @@ var DEFAULT_CONFIG = {
 		"bing",
 		"yandex",
 		"brave",
-		"mojeek"
+		"qwant"
 	],
 	searchProvider: "searxng",
 	googleApiKey: "",
@@ -84,6 +93,8 @@ var DEFAULT_CONFIG = {
 		userAgent: "LocalLM-Research/1.0 (+https://github.com/locallm/desktop)",
 		waybackFallback: true,
 		domainLearning: true,
+		jsRenderFallback: false,
+		jsRenderTimeoutMs: 2e4,
 		userAgents: [
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -1162,13 +1173,13 @@ function normalizeSearxMeta(data) {
 	if (Array.isArray(data?.suggestions)) meta.suggestions = data.suggestions.filter((s) => typeof s === "string" && s.trim().length > 0).slice(0, 8);
 	return meta;
 }
-/** Engines that require credentials stay off in the default configuration. */
+/** Engines that require credentials or are unreliable without them stay off in the default configuration. */
 var KEYFREE_CREDENTIAL_ENGINES = [
 	"google",
 	"bing",
 	"yandex",
 	"brave",
-	"mojeek"
+	"qwant"
 ];
 var resultMeta = /* @__PURE__ */ new WeakMap();
 /** Meta attached to a `search()` return value so concurrent queries cannot clobber each other. */
@@ -1243,8 +1254,13 @@ var SearXNGProvider = class {
 	/** Instant answers / infoboxes / corrections / suggestions from the last successful search. */
 	lastMeta = null;
 	constructor(baseUrl = "http://127.0.0.1:8080", timeoutMs = 8e3, engines = [
+		"google cse",
+		"yep",
 		"duckduckgo",
+		"google news",
+		"reuters",
 		"wikipedia",
+		"wikinews",
 		"stackoverflow",
 		"github",
 		"arxiv",
@@ -2124,6 +2140,19 @@ async function fetchPageCascade(url, fetcher, options = {}) {
 	const record = async (ok, error) => {
 		if (options.domainStats && domain) await options.domainStats.record(domain, ok, error);
 	};
+	let failureDetail;
+	const tryRender = async () => {
+		if (!options.jsRender) return null;
+		const rendered = await options.jsRender(url).catch(() => null);
+		if (!rendered?.html || detectChallenge(200, rendered.html)) return null;
+		const document = fromHtml(rendered.html, titleHint, rendered.finalUrl || url, "js_render");
+		if (!document.text.trim()) return null;
+		return {
+			document,
+			method: "js_render"
+		};
+	};
+	const minUsefulChars = options.jsRenderMinChars ?? 280;
 	if (!skippedLive) {
 		const github = toGitHubRawCandidates(url);
 		if (github) for (const candidate of github) {
@@ -2148,16 +2177,47 @@ async function fetchPageCascade(url, fetcher, options = {}) {
 				};
 			}
 			const challenge = detectChallenge(live.status ?? 200, live.body);
-			if (challenge) await record(false, `${CHALLENGE_MISS_REASON}:${challenge.marker}`);
-			else {
+			if (challenge) {
+				failureDetail = `${CHALLENGE_MISS_REASON}:${challenge.marker}`;
+				await record(false, failureDetail);
+				const rendered = await tryRender();
+				if (rendered) {
+					await record(true);
+					return rendered;
+				}
+			} else {
+				const document = fromHtml(live.body, titleHint, live.finalUrl || url, "live");
+				if (options.jsRender && document.text.trim().length < minUsefulChars) {
+					const rendered = await tryRender();
+					if (rendered && rendered.document.text.trim().length > document.text.trim().length) {
+						await record(true);
+						return rendered;
+					}
+				}
 				await record(true);
 				return {
-					document: fromHtml(live.body, titleHint, live.finalUrl || url, "live"),
+					document,
 					raw: live,
 					method: "live"
 				};
 			}
-		} else await record(false, live.error);
+		} else {
+			failureDetail = live.error || "empty or thin response";
+			await record(false, live.error);
+			if (!/robots\.txt/i.test(live.error || "")) {
+				const rendered = await tryRender();
+				if (rendered) {
+					await record(true);
+					return rendered;
+				}
+			}
+		}
+	} else {
+		const rendered = await tryRender();
+		if (rendered) {
+			await record(true);
+			return rendered;
+		}
 	}
 	if (options.waybackFallback !== false) {
 		const recovered = await fetchViaWayback(url, fetcher, {
@@ -2182,7 +2242,7 @@ async function fetchPageCascade(url, fetcher, options = {}) {
 		document: null,
 		method: "failed",
 		skippedLive,
-		error: skippedLive ? "chronic domain skipped live fetch" : "fetch failed"
+		error: skippedLive ? "chronic domain skipped live fetch" : failureDetail || "fetch failed"
 	};
 }
 //#endregion
@@ -3894,6 +3954,7 @@ var WebSearchEngine = class {
 	embeddingProvider;
 	reranker;
 	fetcher;
+	jsRender;
 	searchCache;
 	documentCache;
 	domainStats;
@@ -3919,6 +3980,7 @@ var WebSearchEngine = class {
 		const recencyWeight = this.config.reranking.recencyWeight ?? 0;
 		this.reranker = deps.reranker || (this.config.localReranker && this.config.reranking.enabled ? new ResilientReranker(new LocalModelReranker(this.config.localReranker), recencyWeight) : new RerankerService(this.config.reranking.enabled, recencyWeight));
 		this.fetcher = deps.fetcher || new HttpFetcher(this.config.fetch.globalConcurrency, this.config.fetch.perDomainConcurrency);
+		this.jsRender = this.config.fetch.jsRenderFallback ? deps.jsRender : void 0;
 		this.searchCache = new SearchCache(deps.storage);
 		this.documentCache = new DocumentCache(deps.storage);
 		this.searchStorage = deps.storage;
@@ -4003,7 +4065,8 @@ var WebSearchEngine = class {
 			maxBytes: this.config.fetch.maxBytes,
 			userAgent: this.config.fetch.userAgent,
 			waybackFallback: this.config.fetch.waybackFallback,
-			domainStats: this.domainStats
+			domainStats: this.domainStats,
+			jsRender: this.jsRender
 		});
 		const res = outcome.raw;
 		const mime = (res?.mimeType || "").split(";")[0].trim().toLowerCase();
@@ -4039,7 +4102,7 @@ var WebSearchEngine = class {
 			retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
 			searchResultIds: [],
 			metadata: {
-				extractionMethod: outcome.method === "github_raw" ? "github_raw" : outcome.method === "wayback" ? "wayback" : "main_content",
+				extractionMethod: outcome.method === "github_raw" ? "github_raw" : outcome.method === "js_render" ? "js_render" : outcome.method === "wayback" ? "wayback" : "main_content",
 				archivedAt: outcome.document.archivedAt
 			}
 		};
@@ -4062,7 +4125,8 @@ var WebSearchEngine = class {
 			userAgent: this.config.fetch.userAgent,
 			titleHint: candidate.title,
 			waybackFallback: this.config.fetch.waybackFallback,
-			domainStats: this.domainStats
+			domainStats: this.domainStats,
+			jsRender: this.jsRender
 		});
 		if (outcome.document && outcome.document.text.trim().length > 0) {
 			const doc = {
@@ -4080,7 +4144,7 @@ var WebSearchEngine = class {
 				retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
 				searchResultIds: [candidate.id],
 				metadata: {
-					extractionMethod: outcome.method === "github_raw" ? "github_raw" : outcome.method === "wayback" ? "wayback" : "main_content",
+					extractionMethod: outcome.method === "github_raw" ? "github_raw" : outcome.method === "js_render" ? "js_render" : outcome.method === "wayback" ? "wayback" : "main_content",
 					archivedAt: outcome.document.archivedAt
 				}
 			};
@@ -4458,7 +4522,7 @@ var WebSearchEngine = class {
 		for (const res of settledDocs) if (res.status === "fulfilled" && res.value.doc) {
 			const { doc, method, skippedLive } = res.value;
 			if (method === "wayback") waybackRecoveries++;
-			if (method === "live" || method === "github_raw" || method === "wayback" || method === "cache") successfulFetches++;
+			if (method === "live" || method === "github_raw" || method === "js_render" || method === "wayback" || method === "cache") successfulFetches++;
 			else fetchFailures++;
 			if (skippedLive && !domainsChronicSkipped.includes(doc.domain)) domainsChronicSkipped.push(doc.domain);
 			extractedTokens += defaultTokenCounter.count(doc.text);
@@ -4598,7 +4662,7 @@ var WebSearchEngine = class {
 				for (const candidate of retryPages) {
 					const retrieved = await this.retrieveCandidate(candidate, documents.length, route.freshness);
 					const retryDoc = retrieved.doc;
-					if (retrieved.method === "live" || retrieved.method === "github_raw" || retrieved.method === "wayback" || retrieved.method === "cache") {
+					if (retrieved.method === "live" || retrieved.method === "github_raw" || retrieved.method === "js_render" || retrieved.method === "wayback" || retrieved.method === "cache") {
 						successfulFetches++;
 						if (retrieved.method === "wayback") waybackRecoveries++;
 					} else fetchFailures++;
@@ -5144,7 +5208,127 @@ var PinnedPageFetcher = class {
 	}
 };
 //#endregion
+//#region scripts/web-render.mjs
+/**
+* Last-resort headless render for the research fetch cascade.
+*
+* Pages behind bot-wall interstitials or heavy client-side rendering return a
+* shell that static extraction cannot read. Instead of bundling Playwright (an
+* extra browser download and container-weight dependency), we reuse the Edge
+* installation that WebView2 already requires on Windows: `msedge --headless`
+* renders the page and dumps the post-script DOM.
+*
+* The renderer re-checks the SSRF guard itself: the browser resolves DNS on
+* its own, so the pinned-address check from web-transport must run before
+* spawn. Rendered output is untrusted page text; it flows through the same
+* extraction and sanitization path as a normal fetch.
+*/
+var EDGE_CANDIDATES = [
+	process.env.LOCALLM_EDGE_PATH,
+	"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+	"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+	process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "Microsoft\\Edge\\Application\\msedge.exe") : void 0
+].filter(Boolean);
+function findEdgeBinary(candidates = EDGE_CANDIDATES, exists = existsSync) {
+	return candidates.find((path) => exists(path)) || null;
+}
+/**
+* Render `url` in headless Edge and return the serialized DOM.
+* @returns {Promise<{html: string, finalUrl: string} | null>} null when Edge is
+* unavailable, the render times out, or the page yields no usable markup.
+*/
+async function renderPage(url, { timeoutMs = 2e4, maxBytes = 5242880, virtualTimeBudgetMs = 8e3, edgePath } = {}) {
+	let parsed;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return null;
+	}
+	try {
+		await addressesFor(parsed);
+	} catch {
+		return null;
+	}
+	const binary = edgePath || findEdgeBinary();
+	if (!binary) return null;
+	const profile = mkdtempSync(join(tmpdir(), "locallm-render-"));
+	try {
+		const html = await dumpDom(binary, url, profile, {
+			timeoutMs,
+			maxBytes,
+			virtualTimeBudgetMs
+		});
+		return html && html.length >= 150 ? {
+			html,
+			finalUrl: url
+		} : null;
+	} catch {
+		return null;
+	} finally {
+		rmSync(profile, {
+			recursive: true,
+			force: true
+		});
+	}
+}
+function dumpDom(binary, url, profile, { timeoutMs, maxBytes, virtualTimeBudgetMs }) {
+	return new Promise((resolve, reject) => {
+		const child = spawn(binary, [
+			"--headless=new",
+			"--disable-gpu",
+			"--disable-extensions",
+			"--no-first-run",
+			"--no-default-browser-check",
+			"--disable-background-networking",
+			"--disable-sync",
+			"--mute-audio",
+			`--user-data-dir=${profile}`,
+			`--virtual-time-budget=${virtualTimeBudgetMs}`,
+			"--dump-dom",
+			url
+		], {
+			stdio: [
+				"ignore",
+				"pipe",
+				"ignore"
+			],
+			windowsHide: true
+		});
+		let size = 0;
+		let overflow = false;
+		const parts = [];
+		child.stdout.on("data", (chunk) => {
+			size += chunk.length;
+			if (size > maxBytes) {
+				overflow = true;
+				child.kill();
+			} else parts.push(chunk);
+		});
+		const timer = setTimeout(() => child.kill(), timeoutMs);
+		child.on("error", reject);
+		child.on("close", () => {
+			clearTimeout(timer);
+			if (overflow) reject(/* @__PURE__ */ new Error("Rendered DOM exceeds byte limit"));
+			else resolve(Buffer.concat(parts).toString("utf8"));
+		});
+	});
+}
+//#endregion
 //#region scripts/web-worker.mjs
+/** Bounded page shape returned to the model for visit/fetch-url calls. */
+function shapeDocument(doc) {
+	return {
+		id: doc.id,
+		url: doc.url,
+		title: doc.title,
+		extractionMethod: doc.metadata?.extractionMethod || "main_content",
+		snippetOnly: (doc.metadata?.extractionMethod || "").includes("snippet"),
+		ocrRequired: Boolean(doc.metadata?.ocrRequired),
+		text: (doc.text || "").slice(0, 8e3),
+		headings: (doc.headings || []).slice(0, 30),
+		links: (doc.links || []).slice(0, 20)
+	};
+}
 function loadDocumentStore(storage, sessionId) {
 	const store = new DocumentStore();
 	try {
@@ -5171,6 +5355,10 @@ try {
 		config: request.config,
 		storage,
 		fetcher: new PinnedPageFetcher(request.config?.fetch?.globalConcurrency, request.config?.fetch?.perDomainConcurrency),
+		jsRender: request.config?.fetch?.jsRenderFallback ? (url) => renderPage(url, {
+			timeoutMs: request.config.fetch.jsRenderTimeoutMs || 2e4,
+			maxBytes: request.config.fetch.maxBytes
+		}) : void 0,
 		llmProvider: request.localModel ? new LocalOpenAICompatibleProvider(request.localModel) : void 0
 	});
 	let result;
@@ -5210,19 +5398,30 @@ try {
 			};
 		}
 	} else if (request.action === "search") result = await engine.searchQueries(request.query);
-	else if (request.action === "fetch-url") {
-		const doc = await engine.fetchUrl(request.url);
-		result = {
-			id: doc.id,
-			url: doc.url,
-			title: doc.title,
-			extractionMethod: doc.metadata?.extractionMethod || "main_content",
-			snippetOnly: (doc.metadata?.extractionMethod || "").includes("snippet"),
-			ocrRequired: Boolean(doc.metadata?.ocrRequired),
-			text: (doc.text || "").slice(0, 8e3),
-			headings: (doc.headings || []).slice(0, 30),
-			links: (doc.links || []).slice(0, 20)
-		};
+	else if (request.action === "fetch-url") result = shapeDocument(await engine.fetchUrl(request.url));
+	else if (request.action === "fetch-urls") {
+		const urls = (Array.isArray(request.urls) ? request.urls : []).slice(0, 4);
+		result = { pages: await Promise.all(urls.map(async (url) => {
+			try {
+				return shapeDocument(await engine.fetchUrl(String(url)));
+			} catch (error) {
+				return {
+					url: String(url),
+					isError: true,
+					message: String(error?.message || error)
+				};
+			}
+		})) };
+	} else if (request.action === "verify") {
+		const claims = extractAtomicClaims(String(request.answer || "").slice(0, 16e3));
+		const evidence = (Array.isArray(request.evidence) ? request.evidence : []).slice(0, 30).map((item, index) => ({
+			id: `E${index + 1}`,
+			claim: String(item?.claim ?? item?.text ?? "").slice(0, 8e3),
+			supportingSources: [String(item?.url || `E${index + 1}`)],
+			status: "supported",
+			confidence: 1
+		})).filter((item) => item.claim.trim().length > 0);
+		result = new ClaimVerifier().verifyClaimsDeterministic(claims, evidence);
 	} else {
 		const session = await engine.research(request.question, { mode: request.mode });
 		storage.save(session);

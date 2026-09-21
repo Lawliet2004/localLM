@@ -78,6 +78,7 @@ export interface EngineDependencies {
   embeddingProvider?: EmbeddingProvider;
   reranker?: Reranker;
   fetcher?: Pick<HttpFetcher, 'fetch'>;
+  jsRender?: import('./fetch/cascade').JsRenderer;
   storage?: StorageAdapter;
   config?: Partial<WebSearchConfig>;
 }
@@ -91,6 +92,7 @@ export class WebSearchEngine {
   private embeddingProvider: EmbeddingProvider;
   private reranker: Reranker;
   private fetcher: Pick<HttpFetcher, 'fetch'>;
+  private jsRender?: import('./fetch/cascade').JsRenderer;
   private searchCache: SearchCache;
   private documentCache: DocumentCache;
   private domainStats?: DomainStatsStore;
@@ -128,6 +130,7 @@ export class WebSearchEngine {
         this.config.fetch.globalConcurrency,
         this.config.fetch.perDomainConcurrency
       );
+    this.jsRender = this.config.fetch.jsRenderFallback ? deps.jsRender : undefined;
     this.searchCache = new SearchCache(deps.storage);
     this.documentCache = new DocumentCache(deps.storage);
     this.searchStorage = deps.storage;
@@ -226,6 +229,7 @@ export class WebSearchEngine {
       userAgent: this.config.fetch.userAgent,
       waybackFallback: this.config.fetch.waybackFallback,
       domainStats: this.domainStats,
+      jsRender: this.jsRender,
     });
     const res = outcome.raw;
     const mime = (res?.mimeType || '').split(';')[0].trim().toLowerCase();
@@ -266,6 +270,7 @@ export class WebSearchEngine {
         searchResultIds: [],
         metadata: {
           extractionMethod: outcome.method === 'github_raw' ? 'github_raw'
+            : outcome.method === 'js_render' ? 'js_render'
             : outcome.method === 'wayback' ? 'wayback' : 'main_content',
           archivedAt: outcome.document.archivedAt,
         },
@@ -291,6 +296,7 @@ export class WebSearchEngine {
       titleHint: candidate.title,
       waybackFallback: this.config.fetch.waybackFallback,
       domainStats: this.domainStats,
+      jsRender: this.jsRender,
     });
 
     if (outcome.document && outcome.document.text.trim().length > 0) {
@@ -310,6 +316,7 @@ export class WebSearchEngine {
         searchResultIds: [candidate.id],
         metadata: {
           extractionMethod: outcome.method === 'github_raw' ? 'github_raw'
+            : outcome.method === 'js_render' ? 'js_render'
             : outcome.method === 'wayback' ? 'wayback' : 'main_content',
           archivedAt: outcome.document.archivedAt,
         },
@@ -721,7 +728,7 @@ export class WebSearchEngine {
       if (res.status === 'fulfilled' && res.value.doc) {
         const { doc, method, skippedLive } = res.value;
         if (method === 'wayback') waybackRecoveries++;
-        if (method === 'live' || method === 'github_raw' || method === 'wayback' || method === 'cache') successfulFetches++;
+        if (method === 'live' || method === 'github_raw' || method === 'js_render' || method === 'wayback' || method === 'cache') successfulFetches++;
         else fetchFailures++;
         if (skippedLive && !domainsChronicSkipped.includes(doc.domain)) domainsChronicSkipped.push(doc.domain);
         extractedTokens += defaultTokenCounter.count(doc.text);
@@ -926,7 +933,7 @@ export class WebSearchEngine {
         for (const candidate of retryPages) {
           const retrieved = await this.retrieveCandidate(candidate, documents.length, route.freshness);
           const retryDoc = retrieved.doc;
-          if (retrieved.method === 'live' || retrieved.method === 'github_raw' || retrieved.method === 'wayback' || retrieved.method === 'cache') {
+          if (retrieved.method === 'live' || retrieved.method === 'github_raw' || retrieved.method === 'js_render' || retrieved.method === 'wayback' || retrieved.method === 'cache') {
             successfulFetches++;
             if (retrieved.method === 'wayback') waybackRecoveries++;
           } else {

@@ -1,10 +1,12 @@
-param([switch]$IncludeModel, [switch]$Bonsai)
+param([switch]$IncludeModel, [switch]$Bonsai, [switch]$Bonsai2)
 $ErrorActionPreference = 'Stop'
+if ($Bonsai -and $Bonsai2) { throw 'Choose only one of -Bonsai or -Bonsai2.' }
 $taskRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $localRoot = Join-Path $taskRoot '.local'
 $downloadRoot = Join-Path $localRoot 'downloads'
 $runtimeRoot = Join-Path $localRoot 'runtime'
 if ($Bonsai) { $runtimeRoot = Join-Path $localRoot 'runtime-prism-b9601-68faa14' }
+if ($Bonsai2) { $runtimeRoot = Join-Path $localRoot 'runtime-prism-b10709-9a9394a' }
 New-Item -ItemType Directory -Force $downloadRoot,$runtimeRoot | Out-Null
 $assets = @(
     @{ Name='llama-b10855-bin-win-cuda-12.4-x64.zip'; Hash='4f1e2505e5c3ce0126b2f44c5b87af375960428a4ff98535dfeee8a5fbed8a5b' },
@@ -15,6 +17,12 @@ if ($Bonsai) {
     # This model uses legacy group-128 Q2_0. New Prism releases use a different type layout.
     $releaseUrl = 'https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b9601-68faa14'
     $assets[0] = @{ Name='llama-prism-b1-68faa14-bin-win-cuda-12.4-x64.zip'; Hash='16115de1c186a65d9501dbc38a50f504dc065333abb567cab7c8d3462fb4f42b' }
+}
+if ($Bonsai2) {
+    # Ternary Bonsai 2 PTQ1_0 / PQ2_0. Stock llama.cpp refuses ggml type 143.
+    $releaseUrl = 'https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10709-9a9394a'
+    $assets[0] = @{ Name='llama-prism-b10709-9a9394a-bin-win-cuda-12.4-x64.zip'; Hash='f565c8428c1f108311f65ed97f02425188b3aa3c745c2bc597521bbd24bcbbc9' }
+    # CUDA 12.4 runtime DLLs are the same archive as ggml-org b10855.
 }
 function Get-VerifiedFile([string]$Url, [string]$Destination, [string]$ExpectedHash) {
     if (Test-Path -LiteralPath $Destination) {

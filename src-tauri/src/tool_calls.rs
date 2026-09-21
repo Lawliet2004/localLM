@@ -90,6 +90,160 @@ impl ToolCalls {
     }
 }
 
+impl ToolCalls {
+    /// Wrap text-parsed calls so they pass through `finish()`'s normal
+    /// validation (duplicate ids, JSON balance) like structured deltas do.
+    pub fn from_parsed(calls: Vec<ToolCall>) -> Self {
+        let mut acc = Self::default();
+        for (index, call) in calls.into_iter().enumerate() {
+            acc.0.insert(index as u64, PartialCall {
+                id: call.id,
+                name: call.name,
+                arguments: call.arguments.to_string(),
+            });
+        }
+        acc
+    }
+}
+
+/// Some local-model templates (AREX-family) stream literal
+/// `<tool_call>{json}</tool_call>` or `<function=name>{json}</function>` text
+/// instead of structured tool_call deltas. Prose around the blocks is skipped,
+/// so a call the model appended after its commentary still executes through
+/// the normal permissioned dispatch instead of leaking into the answer.
+/// Returns None when any block is malformed — a partial parse is never executed.
+pub fn parse_text_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut rest = text;
+    let mut calls = Vec::new();
+    while let Some(start) = [rest.find("<tool_call>"), rest.find("<function=")]
+        .into_iter().flatten().min()
+    {
+        rest = &rest[start..];
+        if let Some(body) = rest.strip_prefix("<tool_call>") {
+            let end = body.find("</tool_call>")?;
+            let inner = body[..end].trim();
+            // Two wire forms share the <tool_call> wrapper: a JSON object, or
+            // a Qwen/AREX-style <function=name><parameter=…>…</parameter></function> block.
+            let call = if inner.starts_with("<function=") {
+                parse_function_block(inner, calls.len())?
+            } else {
+                parse_json_call(inner, calls.len())?
+            };
+            if calls.iter().any(|existing: &ToolCall| existing.id == call.id) { return None; }
+            calls.push(call);
+            rest = body[end + "</tool_call>".len()..].trim_start();
+        } else if let Some(body) = rest.strip_prefix("<function=") {
+            let name_end = body.find('>')?;
+            let name = body[..name_end].trim();
+            if name.is_empty() || name.len() > 128 { return None; }
+            let body = &body[name_end + 1..];
+            let (args_part, tail) = match body.find("</function>") {
+                Some(end) => (&body[..end], &body[end + "</function>".len()..]),
+                None => (body, ""),
+            };
+            let arguments = parse_function_args(args_part.trim())?;
+            calls.push(ToolCall { id: format!("textcall_{}", calls.len()), name: name.into(), arguments });
+            rest = tail.trim_start();
+        } else {
+            break;
+        }
+        if calls.len() > 8 { return None; }
+    }
+    if calls.is_empty() { return None; }
+    Some(calls)
+}
+
+/// `{"name": "…", "arguments": {…}}` (or arguments as a JSON string).
+fn parse_json_call(inner: &str, index: usize) -> Option<ToolCall> {
+    let parsed: Value = serde_json::from_str(inner).ok()?;
+    let name = parsed["name"].as_str()?.trim();
+    if name.is_empty() || name.len() > 128 { return None; }
+    let arguments = match &parsed["arguments"] {
+        Value::Object(_) => parsed["arguments"].clone(),
+        Value::String(raw) => serde_json::from_str(raw).ok()?,
+        _ => return None,
+    };
+    if !arguments.is_object() { return None; }
+    let id = parsed["id"].as_str()
+        .filter(|id| !id.is_empty() && id.len() <= 128)
+        .map(String::from)
+        .unwrap_or_else(|| format!("textcall_{index}"));
+    Some(ToolCall { id, name: name.into(), arguments })
+}
+
+/// `<function=name>` followed by a bare JSON object or `<parameter=k>v</parameter>`
+/// blocks, optionally closed by `</function>`.
+fn parse_function_block(text: &str, index: usize) -> Option<ToolCall> {
+    let body = text.strip_prefix("<function=")?;
+    let name_end = body.find('>')?;
+    let name = body[..name_end].trim();
+    if name.is_empty() || name.len() > 128 { return None; }
+    let body = &body[name_end + 1..];
+    let args_part = match body.find("</function>") {
+        Some(end) => &body[..end],
+        None => body,
+    };
+    let arguments = parse_function_args(args_part.trim())?;
+    Some(ToolCall { id: format!("textcall_{index}"), name: name.into(), arguments })
+}
+
+/// `<function>` bodies are either a bare JSON object or Qwen/AREX-style
+/// `<parameter=name>value</parameter>` blocks. Structured parameter values
+/// (query arrays, evidences objects) arrive as JSON text inside the block.
+fn parse_function_args(body: &str) -> Option<Value> {
+    let body = body.trim();
+    if body.starts_with('{') {
+        let args: Value = serde_json::from_str(body).ok()?;
+        return args.is_object().then_some(args);
+    }
+    if body.is_empty() {
+        return Some(json!({}));
+    }
+    let mut args = serde_json::Map::new();
+    let mut rest = body;
+    while !rest.trim().is_empty() {
+        let inner = rest.trim_start().strip_prefix("<parameter=")?;
+        let key_end = inner.find('>')?;
+        let key = inner[..key_end].trim();
+        if key.is_empty() || key.len() > 128 { return None; }
+        let after = &inner[key_end + 1..];
+        let end = after.find("</parameter>")?;
+        let raw = after[..end].trim();
+        let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()));
+        args.insert(key.to_string(), value);
+        rest = &after[end + "</parameter>".len()..];
+    }
+    Some(Value::Object(args))
+}
+
+/// Remove the literal tool-call blocks a text fallback consumed, leaving any
+/// surrounding prose for the stored assistant message.
+pub fn strip_text_tool_calls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next = [rest.find("<tool_call>"), rest.find("<function=")]
+            .into_iter().flatten().min();
+        let Some(start) = next else { out.push_str(rest); break };
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        rest = if let Some(body) = after.strip_prefix("<tool_call>") {
+            match body.find("</tool_call>") {
+                Some(end) => &body[end + "</tool_call>".len()..],
+                None => { out.push_str(after); break }
+            }
+        } else if let Some(body) = after.strip_prefix("<function=") {
+            match body.find("</function>") {
+                Some(end) => &body[end + "</function>".len()..],
+                None => { out.push_str(after); break }
+            }
+        } else {
+            unreachable!()
+        };
+    }
+    out.trim().to_string()
+}
+
 /// True when every `{`/`[` outside strings is closed. Local runtimes cut
 /// streams at the response budget; an unbalanced suffix means truncation.
 fn braces_balanced(text: &str) -> bool {
@@ -156,6 +310,85 @@ mod tests {
             assert!(calls.finish().is_err());
         }
     }
+    #[test]
+    fn text_tool_calls_parse_only_complete_blocks() {
+        let calls = parse_text_tool_calls(
+            "<tool_call>\n{\"name\":\"search\",\"arguments\":{\"query\":[\"a\",\"b\"]}}\n</tool_call>\n<tool_call>{\"name\":\"visit\",\"arguments\":{\"url\":\"https://example.org\",\"goal\":\"check\"}}</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].arguments["query"][0], "a");
+        assert_eq!(calls[1].name, "visit");
+        // Structured calls flow through the normal finisher validation.
+        let assembled = ToolCalls::from_parsed(calls).finish().unwrap();
+        assert_eq!(assembled[0].name, "search");
+
+        let legacy = parse_text_tool_calls("<function=search>{\"query\":[\"q\"]}</function>").unwrap();
+        assert_eq!(legacy[0].name, "search");
+
+        // AREX's native Qwen-style form: parameter blocks inside the wrapper.
+        let arex = parse_text_tool_calls(
+            "<tool_call>\n<function=visit>\n<parameter=url>\nhttps://example.org/a\n</parameter>\n<parameter=goal>\nCheck the claim\n</parameter>\n</function>\n</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(arex[0].name, "visit");
+        assert_eq!(arex[0].arguments["url"], "https://example.org/a");
+        assert_eq!(arex[0].arguments["goal"], "Check the claim");
+
+        // Structured parameters arrive as JSON inside the parameter block.
+        let with_json = parse_text_tool_calls(
+            "<tool_call><function=search><parameter=query>[\"first\",\"second\"]</parameter></function></tool_call>",
+        )
+        .unwrap();
+        assert_eq!(with_json[0].arguments["query"][1], "second");
+
+        // Malformed or argument-less blocks are never executed.
+        for bad in [
+            "<tool_call>{\"name\":\"search\",\"arguments\":\"{unclosed\"}</tool_call>",
+            "<tool_call>{\"name\":\"search\"}</tool_call>",
+            "<tool_call>{\"name\":\"search\",\"arguments\":[]}</tool_call>",
+            "<tool_call>not json</tool_call>",
+            "<tool_call>{\"name\":\"search\",\"arguments\":{}}", // truncated, no closing tag
+        ] {
+            assert!(parse_text_tool_calls(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn text_tool_calls_parse_after_prose() {
+        // The observed failure: commentary first, then the call markup.
+        let calls = parse_text_tool_calls(
+            "Let me search specifically for benchmark results.\n\n<tool_call>\n<function=search>\n<parameter=query>\n[\"GPT-6 Astra benchmarks\"]\n</parameter>\n</function>\n</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].arguments["query"][0], "GPT-6 Astra benchmarks");
+
+        // Prose between two call blocks is skipped as well.
+        let calls = parse_text_tool_calls(
+            "first <tool_call>{\"name\":\"search\",\"arguments\":{\"query\":[\"a\"]}}</tool_call> then <tool_call>{\"name\":\"visit\",\"arguments\":{\"url\":\"https://example.org\",\"goal\":\"g\"}}</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].name, "visit");
+
+        // A malformed embedded block still fails the whole parse.
+        assert!(parse_text_tool_calls("prose <tool_call>not json</tool_call>").is_none());
+        assert!(parse_text_tool_calls("prose <tool_call>{\"name\":\"x\",\"arguments\":{}}").is_none());
+    }
+
+    #[test]
+    fn strip_removes_call_markup_but_keeps_prose() {
+        let stripped = strip_text_tool_calls(
+            "<tool_call>{\"name\":\"search\",\"arguments\":{}}</tool_call>\nChecking results.",
+        );
+        assert_eq!(stripped, "Checking results.");
+        let kept = strip_text_tool_calls("prose before <tool_call>{malformed");
+        assert_eq!(kept, "prose before <tool_call>{malformed");
+    }
+
     #[test]
     fn truncated_arguments_are_never_executable() {
         // Balanced JSON with a brace inside a string is fine.

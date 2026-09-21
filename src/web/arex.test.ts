@@ -1,5 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import { WebSearchEngine, DEFAULT_CONFIG } from './index';
+import { extractAtomicClaims } from './verification/claim_extractor';
+import { ClaimVerifier } from './verification/claim_verifier';
 
 it('AREX search returns sources without invoking a nested research model', async () => {
   const generate = vi.fn();
@@ -15,4 +17,23 @@ it('AREX search returns sources without invoking a nested research model', async
   expect(generate).not.toHaveBeenCalled();
   await expect(engine.searchQueries([])).rejects.toThrow();
   await expect(engine.searchQueries(['x'.repeat(8001)])).rejects.toThrow();
+});
+
+it('post-finish audit flags answer claims absent from collected evidence', () => {
+  // Mirrors the worker's verify action: atomic claims from the finish answer,
+  // checked deterministically against evidence gathered during the run.
+  const claims = extractAtomicClaims(
+    'The adapter supports USB-C charging. The warranty lasts five years.',
+  );
+  const report = new ClaimVerifier().verifyClaimsDeterministic(claims, [{
+    id: 'E1',
+    claim: 'The adapter supports USB-C charging at up to 60 watts.',
+    supportingSources: ['https://example.org/spec'],
+    status: 'supported',
+    confidence: 1,
+  }]);
+  expect(report.claims).toHaveLength(2);
+  expect(report.supportedCount).toBe(1);
+  expect(report.unsupportedCount).toBe(1);
+  expect(report.allSupported).toBe(false);
 });

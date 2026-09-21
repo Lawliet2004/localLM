@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
-import { Check, Copy, ChevronDown, ChevronRight, FileCode, FileText, AlertCircle, Clock, XCircle, Atom, Globe } from 'lucide-react';
+import { Check, Copy, ChevronRight, FileCode, FileText, AlertCircle, Clock, XCircle, Atom, ExternalLink } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
+import { TRACE_ICONS, toolKindOf, type TraceKind } from './TraceIcon';
 
 export function FileIcon({ filename, size = 14 }: { filename?: string; size?: number }) {
   if (!filename) return <FileCode size={size} className="cmd-icon" />;
@@ -140,6 +141,15 @@ function parseObjectJson(value?: string | null): Record<string, unknown> | null 
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
   } catch {
     return null;
+  }
+}
+
+function domainOf(url?: string): string | undefined {
+  if (!url) return undefined;
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return undefined;
   }
 }
 
@@ -335,11 +345,15 @@ export function CommandRunCard({
     searchResultCount = webSources.length;
   }
 
-  const renderHeaderIcon = () => {
-    if (isWeb) return <Globe size={14} className="cmd-icon web-icon" />;
-    if (path || isRead || isEdit || displayFilename) return <FileIcon filename={displayFilename ?? path} size={14} />;
-    return null;
-  };
+  const traceKind: TraceKind = toolKindOf(toolName, args ?? {}, { diff });
+  const HeaderGlyph = TRACE_ICONS[traceKind];
+  const headerIcon = (
+    <i className={`trace-icon trace-icon-${traceKind}`} aria-hidden="true">
+      {(traceKind === 'read' || traceKind === 'edit') && (path || displayFilename)
+        ? <FileIcon filename={displayFilename ?? path} size={13} />
+        : <HeaderGlyph size={13} />}
+    </i>
+  );
 
   const combinedOutput = stdout + (stderr ? (stdout ? '\n' : '') + stderr : '');
   const lines = combinedOutput ? combinedOutput.split(/\r?\n/) : [];
@@ -417,7 +431,6 @@ export function CommandRunCard({
           <span className="status-badge success" data-testid="status-exit-0">
             <span className="exit-text">Exit 0</span>
             <span className="finished-tag">finished</span>
-            <ChevronRight size={13} className="finished-chevron" />
           </span>
         );
       }
@@ -458,7 +471,6 @@ export function CommandRunCard({
           <>
             <span className="finished-text sr-only">Finished</span>
             <span className="finished-tag">finished</span>
-            <ChevronRight size={13} className="finished-chevron" />
           </>
         ) : (
           <span className="finished-text">Finished</span>
@@ -477,12 +489,9 @@ export function CommandRunCard({
       {/* Title Bar */}
       <summary className="card-header">
         <div className="header-left">
-          <span className="collapse-btn sr-only" aria-label={expanded ? 'Collapse output' : 'Expand output'}>
-            {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          </span>
+          {headerIcon}
           {!(isCommand && status === 'completed') && <strong className="activity-kind">{displayVerb}</strong>}
-          {renderHeaderIcon()}
-          <span className="cmd-title" title={path ?? displayTitle}>
+          <span className={`cmd-title ${isCommand || path ? 'cmd-title-mono' : ''}`} title={path ?? displayTitle}>
             <span>{displayTitle}</span>
           </span>
           {lineRange && <span className="trace-line-range">#L{lineRange}</span>}
@@ -512,6 +521,8 @@ export function CommandRunCard({
             </span>
           )}
         </div>
+
+        <ChevronRight size={14} className="trace-chevron" aria-hidden="true" />
       </summary>
 
       <div className="card-body">
@@ -532,15 +543,22 @@ export function CommandRunCard({
             {webAnswer && <p className="web-answer-excerpt">{webAnswer.length > 280 ? `${webAnswer.slice(0, 280).trim()}…` : webAnswer}</p>}
             {webSources.length > 0 && (
               <ul className="web-source-list">
-                {webSources.map(source => (
-                  <li key={source.id}>
-                    {source.url ? (
-                      <a href={source.url} target="_blank" rel="noreferrer">{source.title || source.url.replace(/^https?:\/\//, '')}</a>
-                    ) : (
-                      <span>{source.title || source.id}</span>
-                    )}
-                  </li>
-                ))}
+                {webSources.map((source, index) => {
+                  const domain = domainOf(source.url);
+                  const label = source.title || domain || (source.url ? source.url.replace(/^https?:\/\//, '') : source.id);
+                  return (
+                    <li key={source.id} className="web-source">
+                      <span className="web-source-index" aria-hidden="true">{index + 1}</span>
+                      {source.url ? (
+                        <a className="web-source-link" href={source.url} target="_blank" rel="noreferrer">{label}</a>
+                      ) : (
+                        <span className="web-source-link web-source-static">{label}</span>
+                      )}
+                      {source.url && domain && <span className="web-source-domain">{domain}</span>}
+                      {source.url && <ExternalLink size={11} className="web-source-open" aria-hidden="true" />}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </div>
@@ -709,7 +727,16 @@ export function CommandRunCard({
         {/* Tab 4: Raw Arguments */}
         {activeTab === 'raw' && args && (
           <div className="raw-viewport">
-            <pre>{JSON.stringify(args, null, 2)}</pre>
+            <dl className="param-list">
+              {Object.entries(args).map(([key, value]) => (
+                <div key={key} className="param-row">
+                  <dt className="param-key">{key}</dt>
+                  <dd className="param-value">
+                    {value !== null && typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}
+                  </dd>
+                </div>
+              ))}
+            </dl>
           </div>
         )}
 

@@ -139,6 +139,19 @@
       "auth": {
         "type": "dcr"
       }
+    },
+    {
+      "type": "remote",
+      "name": "firecrawl",
+      "logo": "https://assets.production.truefoundry.com/firecrawl.svg",
+      "url": "https://mcp.firecrawl.dev/v2/mcp",
+      "description": "Scrape pages, crawl and map sites, search the web, and extract structured data.",
+      "auth": {
+        "type": "header",
+        "headers": {
+          "Authorization": "Bearer YOUR_FIRECRAWL_API_KEY"
+        }
+      }
     }
   ],
   "skills": [

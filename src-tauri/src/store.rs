@@ -73,9 +73,15 @@ impl Default for Preferences {
 }
 impl Preferences {
     /// ZAYA spends a substantial part of its response budget on reasoning.
+    /// AREX answers arrive inside a `finish` call — the JSON envelope plus the
+    /// evidences list need headroom beyond a chat-sized budget, and report-
+    /// style answers visibly splice when they hit a small cap mid-sentence.
     /// Upgrade older saved defaults without lowering an explicit larger budget.
     pub fn apply_model_defaults(mut self) -> Self {
-        if self.model_path.ends_with(crate::model_catalog::ZAYA1_FILENAME) && self.max_tokens < 8192 {
+        if (self.model_path.ends_with(crate::model_catalog::ZAYA1_FILENAME)
+            || crate::arex::is_arex_model(&self.model_path))
+            && self.max_tokens < 8192
+        {
             self.max_tokens = 8192;
         }
         self
@@ -2059,6 +2065,11 @@ mod tests {
         let base = Preferences { model_path: "C:/models/ZAYA1-8B-Q4_K_M.gguf".into(), max_tokens: 2048, ..Default::default() };
         assert_eq!(base.clone().apply_model_defaults().max_tokens, 8192);
         assert_eq!(Preferences { max_tokens: 12000, ..base.clone() }.apply_model_defaults().max_tokens, 12000);
+        // AREX gets the same bump — its finish-call answers truncate at the
+        // chat-sized default.
+        let arex = Preferences { model_path: "C:/models/BAAI_AREX-Turbo-Q4_K_M.gguf".into(), max_tokens: 2048, ..Default::default() };
+        assert_eq!(arex.clone().apply_model_defaults().max_tokens, 8192);
+        assert_eq!(Preferences { max_tokens: 12000, ..arex }.apply_model_defaults().max_tokens, 12000);
         let fitted = crate::context::fit_response_budget(
             base.clone().apply_model_defaults().max_tokens,
             8192,

@@ -44,7 +44,9 @@ impl CacheType {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            context_length: 131072,
+            // 32k keeps the KV cache small enough for 4 GB-class GPUs; larger
+            // contexts push the cache into host memory and slow every round.
+            context_length: 32768,
             gpu_layers: -1,
             cpu_threads: 6,
             batch_size: 512,
@@ -60,6 +62,26 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// First-load settings for Ternary Bonsai 2 27B on a 4 GB GPU / 16 GB RAM
+    /// laptop. Automatic GPU fit splits layers; mmap keeps the 6 GiB weights
+    /// from doubling in RAM; Flash Attention and Q8 KV match the Prism kernels.
+    /// Context stays small so a hybrid-attention KV cache plus CPU layers fit.
+    pub fn bonsai2_recommended() -> Self {
+        Self {
+            context_length: 4096,
+            gpu_layers: -1,
+            cpu_threads: 6,
+            batch_size: 256,
+            micro_batch_size: 64,
+            flash_attention: true,
+            cache_type_k: CacheType::Q8_0,
+            cache_type_v: CacheType::Q8_0,
+            offload_kv_cache: true,
+            mmap: true,
+            inference_slots: 1,
+        }
+    }
+
     /// Known-good configuration for ZAYA1-8B on a laptop with limited VRAM.
     /// CPU-only, 8 192-token context, conservative batch sizes, f16 caches.
     pub fn zaya_recommended() -> Self {
@@ -222,9 +244,9 @@ mod tests {
     fn default_configuration_is_valid_for_initial_load() {
         let config = RuntimeConfig::default();
         assert!(config.validate().is_ok());
-        assert_eq!(config.context_length, 131072);
+        assert_eq!(config.context_length, 32768);
         assert_eq!(config.inference_slots, 1);
-        assert!(config.arguments().unwrap().windows(2).any(|pair| pair == ["--ctx-size", "131072"]));
+        assert!(config.arguments().unwrap().windows(2).any(|pair| pair == ["--ctx-size", "32768"]));
         assert!(config.arguments().unwrap().windows(2).any(|pair| pair == ["--parallel", "1"]));
         assert!(!config.arguments().unwrap().iter().any(|arg| arg == "--n-gpu-layers"));
     }
@@ -294,6 +316,24 @@ mod tests {
         assert!(two.arguments().unwrap().windows(2).any(|pair| pair == ["--parallel", "2"]));
         let three = RuntimeConfig { inference_slots: 3, ..Default::default() };
         assert!(three.validate().is_err());
+    }
+
+    #[test]
+    fn bonsai2_recommended_uses_automatic_gpu_fit() {
+        let config = RuntimeConfig::bonsai2_recommended();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.context_length, 4096);
+        assert_eq!(config.gpu_layers, -1);
+        assert!(config.flash_attention);
+        assert_eq!(config.cache_type_k, CacheType::Q8_0);
+        assert_eq!(config.cache_type_v, CacheType::Q8_0);
+        assert!(config.offload_kv_cache);
+        assert!(config.mmap);
+        let args = config.arguments().unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["--ctx-size", "4096"]));
+        assert!(!args.iter().any(|arg| arg == "--n-gpu-layers"));
+        assert!(args.windows(2).any(|pair| pair == ["--flash-attn", "on"]));
+        assert!(!args.iter().any(|arg| arg == "--no-mmap"));
     }
 
     #[test]

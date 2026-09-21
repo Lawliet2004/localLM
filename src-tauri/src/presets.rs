@@ -108,7 +108,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             system_time: true,
             skills: true,
             harness: harness(&[
-                "todo_write", "memory_recall", "compact_conversation",
+                "todo_write", "todo_add", "todo_update", "memory_recall", "compact_conversation",
                 "search", "visit", "update_context", "finish", "artifact_read",
                 "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch", "file_search",
             ]),

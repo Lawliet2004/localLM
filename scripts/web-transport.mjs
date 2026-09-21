@@ -27,7 +27,7 @@ const USER_AGENTS = [
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
 ];
 
-async function addressesFor(url) {
+export async function addressesFor(url) {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Only credential-free HTTP(S) URLs are allowed');
   const host = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '');
   if (/^(localhost|metadata|instance-data)$|\.(local|internal|localhost|corp|home|lan)$/i.test(host)) throw new Error('Internal host blocked');

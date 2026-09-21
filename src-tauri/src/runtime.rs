@@ -156,6 +156,8 @@ impl Runtime {
         };
         let flags = inspect_runtime(&executable).await?;
         let launch = resolve_launch_config(config, &model, flags.fit).await?;
+        let model_bytes = std::fs::metadata(&model).map(|metadata| metadata.len()).unwrap_or(0);
+        let attempts = startup_attempts(model_bytes);
         self.stop().await?;
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .map_err(|error| error.to_string())?
@@ -174,6 +176,9 @@ impl Runtime {
             .arg(&model);
         if let Some(projector) = &projector {
             command.arg("--mmproj").arg(projector);
+        } else if flags.no_mmproj {
+            // Newer llama-server may auto-discover an mmproj beside the GGUF.
+            command.arg("--no-mmproj");
         }
         command.args([
                 "--host",
@@ -240,7 +245,7 @@ impl Runtime {
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|error| error.to_string())?;
-        for _ in 0..120 {
+        for _ in 0..attempts {
             if self.inspect().phase == "error" {
                 return Err(self.status.message.clone());
             }
@@ -293,6 +298,7 @@ fn runtime_command(executable: &Path) -> Command {
 struct RuntimeFlags {
     no_agent: bool,
     fit: bool,
+    no_mmproj: bool,
 }
 
 async fn inspect_runtime(executable: &Path) -> Result<RuntimeFlags, String> {
@@ -315,6 +321,7 @@ async fn inspect_runtime(executable: &Path) -> Result<RuntimeFlags, String> {
     Ok(RuntimeFlags {
         no_agent: help.contains("--no-agent"),
         fit: help.contains("--fit"),
+        no_mmproj: help.contains("--no-mmproj"),
     })
 }
 
@@ -336,6 +343,16 @@ async fn resolve_launch_config(
         launch.offload_kv_cache = false;
     }
     Ok(launch)
+}
+
+/// Health-poll budget after llama-server starts. 6 GiB-class models and a
+/// cold CUDA context routinely exceed the original 60s window.
+fn startup_attempts(model_bytes: u64) -> u32 {
+    if model_bytes >= 4 * 1024 * 1024 * 1024 {
+        1200
+    } else {
+        360
+    }
 }
 
 fn validate_model_context(path: &Path, config: &RuntimeConfig) -> Result<(), String> {
@@ -393,9 +410,16 @@ fn validate_projector(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn large_ggufs_get_a_longer_startup_window() {
+        assert_eq!(startup_attempts(2 * 1024 * 1024 * 1024), 360);
+        assert_eq!(startup_attempts(4 * 1024 * 1024 * 1024), 1200);
+        assert_eq!(startup_attempts(6 * 1024 * 1024 * 1024), 1200);
+    }
+
+    #[test]
     fn bonsai_rejects_oversized_context_before_starting_runtime() {
         let bonsai = Path::new(crate::model_catalog::BONSAI_FILENAME);
-        let mut config = RuntimeConfig::default();
+        let mut config = RuntimeConfig { context_length: 131_072, ..RuntimeConfig::default() };
         assert!(validate_model_context(bonsai, &config).unwrap_err().contains("65,536 or less"));
         config.context_length = 65536;
         assert!(validate_model_context(bonsai, &config).is_ok());

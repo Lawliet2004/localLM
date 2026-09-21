@@ -54,6 +54,12 @@ pub async fn remove_project(state: tauri::State<'_, crate::AppState>, id: String
     Ok(data)
 }
 
+pub fn remove_task_meta(store: &crate::store::Store, id: &str) -> Result<(), String> {
+    let mut data = index(store)?;
+    if data.tasks.remove(id).is_some() { store.save_setting("workspace_index_v1", &data)?; }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn save_task_meta(state: tauri::State<'_, crate::AppState>, id: String, meta: TaskMeta) -> Result<WorkspaceIndex, String> {
     let _guard = state.operation.try_lock().map_err(|_| "Wait for the active operation.")?;

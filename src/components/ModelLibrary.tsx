@@ -3,7 +3,7 @@ import { Download, HardDrive, Heart, Search, Trash2, Play, RefreshCw, ExternalLi
 import { api, errorMessage, nativeAvailable, type ModelInstallStatus } from '../lib/api';
 import type { HardwareStatus, HubRepo, HubSearchHit, InstalledModel } from '../lib/types';
 import { modelLabel } from '../lib/localModels';
-import { compactCount, downloadSize, fitKind, fitLabel, parseHubQuery, preferredFile, preferredProjector, projectorFiles, quantLabel, repoParts, weightFiles } from '../lib/modelStudio';
+import { compactCount, downloadSize, fitKind, fitLabel, isBonsai2Filename, parseHubQuery, preferredFile, preferredProjector, projectorFiles, quantLabel, repoParts, weightFiles } from '../lib/modelStudio';
 import { gib } from '../lib/runtimeGuidance';
 import { samePath } from '../lib/pathUtils';
 
@@ -207,6 +207,7 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
             <strong>{modelLabel(model.filename)}</strong>
             <span>{model.repo ? `Hugging Face · ${model.repo}` : 'Local GGUF file'}</span>
             <small>{quant} · {model.complete ? gib(model.bytes) : `${gib(received)} of ${gib(model.bytes)} saved`} · {model.files.length > 1 ? `${model.files.length} files` : '1 file'}{model.projectorFilename ? ` · Vision: ${model.projectorFilename}` : ''}</small>
+            {isBonsai2Filename(model.filename) && <p className="selection-warning">Needs PrismML llama.cpp prism-b10709 or newer. Stock llama.cpp and the older Bonsai 8B Prism build cannot load PTQ1_0. First load is text-only at 4,096 context so a 4 GB GPU can share layers with RAM.</p>}
             {statusLabel && <span className={`library-chip${statusLabel === 'Incomplete' || statusLabel === 'Interrupted' ? ' warning' : ''}`}>{statusLabel}</span>}
             {!model.complete && <progress aria-label={`${modelLabel(model.filename)} download progress`} value={received} max={model.bytes || 1} />}
             <details><summary>File location & source</summary>{model.files.map(path => <p key={path}>{path}</p>)}{model.repo && <a href={`https://huggingface.co/${model.repo}`} target="_blank" rel="noreferrer">View on Hugging Face ↗</a>}{model.revision && <small>Revision {model.revision}</small>}</details>

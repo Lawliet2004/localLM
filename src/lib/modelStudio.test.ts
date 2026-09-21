@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fitKind, parseHubQuery, preferredFile, preferredProjector, projectorFiles, quantLabel, repoParts } from './modelStudio';
+import { fitKind, isBonsai2Filename, parseHubQuery, preferredFile, preferredProjector, projectorFiles, quantLabel, repoParts } from './modelStudio';
 import type { HardwareStatus } from './types';
 
 const hardware = (vramMib: number, ramBytes: number): HardwareStatus => ({
@@ -17,6 +17,10 @@ describe('model studio helpers', () => {
 
   it('reads quantization tags and prefers Q4_K_M', () => {
     expect(quantLabel('folder/Model-Q5_K_M.gguf')).toBe('Q5_K_M');
+    expect(quantLabel('Ternary-Bonsai-2-27B-PTQ1_0.gguf')).toBe('PTQ1_0');
+    expect(quantLabel('Ternary-Bonsai-2-27B-PQ2_0.gguf')).toBe('PQ2_0');
+    expect(isBonsai2Filename('Ternary-Bonsai-2-27B-PTQ1_0.gguf')).toBe(true);
+    expect(isBonsai2Filename('Ternary-Bonsai-8B-Q2_0.gguf')).toBe(false);
     expect(preferredFile([
       { filename: 'model-Q8_0.gguf', bytes: 8, sha256: 'a' },
       { filename: 'model-Q4_K_M.gguf', bytes: 4, sha256: 'b' },
