@@ -85,6 +85,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
                 "interrupt_agent", "list_agents", "list_subagent_models", "workflow_run", "ralph_run",
                 "terminal_create", "terminal_send", "terminal_close", "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch",
                 "file_search", "memory_teach", "memory_recall",
+                "git_status", "git_diff", "git_log", "git_branch", "git_commit",
                 "ask_user", "artifact_read", "docker_exec",
                 "preset_guide", "compact_conversation", "research_pause", "research_resume", "research_cancel", "research_progress",
             ]),
@@ -126,6 +127,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
                 "subagent", "send_message", "interrupt_agent", "list_agents",
                 "terminal_create", "terminal_send", "terminal_close",
                 "file_search", "memory_teach", "memory_recall",
+                "git_status", "git_diff", "git_log", "git_branch", "git_commit",
                 "artifact_read", "ask_user", "compact_conversation", "research_pause", "research_resume", "research_cancel", "research_progress",
             ]),
         },
@@ -146,6 +148,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
                 "subagent", "send_message", "interrupt_agent", "list_agents",
                 "terminal_create", "terminal_send", "terminal_close",
                 "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch", "file_search", "memory_teach", "memory_recall",
+                "git_status", "git_diff", "git_log", "git_branch", "git_commit",
                 "artifact_read", "ask_user", "compact_conversation", "research_pause", "research_resume", "research_cancel", "research_progress",
             ]),
         },
@@ -250,6 +253,17 @@ mod tests {
         for advanced in ["workflow_run", "ralph_run", "docker_exec", "preset_guide"] {
             assert!(creator.harness.contains(&advanced.to_string()));
         }
+    }
+    #[test]
+    fn git_tools_are_offered_where_code_is_edited() {
+        for id in [STANDARD, CODING, CREATOR] {
+            let preset = get(id).unwrap();
+            for tool in ["git_status", "git_diff", "git_log", "git_branch", "git_commit"] {
+                assert!(preset.harness.contains(&tool.to_string()), "{id} should offer {tool}");
+                assert!(crate::harness::definition(tool).is_some());
+            }
+        }
+        assert!(!get(CHAT).unwrap().harness.contains(&"git_commit".to_string()));
     }
 }
 

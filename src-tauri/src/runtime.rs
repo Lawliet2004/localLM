@@ -72,6 +72,13 @@ pub struct Runtime {
     pub supports_images: bool,
     log_path: PathBuf,
     log_tasks: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    /// `--slot-save-path` directory when the loaded runtime supports it.
+    pub slot_dir: Option<PathBuf>,
+    /// Identity of the loaded model + launch configuration (kv_slots.rs).
+    pub cache_key: String,
+    /// Conversation whose KV state is believed to occupy the conversation
+    /// slot. A wrong guess only costs prefill; llama.cpp verifies the prefix.
+    pub slot_resident: Option<String>,
 }
 impl Runtime {
     pub fn new(log_path: PathBuf) -> Self {
@@ -84,6 +91,9 @@ impl Runtime {
             supports_images: false,
             log_path,
             log_tasks: Vec::new(),
+            slot_dir: None,
+            cache_key: String::new(),
+            slot_resident: None,
         }
     }
     pub fn inspect(&mut self) -> RuntimeStatus {
@@ -128,6 +138,9 @@ impl Runtime {
         self.api_key.clear();
         self.endpoint.clear();
         self.supports_images = false;
+        self.slot_dir = None;
+        self.cache_key.clear();
+        self.slot_resident = None;
         Ok(self.status.clone())
     }
     pub async fn load(
@@ -193,6 +206,16 @@ impl Runtime {
         if flags.fit {
             command.arg("--fit").arg(if config.automatic_gpu() { "on" } else { "off" });
         }
+        // Enables the slot save/restore endpoints only; whether anything is
+        // written is decided per turn by the KV cache setting.
+        let slot_dir = if flags.slot_save {
+            let dir = self.log_path.with_file_name("kv-slots");
+            std::fs::create_dir_all(&dir).map_err(|error| format!("Cannot create the KV slot directory: {error}"))?;
+            command.arg("--slot-save-path").arg(&dir);
+            Some(dir)
+        } else {
+            None
+        };
         command
             .env("LLAMA_API_KEY", &self.api_key)
             .stdin(Stdio::null())
@@ -262,6 +285,8 @@ impl Runtime {
                         if health.status().is_success() {
                             self.context_length = config.context_length;
                             self.supports_images = projector.is_some();
+                            self.slot_dir = slot_dir.clone();
+                            self.cache_key = crate::kv_slots::cache_key(&model, projector.as_deref(), &executable, &launch);
                             self.status.loaded_config = Some(config.clone());
                             self.status.gpu_offload = read_offload(&self.log_path);
                             self.status.phase = "ready".into();
@@ -299,6 +324,7 @@ struct RuntimeFlags {
     no_agent: bool,
     fit: bool,
     no_mmproj: bool,
+    slot_save: bool,
 }
 
 async fn inspect_runtime(executable: &Path) -> Result<RuntimeFlags, String> {
@@ -322,6 +348,7 @@ async fn inspect_runtime(executable: &Path) -> Result<RuntimeFlags, String> {
         no_agent: help.contains("--no-agent"),
         fit: help.contains("--fit"),
         no_mmproj: help.contains("--no-mmproj"),
+        slot_save: help.contains("--slot-save-path"),
     })
 }
 

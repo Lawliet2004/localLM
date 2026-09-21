@@ -4,6 +4,7 @@ import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import { File, Folder, FolderOpen, GitBranch, PanelRight, PanelBottom, Terminal, RefreshCw, ArrowLeft, Maximize2, Minimize2, Globe, Files, ListTodo } from 'lucide-react';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import { CommandRunCard } from './CommandRunCard';
+import { TurnChanges } from './TurnChanges';
 import type { ArtifactRecord } from '../lib/types';
 
 export function WorkspacePanel({ busy, conversationId, revision, onBusy }: { busy: boolean; conversationId: string | null; revision: string; onBusy: (busy: boolean) => void }) {
@@ -99,6 +100,7 @@ export function WorkspacePanel({ busy, conversationId, revision, onBusy }: { bus
         {preview && <pre className="file-preview">{preview}</pre>}
       </>}
       {panel === 'changes' && git && <><label className="panel-toolbar">Branch<select aria-label="Switch branch" value={git.branch} disabled={busy || loading} onChange={e => void act(async () => setGit(await api.workspaceGit(e.target.value)))}>{!git.branch && <option value="">Detached HEAD</option>}{git.branches.map(b => <option key={b}>{b}</option>)}</select></label><pre>{git.status || 'Working tree clean'}</pre><pre>{git.diff || 'No unstaged diff.'}</pre></>}
+      {panel === 'changes' && root && <TurnChanges conversationId={conversationId} revision={revision} busy={busy} />}
       {panel === 'artifacts' && <>{!artifacts.length && <p>No saved artifacts in this task.</p>}{artifacts.map(a => <details key={a.id}><summary>{a.toolName} · {Math.ceil(a.sizeBytes/1024)} KB</summary><pre>{a.content}</pre></details>)}</>}
       {panel === 'terminal' && <><p className="muted">Commands run in {root || 'the selected workspace'}.</p>
         {run && <CommandRunCard toolName="execute_command" {...run} cwd={root} />}

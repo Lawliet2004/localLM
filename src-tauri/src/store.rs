@@ -64,11 +64,70 @@ pub struct Preferences {
     pub top_p: f64,
     pub max_tokens: u32,
     pub system_prompt: String,
+    #[serde(default)]
+    pub sampling: Sampling,
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self { runtime_path: String::new(), model_path: String::new(), projector_path: String::new(), temperature: 1.0,
-            top_p: 0.95, max_tokens: 2048, system_prompt: "You are a helpful local assistant. Be clear and accurate. If you do not know something, say so.".into() }
+            top_p: 0.95, max_tokens: 2048, system_prompt: "You are a helpful local assistant. Be clear and accurate. If you do not know something, say so.".into(),
+            sampling: Sampling::default() }
+    }
+}
+
+/// Optional sampler controls beyond temperature/top-p. `None` means "leave the
+/// backend default in place" and the field is not sent at all.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Sampling {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    /// Fixed RNG seed for reproducible sampling (evals, replay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+}
+impl Sampling {
+    pub fn validate(&self) -> Result<()> {
+        if matches!(self.top_k, Some(k) if k > 1000) {
+            return Err("Top-k must be between 0 and 1000.".into());
+        }
+        let ranged = |value: Option<f64>, low: f64, high: f64, label: &str| -> Result<()> {
+            match value {
+                Some(v) if !v.is_finite() || !(low..=high).contains(&v) => Err(format!("{label} must be between {low} and {high}.").into()),
+                _ => Ok(()),
+            }
+        };
+        ranged(self.min_p, 0.0, 1.0, "Min-p")?;
+        ranged(self.repeat_penalty, 0.0, 2.0, "Repeat penalty")?;
+        ranged(self.presence_penalty, -2.0, 2.0, "Presence penalty")?;
+        ranged(self.frequency_penalty, -2.0, 2.0, "Frequency penalty")?;
+        Ok(())
+    }
+
+    /// Write the configured fields into an internal (llama.cpp / OpenAI-style)
+    /// request payload. Provider adapters drop what their backend lacks.
+    pub fn apply(&self, payload: &mut serde_json::Value) {
+        let fields: [(&str, Option<serde_json::Value>); 6] = [
+            ("top_k", self.top_k.map(Into::into)),
+            ("min_p", self.min_p.map(Into::into)),
+            ("repeat_penalty", self.repeat_penalty.map(Into::into)),
+            ("presence_penalty", self.presence_penalty.map(Into::into)),
+            ("frequency_penalty", self.frequency_penalty.map(Into::into)),
+            ("seed", self.seed.map(Into::into)),
+        ];
+        for (key, value) in fields {
+            if let Some(value) = value {
+                payload[key] = value;
+            }
+        }
     }
 }
 impl Preferences {
@@ -103,7 +162,7 @@ impl Preferences {
         if self.runtime_path.len() > 32768 || self.model_path.len() > 32768 || self.projector_path.len() > 32768 {
             return Err("File path is too long.".into());
         }
-        Ok(())
+        self.sampling.validate()
     }
 }
 
@@ -233,6 +292,13 @@ impl Store {
                 status TEXT NOT NULL CHECK(status IN ('complete','streaming','interrupted','error')), created_at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id,created_at);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS checkpoints(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                run_id TEXT, workspace TEXT NOT NULL, label TEXT NOT NULL, before_commit TEXT NOT NULL, after_commit TEXT,
+                files_changed INTEGER, excluded TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS checkpoints_conversation ON checkpoints(conversation_id, created_at);
+            CREATE INDEX IF NOT EXISTS checkpoints_workspace ON checkpoints(workspace, created_at);
+            CREATE TABLE IF NOT EXISTS kv_slots(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+                cache_key TEXT NOT NULL, bytes INTEGER NOT NULL, updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS conversation_tools(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, name TEXT NOT NULL, api_format TEXT NOT NULL, base_url TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, last_tested_at INTEGER, models TEXT NOT NULL DEFAULT '[]');
             CREATE TABLE IF NOT EXISTS runs(
@@ -1564,6 +1630,114 @@ impl Store {
             .map_err(db_error)?;
         Ok(())
     }
+    fn checkpoint_rows(&self, filter: &str, value: &str) -> Result<Vec<crate::checkpoints::Checkpoint>> {
+        let sql = format!(
+            "SELECT id, conversation_id, run_id, workspace, label, before_commit, after_commit, files_changed, excluded, status, created_at
+             FROM checkpoints WHERE {filter} = ?1 ORDER BY created_at DESC, rowid DESC"
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(db_error)?;
+        let rows = statement
+            .query_map([value], |row| {
+                let excluded: String = row.get(8)?;
+                Ok(crate::checkpoints::Checkpoint {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    workspace: row.get(3)?,
+                    label: row.get(4)?,
+                    before_commit: row.get(5)?,
+                    after_commit: row.get(6)?,
+                    files_changed: row.get::<_, Option<i64>>(7)?.map(|count| count.clamp(0, u32::MAX as i64) as u32),
+                    excluded: serde_json::from_str(&excluded).unwrap_or(serde_json::Value::Array(vec![])),
+                    status: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)
+    }
+    pub fn checkpoint(&self, id: &str) -> Result<Option<crate::checkpoints::Checkpoint>> {
+        Ok(self.checkpoint_rows("id", id)?.into_iter().next())
+    }
+    /// Newest first.
+    pub fn checkpoints_for_conversation(&self, conversation_id: &str) -> Result<Vec<crate::checkpoints::Checkpoint>> {
+        self.checkpoint_rows("conversation_id", conversation_id)
+    }
+    /// Newest first.
+    pub fn checkpoints_for_workspace(&self, workspace: &str) -> Result<Vec<crate::checkpoints::Checkpoint>> {
+        self.checkpoint_rows("workspace", workspace)
+    }
+    pub fn insert_checkpoint(&self, checkpoint: &crate::checkpoints::Checkpoint) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO checkpoints(id, conversation_id, run_id, workspace, label, before_commit, after_commit, files_changed, excluded, status, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    checkpoint.id, checkpoint.conversation_id, checkpoint.run_id, checkpoint.workspace, checkpoint.label,
+                    checkpoint.before_commit, checkpoint.after_commit, checkpoint.files_changed.map(i64::from),
+                    checkpoint.excluded.to_string(), checkpoint.status, checkpoint.created_at
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn complete_checkpoint(&self, id: &str, after_commit: &str, files_changed: u32) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE checkpoints SET after_commit=?2, files_changed=?3, status='complete' WHERE id=?1",
+                params![id, after_commit, i64::from(files_changed)],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn set_checkpoint_status(&self, id: &str, status: &str) -> Result<()> {
+        self.connection.execute("UPDATE checkpoints SET status=?2 WHERE id=?1", params![id, status]).map_err(db_error)?;
+        Ok(())
+    }
+    pub fn delete_checkpoint(&self, id: &str) -> Result<()> {
+        self.connection.execute("DELETE FROM checkpoints WHERE id=?1", [id]).map_err(db_error)?;
+        Ok(())
+    }
+    pub fn delete_all_checkpoints(&self) -> Result<()> {
+        self.connection.execute("DELETE FROM checkpoints", []).map_err(db_error)?;
+        Ok(())
+    }
+    pub fn kv_slot(&self, conversation_id: &str) -> Result<Option<crate::kv_slots::SlotEntry>> {
+        self.connection
+            .query_row(
+                "SELECT conversation_id, cache_key, bytes, updated_at FROM kv_slots WHERE conversation_id=?1",
+                [conversation_id],
+                |row| Ok(crate::kv_slots::SlotEntry { conversation_id: row.get(0)?, cache_key: row.get(1)?, bytes: row.get::<_, i64>(2)?.max(0) as u64, updated_at: row.get(3)? }),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn kv_slots(&self) -> Result<Vec<crate::kv_slots::SlotEntry>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT conversation_id, cache_key, bytes, updated_at FROM kv_slots ORDER BY updated_at")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| Ok(crate::kv_slots::SlotEntry { conversation_id: row.get(0)?, cache_key: row.get(1)?, bytes: row.get::<_, i64>(2)?.max(0) as u64, updated_at: row.get(3)? }))
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)
+    }
+    pub fn save_kv_slot(&self, entry: &crate::kv_slots::SlotEntry) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO kv_slots(conversation_id, cache_key, bytes, updated_at) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(conversation_id) DO UPDATE SET cache_key=excluded.cache_key, bytes=excluded.bytes, updated_at=excluded.updated_at",
+                params![entry.conversation_id, entry.cache_key, entry.bytes.min(i64::MAX as u64) as i64, entry.updated_at],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn delete_kv_slot(&self, conversation_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM kv_slots WHERE conversation_id=?1", [conversation_id])
+            .map_err(db_error)?;
+        Ok(())
+    }
     pub fn conversation_model(&self, id: &str) -> Result<(ModelSelection, bool)> {
         let row: Option<(Option<String>, Option<String>, i64)> = self
             .connection
@@ -2058,6 +2232,19 @@ mod tests {
         assert_eq!(resumed.completed_results.len(), 1);
         let recoverable = store.recoverable_research_tasks(&conversation.id).unwrap();
         assert_eq!(recoverable.len(), 1);
+    }
+
+    #[test]
+    fn sampling_is_optional_and_validated() {
+        let legacy: Preferences = serde_json::from_str(r#"{"runtimePath":"","modelPath":"","temperature":1.0,"topP":0.95,"maxTokens":2048,"systemPrompt":""}"#).unwrap();
+        assert_eq!(legacy.sampling, Sampling::default());
+        assert!(legacy.validate().is_ok());
+        let saved = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(saved["sampling"], serde_json::json!({}));
+        let bad = Preferences { sampling: Sampling { min_p: Some(1.5), ..Default::default() }, ..Default::default() };
+        assert!(bad.validate().is_err());
+        let penalty = Preferences { sampling: Sampling { presence_penalty: Some(f64::NAN), ..Default::default() }, ..Default::default() };
+        assert!(penalty.validate().is_err());
     }
 
     #[test]

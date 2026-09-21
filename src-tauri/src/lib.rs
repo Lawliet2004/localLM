@@ -49,6 +49,11 @@ pub mod sessions;
 pub mod skills;
 mod sse;
 mod store;
+mod structured_output;
+mod telemetry;
+mod kv_slots;
+mod git;
+mod checkpoints;
 mod tool_envelope;
 mod research_tasks;
 pub mod web_search;
@@ -298,6 +303,15 @@ pub fn run() {
             model_install::install_model,
             model_install::cancel_model_install,
             chat::send_message,
+            kv_slots::kv_cache_usage,
+            kv_slots::save_kv_cache_settings,
+            kv_slots::clear_kv_cache,
+            checkpoints::list_checkpoints,
+            checkpoints::checkpoint_diff,
+            checkpoints::revert_checkpoint,
+            checkpoints::checkpoint_settings,
+            checkpoints::save_checkpoint_settings,
+            checkpoints::clear_checkpoints,
             chat::context_preflight,
             chat::cancel_generation,
             approval::resolve_tool_approval,

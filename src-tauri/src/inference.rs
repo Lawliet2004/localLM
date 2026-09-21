@@ -2,6 +2,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
 
+/// Extended sampler fields written by `store::Sampling::apply`.
+const SAMPLER_FIELDS: [&str; 6] = ["top_k", "min_p", "repeat_penalty", "presence_penalty", "frequency_penalty", "seed"];
+/// The subset the OpenAI Chat Completions API does not define.
+const LLAMA_ONLY_SAMPLER_FIELDS: [&str; 3] = ["top_k", "min_p", "repeat_penalty"];
+
 #[async_trait]
 pub trait InferenceProvider: Send + Sync {
     fn payload(&self, payload: &Value) -> Value;
@@ -191,9 +196,20 @@ impl InferenceProvider for Backend {
             }
             Self::OpenAi { model_id, .. } | Self::Subscription { model_id, .. } => {
                 let mut payload = payload.clone();
+                // llama.cpp-only sampler fields are dropped explicitly rather
+                // than passed through to an API that may reject them. The
+                // subscription backends accept none of the extended fields.
+                let unsupported: &[&str] = if matches!(self, Self::Subscription { .. }) {
+                    &SAMPLER_FIELDS
+                } else {
+                    &LLAMA_ONLY_SAMPLER_FIELDS
+                };
                 if let Some(object) = payload.as_object_mut() {
                     object.remove("cache_prompt");
                     object.remove("id_slot");
+                    for field in unsupported {
+                        object.remove(*field);
+                    }
                     object.insert("model".into(), Value::String(model_id.clone()));
                 }
                 payload
@@ -456,6 +472,24 @@ mod tests {
         assert!(payload.get("cache_prompt").is_none());
         assert!(payload.get("id_slot").is_none());
         assert!(backend.context_is_estimate());
+    }
+
+    #[test]
+    fn remote_payloads_drop_unsupported_sampler_fields() {
+        let sampled = json!({"messages":[],"top_k":40,"min_p":0.05,"repeat_penalty":1.1,"presence_penalty":0.2,"frequency_penalty":0.3,"seed":7});
+        let model = RemoteModel { id: "m".into(), context_length: Some(4096), max_output_tokens: None, supports_images: false, tool_support: ToolSupport::Unknown };
+        let openai = Backend::openai(&provider(), "secret".into(), &model).unwrap().payload(&sampled);
+        for field in LLAMA_ONLY_SAMPLER_FIELDS {
+            assert!(openai.get(field).is_none(), "{field} leaked to OpenAI");
+        }
+        assert_eq!(openai["seed"], 7);
+        assert_eq!(openai["presence_penalty"], 0.2);
+        let subscription = Backend::subscription("ChatGPT", "https://chatgpt.com/backend-api/codex", "t".into(), None, &model).unwrap().payload(&sampled);
+        for field in SAMPLER_FIELDS {
+            assert!(subscription.get(field).is_none(), "{field} leaked to subscription");
+        }
+        let local = Backend::local("http://127.0.0.1:1".into(), "k".into(), 4096).unwrap().payload(&sampled);
+        assert_eq!(local, sampled);
     }
 
     #[test]

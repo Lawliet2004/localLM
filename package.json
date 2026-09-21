@@ -11,6 +11,8 @@
     "test:grounding": "node scripts/build-web-worker.mjs && node scripts/phase1-grounding-smoke.mjs",
     "test:arex-loop": "node scripts/arex-loop-smoke.mjs",
     "test:web-transport": "node --test scripts/web-transport.test.mjs scripts/web-render.test.mjs",
+    "test:eval": "node --test scripts/eval/score.test.mjs",
+    "eval": "node scripts/eval/run.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",

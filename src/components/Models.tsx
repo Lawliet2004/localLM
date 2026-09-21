@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type SetStateAction } from 'react';
 import { Cpu, Play, Square } from 'lucide-react';
-import type { InstalledModel, Preferences, RuntimeConfig, RuntimeStatus } from '../lib/types';
+import type { InstalledModel, Preferences, RuntimeConfig, RuntimeStatus, Sampling } from '../lib/types';
 import type { ModelSelection, ProviderConnection } from '../lib/types';
 import { RuntimeForm } from './RuntimeForm';
 import { HardwareStatus } from './HardwareStatus';
 import { RuntimeDiagnostics } from './RuntimeDiagnostics';
+import { KvCachePanel } from './KvCachePanel';
 import { ModelDownload } from './ModelDownload';
 import { RuntimeDownload } from './RuntimeDownload';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -15,6 +16,16 @@ import { isBonsai2Filename } from '../lib/modelStudio';
 import { api, nativeAvailable } from '../lib/api';
 import { ModelLibrary } from './ModelLibrary';
 import { samePath } from '../lib/pathUtils';
+
+interface SamplingField { key: keyof Sampling; label: string; min: number; max: number; step: number }
+const samplingFields: SamplingField[] = [
+  { key: 'topK', label: 'Top-k', min: 0, max: 1000, step: 1 },
+  { key: 'minP', label: 'Min-p', min: 0, max: 1, step: 0.01 },
+  { key: 'repeatPenalty', label: 'Repeat penalty', min: 0, max: 2, step: 0.05 },
+  { key: 'presencePenalty', label: 'Presence penalty', min: -2, max: 2, step: 0.05 },
+  { key: 'frequencyPenalty', label: 'Frequency penalty', min: -2, max: 2, step: 0.05 },
+  { key: 'seed', label: 'Seed', min: 0, max: 4294967295, step: 1 },
+];
 
 interface Props {
   config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus; busy: boolean;
@@ -71,6 +82,16 @@ export function Models({ config, preferences, runtime, busy, providers = [], sel
     }
   }, [preferences]);
 
+  function updateSampling(key: keyof Sampling, value: number) {
+    updateDraft(current => {
+      const sampling = { ...(current.sampling ?? {}) };
+      if (Number.isFinite(value)) sampling[key] = value; else delete sampling[key];
+      return { ...current, sampling };
+    });
+  }
+  function renderSamplingField(field: SamplingField) {
+    return <label key={field.key}>{field.label}<input type="number" aria-label={field.label} min={field.min} max={field.max} step={field.step} placeholder="Default" value={draft.sampling?.[field.key] ?? ''} onChange={e => updateSampling(field.key, e.target.valueAsNumber)} /></label>;
+  }
   function updateDraft(value: SetStateAction<Preferences>) {
     const next = typeof value === 'function' ? value(draftRef.current) : value;
     draftRef.current = next;
@@ -152,9 +173,9 @@ export function Models({ config, preferences, runtime, busy, providers = [], sel
     {draft.modelPath.endsWith(bonsaiFilename) && <p className="selection-warning">Bonsai Q2_0 needs Prism build prism-b9601-68faa14 with its CUDA DLLs. The standard CUDA installer below is for MiniCPM. Bonsai supports up to 65,536 context tokens; use that value for the full model context, or choose a smaller value if memory is limited.</p>}
     {isBonsai2Filename(draft.modelPath) && <p className="selection-warning">Ternary Bonsai 2 needs PrismML llama.cpp prism-b10709 or newer (scripts/prepare-runtime.ps1 -Bonsai2). The standard CUDA installer and the older prism-b9601 Bonsai 8B runtime cannot load PTQ1_0. First load uses 4,096 context, automatic GPU fit, and no vision projector. Attach the mmproj later from Model files if you want image input.</p>}
     {tab === 'model' && <RuntimeDownload busy={busy} onSelect={path => { updateDraft(current => ({ ...current, runtimePath: path })); setNotice('Installed runtime selected. Save settings to apply it.'); }} />}
-    {tab === 'diagnostics' ? <RuntimeDiagnostics /> : tab === 'runtime' ? <RuntimeForm key={preferences.modelPath} modelPath={preferences.modelPath} runtime={runtime} initial={config} busy={busy || switching} onSave={async value => { try { setError(''); await onSaveConfig(value); if (runtime.phase === 'ready' || runtime.phase === 'error') { setNotice('Runtime configuration saved. Reloading the model so the new context applies.'); onLoad(); } else { setNotice('Runtime configuration saved. Load the model to use it.'); } } catch (e) { setError(String(e)); } }} /> :
+    {tab === 'diagnostics' ? <RuntimeDiagnostics /> : tab === 'runtime' ? <><RuntimeForm key={preferences.modelPath} modelPath={preferences.modelPath} runtime={runtime} initial={config} busy={busy || switching} onSave={async value => { try { setError(''); await onSaveConfig(value); if (runtime.phase === 'ready' || runtime.phase === 'error') { setNotice('Runtime configuration saved. Reloading the model so the new context applies.'); onLoad(); } else { setNotice('Runtime configuration saved. Load the model to use it.'); } } catch (e) { setError(String(e)); } }} /><KvCachePanel /></> :
       <form className="runtime-form" onSubmit={async event => { event.preventDefault(); try { setError(''); await onSavePreferences(draft); setNotice('Settings saved.'); } catch (e) { setError(String(e)); } }}>
-        <fieldset disabled={busy}>{tab === 'model' ? <><legend>Local files</legend><p className="section-description">Use a GGUF model and a compatible llama.cpp runtime. Q6_K is the recommended starting point for MiniCPM5-2B.</p><label>llama-server executable<input aria-label="llama-server executable" placeholder="C:\path\to\llama-server.exe" value={draft.runtimePath} onChange={e => updateDraft(current => ({ ...current, runtimePath: e.target.value }))} required spellCheck={false} /><small>Choose the CUDA build to use your NVIDIA GPU.</small></label><label>GGUF model file<input aria-label="GGUF model file" placeholder="C:\path\to\MiniCPM5-2B.Q6_K.gguf" value={draft.modelPath} onChange={e => updateDraft(current => ({ ...current, modelPath: e.target.value }))} required spellCheck={false} /></label><label>Vision projector (optional, enables image input)<input aria-label="Vision projector file" placeholder="C:\path\to\mmproj-model-f16.gguf (leave empty for text-only)" value={draft.projectorPath ?? ''} onChange={e => updateDraft(current => ({ ...current, projectorPath: e.target.value }))} spellCheck={false} /><small>Multimodal GGUF models need their matching mmproj file to see images. Leave empty for text-only chat.</small></label></> : <><legend>Response behavior</legend><div className="field-pair"><label>Temperature<input type="number" min="0" max="2" step="0.05" required value={draft.temperature} onChange={e => updateDraft(current => ({ ...current, temperature: e.target.valueAsNumber }))} /></label><label>Top-p<input type="number" min="0.01" max="1" step="0.01" required value={draft.topP} onChange={e => updateDraft(current => ({ ...current, topP: e.target.valueAsNumber }))} /></label></div><label>Maximum response tokens<input type="number" min="1" max="32768" required value={draft.maxTokens} onChange={e => updateDraft(current => ({ ...current, maxTokens: e.target.valueAsNumber }))} /><small>Includes reasoning and the final answer. This reserve must leave room for the prompt in the loaded context. For reasoning models such as ZAYA1, start with 2,048 tokens or more.</small></label>
+        <fieldset disabled={busy}>{tab === 'model' ? <><legend>Local files</legend><p className="section-description">Use a GGUF model and a compatible llama.cpp runtime. Q6_K is the recommended starting point for MiniCPM5-2B.</p><label>llama-server executable<input aria-label="llama-server executable" placeholder="C:\path\to\llama-server.exe" value={draft.runtimePath} onChange={e => updateDraft(current => ({ ...current, runtimePath: e.target.value }))} required spellCheck={false} /><small>Choose the CUDA build to use your NVIDIA GPU.</small></label><label>GGUF model file<input aria-label="GGUF model file" placeholder="C:\path\to\MiniCPM5-2B.Q6_K.gguf" value={draft.modelPath} onChange={e => updateDraft(current => ({ ...current, modelPath: e.target.value }))} required spellCheck={false} /></label><label>Vision projector (optional, enables image input)<input aria-label="Vision projector file" placeholder="C:\path\to\mmproj-model-f16.gguf (leave empty for text-only)" value={draft.projectorPath ?? ''} onChange={e => updateDraft(current => ({ ...current, projectorPath: e.target.value }))} spellCheck={false} /><small>Multimodal GGUF models need their matching mmproj file to see images. Leave empty for text-only chat.</small></label></> : <><legend>Response behavior</legend><div className="field-pair"><label>Temperature<input type="number" min="0" max="2" step="0.05" required value={draft.temperature} onChange={e => updateDraft(current => ({ ...current, temperature: e.target.valueAsNumber }))} /></label><label>Top-p<input type="number" min="0.01" max="1" step="0.01" required value={draft.topP} onChange={e => updateDraft(current => ({ ...current, topP: e.target.valueAsNumber }))} /></label></div><label>Maximum response tokens<input type="number" min="1" max="32768" required value={draft.maxTokens} onChange={e => updateDraft(current => ({ ...current, maxTokens: e.target.valueAsNumber }))} /><small>Includes reasoning and the final answer. This reserve must leave room for the prompt in the loaded context. For reasoning models such as ZAYA1, start with 2,048 tokens or more.</small></label><details className="sampling-advanced"><summary>Advanced sampling</summary><p className="section-description">Leave a field empty to keep the backend default. Top-k, min-p and repeat penalty apply to the local runtime only; remote providers receive the fields their API supports.</p><div className="field-pair">{samplingFields.slice(0, 2).map(renderSamplingField)}</div><div className="field-pair">{samplingFields.slice(2, 4).map(renderSamplingField)}</div><div className="field-pair">{samplingFields.slice(4).map(renderSamplingField)}</div><small>A fixed seed makes local sampling reproducible for the same prompt, model and settings.</small></details>
             {draft.maxTokens >= config.contextLength && <p className="error" role="alert">The response reserve uses the entire {config.contextLength.toLocaleString()}-token context, so every message will fail. Lower this value or increase Context window and reload the model.</p>}<label>System instructions<textarea rows={5} maxLength={32768} value={draft.systemPrompt} onChange={e => updateDraft(current => ({ ...current, systemPrompt: e.target.value }))} /></label></>}</fieldset>
         {tab === 'model' && <div className="file-actions">{(['runtimePath','modelPath','projectorPath'] as const).map(key => <button type="button" className="secondary" key={key} disabled={busy} onClick={async () => {
           try {

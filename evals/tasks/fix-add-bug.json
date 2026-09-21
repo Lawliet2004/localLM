@@ -1,0 +1,14 @@
+{
+  "id": "fix-add-bug",
+  "description": "Edit an existing file in place to fix a one-character bug without collateral changes.",
+  "fixture": "buggy-math",
+  "presets": ["standard", "coding", "chat", "creator", "code", "research"],
+  "prompt": "The add function in src/math.js returns the wrong result. Fix it by editing that file. Do not change multiply and do not create new files.",
+  "approve": ["list_files", "read_file", "file_search", "edit_file"],
+  "assertions": [
+    { "type": "fileIncludes", "path": "src/math.js", "text": ["return a + b;", "return a * b;"] },
+    { "type": "toolCalled", "name": "edit_file" },
+    { "type": "toolNotCalled", "name": "create_file" },
+    { "type": "status", "equals": "complete" }
+  ]
+}

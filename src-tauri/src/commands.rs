@@ -183,7 +183,12 @@ pub async fn delete_conversation(state: State<'_, AppState>, id: String) -> Resu
         .map_err(|_| "Stop the active operation before deleting a conversation.")?;
     let store = state.database()?;
     store.delete_conversation(&id)?;
-    crate::workspace_ui::remove_task_meta(&store, &id)
+    crate::workspace_ui::remove_task_meta(&store, &id)?;
+    drop(store);
+    // The saved KV state holds this conversation's content; the index row
+    // cascades with the conversation, the file is removed here.
+    crate::kv_slots::delete_for_conversation(&state, &id);
+    Ok(())
 }
 #[tauri::command]
 pub fn get_messages(state: State<'_, AppState>, id: String) -> Result<Vec<Message>, String> {

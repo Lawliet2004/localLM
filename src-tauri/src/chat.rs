@@ -521,6 +521,9 @@ pub struct ChatEvent {
     pub round_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_stream: Option<ToolStreamEvent>,
+    /// Measured llama-server timings for a finished round (telemetry.rs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Value>,
 }
 
 impl ChatEvent {
@@ -546,6 +549,7 @@ impl ChatEvent {
             approval,
             elapsed_secs: None,
             round_index: None,
+            timings: None,
             tool_stream: None,
         }
     }
@@ -575,6 +579,7 @@ impl ChatEvent {
             approval,
             elapsed_secs: None,
             round_index: None,
+            timings: None,
             tool_stream: None,
         }
     }
@@ -1247,6 +1252,19 @@ pub async fn send_message(
     let mut reasoning = String::new();
     let mut research_fallback: Option<String> = None;
     let mut finalization_retried = false;
+    // Reload this conversation's saved KV state if another conversation has
+    // used the slot since (kv_slots.rs). Logged; never model-visible.
+    if let Some(payload) = crate::kv_slots::restore_for_turn(&state, &plan.backend, &conversation_id).await {
+        if let Ok(store) = state.database() {
+            emit_session_event(&store, &conversation_id, Some(&run.id), None, None, "kv_slot", payload, true);
+        }
+    }
+    // Snapshot the workspace so this turn's file changes can be reviewed and
+    // reverted (checkpoints.rs). A skipped snapshot is logged with its reason.
+    let (checkpoint_id, checkpoint_event) = crate::checkpoints::begin_turn(&state, &plan.tools, &conversation_id, &run.id).await;
+    if let (Some(payload), Ok(store)) = (checkpoint_event, state.database()) {
+        emit_session_event(&store, &conversation_id, Some(&run.id), None, None, "checkpoint", payload, true);
+    }
     let result: Result<bool,String> = async {
         seq += 1;
         channel.send(ChatEvent::new(
@@ -1347,6 +1365,7 @@ pub async fn send_message(
             let mut round_answer = String::new();
             let mut round_reasoning = String::new();
             let mut finish_reason = String::new();
+            let mut round_timings: Option<crate::telemetry::RoundTimings> = None;
             let mut think_filter = ThinkFilter::new();
             // A call attempt on a no-tool round is not a visible answer — but
             // its markup is stripped from the answer text all the same.
@@ -1376,6 +1395,7 @@ pub async fn send_message(
                     };
                     if let Some(error) = value.get("error") { return Err(plan.backend.stream_error(error)); }
                     if let Some(reason) = value["choices"][0]["finish_reason"].as_str() { finish_reason = reason.to_string(); }
+                    if let Some(timings) = crate::telemetry::RoundTimings::from_chunk(&value) { round_timings = Some(timings); }
                     let delta = &value["choices"][0]["delta"];
                     calls.push(delta)?;
                     let raw_content = delta["content"].as_str().unwrap_or("");
@@ -1432,6 +1452,19 @@ pub async fn send_message(
                 );
                 evt.elapsed_secs = Some(round_start_time.elapsed().as_secs_f64());
                 evt.round_index = Some(round);
+                let _ = channel.send(evt);
+            }
+            // Measured runtime timings only; providers that report none leave
+            // no event, and the UI shows the readout as unavailable.
+            if let Some(timings) = &round_timings {
+                let payload = timings.event(round, plan.id_slot);
+                if let Ok(store) = state.database() {
+                    emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), None, "timings", payload.clone(), true);
+                }
+                let mut evt = ChatEvent::progress(&run.id, &step_id, &assistant.id, "", None);
+                evt.activity = None;
+                evt.round_index = Some(round);
+                evt.timings = Some(payload);
                 let _ = channel.send(evt);
             }
             if planning {
@@ -1750,7 +1783,7 @@ pub async fn send_message(
                     continue;
                 };
                 if *cancellation.borrow() { return Ok(false); }
-                let automatic_reason = plan.access_mode.automatic_reason(tool.trusted_read());
+                let automatic_reason = plan.access_mode.automatic_reason(tool.trusted_read()).filter(|_| !tool.always_asks());
                 let blocked_by_denial = tool_use_denied;
                 let allow = if blocked_by_denial { false } else if automatic_reason.is_some() { true } else {
                     let _ = run.transition_to(crate::agent_run::RunState::AwaitingApproval);
@@ -1833,6 +1866,7 @@ pub async fn send_message(
                         approval: None,
                         elapsed_secs: Some(0.0),
                         round_index: Some(round),
+                        timings: None,
                         tool_stream: Some(ToolStreamEvent::Started {
                             tool_call_id: call.id.clone(),
                             tool_name: tool.tool.name.clone(),
@@ -1879,6 +1913,7 @@ pub async fn send_message(
                                 approval: None,
                                 elapsed_secs: Some(tool_exec_start.elapsed().as_secs_f64()),
                                 round_index: Some(round),
+                                timings: None,
                                 tool_stream: Some(ToolStreamEvent::OutputChunk {
                                     tool_call_id: emit_tool_call_id.clone(),
                                     stream: stream_name.to_string(),
@@ -1966,6 +2001,7 @@ pub async fn send_message(
                             approval: None,
                             elapsed_secs: Some(tool_exec_start.elapsed().as_secs_f64()),
                             round_index: Some(round),
+                            timings: None,
                             tool_stream: Some(ToolStreamEvent::Finished {
                                 tool_call_id: call.id.clone(),
                                 exit_code,
@@ -2142,6 +2178,22 @@ pub async fn send_message(
             false,
         );
     }
+    if let Some(id) = &checkpoint_id {
+        if let Some(payload) = crate::checkpoints::end_turn(&state, id).await {
+            if let Ok(store) = state.database() {
+                emit_session_event(&store, &conversation_id, Some(&run.id), None, None, "checkpoint", payload, true);
+            }
+        }
+    }
+    // Persist the slot only after a completed turn: a cancelled request can
+    // leave the slot busy, and a failed save would only be noise.
+    if matches!(result, Ok(true)) {
+        if let Some(payload) = crate::kv_slots::save_after_turn(&state, &plan.backend, &conversation_id).await {
+            if let Ok(store) = state.database() {
+                emit_session_event(&store, &conversation_id, Some(&run.id), None, None, "kv_slot", payload, true);
+            }
+        }
+    }
     result.map(|_| ())
 }
 
@@ -2297,6 +2349,7 @@ fn request_payload(
     arex: bool,
 ) -> Value {
     let mut payload = json!({"messages":messages,"temperature":preferences.temperature,"top_p":preferences.top_p,"max_tokens":preferences.max_tokens,"stream":true,"cache_prompt":true});
+    preferences.sampling.apply(&mut payload);
     // ZAYA's hybrid reasoning loop can otherwise consume the entire response
     // reserve without emitting an answer. Its runtime supports this field and
     // treats it as a separate thinking budget; other local models are unchanged.
@@ -2500,6 +2553,21 @@ mod finish_tests {
             super::finalization_action("A visible answer", Some("research"), false, false),
             super::FinalizationAction::Complete,
         );
+    }
+
+    #[test]
+    fn sampler_fields_are_sent_only_when_configured() {
+        let messages = vec![serde_json::json!({"role":"user","content":"Hello"})];
+        let plain = super::request_payload(&messages, &[], &crate::store::Preferences::default(), false, false, false, None, false);
+        assert!(plain.get("seed").is_none());
+        assert!(plain.get("top_k").is_none());
+        let mut preferences = crate::store::Preferences::default();
+        preferences.sampling.seed = Some(42);
+        preferences.sampling.min_p = Some(0.05);
+        let seeded = super::request_payload(&messages, &[], &preferences, false, false, false, None, false);
+        assert_eq!(seeded["seed"], 42);
+        assert_eq!(seeded["min_p"], 0.05);
+        assert!(seeded.get("repeat_penalty").is_none());
     }
 
     #[test]

@@ -1,0 +1,13 @@
+{
+  "id": "read-config-value",
+  "description": "Locate and read a workspace file to answer a factual question.",
+  "fixture": "service-config",
+  "presets": ["standard", "coding", "chat", "creator", "code", "research"],
+  "prompt": "Which TCP port does the service in this workspace listen on? Look it up in the workspace files and reply with the port number.",
+  "approve": ["list_files", "read_file", "file_search"],
+  "assertions": [
+    { "type": "answerIncludes", "text": "8743" },
+    { "type": "toolCalled", "name": "read_file" },
+    { "type": "status", "equals": "complete" }
+  ]
+}

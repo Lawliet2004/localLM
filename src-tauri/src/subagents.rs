@@ -204,6 +204,7 @@ pub struct BackendSnapshot {
     pub temperature: f64,
     pub top_p: f64,
     pub max_tokens: u32,
+    pub sampling: crate::store::Sampling,
     pub workspace_path: String,
     pub execution_config: crate::execution::ExecutionConfig,
     pub active_skills: Vec<String>,
@@ -302,6 +303,7 @@ pub async fn snapshot_for_conversation(
         temperature: preferences.temperature,
         top_p: preferences.top_p,
         max_tokens: preferences.max_tokens,
+        sampling: preferences.sampling,
         workspace_path,
         execution_config,
         active_skills,
@@ -574,6 +576,7 @@ pub async fn drive_child(
         temperature: snapshot.temperature,
         top_p: snapshot.top_p,
         max_tokens: snapshot.max_tokens,
+        sampling: snapshot.sampling.clone(),
         ..Default::default()
     };
     preferences.max_tokens =
@@ -581,6 +584,9 @@ pub async fn drive_child(
     preferences.validate()?;
     backend.validate_response_tokens(preferences.max_tokens)?;
     let mut answer = String::new();
+    // The last tool-free round is the candidate final answer; earlier rounds'
+    // prose ("let me check…") is not part of a structured result.
+    let mut final_text = String::new();
     let max_rounds = request.max_rounds.min(8);
     // Monotonic per-run sequence: (run_id, seq) is the primary key.
     let mut event_seq: u64 = 1;
@@ -602,6 +608,7 @@ pub async fn drive_child(
             "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
             "stream": true, "cache_prompt": true,
         });
+        preferences.sampling.apply(&mut payload);
         if snapshot.inference_slots >= 2 {
             payload["id_slot"] = serde_json::json!(1);
         }
@@ -654,6 +661,7 @@ pub async fn drive_child(
         let calls = calls.finish()?;
         crate::arex::validate_batch(&calls)?;
         if calls.is_empty() {
+            final_text = round_answer;
             break;
         }
         if round + 1 >= max_rounds && !calls.iter().any(|c| c.name == "finish") {
@@ -714,7 +722,12 @@ pub async fn drive_child(
         }
     }
     if let Some(schema) = &request.output_schema {
-        check_output_schema(schema, &answer)?;
+        let (result, record) = enforce_output_schema(backend, snapshot, &preferences, &mut messages, schema, &final_text).await;
+        if let (Some(record), Ok(store)) = (record, state.database()) {
+            event_seq += 1;
+            let _ = store.append_run_event(&structured_output_event(child_run_id, event_seq, record));
+        }
+        return result;
     }
     Ok(answer)
 }
@@ -1019,6 +1032,7 @@ pub async fn drive_detached(
         temperature: snapshot.temperature,
         top_p: snapshot.top_p,
         max_tokens: snapshot.max_tokens,
+        sampling: snapshot.sampling.clone(),
         ..Default::default()
     };
     preferences.max_tokens =
@@ -1026,6 +1040,7 @@ pub async fn drive_detached(
     preferences.validate()?;
     backend.validate_response_tokens(preferences.max_tokens)?;
     let mut answer = String::new();
+    let mut final_text = String::new();
     let max_rounds = request.max_rounds.min(8);
     let mut event_seq: u64 = 1;
     for round in 0..max_rounds {
@@ -1045,6 +1060,7 @@ pub async fn drive_detached(
             "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
             "stream": true, "cache_prompt": true,
         });
+        preferences.sampling.apply(&mut payload);
         if snapshot.inference_slots >= 2 {
             payload["id_slot"] = serde_json::json!(1);
         }
@@ -1064,6 +1080,7 @@ pub async fn drive_detached(
             return Err("Subagent hit the response token limit.".into());
         }
         if outcome.calls.is_empty() {
+            final_text = outcome.text;
             break;
         }
         if round + 1 >= max_rounds && !outcome.calls.iter().any(|c| c.name == "finish") {
@@ -1129,9 +1146,106 @@ pub async fn drive_detached(
         }
     }
     if let Some(schema) = &request.output_schema {
-        check_output_schema(schema, &answer)?;
+        let (result, record) = enforce_output_schema(backend, snapshot, &preferences, &mut messages, schema, &final_text).await;
+        if let Some(record) = record {
+            event_seq += 1;
+            if let Ok(s) = store.lock() {
+                let _ = s.append_run_event(&structured_output_event(child_run_id, event_seq, record));
+            }
+        }
+        return result;
     }
     Ok(answer)
+}
+
+fn structured_output_event(run_id: &str, seq: u64, payload: serde_json::Value) -> crate::agent_run::RunEvent {
+    crate::agent_run::RunEvent {
+        run_id: run_id.to_string(),
+        seq,
+        step_id: "structured-output".into(),
+        tool_call_id: None,
+        event_type: "structured_output".into(),
+        payload,
+        created_at: crate::store::now(),
+    }
+}
+
+/// Enforce a subagent's outputSchema on its final answer. A conforming
+/// answer is accepted as-is at no extra cost. Otherwise one tool-free repair
+/// round runs: grammar-constrained on the local runtime, instruction-only
+/// elsewhere (see `structured_output`). The second value is the run-log
+/// record, present whenever a repair round ran, because its prompt is
+/// model-visible.
+async fn enforce_output_schema(
+    backend: &crate::inference::Backend,
+    snapshot: &BackendSnapshot,
+    preferences: &crate::store::Preferences,
+    messages: &mut Vec<serde_json::Value>,
+    schema: &serde_json::Value,
+    candidate: &str,
+) -> (Result<String, String>, Option<serde_json::Value>) {
+    use crate::structured_output::{repair_payload, repair_prompt, Decoding};
+    let problem = match check_output_schema(schema, candidate) {
+        Ok(()) => return (Ok(candidate.trim().to_string()), None),
+        Err(problem) => problem,
+    };
+    if !candidate.trim().is_empty() {
+        messages.push(serde_json::json!({"role": "assistant", "content": candidate}));
+    }
+    let prompt = repair_prompt(schema, &problem);
+    messages.push(serde_json::json!({"role": "user", "content": prompt}));
+    let id_slot = (snapshot.inference_slots >= 2).then_some(1);
+    let mut decoding = Decoding::for_backend(backend);
+    let mut fallback_reason: Option<String> = None;
+    let outcome = loop {
+        let payload = repair_payload(messages.as_slice(), preferences, schema, decoding, id_slot);
+        match repair_round(backend, &payload, preferences.max_tokens).await {
+            // llama.cpp rejects schema features its converter does not
+            // support. Retry once without the grammar, and record why, rather
+            // than failing a subtask the model may still answer correctly.
+            Err(error) if decoding == Decoding::Grammar && fallback_reason.is_none() => {
+                fallback_reason = Some(error);
+                decoding = Decoding::Unconstrained;
+            }
+            other => break other,
+        }
+    };
+    let result = match outcome {
+        Err(error) => Err(error),
+        Ok(outcome) if outcome.finish == "length" => {
+            Err("Subagent hit the response token limit while producing its structured answer.".into())
+        }
+        Ok(outcome) if !outcome.calls.is_empty() => {
+            Err("Subagent requested a tool during its structured answer, but no tools were offered.".into())
+        }
+        Ok(outcome) => check_output_schema(schema, &outcome.text).map(|()| outcome.text.trim().to_string()),
+    };
+    let record = serde_json::json!({
+        "decoding": decoding.as_str(),
+        "problem": problem,
+        "prompt": prompt,
+        "fallbackReason": fallback_reason,
+        "valid": result.is_ok(),
+        "error": result.as_ref().err(),
+    });
+    (result, Some(record))
+}
+
+async fn repair_round(
+    backend: &crate::inference::Backend,
+    payload: &serde_json::Value,
+    max_tokens: u32,
+) -> Result<StreamOutcome, String> {
+    use crate::inference::InferenceProvider;
+    let payload = backend.payload(payload);
+    tokio::time::timeout(Duration::from_secs(30), backend.check_context(&payload, max_tokens))
+        .await
+        .map_err(|_| "Subagent context check timed out.".to_string())??;
+    let response = tokio::time::timeout(Duration::from_secs(600), backend.stream(&payload))
+        .await
+        .map_err(|_| "Subagent model did not respond within ten minutes.".to_string())??;
+    let mut scratch = String::new();
+    collect_stream(backend, response, &mut scratch).await
 }
 
 struct StreamOutcome {
@@ -1451,6 +1565,117 @@ pub fn list_models(store: &crate::store::Store) -> Result<Vec<serde_json::Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schema_snapshot() -> BackendSnapshot {
+        BackendSnapshot {
+            kind: "local".into(), endpoint: String::new(), key: String::new(), base_url: String::new(),
+            model_id: String::new(), context_length: 8192, max_output_tokens: None, supports_tools: true,
+            system_prompt: String::new(), temperature: 1.0, top_p: 0.95, max_tokens: 512,
+            sampling: crate::store::Sampling::default(), workspace_path: String::new(),
+            execution_config: crate::execution::ExecutionConfig::default(), active_skills: vec![],
+            db_path: std::path::PathBuf::new(), data_dir: std::path::PathBuf::new(), account_id: None,
+            inference_slots: 1,
+        }
+    }
+
+    /// Minimal llama-server stand-in: answers token counts itself and serves
+    /// `chat` responses (status, body) in order, recording each chat payload.
+    async fn mock_llama(chat: Vec<(u16, String)>) -> (String, tokio::task::JoinHandle<Vec<serde_json::Value>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut pending = std::collections::VecDeque::from(chat);
+            let mut seen = Vec::new();
+            while !pending.is_empty() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (head, body) = loop {
+                    let mut buffer = [0; 4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length: usize = head.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                        if request.len() >= end + 4 + length {
+                            break (head, serde_json::from_slice::<serde_json::Value>(&request[end + 4..end + 4 + length]).unwrap());
+                        }
+                    }
+                };
+                let (status, content_type, reply) = if head.starts_with("post /v1/chat/completions/input_tokens ") {
+                    (200, "application/json", r#"{"input_tokens":50}"#.to_string())
+                } else {
+                    assert!(head.starts_with("post /v1/chat/completions "), "unexpected request: {head}");
+                    seen.push(body);
+                    let (status, reply) = pending.pop_front().unwrap();
+                    (status, if status == 200 { "text/event-stream" } else { "application/json" }, reply)
+                };
+                let response = format!("HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+            seen
+        });
+        (endpoint, server)
+    }
+
+    fn sse_answer(text: &str) -> String {
+        let chunk = serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]});
+        format!("data: {chunk}\n\ndata: [DONE]\n\n")
+    }
+
+    #[tokio::test]
+    async fn conforming_answer_is_accepted_without_a_repair_round() {
+        // Nothing listens here: any request would fail the test.
+        let backend = crate::inference::Backend::local("http://127.0.0.1:9".into(), "k".into(), 8192).unwrap();
+        let schema = serde_json::json!({"type": "object", "required": ["verdict"]});
+        let mut messages = vec![];
+        let (result, record) = enforce_output_schema(&backend, &schema_snapshot(), &crate::store::Preferences::default(), &mut messages, &schema, " {\"verdict\":\"ok\"} ").await;
+        assert_eq!(result.unwrap(), r#"{"verdict":"ok"}"#);
+        assert!(record.is_none());
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failing_answer_gets_one_grammar_constrained_repair() {
+        let (endpoint, server) = mock_llama(vec![(200, sse_answer(r#"{"verdict":"ok"}"#))]).await;
+        let backend = crate::inference::Backend::local(endpoint, "k".into(), 8192).unwrap();
+        let schema = serde_json::json!({"type": "object", "required": ["verdict"]});
+        let mut messages = vec![serde_json::json!({"role": "user", "content": "judge"})];
+        let (result, record) = enforce_output_schema(&backend, &schema_snapshot(), &crate::store::Preferences::default(), &mut messages, &schema, "Looks fine to me.").await;
+        assert_eq!(result.unwrap(), r#"{"verdict":"ok"}"#);
+        let record = record.unwrap();
+        assert_eq!(record["decoding"], "grammar");
+        assert_eq!(record["valid"], true);
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["response_format"]["json_schema"]["schema"], schema);
+        assert!(seen[0].get("tools").is_none());
+        // The rejected answer and the repair prompt are both model-visible.
+        let sent = seen[0]["messages"].as_array().unwrap();
+        assert_eq!(sent[sent.len() - 2]["content"], "Looks fine to me.");
+        assert_eq!(sent[sent.len() - 1]["content"], record["prompt"]);
+    }
+
+    #[tokio::test]
+    async fn rejected_grammar_falls_back_once_and_records_why() {
+        let (endpoint, server) = mock_llama(vec![
+            (400, r#"{"error":{"message":"unsupported schema"}}"#.into()),
+            (200, sse_answer(r#"{"verdict":"ok"}"#)),
+        ]).await;
+        let backend = crate::inference::Backend::local(endpoint, "k".into(), 8192).unwrap();
+        let schema = serde_json::json!({"type": "object", "required": ["verdict"]});
+        let mut messages = vec![];
+        let (result, record) = enforce_output_schema(&backend, &schema_snapshot(), &crate::store::Preferences::default(), &mut messages, &schema, "").await;
+        assert!(result.is_ok());
+        let record = record.unwrap();
+        assert_eq!(record["decoding"], "unconstrained");
+        assert!(record["fallbackReason"].is_string());
+        let seen = server.await.unwrap();
+        assert!(seen[0].get("response_format").is_some());
+        assert!(seen[1].get("response_format").is_none());
+    }
+
     #[test]
     fn depth_policy_and_filter_rules() {
         assert_eq!(ChildPolicy::from_access(crate::permissions::AccessMode::Ask), ChildPolicy::ReadsOnly);

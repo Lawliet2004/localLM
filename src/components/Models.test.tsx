@@ -86,3 +86,19 @@ it('consumes a chat model request once and saves the requested file', async () =
   expect(onSavePreferences.mock.calls[0][0].modelPath).toContain('Ternary-Bonsai-8B-Q2_0.gguf');
   expect(onRequestedModelHandled).toHaveBeenCalledOnce();
 });
+
+it('saves optional sampler fields and drops cleared ones', async () => {
+  const onSavePreferences = vi.fn().mockResolvedValue(undefined);
+  render(<Models config={defaultRuntimeConfig}
+    preferences={{ runtimePath: 'server.exe', modelPath: 'model.gguf', temperature: 1, topP: 0.95, maxTokens: 2048, systemPrompt: '', sampling: { minP: 0.05 } }}
+    runtime={{ phase: 'stopped', message: 'No model loaded', modelPath: null }}
+    providers={[]} selection={{ providerId: null, modelId: '' }} onSaveSelection={vi.fn()} onProvidersChanged={vi.fn()}
+    busy={false} onSaveConfig={vi.fn()} onSavePreferences={onSavePreferences} onLoad={vi.fn()} onUnload={vi.fn()} />);
+  await userEvent.click(screen.getByRole('tab', { name: 'Generation' }));
+  await userEvent.click(screen.getByText('Advanced sampling'));
+  await userEvent.type(screen.getByLabelText('Seed'), '42');
+  await userEvent.clear(screen.getByLabelText('Min-p'));
+  await userEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await vi.waitFor(() => expect(onSavePreferences).toHaveBeenCalled());
+  expect(onSavePreferences.mock.calls[0][0].sampling).toEqual({ seed: 42 });
+});

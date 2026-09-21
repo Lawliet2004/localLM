@@ -301,6 +301,10 @@ impl AgentTool {
             backend: ToolBackend::Harness { name: alias.into() },
         })
     }
+    /// Tools that ask the user every time, even under Full access.
+    pub fn always_asks(&self) -> bool {
+        matches!(&self.backend, ToolBackend::Harness { name } if name == "git_commit")
+    }
     pub fn trusted_read(&self) -> bool {
         matches!(&self.backend, ToolBackend::System)
             || matches!(&self.backend, ToolBackend::Harness { name } if crate::harness::is_trusted_read(name))

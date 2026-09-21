@@ -16,6 +16,12 @@ Successfully connected services are remembered and reconnected at startup. Disco
 
 Full access changes approval behavior, not tool selection. It does not install tools, enable connectors, supply account credentials, or remove tool argument checks, workspace file boundaries, output limits, cancellation and timeouts. Local execution runs with your Windows account's filesystem and network permissions and is not sandboxed. In Full access it runs without a code-review prompt.
 
+Git tools (Standard, Coding and Creator presets):
+- `git_status`, `git_diff`, `git_log` and `git_branch` are read-only trusted reads.
+- `git_commit` asks every time, including under Full access and inside `ptc_run` programs. Subagents cannot call it at all, because they have no approval surface.
+- It commits only what is staged (plus any paths it is given), with the repository's own hooks and identity.
+- No tool pushes, resets, checks out, rebases, amends or deletes branches.
+
 Auto-approve reads uses an explicit native policy, not an AI reviewer. Tool descriptions and server-provided claims do not grant automatic approval. Skills and model messages cannot change the conversation's permission mode.
 
 Every tool audit records its permission mode, allow/deny decision, authorization source, arguments and result. An automatically approved operation can still fail; approval is not a success guarantee.

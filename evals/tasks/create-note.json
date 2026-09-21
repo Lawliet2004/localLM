@@ -1,0 +1,13 @@
+{
+  "id": "create-note",
+  "description": "Create a new file with exact content at a nested path.",
+  "fixture": "empty-notes",
+  "presets": ["standard", "coding", "chat", "creator", "code", "research"],
+  "prompt": "Create the file notes/status.md whose content is exactly the single line: Eval harness OK",
+  "approve": ["list_files", "read_file", "create_file"],
+  "assertions": [
+    { "type": "fileIncludes", "path": "notes/status.md", "text": "Eval harness OK" },
+    { "type": "toolCalled", "name": "create_file" },
+    { "type": "status", "equals": "complete" }
+  ]
+}

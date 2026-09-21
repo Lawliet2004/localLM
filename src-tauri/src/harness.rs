@@ -147,6 +147,7 @@ pub fn registry() -> Vec<(String, String, Value)> {
         ("research_progress".into(), "Report completed work, remaining questions, and partial results.".into(), schema(json!({}), &[])),
     ];
     tools.extend(crate::arex::registry());
+    tools.extend(crate::git::registry());
     tools
 }
 
@@ -171,6 +172,7 @@ pub fn definition(alias: &str) -> Option<crate::connectors::ToolView> {
 pub fn is_trusted_read(alias: &str) -> bool {
     matches!(alias, "list_agents" | "list_subagent_models" | "memory_recall" | "file_search"
         | "preset_guide" | "artifact_read" | "update_context" | "finish")
+        || crate::git::READ_ONLY.contains(&alias)
 }
 
 fn arg_str(args: &Value, key: &str, min: usize, max: usize, label: &str) -> Result<String, String> {
@@ -480,6 +482,14 @@ pub async fn execute(ctx: &HarnessCtx<'_>, alias: &str, args: Value) -> Result<H
                 .unwrap_or(false);
             Ok(HarnessOutcome::value(crate::sandbox::web_fetch_with_flag(&url, allow_private).await?))
         }
+        "git_status" | "git_diff" | "git_log" | "git_branch" | "git_commit" => {
+            // A commit needs a user decision; subagents (depth > 0) can run
+            // under a Full-access policy with no approval surface.
+            if alias == "git_commit" && ctx.depth > 0 {
+                return Err("git_commit is available only to the top-level agent, where the user approves each commit.".into());
+            }
+            Ok(HarnessOutcome::value(crate::git::execute(alias, &ctx.snapshot.workspace_path, &args).await?))
+        }
         "file_search" => {
             let query = arg_str(&args, "query", 1, 200, "file_search")?;
             if ctx.snapshot.workspace_path.is_empty() {
@@ -704,7 +714,7 @@ async fn execute_ptc(ctx: &HarnessCtx<'_>, args: Value) -> Result<HarnessOutcome
             continue;
         };
         let call_id = format!("ptc-{index}");
-        let automatic = ctx.access_mode.automatic_reason(tool.trusted_read()).is_some();
+        let automatic = !tool.always_asks() && ctx.access_mode.automatic_reason(tool.trusted_read()).is_some();
         let allow = if automatic {
             true
         } else {

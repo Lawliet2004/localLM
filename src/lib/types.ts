@@ -44,7 +44,11 @@ export interface ModelMetadata {
 }
 export interface Preferences {
   runtimePath: string; modelPath: string; projectorPath?: string; temperature: number; topP: number; maxTokens: number;
-  systemPrompt: string;
+  systemPrompt: string; sampling?: Sampling;
+}
+/** Optional sampler controls; an absent field keeps the backend default. */
+export interface Sampling {
+  topK?: number; minP?: number; repeatPenalty?: number; presencePenalty?: number; frequencyPenalty?: number; seed?: number;
 }
 export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null; gpuOffload?: { layers: number; totalLayers: number } | null }
 export type ToolSupport = 'unknown' | 'supported' | 'unsupported';
@@ -82,6 +86,14 @@ export interface Bootstrap {
 export interface RememberedTools { sources: string[]; tools: ToolSelection[]; accessMode?: AccessMode }
 export interface ToolApproval { id: string; kind?: 'tool' | 'ask_user'; connector: string; localServerName?: string | null; name: string; arguments: Record<string, unknown> }
 export interface AskUserApproval extends ToolApproval { kind: 'ask_user'; }
+export interface Checkpoint {
+  id: string; conversationId: string; runId?: string | null; workspace: string; label: string;
+  beforeCommit: string; afterCommit?: string | null; filesChanged?: number | null; excluded: unknown; status: string; createdAt: number;
+}
+export interface CheckpointDiff { changes: { status: string; path: string }[]; diff: string; truncated: boolean; excluded: unknown }
+export interface RevertResult { restored: string[]; deleted: string[]; conflicts: string[]; revertCheckpointId?: string | null }
+export interface KvCacheSettings { enabled: boolean; budgetMb: number }
+export interface KvCacheUsage { settings: KvCacheSettings; files: number; bytes: number; runtimeSupported: boolean | null }
 export interface ContextUsage { inputTokens: number; responseReserve: number; contextLength: number; estimated?: boolean }
 export interface PreflightBreakdown { total: number; instructions: number; tools: number; history: number; scratchpad?: number; draft: number; responseReserve: number; contextLength: number; exact: boolean; fits: boolean; notice?: string; overflow?: string }
 export interface Preset {
@@ -193,6 +205,13 @@ export interface ChatEvent {
   elapsedSecs?: number;
   roundIndex?: number;
   toolStream?: ToolStreamEvent;
+  timings?: RoundTimings;
+}
+/** Measured llama-server timings for one finished round (telemetry.rs). Absent fields were not reported. */
+export interface RoundTimings {
+  round: number; source: string; idSlot?: number | null; cacheHitRatio?: number | null;
+  cacheN?: number | null; promptN?: number | null; promptMs?: number | null; promptPerSecond?: number | null;
+  predictedN?: number | null; predictedMs?: number | null; predictedPerSecond?: number | null;
 }
 export interface ToolView { name: string; description: string; inputSchema: Record<string, unknown> }
 export interface ToolSelection { connectorId: string; toolName: string }

@@ -93,6 +93,11 @@ pub fn to_messages_request(internal: &Value, model_id: &str, max_output_tokens: 
     if let Some(top_p) = internal.get("top_p").and_then(Value::as_f64) {
         request["top_p"] = json!(top_p);
     }
+    // Messages supports top_k; the other extended sampler fields (min_p,
+    // penalties, seed) have no equivalent and are intentionally not copied.
+    if let Some(top_k) = internal.get("top_k").and_then(Value::as_u64) {
+        request["top_k"] = json!(top_k);
+    }
     if let Some(tools) = internal.get("tools") {
         let converted: Vec<Value> = tools
             .as_array()

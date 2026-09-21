@@ -5,7 +5,8 @@ import remarkGfm from 'remark-gfm';
 import { attachmentAccept, composeMessage, readAttachment, type Attachment } from '../lib/attachments';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import { modelLabel as localModelLabel } from '../lib/localModels';
-import type { Message, ContextUsage, ModelSelection, ProviderConnection, PreflightBreakdown, ToolSelection } from '../lib/types';
+import type { Message, ContextUsage, ModelSelection, ProviderConnection, PreflightBreakdown, ToolSelection, RoundTimings } from '../lib/types';
+import { formatTimings } from '../lib/timings';
 import type { InstalledModel } from '../lib/types';
 import { WorkSummary } from './WorkSummary';
 import { ActivityTimeline, useSessionActivity } from './ActivityTimeline';
@@ -21,6 +22,7 @@ interface Props {
   attachmentDrafts?: Record<string, Attachment[]>;
   onAttachmentDraftsChange?: Dispatch<SetStateAction<Record<string, Attachment[]>>>;
   contextUsage?: ContextUsage;
+  roundTimings?: RoundTimings;
   modelLabel?: string;
   selectionIssue?: boolean;
   draft?: string;
@@ -463,6 +465,7 @@ export function Chat({
   composerTools,
   conversationKey = 'new',
   contextUsage,
+  roundTimings,
   modelLabel = 'Local model',
   selectionIssue = false,
   messages,
@@ -1033,6 +1036,12 @@ export function Chat({
             Last request: {contextUsage.estimated ? 'estimated ' : ''}
             {contextUsage.inputTokens.toLocaleString()} input + {contextUsage.responseReserve.toLocaleString()} response reserve / {contextUsage.contextLength.toLocaleString()} context tokens. Draft changes are not included.
           </p>
+        )}
+        {roundTimings && formatTimings(roundTimings) && (
+          <p className="composer-note" aria-label="Last round timings">{formatTimings(roundTimings)}</p>
+        )}
+        {!roundTimings && contextUsage?.estimated && (
+          <p className="composer-note" aria-label="Last round timings">Runtime timings: unavailable for this provider.</p>
         )}
       </div>
     </div>

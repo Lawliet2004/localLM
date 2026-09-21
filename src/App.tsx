@@ -5,7 +5,7 @@ import { confirm, save } from '@tauri-apps/plugin-dialog';
 
 import { api, errorMessage, nativeAvailable } from './lib/api';
 
-import { defaultRuntimeConfig, type Bootstrap, type Message, type ToolApproval, type ToolSelection, type AccessMode, type ContextUsage, type ModelSelection, type RememberedTools } from './lib/types';
+import { defaultRuntimeConfig, type Bootstrap, type Message, type ToolApproval, type ToolSelection, type AccessMode, type ContextUsage, type ModelSelection, type RememberedTools, type RoundTimings } from './lib/types';
 
 import { Sidebar, type Page } from './components/Sidebar';
 
@@ -175,6 +175,7 @@ export default function App() {
   const [generating, setGenerating] = useState(false);
 
   const [liveActivity, setLiveActivity] = useState<{ state?: string; activity?: string } | null>(null);
+  const [roundTimings, setRoundTimings] = useState<{ conversationId: string; timings: RoundTimings } | null>(null);
 
   const [chatError, setChatError] = useState('');
 
@@ -601,6 +602,7 @@ export default function App() {
         if (event.notice) { setChatNotice(event.notice); return; }
 
         if (event.context) setContextUsage({ conversationId, usage: event.context });
+        if (event.timings) setRoundTimings({ conversationId, timings: event.timings });
 
         if ('approval' in event) setApproval(event.approval || null);
 
@@ -1087,6 +1089,7 @@ export default function App() {
         composerTools={<PermissionSelector accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} nativeAvailable={nativeAvailable} />}
 
         contextUsage={contextUsage?.conversationId === activeId ? contextUsage.usage : undefined}
+        roundTimings={roundTimings?.conversationId === activeId ? roundTimings.timings : undefined}
 
         modelLabel={modelLabel}
 
