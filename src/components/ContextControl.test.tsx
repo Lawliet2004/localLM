@@ -8,7 +8,7 @@ vi.mock('../lib/api', () => ({ nativeAvailable: true, errorMessage: String, api:
 it('shows reserved context and persists opting out without optimistic state loss on failure', async () => {
   mocks.save.mockRejectedValueOnce('Database unavailable').mockResolvedValueOnce(undefined);
   render(<ContextControl conversationId="chat" busy={false} usage={{ inputTokens: 700, responseReserve: 100, contextLength: 1000 }} />);
-  fireEvent.click(screen.getByText('80%'));
+  fireEvent.click(screen.getByRole('button', { name: /Context 80% used/ }));
   const checkbox = screen.getByRole('checkbox', { name: 'Auto-compact at 80%' });
   expect(checkbox).toBeChecked();
   fireEvent.click(checkbox);

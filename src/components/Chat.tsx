@@ -1,5 +1,5 @@
 import { type Dispatch, type SetStateAction, type ReactNode, useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, Copy, Cpu, FileText, Folder, ListTodo, MessageSquare, Mic, Plus, Square, Terminal, WandSparkles, X } from 'lucide-react';
+import { ArrowDown, Check, ChevronDown, ChevronRight, Copy, Cpu, FileText, Folder, ListTodo, MessageSquare, Plus, SendHorizontal, Square, Terminal, WandSparkles, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { attachmentAccept, composeMessage, readAttachment, type Attachment } from '../lib/attachments';
@@ -35,6 +35,9 @@ interface Props {
   connectorTools?: ToolSelection[];
   onSend: (content: string) => Promise<void>;
   onCancel: () => void;
+  onPause?: () => void;
+  onResume?: () => void;
+  paused?: boolean;
   onConfigure: () => void;
   planMode?: boolean;
   onPlanModeChange?: (next: boolean) => void;
@@ -475,6 +478,9 @@ export function Chat({
   connectorTools = [],
   onSend,
   onCancel,
+  onPause,
+  onResume,
+  paused = false,
   onConfigure,
   planMode = false,
   onPlanModeChange,
@@ -610,7 +616,14 @@ export function Chat({
     if (follow.current && scroll.current) {
       scroll.current.scrollTop = scroll.current.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, generating, liveActivity?.activity]);
+
+  useEffect(() => {
+    const el = input.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, [draft, conversationKey]);
 
   useEffect(() => {
     if (preflightTimer.current) clearTimeout(preflightTimer.current);
@@ -665,7 +678,7 @@ export function Chat({
       >
         {loading ? (
           <p className="loading-state" role="status">Opening conversation…</p>
-        ) : messages.length ? (
+        ) : messages.length || generating ? (
           <div className="messages">
             {turns.map((turn, turnIndex) => {
               const assistants = turn.filter(message => message.role === 'assistant');
@@ -684,6 +697,13 @@ export function Chat({
                   : <MessageBody key={message.id} message={message} />)}
               </div>;
             })}
+            {generating && (
+              <div className="activity-live" role="status">
+                <span className="activity-dot" />
+                <span className="activity-live-text">{liveActivity?.activity || 'Generating response…'}</span>
+                {liveActivity?.state && <span className="activity-badge">{liveActivity.state}</span>}
+              </div>
+            )}
           </div>
         ) : (
           <div className="sr-only">
@@ -734,13 +754,6 @@ export function Chat({
       )}
 
       <div className="composer-region">
-        {generating && (
-          <div className="activity-timeline" role="status">
-            <span className="activity-dot" />
-            <span>{liveActivity?.activity || 'Generating response…'}</span>
-            {liveActivity?.state && <span className="activity-badge">{liveActivity.state}</span>}
-          </div>
-        )}
         {chatNotice && <div className="setup-hint" role="status">{chatNotice}</div>}
         {chatError && (
           <div className="error-banner" role="alert" style={{ margin: '8px 0' }}>
@@ -844,7 +857,7 @@ export function Chat({
             aria-label="Message"
             placeholder={planMode ? 'Describe the task to plan…' : 'Do anything'}
             value={draft}
-            rows={2}
+            rows={1}
             maxLength={100000}
             onChange={e => setDraft(e.target.value)}
             onKeyDown={e => {
@@ -889,7 +902,13 @@ export function Chat({
               <div className="composer-tools">{composerTools}</div>
             </div>
             <div className="composer-send" style={{ position: 'relative' }}>
-              <ContextControl conversationId={conversationKey} busy={generating || loading} usage={contextUsage} />
+              <ContextControl
+                conversationId={conversationKey}
+                busy={generating || loading}
+                usage={contextUsage}
+                compacting={compacting}
+                onCompact={messages.length > 2 ? () => void handleCompact() : undefined}
+              />
               <button
                 type="button"
                 className="composer-model"
@@ -964,33 +983,14 @@ export function Chat({
                 </div>
               )}
 
-              <button
-                type="button"
-                className="icon-button composer-mic-btn"
-                aria-label="Voice input"
-                title="Voice input"
-              >
-                <Mic size={16} />
-              </button>
-
-              {(!draft.trim() && !attachments.length && !generating) && (
-                <button
-                  type="button"
-                  className="composer-voice-orb"
-                  aria-label="Voice mode"
-                  title="Voice mode"
-                >
-                  <span className="wave-bar bar-1" />
-                  <span className="wave-bar bar-2" />
-                  <span className="wave-bar bar-3" />
-                  <span className="wave-bar bar-4" />
-                </button>
-              )}
-
+              {paused && onResume && <button type="button" className="send-button" aria-label="Resume response" onClick={onResume}>Resume</button>}
               {generating ? (
-                <button type="button" className="send-button" aria-label="Stop response" onClick={onCancel}>
-                  <Square size={15} fill="currentColor" />
-                </button>
+                <>
+                  {onPause && <button type="button" className="send-button send-stop" aria-label="Pause response" onClick={onPause}>Pause</button>}
+                  <button type="button" className="send-button send-stop" aria-label="Stop response" onClick={onCancel}>
+                    <Square size={15} fill="currentColor" />
+                  </button>
+                </>
               ) : (
                 <button
                   className={`send-button ${(!draft.trim() && !attachments.length) ? 'sr-only' : ''}`}
@@ -998,40 +998,21 @@ export function Chat({
                   aria-label="Send message"
                   disabled={(!draft.trim() && !attachments.length) || !ready || loading || disabled || readingFiles}
                 >
-                  <ArrowUp size={20} />
+                  <SendHorizontal size={17} />
                 </button>
               )}
             </div>
           </div>
         </form>
         </div>
-        <p className={`composer-note ${!messages.length ? 'sr-only' : ''}`}>Shift + Enter for a new line · Attach images, text, code, or CSV files</p>
         {compactionNotice && (
           <p className="composer-note compaction-notice" role="status">
             {compactionNotice}
           </p>
         )}
-        {preflight && (
-          <p className="composer-note" aria-label="Context preview">
-            {preflight.breakdown.exact ? 'Exact' : 'Estimated'} tokens: {preflight.breakdown.total.toLocaleString()} input ({preflight.breakdown.instructions.toLocaleString()} instructions, {preflight.breakdown.tools.toLocaleString()} tools, {preflight.breakdown.history.toLocaleString()} history{preflight.breakdown.scratchpad ? `, ${preflight.breakdown.scratchpad.toLocaleString()} scratchpad` : ''}, {preflight.breakdown.draft.toLocaleString()} draft) + {preflight.breakdown.responseReserve.toLocaleString()} reserve / {preflight.breakdown.contextLength.toLocaleString()} context.
-            {preflight.breakdown.overflow && <span className="context-overflow"> {preflight.breakdown.overflow}</span>}
-            {conversationKey !== 'new' && messages.length > 2 && (
-              <button
-                type="button"
-                className="compact-button secondary inline-compact-btn"
-                disabled={compacting || loading || generating}
-                onClick={() => void handleCompact()}
-                title="Compact older conversation history into an artifact"
-              >
-                {compacting ? 'Compacting…' : 'Compact history'}
-              </button>
-            )}
-          </p>
-        )}
-        {contextUsage && (
-          <p className="composer-note" aria-label="Last request context">
-            Last request: {contextUsage.estimated ? 'estimated ' : ''}
-            {contextUsage.inputTokens.toLocaleString()} input + {contextUsage.responseReserve.toLocaleString()} response reserve / {contextUsage.contextLength.toLocaleString()} context tokens. Draft changes are not included.
+        {preflight?.breakdown.overflow && (
+          <p className="composer-note" role="alert">
+            <span className="context-overflow">{preflight.breakdown.overflow}</span>
           </p>
         )}
       </div>

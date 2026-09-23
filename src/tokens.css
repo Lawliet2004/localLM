@@ -1,24 +1,107 @@
+/* ------------------------------------------------------------------
+   LocalLM design tokens
+   Dark-first palette: deep layered neutrals, emerald brand accent.
+------------------------------------------------------------------- */
 :root {
   color-scheme: dark;
-  --background: #17181e; --sidebar: #121318; --surface: #1e2027; --input: #1e2027;
-  --elevated: #24262f;
-  --text: #ecedf2; --secondary: #9aa0ae; --muted: #70758a;
-  --border: #24262f; --border-strong: #323541; --hover: #20222b;
-  --accent: #3ec98d; --accent-strong: #6ee7b7; --accent-subtle: #3ec98d14; --accent-soft: #3ec98d21;
+
+  /* Typography */
+  --font-sans: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: 'Cascadia Code', 'JetBrains Mono', Consolas, 'Liberation Mono', monospace;
+
+  /* Surfaces — darkest at the edges, lighter as layers rise */
+  --background: #0a0c11;
+  --sidebar: #07090d;
+  --surface: #10141c;
+  --input: #12161f;
+  --elevated: #171c27;
+  --overlay: #1c222e;
+
+  /* Text */
+  --text: #eceef4;
+  --foreground: #eceef4;
+  --secondary: #9aa2b4;
+  --muted: #676f84;
+
+  /* Lines & fills */
+  --border: #1d2330;
+  --border-strong: #2c3346;
+  --hover: #1a2029;
+  --active: #212839;
+
+  /* Brand & semantic */
+  --accent: #34d399;
+  --accent-strong: #6ee7b7;
+  --accent-subtle: #34d39914;
+  --accent-soft: #34d39921;
+  --accent-2: #818cf8;
+  --accent-3: #22d3ee;
+  --warn: #fbbf24;
+  --grad-accent: linear-gradient(135deg, var(--accent) 0%, var(--accent-3) 100%);
   --folder: #d9a45b;
-  --focus-border: #3ec98d;
-  --button-bg: #f4f5f7; --button-text: #14151a;
-  --error: #f87171; --error-bg: #451a1a;
+  --focus-border: #34d399;
+
+  /* Buttons */
+  --button-bg: #f2f4f9;
+  --button-text: #11141b;
+
+  /* Feedback */
+  --error: #f87171;
+  --error-bg: #3a1518;
+  --error-subtle: #f8717114;
+
+  /* Radius scale */
+  --radius-xs: 5px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-pill: 999px;
+
+  /* Elevation */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .28);
+  --shadow-md: 0 8px 28px rgba(0, 0, 0, .36);
+  --shadow-lg: 0 20px 56px rgba(0, 0, 0, .5);
+  --ring: 0 0 0 3px var(--accent-subtle);
+  --ring-strong: 0 0 0 2px var(--accent);
+
+  /* Motion */
+  --dur: .16s;
+  --ease: cubic-bezier(.22, .68, .32, 1);
 }
 :root[data-theme=light] {
   color-scheme: light;
-  --background: #fafaf8; --sidebar: #f0f1ed; --surface: #ffffff; --input: #ffffff;
+  --background: #f5f6f3;
+  --sidebar: #eceee8;
+  --surface: #ffffff;
+  --input: #ffffff;
   --elevated: #ffffff;
-  --text: #292d29; --secondary: #535d55; --muted: #6b726c;
-  --border: #e0e3dc; --border-strong: #cbd0c6; --hover: #e7eae2;
-  --accent: #2e7d52; --accent-strong: #1d6a44; --accent-subtle: #2e7d5212; --accent-soft: #2e7d521f;
+  --overlay: #ffffff;
+  --text: #22261f;
+  --foreground: #22261f;
+  --secondary: #4e564d;
+  --muted: #707769;
+  --border: #e0e3da;
+  --border-strong: #c8cdc0;
+  --hover: #e9ece2;
+  --active: #dde1d3;
+  --accent: #2e7d52;
+  --accent-strong: #1d6a44;
+  --accent-subtle: #2e7d5212;
+  --accent-soft: #2e7d521f;
+  --accent-2: #6366f1;
+  --accent-3: #0891b2;
+  --warn: #b45309;
+  --grad-accent: linear-gradient(135deg, var(--accent) 0%, var(--accent-3) 100%);
   --folder: #b07f2e;
   --focus-border: #7a8d7d;
-  --button-bg: #334e38; --button-text: #ffffff;
-  --error: #9d3731; --error-bg: #fae9e5;
+  --button-bg: #2c4634;
+  --button-text: #ffffff;
+  --error: #9d3731;
+  --error-bg: #fae9e5;
+  --error-subtle: #9d373114;
+  --shadow-sm: 0 1px 2px rgba(30, 35, 28, .08);
+  --shadow-md: 0 8px 24px rgba(30, 35, 28, .1);
+  --shadow-lg: 0 18px 48px rgba(30, 35, 28, .16);
+  --ring: 0 0 0 3px var(--accent-subtle);
 }

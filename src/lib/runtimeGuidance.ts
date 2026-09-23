@@ -53,7 +53,6 @@ export function fittingGpuLayers(model: ModelMetadata, hardware: HardwareStatus 
 export function recommendedConfig(model: ModelMetadata, hardware: HardwareStatus | null): RuntimeConfig {
   const config = { ...defaultRuntimeConfig, contextLength: Math.max(128, Math.min(model.contextLength ?? 131072, contextSafetyLimit)),
     cpuThreads: Math.max(1, Math.min(256, Math.floor((hardware?.logicalCpus ?? 12) / 2))), batchSize: 512, microBatchSize: 128 };
-  if (model.architecture === 'zaya') return { ...config, gpuLayers: 0, batchSize: 128, microBatchSize: 32, flashAttention: false, cacheTypeK: 'f16', cacheTypeV: 'f16', offloadKvCache: false, inferenceSlots: 1 };
   const headSize = model.embeddingLength && model.headCount ? model.embeddingLength / model.headCount : null;
   const key = model.keyLength ?? headSize, value = model.valueLength ?? headSize;
   if (!key || !value || key % 32 !== 0 || value % 32 !== 0) {

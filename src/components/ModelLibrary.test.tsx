@@ -116,10 +116,10 @@ it('resumes an ambiguous multimodal download with its persisted projector', asyn
 });
 it('resumes a legacy multimodal download directly as text-only', async () => {
   mock.downloadHuggingFaceModel.mockResolvedValue({ busy: false, phase: 'ready', received: 1024, total: 1024, path: model.path, error: null });
-  render(<ModelLibrary {...props} models={[{ ...model, complete: false, received: 512, filename: 'Ternary-Bonsai-2-27B-PTQ1_0.gguf' }]} />);
+  render(<ModelLibrary {...props} models={[{ ...model, complete: false, received: 512, filename: 'model-Q4_K_M.gguf' }]} />);
   fireEvent.click(screen.getByRole('tab', { name: /My Models/ }));
   fireEvent.click(screen.getByRole('button', { name: 'Resume download' }));
-  await waitFor(() => expect(mock.downloadHuggingFaceModel).toHaveBeenCalledWith(model.repo, model.revision, 'Ternary-Bonsai-2-27B-PTQ1_0.gguf', undefined, null));
+  await waitFor(() => expect(mock.downloadHuggingFaceModel).toHaveBeenCalledWith(model.repo, model.revision, 'model-Q4_K_M.gguf', undefined, null));
   expect(mock.huggingFaceFiles).not.toHaveBeenCalled();
   expect(screen.getByRole('tab', { name: /My Models/ })).toHaveAttribute('aria-selected', 'true');
 });
@@ -127,7 +127,7 @@ it('allows a text-only download when a repository has multiple projectors', asyn
   mock.huggingFaceFiles.mockResolvedValue({
     repo: 'owner/multi-GGUF', revision: model.revision,
     files: [
-      { filename: 'Ternary-Bonsai-2-27B-PTQ1_0.gguf', bytes: 1024, sha256: 'b'.repeat(64) },
+      { filename: 'model-Q4_K_M.gguf', bytes: 1024, sha256: 'b'.repeat(64) },
       { filename: 'mmproj-F16.gguf', bytes: 64, sha256: 'c'.repeat(64) },
       { filename: 'mmproj-Q8_0.gguf', bytes: 96, sha256: 'd'.repeat(64) },
     ],
@@ -138,9 +138,9 @@ it('allows a text-only download when a repository has multiple projectors', asyn
   fireEvent.click(screen.getByRole('button', { name: 'Search' }));
   await screen.findByLabelText('Vision projector');
   expect(screen.getByLabelText('Vision projector')).toHaveValue('');
-  expect(screen.getByLabelText('Download PTQ1_0')).toBeEnabled();
-  fireEvent.click(screen.getByLabelText('Download PTQ1_0'));
-  await waitFor(() => expect(mock.downloadHuggingFaceModel).toHaveBeenCalledWith('owner/multi-GGUF', model.revision, 'Ternary-Bonsai-2-27B-PTQ1_0.gguf', undefined, null));
+  expect(screen.getByLabelText('Download Q4_K_M')).toBeEnabled();
+  fireEvent.click(screen.getByLabelText('Download Q4_K_M'));
+  await waitFor(() => expect(mock.downloadHuggingFaceModel).toHaveBeenCalledWith('owner/multi-GGUF', model.revision, 'model-Q4_K_M.gguf', undefined, null));
 });
 it('retries an incomplete download from saved Hugging Face provenance', async () => {
   mock.downloadHuggingFaceModel.mockResolvedValue({ busy: false, phase: 'ready', received: 1024, total: 1024, path: model.path, error: null });

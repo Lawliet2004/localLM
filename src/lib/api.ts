@@ -14,9 +14,6 @@ import type {
   Message,
   ModelSelection,
   Preferences,
-  ProviderConnection,
-  ProviderDraft,
-  ProviderTestResult,
   RememberedTools,
   RunEvent,
   RunRecord,
@@ -28,8 +25,6 @@ import type {
   SkillDependencyStatus,
   SkillUpdateStatus,
   SkillView,
-  SubscriptionStatus,
-  CliDetectionResult,
   ToolSelection,
   PreflightBreakdown,
   Preset,
@@ -39,6 +34,7 @@ import type {
 } from './types';
 
 export const nativeAvailable = isTauri();
+export interface TerminalEvent { type: 'output' | 'exit'; data?: string; code?: number }
 export interface LocalServerConfig {
   id: string;
   name: string;
@@ -70,12 +66,25 @@ export const api = {
   saveProject: (project: Project) => invoke<WorkspaceIndex>('save_project', { project }),
   removeProject: (id: string) => invoke<WorkspaceIndex>('remove_project', { id }),
   saveTaskMeta: (id: string, meta: TaskMeta) => invoke<WorkspaceIndex>('save_task_meta', { id, meta }),
-  workspaceInspect: (path: string, directory: boolean) => invoke<{ entries?: {name: string; kind: string}[]; content?: string; truncated?: boolean }>('workspace_inspect', { path, directory }),
+  workspaceInspect: (path: string, directory: boolean, root?: string) => invoke<{ entries?: {name: string; kind: string}[]; content?: string; truncated?: boolean; totalLines?: number; workspaceId?: string; root?: string }>('workspace_inspect', { path, directory, root }),
+  workspaceSearch: (query: string, root?: string) => invoke<{ results: { path: string; kind: string }[]; truncated: boolean; truncation?: 'result' | 'scan' | 'depth' | null; workspaceId?: string; root?: string }>('workspace_search', { query, root }),
   workspaceGit: (branch?: string) => invoke<{ branch: string; branches: string[]; status: string; diff: string }>('workspace_git', { branch }),
-  workspaceCommand: (command: string, onChunk: (event: {stream: string; chunk: string}) => void) => {
-    const channel = new Channel<{stream: string; chunk: string}>(); channel.onmessage = onChunk;
-    return invoke<{stdout: string; stderr: string; exitCode: number | null; error?: string; durationMs: number}>('workspace_command', { command, channel });
+  terminalOpen: (cols: number, rows: number) => invoke<{ id: string }>('terminal_open', { cols, rows }),
+  terminalAttach: (id: string, onEvent: (event: TerminalEvent) => void) => {
+    const channel = new Channel<TerminalEvent>(); channel.onmessage = onEvent;
+    return invoke<{ id: string; exited: boolean }>('terminal_attach', { id, channel });
   },
+  terminalInput: (id: string, data: string) => invoke<void>('terminal_input', { id, data }),
+  terminalResize: (id: string, cols: number, rows: number) => invoke<void>('terminal_resize', { id, cols, rows }),
+  terminalClose: (id: string) => invoke<void>('terminal_close', { id }),
+  browserShow: (label: string, x: number, y: number, width: number, height: number) => invoke<void>('browser_show', { label, x, y, width, height }),
+  browserHide: (label: string) => invoke<void>('browser_hide', { label }),
+  browserClose: (label: string) => invoke<void>('browser_close', { label }),
+  browserNavigate: (label: string, url: string) => invoke<void>('browser_navigate', { label, url }),
+  browserReload: (label: string) => invoke<void>('browser_reload', { label }),
+  browserGoBack: (label: string) => invoke<void>('browser_go_back', { label }),
+  browserGoForward: (label: string) => invoke<void>('browser_go_forward', { label }),
+  browserUrl: (label: string) => invoke<{ url: string | null }>('browser_url', { label }),
   readLocalConnector: (id: string) => invoke<LocalServerConfig>('read_local_connector', { id }),
   saveLocalConnector: (server: LocalServerConfig) => invoke<void>('save_local_connector', { server }),
   removeLocalConnector: (id: string) => invoke<void>('remove_local_connector', { id }),
@@ -122,27 +131,13 @@ export const api = {
   signInConnector: (id: string) => invoke<ConnectorView>('sign_in_connector', { id }),
   cancelConnectorSignIn: () => invoke<void>('cancel_connector_sign_in'),
   bootstrap: () => invoke<Bootstrap>('bootstrap'),
-  createConversation: () => invoke<Conversation>('create_conversation'),
+  createConversation: (projectId?: string | null) => invoke<Conversation>('create_conversation', { projectId }),
   renameConversation: (id: string, title: string) => invoke<void>('rename_conversation', { id, title }),
   deleteConversation: (id: string) => invoke<void>('delete_conversation', { id }),
   conversationTools: (id: string) => invoke<ConversationTools>('get_conversation_tools', { id }),
   saveConversationTools: (id: string, tools: ConversationTools) => invoke<void>('save_conversation_tools', { id, tools }),
   rememberedTools: () => invoke<RememberedTools>('get_remembered_tools'),
   saveRememberedTools: (tools: RememberedTools) => invoke<void>('save_remembered_tools', { tools }),
-  listProviders: () => invoke<ProviderConnection[]>('list_providers'),
-  saveProvider: (provider: ProviderDraft) => invoke<ProviderConnection>('save_provider', { draft: provider }),
-  deleteProvider: (id: string) => invoke<void>('delete_provider', { id }),
-  testProvider: (id: string) => invoke<ProviderTestResult>('test_provider', { id }),
-  testProviderInference: (id: string, modelId: string) => invoke<ProviderTestResult>('test_provider_inference', { id, modelId }),
-  listProviderModels: (id: string) => invoke<ProviderConnection>('list_provider_models', { id }),
-  detectSubscriptionCli: (provider: string) => invoke<CliDetectionResult>('detect_subscription_cli', { provider }),
-  importSubscriptionCli: (provider: string) => invoke<SubscriptionStatus>('import_subscription_cli', { provider }),
-  getSubscriptionStatus: (provider: string) => invoke<SubscriptionStatus>('get_subscription_status', { provider }),
-  saveManualSubscriptionToken: (provider: string, token: string, refreshToken?: string | null, accountId?: string | null) =>
-    invoke<SubscriptionStatus>('save_manual_subscription_token', { provider, token, refreshToken, accountId }),
-  disconnectSubscription: (provider: string) => invoke<void>('disconnect_subscription', { provider }),
-  startSubscriptionSignIn: (provider: string) => invoke<SubscriptionStatus>('start_subscription_sign_in', { provider }),
-  cancelSubscriptionSignIn: () => invoke<void>('cancel_subscription_sign_in'),
   preferredModel: () => invoke<ModelSelection>('preferred_model'),
   savePreferredModel: (selection: ModelSelection) => invoke<void>('save_preferred_model', { selection }),
   saveConversationModel: (id: string, selection: ModelSelection) => invoke<void>('save_conversation_model', { id, selection }),
@@ -163,7 +158,6 @@ export const api = {
   compactionStatus: (conversationId: string) => invoke<CompactionStatus>('compaction_status', { conversationId }),
   setCompactionAuto: (conversationId: string, enabled: boolean) => invoke<void>('set_compaction_auto', { conversationId, enabled }),
   getArtifact: (id: string) => invoke<ArtifactRecord | null>('get_artifact', { id }),
-  listConversationArtifacts: (conversationId: string) => invoke<ArtifactRecord[]>('list_conversation_artifacts', { conversationId }),
   saveConfig: (config: RuntimeConfig) => invoke<void>('save_runtime_config', { config }),
   savePreferences: (preferences: Preferences) => invoke<void>('save_preferences', { preferences }),
   loadModel: () => invoke<RuntimeStatus>('load_model'),
@@ -175,6 +169,9 @@ export const api = {
     return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools, planMode });
   },
   cancelGeneration: () => invoke<void>('cancel_generation'),
+  pauseGeneration: () => invoke<void>('pause_generation'),
+  resumeGeneration: (conversationId: string) => invoke<{ generation: number; question: string; pending: string[]; completed: string[]; checkpoint: string }>('resume_generation', { conversationId }),
+  restartGeneration: () => invoke<{ replayedWriteIds: string[]; unconditionalSuccess: boolean }>('restart_generation'),
   resolveToolApproval: (id: string, allow: boolean) => invoke<void>('resolve_tool_approval', { id, allow }),
   resolveAskUser: (id: string, choice: string | null) => invoke<void>('resolve_ask_user', { id, choice }),
   getTodos: (conversationId: string) => invoke<TodoItem[]>('get_todos', { conversationId }),

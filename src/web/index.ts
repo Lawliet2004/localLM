@@ -200,8 +200,8 @@ export class WebSearchEngine {
 
   /**
    * Fetch + extract one URL with full SSRF/redirect/fetch limits: HTML keeps
-   * headings, links, and table structure; PDFs keep page references; scanned
-   * PDFs report ocrRequired explicitly. Browser rendering fallback is
+   * headings, links, and table structure; PDFs keep page references. Missing
+   * text is not labeled OCR-required. Browser rendering fallback is
    * intentionally NOT bundled: JS-dependent pages surface as snippet-only
    * evidence with an explicit limitation (see docs).
    */
@@ -236,12 +236,22 @@ export class WebSearchEngine {
     if (res?.success && res.body && (mime === 'application/pdf' || /\.pdf(\?|#|$)/i.test(res.finalUrl || rawUrl))) {
       const latin1 = res.body || '';
       const bytes = Uint8Array.from(latin1, (ch) => ch.charCodeAt(0) & 0xff);
-      const pdf = extractPdfText(bytes, rawUrl);
-      if (pdf.needsOcr) {
-        throw new Error(
-          'OCR required: this PDF has no extractable text (scanned document). ' +
-          'No OCR engine is bundled; install an OCR tool or supply the text directly.',
-        );
+      const pdf = extractPdfText(bytes);
+      switch (pdf.status) {
+        case 'text_extracted':
+          break;
+        case 'no_extractable_text':
+          throw new Error('This PDF has no extractable text.');
+        case 'password_required':
+          throw new Error('This PDF is password-protected and cannot be extracted locally.');
+        case 'invalid_document':
+          throw new Error('The response is not a valid PDF.');
+        case 'limit_exceeded':
+          throw new Error('PDF exceeds the local extraction size limit.');
+        default: {
+          const unexpected: never = pdf.status;
+          throw new Error(`PDF extraction failed (${String(unexpected)}).`);
+        }
       }
       return {
         id: `pdf-${Date.now()}`,

@@ -62,44 +62,6 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// First-load settings for Ternary Bonsai 2 27B on a 4 GB GPU / 16 GB RAM
-    /// laptop. Automatic GPU fit splits layers; mmap keeps the 6 GiB weights
-    /// from doubling in RAM; Flash Attention and Q8 KV match the Prism kernels.
-    /// Context stays small so a hybrid-attention KV cache plus CPU layers fit.
-    pub fn bonsai2_recommended() -> Self {
-        Self {
-            context_length: 4096,
-            gpu_layers: -1,
-            cpu_threads: 6,
-            batch_size: 256,
-            micro_batch_size: 64,
-            flash_attention: true,
-            cache_type_k: CacheType::Q8_0,
-            cache_type_v: CacheType::Q8_0,
-            offload_kv_cache: true,
-            mmap: true,
-            inference_slots: 1,
-        }
-    }
-
-    /// Known-good configuration for ZAYA1-8B on a laptop with limited VRAM.
-    /// CPU-only, 8 192-token context, conservative batch sizes, f16 caches.
-    pub fn zaya_recommended() -> Self {
-        Self {
-            context_length: 8192,
-            gpu_layers: 0,
-            cpu_threads: 6,
-            batch_size: 128,
-            micro_batch_size: 32,
-            flash_attention: false,
-            cache_type_k: CacheType::F16,
-            cache_type_v: CacheType::F16,
-            offload_kv_cache: false,
-            mmap: true,
-            inference_slots: 1,
-        }
-    }
-
     pub fn validate(&self) -> Result<(), String> {
         if !(128..=2_097_152).contains(&self.context_length) {
             return Err("Context must be between 128 and 2097152 tokens.".into());
@@ -173,9 +135,6 @@ impl RuntimeConfig {
         config: &Self,
         available_gpu_bytes: Option<u64>,
     ) -> i32 {
-        if model.architecture.as_deref() == Some("zaya") {
-            return 0;
-        }
         let Some(blocks) = model.block_count.filter(|count| *count > 0) else {
             return 0;
         };
@@ -283,16 +242,6 @@ mod tests {
         );
         let tight = RuntimeConfig::auto_gpu_layers(&model, &config, Some(5 * 1024 * 1024 * 1024));
         assert!(tight > 0 && tight < 33, "tight fit was {tight}");
-        let zaya = crate::gguf::ModelMetadata {
-            architecture: Some("zaya".into()),
-            block_count: Some(32),
-            file_bytes: 5 * 1024 * 1024 * 1024,
-            ..Default::default()
-        };
-        assert_eq!(
-            RuntimeConfig::auto_gpu_layers(&zaya, &config, Some(24 * 1024 * 1024 * 1024)),
-            0
-        );
     }
 
     #[test]
@@ -316,41 +265,6 @@ mod tests {
         assert!(two.arguments().unwrap().windows(2).any(|pair| pair == ["--parallel", "2"]));
         let three = RuntimeConfig { inference_slots: 3, ..Default::default() };
         assert!(three.validate().is_err());
-    }
-
-    #[test]
-    fn bonsai2_recommended_uses_automatic_gpu_fit() {
-        let config = RuntimeConfig::bonsai2_recommended();
-        assert!(config.validate().is_ok());
-        assert_eq!(config.context_length, 4096);
-        assert_eq!(config.gpu_layers, -1);
-        assert!(config.flash_attention);
-        assert_eq!(config.cache_type_k, CacheType::Q8_0);
-        assert_eq!(config.cache_type_v, CacheType::Q8_0);
-        assert!(config.offload_kv_cache);
-        assert!(config.mmap);
-        let args = config.arguments().unwrap();
-        assert!(args.windows(2).any(|pair| pair == ["--ctx-size", "4096"]));
-        assert!(!args.iter().any(|arg| arg == "--n-gpu-layers"));
-        assert!(args.windows(2).any(|pair| pair == ["--flash-attn", "on"]));
-        assert!(!args.iter().any(|arg| arg == "--no-mmap"));
-    }
-
-    #[test]
-    fn zaya_recommended_is_valid_cpu_only_configuration() {
-        let config = RuntimeConfig::zaya_recommended();
-        assert!(config.validate().is_ok());
-        assert_eq!(config.context_length, 8192);
-        assert_eq!(config.gpu_layers, 0);
-        assert!(!config.flash_attention);
-        assert_eq!(config.cache_type_k, CacheType::F16);
-        assert_eq!(config.cache_type_v, CacheType::F16);
-        assert!(!config.offload_kv_cache);
-        let args = config.arguments().unwrap();
-        assert!(args.windows(2).any(|pair| pair == ["--ctx-size", "8192"]));
-        assert!(args.windows(2).any(|pair| pair == ["--n-gpu-layers", "0"]));
-        assert!(args.windows(2).any(|pair| pair == ["--flash-attn", "off"]));
-        assert!(args.iter().any(|arg| arg == "--no-kv-offload"));
     }
 
     #[test]

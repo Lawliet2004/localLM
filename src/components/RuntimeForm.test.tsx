@@ -92,9 +92,9 @@ describe('runtime settings', () => {
   });
 
   it('does not invent cache cost for hybrid architectures', async () => {
-    api.readModelMetadata.mockResolvedValue({ ...llama, architecture: 'zaya' });
+    api.readModelMetadata.mockResolvedValue({ ...llama, architecture: 'hybridnet' });
     api.hardwareStatus.mockResolvedValue(hardware);
-    render(<RuntimeForm initial={defaultRuntimeConfig} onSave={vi.fn()} busy={false} modelPath="C:/models/zaya.gguf" />);
+    render(<RuntimeForm initial={defaultRuntimeConfig} onSave={vi.fn()} busy={false} modelPath="C:/models/hybrid.gguf" />);
     expect(await screen.findByText('CPU recommended')).toBeVisible();
     expect(screen.getByText('Unknown')).toBeVisible();
     expect(screen.getByText(/cache layout incomplete/)).toBeVisible();

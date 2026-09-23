@@ -6,6 +6,7 @@ use std::path::Path;
 
 type Result<T> = std::result::Result<T, String>;
 const LOCAL_TOOL_CALLING_SUPPORT_KEY: &str = "local_tool_calling_support";
+const TOOL_COMPATIBILITY_KEY: &str = "tool_compatibility_v2";
 
 fn db_error(error: rusqlite::Error) -> String {
     format!("Local database: {error}")
@@ -72,16 +73,12 @@ impl Default for Preferences {
     }
 }
 impl Preferences {
-    /// ZAYA spends a substantial part of its response budget on reasoning.
     /// AREX answers arrive inside a `finish` call — the JSON envelope plus the
     /// evidences list need headroom beyond a chat-sized budget, and report-
     /// style answers visibly splice when they hit a small cap mid-sentence.
     /// Upgrade older saved defaults without lowering an explicit larger budget.
     pub fn apply_model_defaults(mut self) -> Self {
-        if (self.model_path.ends_with(crate::model_catalog::ZAYA1_FILENAME)
-            || crate::arex::is_arex_model(&self.model_path))
-            && self.max_tokens < 8192
-        {
+        if crate::arex::is_arex_model(&self.model_path) && self.max_tokens < 8192 {
             self.max_tokens = 8192;
         }
         self
@@ -1861,8 +1858,20 @@ impl Store {
         runtime_path: &str,
         model_path: &str,
     ) -> Result<Option<bool>> {
-        let support: std::collections::BTreeMap<String, bool> = self.setting(LOCAL_TOOL_CALLING_SUPPORT_KEY)?;
-        Ok(support.get(&tool_calling_key(runtime_path, model_path)).copied())
+        // Path-keyed booleans are the old unreliable signal. They stay on disk
+        // and are treated as unknown so one bad parse cannot disable tools.
+        let _support: std::collections::BTreeMap<String, bool> = self.setting(LOCAL_TOOL_CALLING_SUPPORT_KEY)?;
+        let _ = (runtime_path, model_path);
+        Ok(None)
+    }
+    pub fn tool_compatibility(&self, fingerprint: &str) -> Result<Option<String>> {
+        let support: std::collections::BTreeMap<String, String> = self.setting(TOOL_COMPATIBILITY_KEY)?;
+        Ok(support.get(fingerprint).cloned())
+    }
+    pub fn record_tool_compatibility(&self, fingerprint: &str, state: &str) -> Result<()> {
+        let mut support: std::collections::BTreeMap<String, String> = self.setting(TOOL_COMPATIBILITY_KEY)?;
+        support.insert(fingerprint.to_string(), state.to_string());
+        self.save_setting(TOOL_COMPATIBILITY_KEY, &support)
     }
     pub fn record_local_tool_calling_support(
         &self,
@@ -1997,6 +2006,20 @@ impl Store {
             .map_err(db_error)
     }
 
+    pub fn running_research_task_ids(&self) -> Result<Vec<String>> {
+        crate::research_tasks::ensure_table(&self.connection)?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM research_tasks WHERE status IN ('running','paused') ORDER BY updated_at DESC LIMIT 50")
+            .map_err(db_error)?;
+        let ids = statement
+            .query_map([], |row| row.get(0))
+            .map_err(db_error)?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(ids)
+    }
+
     pub fn recoverable_research_tasks(&self, conversation_id: &str) -> Result<Vec<crate::research_tasks::ResearchTask>> {
         crate::research_tasks::ensure_table(&self.connection)?;
         let mut statement = self
@@ -2061,17 +2084,14 @@ mod tests {
     }
 
     #[test]
-    fn zaya_gets_a_reasoning_safe_response_budget_without_lowering_explicit_limits() {
-        let base = Preferences { model_path: "C:/models/ZAYA1-8B-Q4_K_M.gguf".into(), max_tokens: 2048, ..Default::default() };
-        assert_eq!(base.clone().apply_model_defaults().max_tokens, 8192);
-        assert_eq!(Preferences { max_tokens: 12000, ..base.clone() }.apply_model_defaults().max_tokens, 12000);
-        // AREX gets the same bump — its finish-call answers truncate at the
-        // chat-sized default.
+    fn arex_gets_a_reasoning_safe_response_budget_without_lowering_explicit_limits() {
         let arex = Preferences { model_path: "C:/models/BAAI_AREX-Turbo-Q4_K_M.gguf".into(), max_tokens: 2048, ..Default::default() };
         assert_eq!(arex.clone().apply_model_defaults().max_tokens, 8192);
-        assert_eq!(Preferences { max_tokens: 12000, ..arex }.apply_model_defaults().max_tokens, 12000);
+        assert_eq!(Preferences { max_tokens: 12000, ..arex.clone() }.apply_model_defaults().max_tokens, 12000);
+        let base = Preferences { model_path: "C:/models/model.gguf".into(), max_tokens: 2048, ..Default::default() };
+        assert_eq!(base.clone().apply_model_defaults().max_tokens, 2048);
         let fitted = crate::context::fit_response_budget(
-            base.clone().apply_model_defaults().max_tokens,
+            arex.clone().apply_model_defaults().max_tokens,
             8192,
         );
         assert_eq!(fitted, 4096);
@@ -2198,8 +2218,14 @@ mod tests {
             store.record_local_tool_calling_support("runtime-b", "model-a", true).unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.local_tool_calling_supported("runtime-a", "model-a").unwrap(), Some(false));
-        assert_eq!(store.local_tool_calling_supported("runtime-b", "model-a").unwrap(), Some(true));
+        // The path-keyed false flag is historical and must not disable tools.
+        assert_eq!(store.local_tool_calling_supported("runtime-a", "model-a").unwrap(), None);
+        assert_eq!(store.local_tool_calling_supported("runtime-b", "model-a").unwrap(), None);
+        store.record_tool_compatibility("fp-old", "unsupported").unwrap();
+        store.record_tool_compatibility("fp-new", "supported").unwrap();
+        assert_eq!(store.tool_compatibility("fp-old").unwrap().as_deref(), Some("unsupported"));
+        assert_eq!(store.tool_compatibility("fp-new").unwrap().as_deref(), Some("supported"));
+        assert_eq!(store.tool_compatibility("fp-replaced").unwrap(), None);
     }
 
     #[test]

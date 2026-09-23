@@ -7,6 +7,6 @@ it('treats Windows device and regular paths as the same file', () => {
 });
 
 it('does not collapse different model files', () => {
-  expect(samePath('C:\\Models\\Mini.gguf', 'C:\\Models\\Zaya.gguf')).toBe(false);
+  expect(samePath('C:\\Models\\Mini.gguf', 'C:\\Models\\Other.gguf')).toBe(false);
   expect(samePath('', 'C:\\Models\\Mini.gguf')).toBe(false);
 });

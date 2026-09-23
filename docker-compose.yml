@@ -1,6 +1,6 @@
 services:
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng:2026.9.22-019460e07
     container_name: locallm-searxng
     restart: unless-stopped
     ports:

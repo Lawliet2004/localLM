@@ -194,6 +194,9 @@ impl InferenceProvider for Backend {
                 if let Some(object) = payload.as_object_mut() {
                     object.remove("cache_prompt");
                     object.remove("id_slot");
+                    // repeat_penalty is a llama.cpp extension — some
+                    // OpenAI-compatible endpoints reject unknown fields.
+                    object.remove("repeat_penalty");
                     object.insert("model".into(), Value::String(model_id.clone()));
                 }
                 payload

@@ -25,10 +25,24 @@ vi.mock('../lib/api', () => ({
 afterEach(() => {
   apiMocks.getTodos.mockReset();
   apiMocks.getTodos.mockResolvedValue([]);
+  apiMocks.contextPreflight.mockReset();
+  apiMocks.contextPreflight.mockResolvedValue({ available: false });
+  apiMocks.compactConversation.mockReset();
+  apiMocks.compactConversation.mockResolvedValue({ note: '', checkpoint: null });
 });
 
 const props = { generating: false, ready: true, loading: false, onSend: vi.fn(), onCancel: vi.fn(), onConfigure: vi.fn() };
 describe('chat action reporting and submission', () => {
+  it('pause and resume call the generation controls while a response is running', () => {
+    const onPause = vi.fn();
+    const onResume = vi.fn();
+    const { rerender } = render(<Chat {...props} messages={[]} generating onPause={onPause} onResume={onResume} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Pause response' }));
+    expect(onPause).toHaveBeenCalledOnce();
+    rerender(<Chat {...props} messages={[]} generating={false} paused onPause={onPause} onResume={onResume} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Resume response' }));
+    expect(onResume).toHaveBeenCalledOnce();
+  });
   it('shows a collapsible plan checklist and hides todo harness cards', async () => {
     apiMocks.getTodos.mockResolvedValue([
       { text: 'Search papers', status: 'completed', updatedAt: 1 },
@@ -168,25 +182,19 @@ describe('chat action reporting and submission', () => {
     expect(screen.getByLabelText('Message')).toHaveValue('Unsent draft');
     expect(screen.getByText('Partial answer')).toBeInTheDocument();
   });
-it('labels measured context separately from draft changes', () => {
+it('shows measured context usage in the context popover', () => {
      render(<Chat {...props} messages={[]} contextUsage={{ inputTokens: 123, responseReserve: 512, contextLength: 8192 }} />);
-     const usage = screen.getByLabelText('Last request context');
-     expect(usage).toHaveTextContent('123 input + 512 response reserve');
-     fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'A new draft that has not been counted' } });
-     expect(usage).toHaveTextContent('123 input');
-     expect(usage).toHaveTextContent('Draft changes are not included');
+     const popover = screen.getByRole('dialog', { name: 'Context usage and compaction' });
+     expect(popover).toHaveTextContent('123 input + 512 reserved / 8,192 tokens');
    });
-    it('shows exact token breakdown from debounced preflight', async () => {
-      apiMocks.contextPreflight.mockResolvedValue({ available: true, breakdown: { total: 123, instructions: 50, tools: 30, history: 40, draft: 3, responseReserve: 512, contextLength: 8192, exact: true, fits: true } });
+    it('warns when the draft overflows the context window', async () => {
+      apiMocks.contextPreflight.mockResolvedValue({ available: true, breakdown: { total: 9000, instructions: 50, tools: 30, history: 4000, draft: 4920, responseReserve: 512, contextLength: 8192, exact: true, fits: false, overflow: 'Over the context limit — compact history or shorten the draft.' } });
       render(<Chat {...props} messages={[]} ready={true} draft="test prompt" />);
       await waitFor(() => {
-        expect(screen.getByLabelText('Context preview')).toHaveTextContent(
-          'Exact tokens: 123 input (50 instructions, 30 tools, 40 history, 3 draft) + 512 reserve / 8,192 context.'
-        );
+        expect(screen.getByRole('alert')).toHaveTextContent('Over the context limit');
       });
     });
-    it('triggers manual compaction when history is present and preflight fires', async () => {
-      apiMocks.contextPreflight.mockResolvedValue({ available: true, breakdown: { total: 5000, instructions: 50, tools: 30, history: 4000, draft: 920, responseReserve: 512, contextLength: 8192, exact: true, fits: true } });
+    it('triggers manual compaction from the context popover', async () => {
       apiMocks.compactConversation.mockResolvedValue({ note: 'Compacted 4 messages into artifact art-1', checkpoint: { cutoff: 12345 } });
       const messages: Message[] = [
         { id: '1', conversationId: 'c1', role: 'user', content: 'Turn 1', reasoning: '', status: 'complete', createdAt: 1 },

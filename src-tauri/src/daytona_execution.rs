@@ -121,6 +121,7 @@ pub async fn run<T: ExecutionTransport + 'static>(
     scope: String,
     request: CodeRequest,
 ) -> Result<Outcome, String> {
+    crate::local_only::cloud_execution_allowed()?;
     request.validate()?;
     let (sender, mut cancelled) = watch::channel(false);
     let _cancel = CancelOnDrop(sender);
@@ -218,52 +219,40 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn execution_and_caller_cancellation_both_cleanup_owned_resources() {
-        for (block, exit_code) in [(false, 0), (true, 0), (false, 7)] {
-            let temp = tempfile::tempdir().unwrap();
-            let store = Arc::new(Mutex::new(
-                Journal::open(&temp.path().join("journal")).unwrap(),
-            ));
-            let remote = Arc::new(Remote {
-                store: store.clone(),
-                name: Mutex::new(String::new()),
-                deleted: AtomicBool::new(false),
-                runs: AtomicUsize::new(0),
-                entered: tokio::sync::Notify::new(),
-                block,
-                exit_code,
-            });
-            let task = tokio::spawn(run(
-                remote.clone(),
-                store.clone(),
-                Arc::new(AsyncMutex::new(())),
-                "a".repeat(64),
-                CodeRequest {
-                    language: "python".into(),
-                    code: "print(42)".into(),
-                    timeout_seconds: 30,
-                },
-            ));
-            tokio::time::timeout(Duration::from_secs(2), remote.entered.notified())
-                .await
-                .unwrap();
-            if block {
-                task.abort();
-                assert!(matches!(task.await, Err(error) if error.is_cancelled()));
-            } else {
-                let outcome = task.await.unwrap().unwrap();
-                assert_eq!(outcome.is_error, exit_code != 0);
-                assert_eq!(outcome.result.unwrap().result, "42");
-            }
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while !journal(&store).unwrap().pending().unwrap().is_empty() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(remote.deleted.load(Ordering::SeqCst));
-            assert_eq!(remote.runs.load(Ordering::SeqCst), 1);
-        }
+    async fn run_rejects_cloud_execution_without_creating_a_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            Journal::open(&temp.path().join("journal")).unwrap(),
+        ));
+        let remote = Arc::new(Remote {
+            store: store.clone(),
+            name: Mutex::new(String::new()),
+            deleted: AtomicBool::new(false),
+            runs: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            block: true,
+            exit_code: 0,
+        });
+        let error = match run(
+            remote.clone(),
+            store.clone(),
+            Arc::new(AsyncMutex::new(())),
+            "a".repeat(64),
+            CodeRequest {
+                language: "python".into(),
+                code: "print(42)".into(),
+                timeout_seconds: 30,
+            },
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("cloud execution must be rejected before a sandbox is created"),
+        };
+        assert!(error.contains("Cloud execution is unavailable"));
+        assert!(error.contains("was not sent"));
+        assert!(journal(&store).unwrap().pending().unwrap().is_empty());
+        assert!(!remote.deleted.load(Ordering::SeqCst));
+        assert_eq!(remote.runs.load(Ordering::SeqCst), 0);
     }
 }

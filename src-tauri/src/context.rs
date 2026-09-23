@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn response_budget_leaves_room_for_a_typical_first_prompt() {
         // 8192 context with an 8192 reserve is the failure mode that blocked
-        // every first ZAYA (and leftover-budget) turn: 2545 + 8192 > 8192.
+        // every first reasoning-model turn: 2545 + 8192 > 8192.
         assert_eq!(fit_response_budget(8192, 8192), 4096);
         assert!(validate_budget(2545, fit_response_budget(8192, 8192), 8192).is_ok());
         assert_eq!(fit_response_budget(2048, 8192), 2048);

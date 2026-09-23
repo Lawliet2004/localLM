@@ -34,3 +34,5 @@ dist-ssr
 .commandcode
 .localqa-*.txt
 nul
+
+graphify-out/

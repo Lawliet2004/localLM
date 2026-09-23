@@ -104,6 +104,35 @@ impl ToolCalls {
         }
         acc
     }
+
+    /// A finished OpenAI message uses the same argument checks as a streamed call.
+    /// Partial or non-object arguments are rejected instead of executed.
+    pub fn from_openai_message(message: &Value) -> Result<Vec<ToolCall>, String> {
+        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+            return Ok(Vec::new());
+        };
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut acc = Self::default();
+        for (index, call) in calls.iter().enumerate() {
+            let arguments = match &call["function"]["arguments"] {
+                Value::String(text) => text.clone(),
+                Value::Object(_) => call["function"]["arguments"].to_string(),
+                _ => return Err("Tool arguments are not valid JSON. The generation may have been truncated; unfinished tool calls are not executed.".into()),
+            };
+            let id = call["id"].as_str().unwrap_or("");
+            let name = call["function"]["name"].as_str().unwrap_or("");
+            acc.push(&json!({
+                "tool_calls": [{
+                    "index": index,
+                    "id": id,
+                    "function": { "name": name, "arguments": arguments }
+                }]
+            }))?;
+        }
+        acc.finish()
+    }
 }
 
 /// Some local-model templates (AREX-family) stream literal

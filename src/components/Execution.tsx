@@ -99,8 +99,8 @@ export function Execution() {
         ].filter(Boolean);
         setNotice(
           found.length > 0
-            ? `Detected from system PATH: ${found.join(', ')}.`
-            : 'No standard interpreters found on system PATH.'
+            ? `Detected from system PATH: ${found.join(', ')}. You do not need to type these paths.`
+            : 'No interpreter was found on PATH. Install Node from the managed runtime path, or install Python, then detect again. Do not hand-edit a config file.'
         );
       } else {
         setNotice('Interpreter detection is unavailable in mock environment.');
@@ -213,7 +213,7 @@ export function Execution() {
       {notice && <p role="status">{notice}</p>}
       <form className="runtime-form" onSubmit={event => { event.preventDefault(); void saveSearch(); }}>
         <h2>Web search</h2>
-        <p>Choose the search provider for deep research. SearXNG is self-hosted and free. Google uses the Custom Search JSON API (100 queries/day free tier).</p>
+        <p>Choose the search provider for deep research. SearXNG is an explicit install of the pinned image searxng/searxng:2026.9.22-019460e07, not latest. Google uses the Custom Search JSON API (100 queries/day free tier).</p>
         <label>
           Search provider
           <select
@@ -310,7 +310,7 @@ export function Execution() {
         To use local execution, choose a workspace folder under Tools in chat and enable Local code. Runs have a 90-second maximum and capture up to 64 KiB from each output stream.
       </p>
       <p className="catalog-notice">
-        Enable Daytona cloud code under Tools in chat to run Python, JavaScript or TypeScript in a temporary remote sandbox. Code leaves this device and cloud usage may incur charges. Local workspace files are not uploaded automatically. Cleanup is attempted after every run; unresolved resources appear below.
+        Cloud execution cannot be started. Unresolved historical cloud operations stay listed below and are not erased. A saved key stays until you choose Forget. Local code is unsandboxed.
       </p>
       <form className="runtime-form" onSubmit={event => { event.preventDefault(); void cloudAction('save'); }}>
         <h2>Daytona credentials</h2>

@@ -95,7 +95,7 @@ const FINAL_ANSWER_INSTRUCTION: &str =
     "Give the user a visible final answer now, using the conversation and tool results already collected. State any unresolved work or missing evidence honestly. Do not call tools, repeat progress updates, or expose private reasoning.";
 const EMPTY_FINAL_ANSWER_ERROR: &str =
     "The model finished without a visible answer after tool work completed. Please retry the request.";
-const RESEARCH_STALLED: &str = "Research stopped because repeated web calls made no progress or reached the research budget. Give the best answer supported by the results already collected, cite available sources, and clearly state any unresolved questions. Do not claim the research or unfinished plan steps are complete. Do not call tools.";
+const RESEARCH_STALLED: &str = "Research stopped because repeated web calls made no progress or reached the research budget. Give the best answer supported by the results already collected, cite each source with its URL (https://…) where available, and clearly state any unresolved questions. Do not claim the research or unfinished plan steps are complete. Do not call tools.";
 const RESEARCH_STALLED_FALLBACK: &str = "Research stopped after repeated unproductive web calls or reaching its research budget. The model could not produce a supported final answer. The collected tool results remain available; unresolved claims have not been verified.";
 
 #[derive(Default)]
@@ -119,11 +119,10 @@ impl ResearchProgress {
         // Discovery calls only make progress by surfacing a new domain.
         // Junk-but-novel hits on the same engines (e.g. fresh arxiv papers for
         // a weather query) used to reset the counter forever.
-        let progressed = if matches!(name, "web_search" | "search") {
-            self.domains.len() > domains_before
-        } else {
-            self.evidence.len() > before
-        };
+        // A new passage is progress even on a domain we already saw. Repeating
+        // the same passage is not. Discovery does not require a new domain.
+        let _ = domains_before;
+        let progressed = self.evidence.len() > before;
         self.stagnant = if progressed { 0 } else { self.stagnant + 1 };
     }
 
@@ -202,14 +201,11 @@ fn research_answer_fallback(tool_name: &str, result: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Ordinary chat may lock tools after the first grounded `web_search` answer.
-/// Plan mode must keep tools so the model can finish every hop on the plan.
+/// A grounded search answer is evidence. It does not lock tools in ordinary
+/// chat or in Plan mode; both use `continuation_after_tool`.
 fn arm_research_finalization(plan_mode: bool, tool_name: &str, result: &Value) -> Option<String> {
-    if plan_mode {
-        None
-    } else {
-        research_answer_fallback(tool_name, result)
-    }
+    let _ = (plan_mode, tool_name, result);
+    None
 }
 
 fn replace_in_content(message: &mut Value, from: &str, to: &str) {
@@ -317,7 +313,10 @@ fn finalization_action(
     stalled: bool,
 ) -> FinalizationAction {
     if !round_answer.trim().is_empty() && !is_text_tool_call(round_answer)
-        && !(stalled && !answer_cites_evidence(round_answer))
+        // On a stalled turn the first answer without URL citations earns one
+        // retry; rejecting the retry too only guarantees the disowning
+        // fallback after a second full generation.
+        && !(stalled && !retried && !answer_cites_evidence(round_answer))
     {
         return FinalizationAction::Complete;
     }
@@ -332,6 +331,29 @@ fn finalization_action(
 
 fn needs_final_answer(finalizing: bool, has_calls: bool, round_answer: &str) -> bool {
     finalizing || (!has_calls && round_answer.trim().is_empty())
+}
+
+pub enum TextCallDecision {
+    Execute(crate::tool_calls::ToolCalls),
+    Repair { error: String },
+    Fail { error: String },
+    NotACall,
+}
+
+/// Malformed text is never executed. One repair carries a bounded error; a
+/// later valid call still returns [`TextCallDecision::Execute`].
+pub fn decide_text_tool_call(round_answer: &str, repairs_used: u32) -> TextCallDecision {
+    if !is_text_tool_call(round_answer) {
+        return TextCallDecision::NotACall;
+    }
+    match crate::tool_calls::parse_text_tool_calls(round_answer) {
+        Some(parsed) => TextCallDecision::Execute(crate::tool_calls::ToolCalls::from_parsed(parsed)),
+        None => match crate::continuation::malformed_call_disposition(false, repairs_used, "text-form tool call could not be parsed") {
+            crate::continuation::ParseDisposition::Repair { error } => TextCallDecision::Repair { error },
+            crate::continuation::ParseDisposition::Fail { error } => TextCallDecision::Fail { error },
+            crate::continuation::ParseDisposition::Execute => TextCallDecision::NotACall,
+        },
+    }
 }
 
 fn is_text_tool_call(text: &str) -> bool {
@@ -369,6 +391,78 @@ fn strip_call_markup(text: &str) -> String {
         .min()
         .unwrap_or(stripped.len());
     stripped[..end].trim().to_string()
+}
+
+/// Detect a verbatim re-emission loop: the normalized tail of `text`
+/// re-generates a block already produced earlier in the same round. Returns
+/// the byte index where the redundant repetition begins so the caller can
+/// truncate. Small local models can loop a whole answer once the context
+/// already contains a draft; nothing else bounds that until the 4 MiB cap.
+fn repetition_cut(text: &str) -> Option<usize> {
+    const ANCHOR: usize = 240; // normalized tail chars searched earlier
+    const MIN_REPEAT: usize = 400; // re-emitted normalized chars before cutting
+    if text.len() < ANCHOR + MIN_REPEAT {
+        return None;
+    }
+    let mut norm: Vec<char> = Vec::with_capacity(text.len());
+    let mut map: Vec<usize> = Vec::with_capacity(text.len());
+    let mut last_ws = true;
+    for (i, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if !last_ws {
+                norm.push(' ');
+                map.push(i);
+            }
+            last_ws = true;
+        } else {
+            norm.push(ch);
+            map.push(i);
+            last_ws = false;
+        }
+    }
+    let n = norm.len();
+    if n < ANCHOR + MIN_REPEAT {
+        return None;
+    }
+    let tail = n - ANCHOR;
+    let needle = &norm[tail..];
+    // The tail's first occurrence in earlier output fixes the offset between
+    // the original block and its re-emission.
+    let p = norm[..tail].windows(ANCHOR).position(|w| w == needle)?;
+    let offset = tail - p;
+    // Walk back while the copy still matches its source: the repetition
+    // begins at the start of the re-emitted block, not midway through it.
+    let mut start = tail;
+    while start > offset && norm[start - 1] == norm[start - 1 - offset] {
+        start -= 1;
+    }
+    (n - start >= MIN_REPEAT).then(|| map[start])
+}
+
+/// Deterministic citation footer for a stalled research answer that reached
+/// the user without URL citations: the collected evidence still identifies
+/// the sources consulted.
+fn sources_footer(evidence: &[(String, String)]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut urls = Vec::new();
+    for (url, _) in evidence {
+        let url = url.trim();
+        if url.is_empty() || !seen.insert(url.to_string()) {
+            continue;
+        }
+        urls.push(url.to_string());
+        if urls.len() >= 8 {
+            break;
+        }
+    }
+    if urls.is_empty() {
+        return None;
+    }
+    let mut footer = String::from("\n\nSources consulted:\n");
+    for url in urls {
+        footer.push_str(&format!("- {url}\n"));
+    }
+    Some(footer)
 }
 
 /// Deterministic claim audit shared by the `finish` path and plain-text
@@ -725,18 +819,12 @@ async fn assemble_turn(
         }
     }
     if use_daytona {
-        let bytes = state
-            .daytona_vault
-            .load("daytona")?
-            .ok_or("Save a Daytona API key in Execution first.")?;
-        let key = String::from_utf8(bytes).map_err(|_| "Saved Daytona key is invalid.")?;
-        tools.push(crate::connectors::AgentTool::daytona(
-            crate::daytona_execution::Executor::new(
-                &key,
-                state.daytona_journal.clone(),
-                state.daytona_operation.clone(),
-            )?,
-        ));
+        // Historical cloud records stay in the journal. This turn does not start one.
+        let _ = crate::local_only::cloud_execution_allowed();
+        add_tool_notice(
+            &mut tool_notice,
+            "Cloud execution is unavailable. Historical cloud records stay readable; this turn will not start a cloud sandbox.".into(),
+        );
     }
     if use_execution {
         let (config, path) = {
@@ -790,6 +878,7 @@ async fn assemble_turn(
     let supports_images;
     let backend = if let Some(provider_id) = selection.provider_id.clone() {
         let provider = state.database()?.provider(&provider_id)?.ok_or("The selected provider was deleted. Choose another provider before sending a message.")?;
+        crate::local_only::inference_allowed(&provider.base_url)?;
         if !provider.verified {
             return Err("Test the selected provider connection successfully before sending a message.".into());
         }
@@ -883,27 +972,25 @@ async fn assemble_turn(
         (preferences, history)
     };
     let mut tool_schemas_suppressed = false;
-    if matches!(&backend, Backend::Local { .. })
-        && !tools.is_empty()
-        && state.database()?.local_tool_calling_supported(&preferences.runtime_path, &preferences.model_path)? == Some(false)
-    {
-        tools.clear();
-        tool_schemas_suppressed = true;
-        let message = "Tool calling is disabled for this local runtime because it previously emitted an unsupported text-form tool call. It can still answer from its available knowledge.";
-        tool_notice = Some(match tool_notice {
-            Some(existing) => format!("{existing} {message}"),
-            None => message.into(),
-        });
-    }
-    // The experimental ZAYA chat template can emit tool-call prose instead of
-    // structured calls. Supplying the full harness then makes it reason until
-    // the response limit with no executable call. Keep local ZAYA turns
-    // answer-only until structured tool parsing is verified for this runtime.
-    if preferences.model_path.ends_with(crate::model_catalog::ZAYA1_FILENAME) {
-        tool_schemas_suppressed = true;
-        if !tools.is_empty() {
+    if matches!(&backend, Backend::Local { .. }) && !tools.is_empty() {
+        let meta = std::fs::metadata(&preferences.runtime_path).ok();
+        let modified = meta.as_ref().and_then(|meta| meta.modified().ok()).and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|time| time.as_secs()).unwrap_or(0);
+        let identity = crate::tool_compat::runtime_identity(
+            &crate::tool_compat::build_label_from_path(&preferences.runtime_path),
+            meta.as_ref().map(|meta| meta.len()).unwrap_or(0),
+            modified,
+        );
+        let model_name = preferences.model_path.rsplit(['/', '\\']).next().unwrap_or(&preferences.model_path);
+        let template = if preferences.model_path.ends_with(crate::model_catalog::MODEL_FILENAME) { "minicpm" } else { "default" };
+        let fingerprint = crate::tool_compat::fingerprint(&identity, model_name, template, crate::tool_compat::PARSER_VERSION);
+        let state_name = state.database()?.tool_compatibility(&fingerprint)?.unwrap_or_default();
+        let compat = crate::tool_compat::CompatState::parse(&state_name);
+        // A path-only historical flag is unknown and does not suppress tools.
+        let _ = state.database()?.local_tool_calling_supported(&preferences.runtime_path, &preferences.model_path)?;
+        if !crate::tool_compat::tools_enabled(compat) {
             tools.clear();
-            let message = "ZAYA1 tool calling is disabled for this local runtime; answering with the model's available knowledge.";
+            tool_schemas_suppressed = true;
+            let message = "Tool calling is unsupported for this runtime build and model. Use Retest tool calling after replacing the runtime. Other conversations are unaffected.";
             tool_notice = Some(match tool_notice {
                 Some(existing) => format!("{existing} {message}"),
                 None => message.into(),
@@ -1061,7 +1148,189 @@ fn build_turn_messages(plan: &TurnPlan) -> Vec<Value> {
 
 #[tauri::command]
 pub fn cancel_generation(state: State<'_, AppState>) {
+    if let Ok(mut control) = state.run_control.lock() {
+        crate::agent_run::request_cancel(&mut control);
+    }
     state.cancel.send_replace(true);
+}
+
+#[tauri::command]
+pub fn pause_generation(state: State<'_, AppState>) {
+    if let Ok(mut control) = state.run_control.lock() {
+        crate::agent_run::apply_pause(&mut control);
+    }
+}
+
+fn save_ledger(state: &AppState, task: &crate::research_tasks::ResearchTask) {
+    if let Ok(store) = state.database() {
+        let _ = store.save_research_task(task);
+    }
+}
+
+pub fn persist_completed_tool(
+    store: &crate::store::Store,
+    task: &mut crate::research_tasks::ResearchTask,
+    name: &str,
+    summary: Option<String>,
+) {
+    task.checkpoint_operation(name, crate::research_tasks::OperationStatus::Completed, summary);
+    let _ = store.save_research_task(task);
+}
+
+pub fn begin_catalog_op(
+    store: &crate::store::Store,
+    task: &mut crate::research_tasks::ResearchTask,
+    call_id: &str,
+    name: &str,
+) {
+    let id = format!("op-{call_id}");
+    if task.operations.iter().any(|op| op.id == id) {
+        return;
+    }
+    task.operations.push(crate::research_tasks::TaskOperation {
+        id,
+        kind: name.to_string(),
+        status: crate::research_tasks::OperationStatus::Running,
+        attempts: 1,
+        result_summary: None,
+        error: None,
+        updated_at: crate::store::now(),
+    });
+    let _ = store.save_research_task(task);
+}
+
+fn settle_catalog_op(
+    store: &crate::store::Store,
+    task: &mut crate::research_tasks::ResearchTask,
+    call_id: &str,
+    result: &Value,
+) {
+    let id = format!("op-{call_id}");
+    let failed = result.get("isError").and_then(Value::as_bool) == Some(true);
+    if !failed {
+        if let Some(op) = task.operations.iter_mut().find(|op| op.id == id) {
+            op.status = crate::research_tasks::OperationStatus::Completed;
+            op.result_summary = result.pointer("/data/result").map(|value| value.to_string())
+                .or_else(|| result.get("content").and_then(Value::as_str).map(|text| text.to_string()));
+            op.updated_at = crate::store::now();
+        }
+    }
+    let _ = store.save_research_task(task);
+}
+
+/// Execute one catalog tool. The running row from [`begin_catalog_op`] becomes
+/// completed on success and stays running when execution fails.
+pub async fn run_catalog_and_record(
+    db_path: &std::path::Path,
+    task_id: &str,
+    workspace_path: &str,
+    config: crate::execution::ExecutionConfig,
+    call_id: &str,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    let executed = crate::harness::execute_workspace_tool(workspace_path, config, name, arguments).await;
+    if let Ok(store) = crate::store::Store::open(db_path) {
+        if let Ok(Some(mut task)) = store.research_task(task_id) {
+            match &executed {
+                Ok(value) => settle_catalog_op(&store, &mut task, call_id, value),
+                Err(_) => {
+                    let _ = store.save_research_task(&task);
+                }
+            }
+        }
+    }
+    executed
+}
+
+fn append_checkpoint(messages: &mut [Value], note: &str) {
+    let Some(message) = messages.iter_mut().rev().find(|message| message["role"] == "user") else { return };
+    if let Some(Value::String(text)) = message.get_mut("content") {
+        if !text.contains("Paused checkpoint.") {
+            text.push_str("\n\n");
+            text.push_str(note);
+        }
+    }
+}
+
+pub struct StagedResume {
+    pub question: String,
+    pub pending: Vec<String>,
+    pub completed: Vec<String>,
+    pub checkpoint: String,
+}
+
+/// Load the paused ledger, mark it running again, and persist the checkpoint
+/// the next user turn must include.
+pub fn stage_paused_resume(store: &crate::store::Store, conversation_id: &str) -> Result<StagedResume, String> {
+    let mut task = store
+        .recoverable_research_tasks(conversation_id)?
+        .into_iter()
+        .find(|task| task.status == crate::research_tasks::TaskStatus::Paused)
+        .ok_or("No paused checkpoint to resume.")?;
+    task.resume()?;
+    let completed: Vec<String> = task
+        .operations
+        .iter()
+        .filter(|op| op.status == crate::research_tasks::OperationStatus::Completed)
+        .map(|op| op.id.clone())
+        .collect();
+    let pending = task.pending_work.clone();
+    let question = task.question.clone();
+    store.save_research_task(&task)?;
+    let checkpoint = format!(
+        "Paused checkpoint. Original request: {question}. Completed operation ids: {}. Do not repeat them. Pending: {}.",
+        completed.join(", "),
+        pending.join(", ")
+    );
+    store.save_setting(&format!("pending_resume:{conversation_id}"), &checkpoint)?;
+    Ok(StagedResume { question, pending, completed, checkpoint })
+}
+
+/// Move a staged checkpoint onto the latest user message once, then clear it.
+pub fn take_staged_checkpoint(store: &crate::store::Store, conversation_id: &str, messages: &mut [Value]) -> bool {
+    let key = format!("pending_resume:{conversation_id}");
+    let staged: String = store.setting(&key).unwrap_or_default();
+    if staged.trim().is_empty() {
+        return false;
+    }
+    let _ = store.save_setting(&key, &String::new());
+    append_checkpoint(messages, &staged);
+    messages.iter().rev().any(|message| {
+        message["role"] == "user" && message["content"].as_str().unwrap_or("").contains("Paused checkpoint.")
+    })
+}
+
+#[tauri::command]
+pub fn resume_generation(state: State<'_, AppState>, conversation_id: String) -> Result<Value, String> {
+    let store = state.database()?;
+    let staged = stage_paused_resume(&store, &conversation_id)?;
+    drop(store);
+    let generation = {
+        let mut control = state.run_control.lock().map_err(|_| "Run control is unavailable.")?;
+        crate::agent_run::resume_run(&mut control)
+    };
+    state.cancel.send_replace(false);
+    Ok(json!({
+        "generation": generation,
+        "question": staged.question,
+        "pending": staged.pending,
+        "completed": staged.completed,
+        "checkpoint": staged.checkpoint,
+    }))
+}
+
+#[tauri::command]
+pub fn restart_generation(state: State<'_, AppState>) -> Result<crate::agent_run::RestartReport, String> {
+    let store = state.database()?;
+    crate::research_tasks::recover_interrupted(&store)
+}
+
+fn cancel_applies(state: &AppState, generation: u64) -> bool {
+    let Ok(control) = state.run_control.lock() else {
+        return true;
+    };
+    *state.cancel.borrow() && crate::agent_run::cancel_matches(control.cancel_generation, generation)
 }
 
 /// Count before every generation round. Compaction never runs inside a tool call.
@@ -1130,9 +1399,17 @@ pub async fn send_message(
         event.notice = Some(notice.clone());
         let _ = channel.send(event);
     }
+    let run_generation = {
+        let mut control = state.run_control.lock().map_err(|_| "Run control is unavailable.")?;
+        crate::agent_run::begin_run(&mut control)
+    };
     state.cancel.send_replace(false);
     let mut cancellation = state.cancel.subscribe();
+
     let mut messages = build_turn_messages(&plan);
+    if let Ok(store) = state.database() {
+        take_staged_checkpoint(&store, &conversation_id, &mut messages);
+    }
     let (mut input_tokens, compacted_once) = tokio::select! {
         _ = cancellation.changed() => return Err("Message cancelled before generation; it was not saved.".into()),
         result = prepare_context(&state, &plan, &conversation_id, &mut messages, false, false) => result?,
@@ -1266,6 +1543,17 @@ pub async fn send_message(
         let mut recent_calls: Vec<(String, String)> = Vec::new();
         let mut research_progress = ResearchProgress::default();
         let mut research_evidence: Vec<(String, String)> = Vec::new();
+        let mut budgets = crate::continuation::Budgets::default();
+        let mut corrections_used = 0u32;
+        let mut repairs_used = 0u32;
+        let mut blocked_calls = std::collections::HashSet::<String>::new();
+        let mut paused_exit = false;
+        let mut evidence_note: Option<String> = None;
+        let question = content.chars().take(4000).collect::<String>();
+        let mut ledger = crate::research_tasks::ResearchTask::new(&conversation_id, if question.trim().is_empty() { "continue" } else { &question }, crate::research_tasks::TaskBudgets::default()).ok();
+        if let Some(task) = ledger.as_ref() {
+            save_ledger(&state, task);
+        }
         for round in 0..64 {
             if *cancellation.borrow() { return Ok(false); }
             let step_id = format!("step-{round}");
@@ -1351,6 +1639,10 @@ pub async fn send_message(
             // A call attempt on a no-tool round is not a visible answer — but
             // its markup is stripped from the answer text all the same.
             let mut suppressed_call = false;
+            let answer_len_before_round = answer.len();
+            // The verbatim-loop detector needs enough output to compare; it
+            // then runs once per further ~1 KiB of generated text.
+            let mut next_rep_check = 1_200usize;
             let round_start_time = Instant::now();
             'stream: loop {
                 let next = tokio::select! {
@@ -1390,6 +1682,23 @@ pub async fn send_message(
                     answer.push_str(&ans_chunk); round_answer.push_str(&ans_chunk);
                     reasoning.push_str(&thought_chunk); round_reasoning.push_str(&thought_chunk);
                     if answer.len() + reasoning.len() > 4_194_304 { return Err("Model output exceeded 4 MiB.".into()); }
+                    if round_answer.len() >= next_rep_check {
+                        next_rep_check = round_answer.len() + 1024;
+                        // A loop may have re-emitted the block more than once;
+                        // keep cutting until only the first copy remains.
+                        let mut removed = 0usize;
+                        while let Some(cut) = repetition_cut(&round_answer) {
+                            removed += round_answer.len() - cut;
+                            round_answer.truncate(cut);
+                        }
+                        if removed > 0 {
+                            answer.truncate(answer.len().saturating_sub(removed));
+                            let mut event = ChatEvent::progress(&run.id, &step_id, &assistant.id, "Stopping repeated output…", None);
+                            event.notice = Some("The model began repeating its earlier output verbatim; the repeated text was removed.".into());
+                            let _ = channel.send(event);
+                            break 'stream;
+                        }
+                    }
                     if !ans_chunk.is_empty() || !thought_chunk.is_empty() {
                         seq += 1;
                         let elapsed_secs = round_start_time.elapsed().as_secs_f64();
@@ -1493,12 +1802,12 @@ pub async fn send_message(
                 )).map_err(|error| error.to_string())?;
                 continue;
             }
-            if !finalizing && calls.is_empty() && is_text_tool_call(&round_answer) {
-                match crate::tool_calls::parse_text_tool_calls(&round_answer) {
+            if !finalizing && calls.is_empty() {
+                match decide_text_tool_call(&round_answer, repairs_used) {
                     // Some templates (AREX-family) emit literal tool-call text;
                     // execute it through the normal permissioned dispatch.
-                    Some(parsed) => {
-                        calls = crate::tool_calls::ToolCalls::from_parsed(parsed);
+                    TextCallDecision::Execute(parsed) => {
+                        calls = parsed;
                         let stripped = crate::tool_calls::strip_text_tool_calls(&round_answer);
                         if answer.ends_with(&round_answer) {
                             answer.truncate(answer.len() - round_answer.len());
@@ -1506,16 +1815,18 @@ pub async fn send_message(
                         }
                         round_answer = stripped;
                     }
-                    None => {
-                        if matches!(&plan.backend, Backend::Local { .. }) {
-                            state.database()?.record_local_tool_calling_support(
-                                &plan.preferences.runtime_path,
-                                &plan.preferences.model_path,
-                                false,
-                            )?;
-                        }
-                        return Err("The model emitted a text-form tool call that this runtime cannot execute. Tool use is unavailable for this model response; retry without tools or use a runtime with structured tool-call support.".into());
+                    TextCallDecision::Repair { error } => {
+                        repairs_used += 1;
+                        answer.truncate(answer_len_before_round);
+                        messages.push(json!({"role":"user","content":format!("The previous tool call was malformed and was not executed. Validation error: {error}. Reply with one valid tool call or a final answer.")}));
+                        let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
+                        state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id))?;
+                        continue;
                     }
+                    TextCallDecision::Fail { error } => {
+                        return Err(format!("Tool call repair failed: {error}. Later turns can still call tools."));
+                    }
+                    TextCallDecision::NotACall => {}
                 }
             }
             // A thinking-only token limit may recover with a tool-free answer pass.
@@ -1557,14 +1868,24 @@ pub async fn send_message(
                     }
                 }
             }
+            let mut stalled_uncited = false;
             if needs_final_answer(finalizing, !calls.is_empty(), &round_answer) {
                 // On a finalizing round a suppressed call attempt still counts
                 // as no visible answer; retry once, then use the grounded result.
                 let final_answer = if calls.is_empty() && !suppressed_call { &round_answer } else { "" };
                 match finalization_action(final_answer, research_fallback.as_deref(), finalization_retried, research_progress.stopped()) {
-                    FinalizationAction::Complete => {}
+                    FinalizationAction::Complete => {
+                        // A retried stalled answer is accepted without URL
+                        // citations; the collected sources are attached
+                        // deterministically before the turn completes.
+                        stalled_uncited = research_progress.stopped() && !answer_cites_evidence(final_answer);
+                    }
                     FinalizationAction::Retry => {
                         finalization_retried = true;
+                        // The superseded draft stays in the transcript for
+                        // context but leaves the visible answer, so a
+                        // regenerated attempt does not stack a second copy.
+                        answer.truncate(answer_len_before_round);
                         // Never replay private reasoning or incomplete tool calls.
                         // The existing transcript already contains the tool evidence.
                         if !round_answer.trim().is_empty() && !is_text_tool_call(&round_answer) {
@@ -1674,6 +1995,23 @@ pub async fn send_message(
                 if round_answer.trim().is_empty() {
                     return Err(EMPTY_FINAL_ANSWER_ERROR.into());
                 }
+                if stalled_uncited {
+                    if let Some(footer) = sources_footer(&research_evidence) {
+                        answer.push_str(&footer);
+                        seq += 1;
+                        channel.send(ChatEvent::new(
+                            &run,
+                            Some(&step_id),
+                            seq,
+                            "Attaching collected sources",
+                            &assistant.id,
+                            &footer,
+                            "",
+                            None,
+                            None,
+                        )).map_err(|error| error.to_string())?;
+                    }
+                }
                 // Plain-text completions skip `finish`, so the claim audit
                 // would never run — apply it here when the turn did research.
                 if plan.local_arex() && !research_evidence.is_empty() {
@@ -1749,7 +2087,24 @@ pub async fn send_message(
                     messages.push(json!({"role":"tool","tool_call_id":call.id,"content":missing.to_string()}));
                     continue;
                 };
-                if *cancellation.borrow() { return Ok(false); }
+                if *cancellation.borrow() && cancel_applies(&state, run_generation) { return Ok(false); }
+                if state.run_control.lock().map(|control| crate::agent_run::pause_blocks_new_tool(control.pause)).unwrap_or(false) {
+                    let notice = crate::agent_run::pause_notice(false);
+                    if let Some(task) = ledger.as_mut() {
+                        let _ = task.pause_before_new_tool(&call.id, &call.name);
+                        save_ledger(&state, task);
+                    }
+                    let paused = json!({"isError":true,"paused":true,"retryable":false,"message":notice});
+                    messages.push(json!({"role":"tool","tool_call_id":call.id,"content":paused.to_string()}));
+                    paused_exit = true;
+                    break;
+                }
+                let signature = crate::continuation::call_signature(&call.name, &call.arguments);
+                if blocked_calls.contains(&signature) {
+                    let skipped = json!({"isError":true,"retryable":false,"message":"Not repeated: the previous attempt had an uncertain outcome."});
+                    messages.push(json!({"role":"tool","tool_call_id":call.id,"content":skipped.to_string()}));
+                    continue;
+                }
                 let automatic_reason = plan.access_mode.automatic_reason(tool.trusted_read());
                 let blocked_by_denial = tool_use_denied;
                 let allow = if blocked_by_denial { false } else if automatic_reason.is_some() { true } else {
@@ -1886,6 +2241,16 @@ pub async fn send_message(
                                 }),
                             });
                         });
+                        let catalog_name = matches!(call.name.as_str(), "run_code" | "file_write" | "file_read");
+                        if allow && catalog_name {
+                            if let Some(task) = ledger.as_mut() {
+                                if let Ok(store) = state.database() {
+                                    begin_catalog_op(&store, task, &call.id, &call.name);
+                                }
+                            }
+                        }
+                        let catalog_db = state.db_path.clone();
+                        let catalog_task = ledger.as_ref().map(|task| task.id.clone()).unwrap_or_default();
                         let outcome = tokio::select! {
                             _ = cancellation.changed() => None,
                             result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
@@ -1917,12 +2282,27 @@ pub async fn send_message(
                                         inherit_tools: &plan.tools,
                                         emit,
                                     };
-                                    match crate::harness::execute(&ctx, &call.name, call.arguments.clone()).await {
-                                        Ok(outcome) => {
-                                            pending_events.extend(outcome.events);
-                                            Ok(outcome.value)
+                                    let catalog = matches!(call.name.as_str(), "run_code" | "file_write" | "file_read");
+                                    if catalog {
+                                        let config = state.database()?.execution_config()?;
+                                        let path = snapshot.workspace_path.clone();
+                                        let value = run_catalog_and_record(&catalog_db, &catalog_task, &path, config, &call.id, &call.name, call.arguments.clone()).await?;
+                                        if let Some(task) = ledger.as_mut() {
+                                            if let Ok(store) = state.database() {
+                                                if let Ok(Some(fresh)) = store.research_task(&task.id) {
+                                                    *task = fresh;
+                                                }
+                                            }
                                         }
-                                        Err(error) => Err(error),
+                                        Ok(value)
+                                    } else {
+                                        match crate::harness::execute(&ctx, &call.name, call.arguments.clone()).await {
+                                            Ok(outcome) => {
+                                                pending_events.extend(outcome.events);
+                                                Ok(outcome.value)
+                                            }
+                                            Err(error) => Err(error),
+                                        }
                                     }
                                 } else {
                                     tool.call_with_stream(call.arguments.clone(), Some(tool_chunk_cb)).await
@@ -1991,13 +2371,41 @@ pub async fn send_message(
                     crate::arex::collect_evidence(&result, &mut research_evidence);
                 }
                 let control = if tool.connector == "Harness" && matches!(call.name.as_str(), "update_context" | "finish") { Some(result.clone()) } else { None };
-                if let Some(fallback) = arm_research_finalization(plan_mode, &call.name, &result) {
-                    research_fallback = Some(fallback);
-                    finalization_retried = false;
+                budgets.note_tool(&call.name);
+                let deliverable_missing = matches!(call.name.as_str(), "file_write" | "create_file" | "run_code")
+                    && result["isError"] == Value::Bool(true);
+                let mut follow_up: Option<String> = None;
+                match crate::continuation::continuation_after_tool(plan_mode, &call.name, &result, &budgets, corrections_used, deliverable_missing) {
+                    crate::continuation::Continuation::Proceed { evidence } => {
+                        if evidence_note.is_none() {
+                            evidence_note = evidence;
+                        }
+                    }
+                    crate::continuation::Continuation::CorrectOnce { reason } => {
+                        corrections_used = corrections_used.saturating_add(1);
+                        follow_up = Some(format!("{reason} Fix it once with the tools still available, then stop. Do not start an open-ended review."));
+                    }
+                    crate::continuation::Continuation::Partial { unresolved } => {
+                        let named = unresolved.join("; ");
+                        research_fallback = Some(format!("Partial result. Unresolved: {named}"));
+                        finalization_retried = false;
+                        follow_up = Some(format!("Budget or checklist limit reached. Answer from the results already collected and name this unresolved work: {named}. Do not call tools."));
+                    }
+                    crate::continuation::Continuation::Stop { message, retryable } => {
+                        if !retryable {
+                            blocked_calls.insert(crate::continuation::call_signature(&call.name, &call.arguments));
+                        }
+                        if result["denied"] == Value::Bool(true) {
+                            tool_use_denied = true;
+                        }
+                        let _ = message;
+                    }
                 }
+
 
                 // Excerpt size follows the tokens still free after the counted
                 // input and response reserve; full results stay in artifacts.
+                let catalog_recorded = matches!(call.name.as_str(), "run_code" | "file_write" | "file_read") && allow;
                 let excerpt_chars = crate::artifacts::excerpt_budget(
                     plan.context_length,
                     input_tokens,
@@ -2015,6 +2423,16 @@ pub async fn send_message(
                 }
                 state.database()?.update_message(&row.id,&json!({"request":audit,"result":bounded_val}).to_string(),"","complete")?;
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":bounded_val.to_string()}));
+                if !catalog_recorded {
+                    if let Some(task) = ledger.as_mut() {
+                        if let Ok(store) = state.database() {
+                            persist_completed_tool(&store, task, &call.name, Some(call.id.clone()));
+                        }
+                    }
+                }
+                if let Some(follow_up) = follow_up {
+                    messages.push(json!({"role":"user","content":follow_up}));
+                }
                 if let Some(control) = control {
                     explicit_finish = crate::arex::apply_control(&call.name, &control, &*state.database()?, &conversation_id, &run.id, &mut messages)?;
                     if explicit_finish.is_some() {
@@ -2045,9 +2463,13 @@ pub async fn send_message(
                 present_research_answer(&state, &channel, &run, &step_id, &conversation_id, &assistant.id, &mut seq, &mut answer, &final_answer, finish_args.as_ref(), &research_evidence).await?;
                 return Ok(true);
             }
+            if paused_exit {
+                return Ok(false);
+            }
             if !tool_use_denied && research_progress.stopped() {
-                research_fallback = Some(RESEARCH_STALLED_FALLBACK.into());
-                messages.push(json!({"role":"user","content":RESEARCH_STALLED}));
+                let unresolved = "Unresolved: the research budget is exhausted before every source was read.";
+                research_fallback = Some(format!("{RESEARCH_STALLED_FALLBACK}\n\n{unresolved}"));
+                messages.push(json!({"role":"user","content":format!("{RESEARCH_STALLED}\n\n{unresolved}")}));
                 let mut event = ChatEvent::progress(&run.id, &step_id, &assistant.id, "Research stopped · preparing answer…", None);
                 event.notice = Some("Research is no longer making progress or has reached its budget. Preparing an answer from the collected results.".into());
                 channel.send(event).map_err(|e| e.to_string())?;
@@ -2071,10 +2493,15 @@ pub async fn send_message(
         }
         Err("Tool round limit reached.".into())
     }.await;
-    let status = match &result {
-        Ok(true) => "complete",
-        Ok(false) => "interrupted",
-        Err(_) => "error",
+    let paused = state.run_control.lock().map(|control| control.pause).unwrap_or(false);
+    let status = if paused {
+        "paused"
+    } else {
+        match &result {
+            Ok(true) => "complete",
+            Ok(false) => "interrupted",
+            Err(_) => "error",
+        }
     };
     // A delivered answer means nothing is still in progress. Models routinely
     // finish without todo bookkeeping, so close out open items here — the
@@ -2113,16 +2540,24 @@ pub async fn send_message(
         status,
         result.as_ref().err().map(String::as_str),
     )?;
-    let final_run_state = match &result {
-        Ok(true) => crate::agent_run::RunState::Completed,
-        Ok(false) => crate::agent_run::RunState::Cancelled,
-        Err(_) => crate::agent_run::RunState::Failed,
+    let final_run_state = if paused {
+        None
+    } else {
+        Some(match &result {
+            Ok(true) => crate::agent_run::RunState::Completed,
+            Ok(false) => crate::agent_run::RunState::Cancelled,
+            Err(_) => crate::agent_run::RunState::Failed,
+        })
     };
-    let _ = run.transition_to(final_run_state);
+    if let Some(final_run_state) = final_run_state {
+        let _ = run.transition_to(final_run_state);
+    } else if run.status.can_transition_to(crate::agent_run::RunState::PreparingNextRound) {
+        let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
+    }
     let _ = state.database()?.update_run_status(
         &run.id,
         run.status,
-        result.as_ref().err().map(String::as_str),
+        if paused { Some(crate::agent_run::pause_notice(false)) } else { result.as_ref().err().map(String::as_str) },
         None,
     );
     if let Ok(store) = state.database() {
@@ -2297,14 +2732,6 @@ fn request_payload(
     arex: bool,
 ) -> Value {
     let mut payload = json!({"messages":messages,"temperature":preferences.temperature,"top_p":preferences.top_p,"max_tokens":preferences.max_tokens,"stream":true,"cache_prompt":true});
-    // ZAYA's hybrid reasoning loop can otherwise consume the entire response
-    // reserve without emitting an answer. Its runtime supports this field and
-    // treats it as a separate thinking budget; other local models are unchanged.
-    // (For AREX a forced budget close spills the thinking into visible content
-    // instead — verified on llama.cpp b10855 — so it gets enable_thinking only.)
-    if preferences.model_path.ends_with(crate::model_catalog::ZAYA1_FILENAME) {
-        payload["reasoning_budget_tokens"] = json!(if finalizing { 0 } else { 2048.min(preferences.max_tokens / 2) });
-    }
     // Keep the tools array identical on every round — including finalizing and
     // planning rounds. Strict templates (AREX) render <tools> at the very top of
     // the prompt, so omitting it shifts the token stream at position ~3 and
@@ -2317,6 +2744,13 @@ fn request_payload(
     // executed like any finish call; stray markup is stripped by the loop.
     if denied || planning || (finalizing && !arex) {
         payload["tool_choice"] = json!("none");
+    }
+    // Small local models fall into verbatim re-emission loops on prose
+    // rounds. llama.cpp honors repeat_penalty; remote backends strip it in
+    // Backend::payload the same way cache_prompt is stripped. Tool-calling
+    // rounds keep clean sampling so structured arguments are never penalized.
+    if denied || planning || finalizing {
+        payload["repeat_penalty"] = json!(1.1);
     }
     // On a finalizing round thinking only competes with the answer for the
     // response reserve — disable it for the templates that honor the kwarg.
@@ -2361,13 +2795,12 @@ mod finish_tests {
         assert!(!reasoning.is_empty());
         assert!(super::needs_final_answer(false, false, &answer));
         assert_eq!(super::finalization_action(&answer, None, false, false), super::FinalizationAction::Retry);
-        let prefs = crate::store::Preferences { model_path: crate::model_catalog::ZAYA1_FILENAME.into(), ..Default::default() };
+        let prefs = crate::store::Preferences::default();
         let payload = super::request_payload(&[], &[serde_json::json!({"type":"function"})], &prefs, false, true, false, None, false);
         // Tools stay rendered on finalizing rounds so the prompt prefix (and
         // llama.cpp cache) is identical to tool-call rounds.
         assert!(payload.get("tools").is_some());
         assert_eq!(payload["tool_choice"], "none");
-        assert_eq!(payload["reasoning_budget_tokens"], 0);
         assert_eq!(super::finalization_action("", None, true, false), super::FinalizationAction::Error);
         assert_eq!(super::finalization_action("The result is 42.", None, true, false), super::FinalizationAction::Complete);
         assert!(super::check_finish_reason("length").is_err(), "incomplete tool calls must still fail");
@@ -2420,20 +2853,17 @@ mod finish_tests {
     }
 
     #[test]
-    fn research_progress_stops_searches_recycling_seen_domains() {
-        // Different snippets on already-seen domains are not progress for a
-        // discovery call — this is the junk-but-novel failure mode.
+    fn research_progress_counts_new_passages_without_a_new_domain() {
         let mut progress = super::ResearchProgress::default();
         for i in 0..4 {
-            let result = serde_json::json!({"results":[{"url":format!("https://arxiv.org/abs/{i}"),"text":format!("novel snippet {i}")},{"url":format!("https://github.com/x/{i}"),"text":format!("other {i}")}]});
+            let result = serde_json::json!({"results":[{"url":format!("https://arxiv.org/abs/{i}"),"text":format!("novel snippet {i}")}]});
             progress.observe("search", &result);
-            assert_eq!(progress.stopped(), i == 3);
+            assert!(!progress.stopped(), "a new passage is progress without a new domain");
         }
-        // A search that surfaces a new domain still counts as progress.
-        let mut fresh = super::ResearchProgress::default();
-        fresh.observe("search", &serde_json::json!({"results":[{"url":"https://a.example.com/1","text":"x"}]}));
-        fresh.observe("search", &serde_json::json!({"results":[{"url":"https://b.example.com/2","text":"y"}]}));
-        assert!(!fresh.stopped());
+        for _ in 0..3 {
+            progress.observe("search", &serde_json::json!({"results":[{"url":"https://arxiv.org/abs/1","text":"novel snippet 1"}]}));
+        }
+        assert!(progress.stopped());
     }
 
     #[test]
@@ -2450,14 +2880,9 @@ mod finish_tests {
     }
 
     #[test]
-    fn zaya_payload_caps_reasoning_without_changing_other_models() {
+    fn request_payload_keeps_id_slot_and_cache_prompt() {
         let messages = vec![serde_json::json!({"role":"user","content":"Hello"})];
-        let zaya = crate::store::Preferences { model_path: "ZAYA1-8B-Q4_K_M.gguf".into(), max_tokens: 8192, ..Default::default() };
         let regular = crate::store::Preferences::default();
-        assert_eq!(super::request_payload(&messages, &[], &zaya, false, false, false, None, false)["reasoning_budget_tokens"], 2048);
-        let small_budget = crate::store::Preferences { max_tokens: 512, ..zaya.clone() };
-        assert_eq!(super::request_payload(&messages, &[], &small_budget, false, false, false, None, false)["reasoning_budget_tokens"], 256);
-        assert!(super::request_payload(&messages, &[], &regular, false, false, false, None, false).get("reasoning_budget_tokens").is_none());
         let slotted = super::request_payload(&messages, &[], &regular, false, false, false, Some(0), false);
         assert_eq!(slotted["id_slot"], 0);
         assert_eq!(slotted["cache_prompt"], true);
@@ -2511,9 +2936,11 @@ mod finish_tests {
             super::finalization_action(narration, Some("best collected answer"), false, true),
             super::FinalizationAction::Retry,
         );
+        // The retry attempt is accepted even without citations — rejecting it
+        // again would only regenerate the same text or force the fallback.
         assert_eq!(
             super::finalization_action(narration, Some("best collected answer"), true, true),
-            super::FinalizationAction::Fallback("Research result:\n\nbest collected answer".into()),
+            super::FinalizationAction::Complete,
         );
         // A stalled answer that does cite a source still completes.
         assert_eq!(
@@ -2525,6 +2952,65 @@ mod finish_tests {
             super::finalization_action(narration, Some("fallback"), true, false),
             super::FinalizationAction::Complete,
         );
+    }
+
+    #[test]
+    fn repetition_cut_finds_only_verbatim_reemission() {
+        let mut block = String::from("## Findings\n\n");
+        for i in 0..8 {
+            block.push_str(&format!("A substantive sentence of results with distinct wording number {i} for this case. "));
+        }
+        block.push('\n');
+        let mut text = String::from("Intro. ");
+        text.push_str(&block);
+        text.push_str("Let me restate. ");
+        text.push_str(&block);
+        // The cut drops the second emission and keeps the first copy intact.
+        let cut = super::repetition_cut(&text).expect("verbatim re-emission");
+        let kept = &text[..cut];
+        assert_eq!(kept.matches("## Findings").count(), 1, "{kept}");
+        assert!(kept.contains("restate"), "{kept}");
+        // Whitespace differences still count as the same emission.
+        let mut noisy = String::from(&block[..]);
+        noisy.push_str(&block.replace("\n\n", "\n"));
+        assert!(super::repetition_cut(&noisy).is_some());
+        // Short text, small echoes, and non-repeating answers are left alone.
+        assert!(super::repetition_cut("short").is_none());
+        assert!(super::repetition_cut("echo echo echo echo echo echo").is_none());
+        // A homogeneous tail is not a repetition of a different earlier block.
+        let unique = format!("{}{}", "a".repeat(600), "b".repeat(600));
+        assert!(super::repetition_cut(&unique).is_none());
+        // A single copy of the block on its own does not self-trigger.
+        assert!(super::repetition_cut(&block).is_none());
+    }
+
+    #[test]
+    fn sources_footer_dedupes_and_caps_evidence_urls() {
+        let evidence = vec![
+            ("https://a.example/1".to_string(), "text a".to_string()),
+            ("".to_string(), "no url".to_string()),
+            ("https://a.example/1".to_string(), "dup".to_string()),
+            ("https://b.example/2".to_string(), "text b".to_string()),
+        ];
+        let footer = super::sources_footer(&evidence).unwrap();
+        assert!(footer.contains("https://a.example/1") && footer.contains("https://b.example/2"));
+        assert_eq!(footer.matches("https://a.example/1").count(), 1);
+        assert!(super::sources_footer(&[]).is_none());
+        assert!(super::sources_footer(&[("".into(), "x".repeat(60))]).is_none());
+    }
+
+    #[test]
+    fn prose_rounds_carry_repeat_penalty_for_local_runtime() {
+        let messages = vec![serde_json::json!({"role":"user","content":"Hello"})];
+        let preferences = crate::store::Preferences::default();
+        let tools = vec![serde_json::json!({"type":"function","function":{"name":"finish"}})];
+        let finalizing = super::request_payload(&messages, &tools, &preferences, false, true, false, None, true);
+        assert_eq!(finalizing["repeat_penalty"], 1.1);
+        let planning = super::request_payload(&messages, &tools, &preferences, false, false, true, None, false);
+        assert_eq!(planning["repeat_penalty"], 1.1);
+        // Tool-calling rounds keep clean sampling.
+        let normal = super::request_payload(&messages, &tools, &preferences, false, false, false, None, true);
+        assert!(normal.get("repeat_penalty").is_none());
     }
 
     #[test]
@@ -2739,10 +3225,14 @@ mod finish_tests {
             "sources": {"S1": {"url": "https://example.com"}},
         });
         assert!(super::arm_research_finalization(true, "web_search", &result).is_none());
-        assert_eq!(
-            super::arm_research_finalization(false, "web_search", &result).as_deref(),
-            Some("Partial hit. [S1](https://example.com)"),
-        );
+        assert!(super::arm_research_finalization(false, "web_search", &result).is_none());
+        assert!(!crate::continuation::search_disables_tools(true, false));
+        assert!(!crate::continuation::search_disables_tools(true, true));
+        let budgets = crate::continuation::Budgets::default();
+        assert!(matches!(
+            crate::continuation::continuation_after_tool(false, "web_search", &result, &budgets, 0, false),
+            crate::continuation::Continuation::Proceed { .. }
+        ));
     }
 
     #[test]

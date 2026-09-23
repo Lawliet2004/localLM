@@ -53,27 +53,6 @@ export interface ProviderConnection {
   id: string; name: string; apiFormat: 'openai-chat-completions' | 'chatgpt-subscription' | 'grok-subscription' | 'freetoken-openai'; baseUrl: string;
   verified: boolean; lastTestedAt: number | null; models: RemoteModel[]; hasApiKey: boolean;
 }
-export interface ProviderDraft {
-  id?: string; name: string; apiFormat: 'openai-chat-completions' | 'chatgpt-subscription' | 'grok-subscription' | 'freetoken-openai'; baseUrl: string;
-  apiKey?: string; models: RemoteModel[];
-}
-export interface SubscriptionStatus {
-  provider: string;
-  connected: boolean;
-  accountEmail?: string | null;
-  accountId?: string | null;
-  planType?: string | null;
-  expiresAt?: number | null;
-  isExpired: boolean;
-}
-export interface CliDetectionResult {
-  provider: string;
-  found: boolean;
-  cliPath?: string | null;
-  accountEmail?: string | null;
-  expiresAt?: number | null;
-}
-export interface ProviderTestResult { verified: boolean; modelListSupported: boolean; models: string[]; message: string }
 export interface ModelSelection { providerId: string | null; modelId: string }
 export interface Bootstrap {
   conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus;

@@ -489,7 +489,7 @@ Dependency posture at release time: `npm audit --omit=dev` zero vulnerabilities 
 
 ### Context preflight, compaction, tool-result budgeting, and presets
 
-Implemented Step 1 of `docs/ZAYA1-FREETOKEN-PLAN.md`:
+Implemented the context/tool-cost step of the (since removed) ZAYA1 evaluation plan:
 - Debounced preflight token counter (400ms) evaluating rendered turn payload with breakdown across instructions, tool schemas, replayed history, and draft tokens, distinguishing exact tokenizer counts from provider estimates.
 - Explicit Chat, Research, and Coding tool profiles in `src-tauri/src/presets.rs`, preventing automatic injection of unnecessary harness tools for conversational workflows.
 - Non-destructive SQLite-backed compaction in `src-tauri/src/compaction.rs`: bounded checkpoints keeping recent complete turns, preserving full history in queryable artifacts with stable artifact IDs, enforcing turn boundaries on user messages to preserve tool-call/result pairs, and auto-compaction retry on context overflow.

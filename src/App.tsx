@@ -78,8 +78,6 @@ export default function App() {
 
   const [projectId, setProjectId] = useState<string | null>(null);
 
-  const [commandBusy, setCommandBusy] = useState(false);
-
   const [navigation, setNavigation] = useState<{ ids: string[]; cursor: number }>({ ids: [], cursor: -1 });
 
   const [hitId, setHitId] = useState<string | null>(null);
@@ -173,6 +171,7 @@ export default function App() {
   }, [messages, loading, hitId]);
 
   const [generating, setGenerating] = useState(false);
+  const [runPaused, setRunPaused] = useState(false);
 
   const [liveActivity, setLiveActivity] = useState<{ state?: string; activity?: string } | null>(null);
 
@@ -208,7 +207,7 @@ export default function App() {
 
   const active = data.conversations.find(item => item.id === activeId);
 
-  const busy = generating || modelBusy || loading || savingTools || exporting || commandBusy;
+  const busy = generating || modelBusy || loading || savingTools || exporting;
 
   const modelSelection: ModelSelection = active ? { providerId: active.providerId, modelId: active.modelId ?? '' } : data.preferredModel;
 
@@ -384,22 +383,6 @@ export default function App() {
 
   }
 
-  async function refreshProviders() {
-
-    try {
-
-      const providers = await api.listProviders();
-
-      setData(current => ({ ...current, providers }));
-
-    } catch (e) {
-
-      setError(errorMessage(e));
-
-    }
-
-  }
-
   useEffect(() => {
 
     const closeMenus = (event: MouseEvent | KeyboardEvent) => {
@@ -566,7 +549,7 @@ export default function App() {
 
       if (!id) {
 
-        const conversation = await api.createConversation(); id = conversation.id;
+        const conversation = await api.createConversation(folderId); id = conversation.id;
 
         setProjectId(folderId);
 
@@ -812,7 +795,7 @@ export default function App() {
 
     finally {
 
-      try { if (id) setMessages(await api.messages(id)); setData(normalizeBootstrap(await api.bootstrap())); }
+      try { if (id) setMessages(await api.messages(id)); setData(normalizeBootstrap(await api.bootstrap())); setWorkspaceIndex(await api.workspaceIndex()); }
 
       catch (e) {
 
@@ -850,11 +833,11 @@ export default function App() {
 
       setData(current => ({ ...current, runtime }));
 
-      // Loading may apply a model-specific runtime profile (for example, the
+      // Loading may apply a saved per-model profile. Refresh the persisted
 
-      // Prism server required by Bonsai). Refresh the persisted preferences so
+      // preferences so the settings page shows the executable actually used
 
-      // the settings page shows the executable actually used by the server.
+      // by the server.
 
       if (load) {
 
@@ -1005,7 +988,7 @@ export default function App() {
 
     {approval && <ApprovalDialog key={approval.id} request={approval} onResolve={allow => api.resolveToolApproval(approval.id, allow)} onResolveAskUser={(choice) => api.resolveAskUser(approval.id, choice)} />}
 
-    <main className="workspace"><header className={`workspace-header ${page === 'chat' && !messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead">{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{page === 'chat' ? <><button className="icon-button" aria-label="Back" disabled={busy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={busy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</> : <><Settings className="task-folder-icon" size={18} /><span className="workspace-title">{page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : page === 'tools' ? 'Tools' : 'Skills'}</span></>}</div><div className="header-actions">{page === 'chat' && allProjects(workspaceIndex).length > 0 && <select aria-label="Task project" value={projectId ?? allProjects(workspaceIndex)[0]?.id} disabled={busy} onChange={e => void selectProject(e.target.value)}>{allProjects(workspaceIndex).map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}{page === 'chat' && <div className="workspace-layout-controls"><button className="icon-button workspace-layout-btn" aria-label="Toggle split view" title="Toggle split view" onClick={() => setCollapsed(!collapsed)}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="8" y1="2" x2="8" y2="14" /></svg></button><button className="icon-button workspace-layout-btn" aria-label="Toggle panel" title="Toggle panel" onClick={() => { const toggleBtn = document.querySelector<HTMLButtonElement>('[aria-label="Toggle files panel"]'); toggleBtn?.click(); }}><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="12" height="12" rx="2" /><line x1="11" y1="2" x2="11" y2="14" /></svg></button></div>}{page === 'chat' && <WorkspacePanel busy={busy} onBusy={setCommandBusy} conversationId={activeId} revision={`${projectId}:${activeId}`} />}<button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header><DownloadActivity />
+    <main className="workspace"><header className={`workspace-header ${page === 'chat' && !messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead">{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{page === 'chat' ? <><button className="icon-button" aria-label="Back" disabled={busy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={busy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</> : <><Settings className="task-folder-icon" size={18} /><span className="workspace-title">{page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : page === 'tools' ? 'Tools' : 'Skills'}</span></>}</div><div className="header-actions">{page === 'chat' && allProjects(workspaceIndex).length > 0 && <select aria-label="Task project" value={projectId ?? allProjects(workspaceIndex)[0]?.id} disabled={busy} onChange={e => void selectProject(e.target.value)}>{allProjects(workspaceIndex).map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}{page === 'chat' && <WorkspacePanel busy={busy} revision={`${projectId}:${activeId}`} />}<button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header><DownloadActivity />
 
       {page !== 'chat' && (
         <nav className="settings-nav-bar" aria-label="Settings navigation">
@@ -1014,7 +997,7 @@ export default function App() {
               className={`settings-nav-tab ${page === 'models' ? 'active' : ''}`}
               aria-label="Settings: Models & runtime"
               onClick={() => navigate('models')}
-              title="Models & runtime (Local GGUF, llama.cpp, API keys, Proxies, Subscriptions)"
+              title="Models & runtime (Local GGUF, llama.cpp)"
             >
               <Cpu size={14} />
               <span>Models &amp; runtime</span>
@@ -1114,7 +1097,17 @@ export default function App() {
 
         onSend={send}
 
-        onCancel={() => { void api.cancelGeneration().catch(e => setChatError(errorMessage(e))); }}
+        onCancel={() => { setRunPaused(false); void api.cancelGeneration().catch(e => setChatError(errorMessage(e))); }}
+        onPause={() => { setRunPaused(true); void api.pauseGeneration().catch(e => setChatError(errorMessage(e))); }}
+        paused={runPaused}
+        onResume={() => {
+          if (!activeId) return;
+          void api.resumeGeneration(activeId).then(checkpoint => {
+            setRunPaused(false);
+            const pending = (checkpoint.pending ?? []).join(', ');
+            return send(`Continue from the paused checkpoint. Do not repeat completed work. Pending: ${pending}.`);
+          }).catch(e => setChatError(errorMessage(e)));
+        }}
 
         onConfigure={() => navigate('models')}
 
@@ -1158,7 +1151,7 @@ export default function App() {
 
         }}
 
-      /></> : page === 'tools' ? <ToolsSettings accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} preset={preset} onPresetChange={changePreset} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} scopeLabel={active?.title} onBack={() => navigate('chat')} busy={busy} loading={loading} saving={savingTools} onNavigate={target => navigate(target)} /> : page === 'models' ? <Models onRefresh={async () => { setData(normalizeBootstrap(await api.bootstrap())); }} requestedModel={requestedModel} onRequestedModelHandled={() => setRequestedModel(undefined)} config={data.config} preferences={data.preferences} runtime={data.runtime} providers={data.providers} selection={modelSelection} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveSelection={saveModelSelection} onProvidersChanged={refreshProviders} onSaveConfig={async config => { try { await api.saveConfig(config); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
+      /></> : page === 'tools' ? <ToolsSettings accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} preset={preset} onPresetChange={changePreset} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} scopeLabel={active?.title} onBack={() => navigate('chat')} busy={busy} loading={loading} saving={savingTools} onNavigate={target => navigate(target)} /> : page === 'models' ? <Models onRefresh={async () => { setData(normalizeBootstrap(await api.bootstrap())); }} requestedModel={requestedModel} onRequestedModelHandled={() => setRequestedModel(undefined)} config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveSelection={saveModelSelection} onSaveConfig={async config => { try { await api.saveConfig(config); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
 
     </main>
 

@@ -122,6 +122,14 @@ pub fn registry() -> Vec<(String, String, Value)> {
             schema(json!({"url": str_prop("absolute http(s) URL")}), &["url"])),
         ("file_search".into(), "Fixed-string search inside the workspace (2000 files, 50 hits max).".into(),
             schema(json!({"query": str_prop("1-200 characters")}), &["query"])),
+        ("web_read".into(), "Fetch a public http(s) URL or open another passage of a stored document. Returns evidence, not a finished answer.".into(),
+            schema(json!({"url": str_prop("absolute http(s) URL"), "sessionId": str_prop("research session id"), "documentId": str_prop("document id")}), &[])),
+        ("file_read".into(), "Read bounded UTF-8 text from a workspace file.".into(),
+            schema(json!({"path": str_prop("relative workspace path")}), &["path"])),
+        ("file_write".into(), "Create a new UTF-8 workspace file. Existing files are not overwritten.".into(),
+            schema(json!({"path": str_prop("relative workspace path"), "content": str_prop("file contents")}), &["path", "content"])),
+        ("run_code".into(), "Run approved local code in the workspace. Unsandboxed: same files and network as this user.".into(),
+            schema(json!({"code": str_prop("source to run"), "language": {"type": "string", "enum": ["python", "javascript", "powershell"]}}), &["code"])),
         ("memory_teach".into(), "Teach one fact to the workspace memory bank (recalled verbatim next session).".into(),
             schema(json!({"fact": str_prop("1-2000 characters"), "scope": {"type": "string"}}), &["fact"])),
         ("memory_recall".into(), "Recall workspace facts now.".into(),
@@ -169,7 +177,7 @@ pub fn definition(alias: &str) -> Option<crate::connectors::ToolView> {
 /// Trusted reads: auto-approved under Auto-approve reads like workspace reads.
 /// Shell execution is never a trusted read: terminal_send always asks.
 pub fn is_trusted_read(alias: &str) -> bool {
-    matches!(alias, "list_agents" | "list_subagent_models" | "memory_recall" | "file_search"
+    matches!(alias, "list_agents" | "list_subagent_models" | "memory_recall" | "file_search" | "file_read"
         | "preset_guide" | "artifact_read" | "update_context" | "finish")
 }
 
@@ -183,6 +191,55 @@ fn arg_str(args: &Value, key: &str, min: usize, max: usize, label: &str) -> Resu
 
 fn error_result(message: String) -> Value {
     json!({"isError": true, "message": message})
+}
+
+async fn read_public_url(ctx: &HarnessCtx<'_>, url: &str) -> Result<HarnessOutcome, String> {
+    let result = crate::web_search::run_worker(ctx.state, None, json!({"action":"fetch-url","url":url,"config":{"fetch":{"waybackFallback":false,"jsRenderFallback":true}}})).await?;
+    Ok(HarnessOutcome::value(result))
+}
+
+async fn open_saved_passage(ctx: &HarnessCtx<'_>, alias: &str, args: &Value) -> Result<HarnessOutcome, String> {
+    let session_id = arg_str(args, "sessionId", 1, 100, alias)?;
+    let document_id = arg_str(args, "documentId", 1, 100, alias)?;
+    let saved = ctx.state.database()?.research_session(&session_id)?.ok_or("Research session not found")?;
+    if saved.conversation_id.as_deref() != Some(ctx.conversation_id.as_str()) { return Err("Research session belongs to another conversation.".into()); }
+    let term = if alias == "web_find" { arg_str(args, "term", 1, 200, alias)? } else { String::new() };
+    let page = args.get("page").and_then(Value::as_u64);
+    let section = args.get("section").and_then(Value::as_str);
+    let passage = args.get("passage").and_then(Value::as_u64).or_else(|| args.get("offset").and_then(Value::as_u64));
+    let result = crate::web_search::run_worker(ctx.state, None, json!({"action":if alias == "web_open" {"open"} else {"find"},
+        "sessionId":session_id,"documentId":document_id,"page":page,"section":section,"passage":passage,"term":term})).await?;
+    Ok(HarnessOutcome::value(result))
+}
+
+/// Workspace catalog tools shared by the chat loop and the live fixture.
+pub async fn execute_workspace_tool(
+    workspace_path: &str,
+    config: crate::execution::ExecutionConfig,
+    name: &str,
+    args: Value,
+) -> Result<Value, String> {
+    if workspace_path.is_empty() {
+        return Err(format!("Choose a workspace folder before {name}."));
+    }
+    match name {
+        "file_read" => {
+            let path = arg_str(&args, "path", 1, 4096, "file_read")?;
+            let workspace = crate::workspace::Workspace::open(workspace_path)?;
+            workspace.call("read_file", json!({"path": path}))
+        }
+        "file_write" => {
+            let path = arg_str(&args, "path", 1, 4096, "file_write")?;
+            let content = args.get("content").and_then(Value::as_str).ok_or("file_write needs 'content'.")?;
+            let workspace = crate::workspace::Workspace::open(workspace_path)?;
+            workspace.call("create_file", json!({"path": path, "content": content}))
+        }
+        "run_code" => {
+            let execution = crate::execution::LocalExecution::new(config, workspace_path)?;
+            execution.run(args).await
+        }
+        other => Err(format!("{other} is not a workspace catalog tool.")),
+    }
 }
 
 pub async fn execute(ctx: &HarnessCtx<'_>, alias: &str, args: Value) -> Result<HarnessOutcome, String> {
@@ -242,6 +299,10 @@ pub async fn execute(ctx: &HarnessCtx<'_>, alias: &str, args: Value) -> Result<H
     }
     match alias {
         "web_search" => {
+            let offline = ctx.state.database().and_then(|store| store.setting::<bool>("offline_mode")).unwrap_or(false);
+            if !crate::local_only::retrieval_allowed(offline) {
+                return Ok(HarnessOutcome::value(json!({"isError": true, "message": "Offline mode: external retrieval is disabled."})));
+            }
             let question = arg_str(&args, "question", 1, 8000, "web_search")?;
             let mode = args.get("mode").and_then(Value::as_str).unwrap_or("normal");
             let normalized: String = question.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
@@ -284,32 +345,20 @@ pub async fn execute(ctx: &HarnessCtx<'_>, alias: &str, args: Value) -> Result<H
                 compact["emptyReason"] = reason;
                 compact["hint"] = json!("No usable evidence — reformulate (simpler terms, split comparisons like 'X specs' / 'Y specs', different mode). Max 2-3 tries, then summarize limitations.");
             }
+            let compact = crate::continuation::as_research_evidence(compact);
             if let Ok(mut cache) = ctx.state.web_search_cache.lock() {
                 if cache.len() > 512 { cache.clear(); }
                 cache.insert(cache_key, compact.clone());
             }
             Ok(HarnessOutcome::value(compact).event("web_research_completed", json!({"sessionId":result["id"],"trace":result["trace"]})))
         }
-        "web_open" | "web_find" => {
-            let session_id = arg_str(&args, "sessionId", 1, 100, alias)?;
-            let document_id = arg_str(&args, "documentId", 1, 100, alias)?;
-            let saved = ctx.state.database()?.research_session(&session_id)?.ok_or("Research session not found")?;
-            if saved.conversation_id.as_deref() != Some(ctx.conversation_id.as_str()) { return Err("Research session belongs to another conversation.".into()); }
-            let term = if alias == "web_find" { arg_str(&args, "term", 1, 200, alias)? } else { String::new() };
-            let page = args.get("page").and_then(Value::as_u64);
-            let section = args.get("section").and_then(Value::as_str);
-            let passage = args.get("passage").and_then(Value::as_u64).or_else(|| args.get("offset").and_then(Value::as_u64));
-            let result = crate::web_search::run_worker(ctx.state, None, json!({"action":if alias == "web_open" {"open"} else {"find"},
-                "sessionId":session_id,"documentId":document_id,"page":page,"section":section,"passage":passage,"term":term})).await?;
-            Ok(HarnessOutcome::value(result))
-        }
+        "web_open" | "web_find" => open_saved_passage(ctx, alias, &args).await,
         "web_fetch_url" => {
             let url = arg_str(&args, "url", 1, 2048, "web_fetch_url")?;
             // Rendered DOM is still the live page — use it to get past
             // challenge interstitials and JS-only pages; keep wayback off so
             // an explicit fetch never silently returns a stale archive.
-            let result = crate::web_search::run_worker(ctx.state, None, json!({"action":"fetch-url","url":url,"config":{"fetch":{"waybackFallback":false,"jsRenderFallback":true}}})).await?;
-            Ok(HarnessOutcome::value(result))
+            read_public_url(ctx, &url).await
         }
         "todo_write" => {
             let todos = crate::plans::parse_todo_write(&args)?;
@@ -487,6 +536,21 @@ pub async fn execute(ctx: &HarnessCtx<'_>, alias: &str, args: Value) -> Result<H
             }
             let hits = crate::sandbox::file_search(std::path::Path::new(&ctx.snapshot.workspace_path), &query)?;
             Ok(HarnessOutcome::value(json!({"hits": hits})))
+        }
+        "web_read" => {
+            let offline = ctx.state.database().and_then(|store| store.setting::<bool>("offline_mode")).unwrap_or(false);
+            if !crate::local_only::retrieval_allowed(offline) {
+                return Ok(HarnessOutcome::value(json!({"isError": true, "message": "Offline mode: external retrieval is disabled."})));
+            }
+            if args.get("url").and_then(Value::as_str).is_some_and(|url| !url.is_empty()) {
+                let url = arg_str(&args, "url", 1, 2048, "web_read")?;
+                return read_public_url(ctx, &url).await;
+            }
+            open_saved_passage(ctx, "web_open", &args).await
+        }
+        "file_read" | "file_write" | "run_code" => {
+            let config = ctx.state.database()?.execution_config()?;
+            Ok(HarnessOutcome::value(execute_workspace_tool(&ctx.snapshot.workspace_path, config, alias, args).await?))
         }
         "memory_teach" => {
             let fact = arg_str(&args, "fact", 1, 2000, "memory_teach")?;

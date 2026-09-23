@@ -36,6 +36,121 @@ struct PathRequest {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SearchRequest {
+    query: String,
+    #[serde(default)]
+    include_generated: bool,
+}
+// ponytail: naive recursive DFS — no .gitignore, no glob engine, no
+// parallelism — bounded by the caps below. Upgrade to the `ignore` crate
+// if searches over huge trees get slow.
+const SEARCH_MAX_SCANNED: usize = 50_000;
+const SEARCH_MAX_RESULTS: usize = 200;
+const SEARCH_MAX_DEPTH: usize = 32;
+const GENERATED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    ".git",
+    "__pycache__",
+    ".next",
+    "build",
+    "coverage",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Truncation {
+    None,
+    Result,
+    Scan,
+    Depth,
+}
+
+impl Truncation {
+    fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Result => Some("result"),
+            Self::Scan => Some("scan"),
+            Self::Depth => Some("depth"),
+        }
+    }
+}
+
+fn is_generated_dir(name: &str) -> bool {
+    GENERATED_DIRS.iter().any(|dir| name.eq_ignore_ascii_case(dir))
+}
+
+struct SearchLimits {
+    scan: usize,
+    results: usize,
+    depth: usize,
+}
+
+/// Depth-first walk collecting files whose name or `/`-joined relative path
+/// contains `needle` (already lowercased). Links are never entered or
+/// returned. A bound stops the walk and names which limit was hit.
+fn search_in(
+    directory: &Dir,
+    prefix: &str,
+    needle: &str,
+    depth: usize,
+    scanned: &mut usize,
+    results: &mut Vec<String>,
+    include_generated: bool,
+    limits: &SearchLimits,
+) -> Result<Truncation, String> {
+    for entry in directory.entries().map_err(|error| error.to_string())? {
+        if results.len() >= limits.results {
+            return Ok(Truncation::Result);
+        }
+        if *scanned >= limits.scan {
+            return Ok(Truncation::Scan);
+        }
+        let entry = entry.map_err(|error| error.to_string())?;
+        *scanned += 1;
+        let kind = entry.file_type().map_err(|error| error.to_string())?;
+        if kind.is_symlink() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if kind.is_dir() {
+            if !include_generated && is_generated_dir(&name) {
+                continue;
+            }
+            if depth >= limits.depth {
+                return Ok(Truncation::Depth);
+            }
+            let child = directory
+                .open_dir(&file_name)
+                .map_err(|error| error.to_string())?;
+            let child_limit = search_in(
+                &child,
+                &path,
+                needle,
+                depth + 1,
+                scanned,
+                results,
+                include_generated,
+                limits,
+            )?;
+            if child_limit != Truncation::None {
+                return Ok(child_limit);
+            }
+        } else if path.to_lowercase().contains(needle) {
+            results.push(path);
+        }
+    }
+    Ok(Truncation::None)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EditRequest {
     path: String,
     expected_sha256: String,
@@ -314,6 +429,44 @@ impl Workspace {
                 }
                 Ok(json!({"path":request.path,"replacements":1,"bytesWritten":updated.len(),"sha256":format!("{:x}",Sha256::digest(updated.as_bytes())),"diff":unified_diff(&request.path,&text,&updated)}))
             }
+            "search_files" => {
+                let request: SearchRequest =
+                    serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+                let needle = request.query.trim();
+                if needle.is_empty() {
+                    return Ok(json!({"results":[],"truncated":false,"truncation":null}));
+                }
+                if needle.chars().count() > 200 || needle.chars().any(char::is_control) {
+                    return Err(
+                        "Use a search query of 1–200 characters without control characters."
+                            .into(),
+                    );
+                }
+                let needle = needle.to_lowercase();
+                let mut results = Vec::new();
+                let mut scanned = 0usize;
+                let limits = SearchLimits {
+                    scan: SEARCH_MAX_SCANNED,
+                    results: SEARCH_MAX_RESULTS,
+                    depth: SEARCH_MAX_DEPTH,
+                };
+                let truncation = search_in(
+                    &self.directory,
+                    "",
+                    &needle,
+                    0,
+                    &mut scanned,
+                    &mut results,
+                    request.include_generated,
+                    &limits,
+                )?;
+                results.sort();
+                let results = results
+                    .into_iter()
+                    .map(|path| json!({"path":path,"kind":"file"}))
+                    .collect::<Vec<_>>();
+                Ok(json!({"results":results,"truncated":truncation != Truncation::None,"truncation":truncation.as_str()}))
+            }
             _ => Err("Unknown workspace tool.".into()),
         }
     }
@@ -484,5 +637,149 @@ mod tests {
         assert!(workspace
             .call("list_files", json!({"path":".","extra":true}))
             .is_err());
+    }
+    #[test]
+    fn search_finds_nested_files_by_name_or_path_and_validates_the_query() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("deep/nested/dir")).unwrap();
+        std::fs::write(temp.path().join("deep/nested/dir/code.rs"), "x").unwrap();
+        std::fs::write(temp.path().join("top.txt"), "x").unwrap();
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        // Case-insensitive name match inside a directory that was never listed.
+        let found = workspace
+            .call("search_files", json!({"query":"CODE"}))
+            .unwrap();
+        assert_eq!(
+            found["results"].as_array().unwrap(),
+            &vec![json!({"path":"deep/nested/dir/code.rs","kind":"file"})]
+        );
+        assert_eq!(found["truncated"], false);
+        // A path fragment surfaces the file even when its name does not match.
+        let by_path = workspace
+            .call("search_files", json!({"query":"nested/dir"}))
+            .unwrap();
+        assert_eq!(by_path["results"][0]["path"], "deep/nested/dir/code.rs");
+        // Directories are never results themselves; their files surface via
+        // the path match.
+        let dir_only = workspace
+            .call("search_files", json!({"query":"deep"}))
+            .unwrap();
+        assert_eq!(
+            dir_only["results"].as_array().unwrap(),
+            &vec![json!({"path":"deep/nested/dir/code.rs","kind":"file"})]
+        );
+        // Blank queries return an empty result rather than an error.
+        let empty = workspace.call("search_files", json!({"query":"   "})).unwrap();
+        assert_eq!(empty["results"].as_array().unwrap().len(), 0);
+        assert_eq!(empty["truncated"], false);
+        // Oversized, control-character, and malformed queries are rejected.
+        assert!(workspace
+            .call("search_files", json!({"query":"x".repeat(201)}))
+            .is_err());
+        assert!(workspace
+            .call("search_files", json!({"query":"a\u{0007}b"}))
+            .is_err());
+        assert!(workspace
+            .call("search_files", json!({"wrong":1}))
+            .is_err());
+    }
+    #[test]
+    fn search_marks_results_beyond_the_cap_as_truncated() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..SEARCH_MAX_RESULTS + 1 {
+            std::fs::write(temp.path().join(format!("match{index:04}.txt")), "x").unwrap();
+        }
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        let found = workspace
+            .call("search_files", json!({"query":"match"}))
+            .unwrap();
+        assert_eq!(found["results"].as_array().unwrap().len(), SEARCH_MAX_RESULTS);
+        assert_eq!(found["truncated"], true);
+        assert_eq!(found["truncation"], "result");
+        let paths: Vec<&str> = found["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn search_never_descends_into_link_directories() {
+        use std::os::windows::process::CommandExt;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("hidden.txt"), "outside fixture").unwrap();
+        let link = root.path().join("escape");
+        let output=std::process::Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","New-Item -ItemType Junction -Path $env:LOCALLM_TEST_LINK -Target $env:LOCALLM_TEST_TARGET -ErrorAction Stop | Out-Null"]).env("LOCALLM_TEST_LINK",&link).env("LOCALLM_TEST_TARGET",outside.path()).creation_flags(0x08000000).output().unwrap();
+        assert!(
+            output.status.success(),
+            "Junction fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let workspace = Workspace::open(root.path().to_str().unwrap()).unwrap();
+        // The junction's target lives outside the workspace; its files must
+        // never appear, and the link itself is not a file result.
+        for query in ["hidden", "escape", "e"] {
+            let found = workspace
+                .call("search_files", json!({"query":query}))
+                .unwrap();
+            assert_eq!(
+                found["results"].as_array().unwrap().len(),
+                0,
+                "query {query} leaked a linked path"
+            );
+        }
+    }
+
+    #[test]
+    fn search_skips_generated_directories_unless_asked_and_names_scan_and_depth() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(temp.path().join("node_modules/pkg/hidden.rs"), "x").unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/kept.rs"), "x").unwrap();
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        let hidden = workspace.call("search_files", json!({"query": "hidden"})).unwrap();
+        assert_eq!(hidden["results"].as_array().unwrap().len(), 0);
+        assert_eq!(hidden["truncated"], false);
+        let kept = workspace.call("search_files", json!({"query": "kept"})).unwrap();
+        assert_eq!(kept["results"][0]["path"], "src/kept.rs");
+        let included = workspace
+            .call("search_files", json!({"query": "hidden", "include_generated": true}))
+            .unwrap();
+        assert_eq!(included["results"][0]["path"], "node_modules/pkg/hidden.rs");
+
+        // A file past the depth cap is not reported as an authoritative miss.
+        let mut deep = temp.path().to_path_buf();
+        for index in 0..=SEARCH_MAX_DEPTH + 1 {
+            deep.push(format!("d{index}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("needle.txt"), "x").unwrap();
+        let depth = workspace.call("search_files", json!({"query": "needle"})).unwrap();
+        assert_eq!(depth["truncated"], true);
+        assert_eq!(depth["truncation"], "depth");
+        assert!(depth["results"].as_array().unwrap().is_empty());
+
+        let mut scanned = 0usize;
+        let mut results = Vec::new();
+        let dir = cap_std::fs::Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority()).unwrap();
+        let scan = search_in(
+            &dir,
+            "",
+            "kept",
+            0,
+            &mut scanned,
+            &mut results,
+            false,
+            &SearchLimits { scan: 1, results: 50, depth: 8 },
+        )
+        .unwrap();
+        assert_eq!(scan, Truncation::Scan);
+        assert!(results.is_empty() || scan == Truncation::Scan);
     }
 }

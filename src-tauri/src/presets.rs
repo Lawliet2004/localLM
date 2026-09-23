@@ -83,8 +83,8 @@ pub fn get(id: &str) -> Result<Preset, String> {
             harness: harness(&[
                 "todo_write", "todo_add", "todo_update", "goal_set", "goal_clear", "subagent", "send_message",
                 "interrupt_agent", "list_agents", "list_subagent_models", "workflow_run", "ralph_run",
-                "terminal_create", "terminal_send", "terminal_close", "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch",
-                "file_search", "memory_teach", "memory_recall",
+                "terminal_create", "terminal_send", "terminal_close", "web_search", "web_read", "web_open", "web_find", "web_fetch_url", "web_fetch",
+                "file_search", "file_read", "file_write", "run_code", "memory_teach", "memory_recall",
                 "ask_user", "artifact_read", "docker_exec",
                 "preset_guide", "compact_conversation", "research_pause", "research_resume", "research_cancel", "research_progress",
             ]),
@@ -133,7 +133,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             id: STANDARD.into(),
             name: "Standard".into(),
             description: "Lean local toolset with per-conversation selection and approval.".into(),
-            sources: vec!["__workspace".into(), "__execution".into(), "__daytona".into()],
+            sources: vec!["__workspace".into(), "__execution".into()],
             mcp: true,
             system_time: true,
             skills: true,
@@ -142,11 +142,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             // (workflow_run, ralph_run), docker, and guides live in
             // Creator or behind subagent delegation.
             harness: harness(&[
-                "todo_write", "todo_add", "todo_update", "goal_set", "goal_clear",
-                "subagent", "send_message", "interrupt_agent", "list_agents",
-                "terminal_create", "terminal_send", "terminal_close",
-                "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch", "file_search", "memory_teach", "memory_recall",
-                "artifact_read", "ask_user", "compact_conversation", "research_pause", "research_resume", "research_cancel", "research_progress",
+                "web_search", "web_read", "web_find", "file_search", "file_read", "file_write", "run_code", "ask_user",
             ]),
         },
     };
@@ -157,6 +153,28 @@ pub fn get(id: &str) -> Result<Preset, String> {
 /// equivalent); listing/reading go through execution when needed.
 pub fn minimal_workspace_tools() -> [&'static str; 1] {
     ["edit_file"]
+}
+
+/// The everyday assistant catalog. Older aliases stay readable.
+pub fn assistant_catalog() -> [&'static str; 8] {
+    ["web_search", "web_read", "web_find", "file_search", "file_read", "file_write", "run_code", "ask_user"]
+}
+
+pub fn canonical_tool(alias: &str) -> String {
+    match alias {
+        "web_open" | "web_fetch" | "web_fetch_url" | "visit" => "web_read".into(),
+        "search" => "web_search".into(),
+        "read_file" => "file_read".into(),
+        "create_file" | "edit_file" => "file_write".into(),
+        "local_run_code" => "run_code".into(),
+        "execute_command" | "terminal_send" => "shell_execution".into(),
+        "subagent" | "workflow_run" | "ralph_run" | "ptc_run" => alias.to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn historical_tool_readable(alias: &str) -> bool {
+    !alias.is_empty()
 }
 
 pub fn list() -> Vec<Preset> {
@@ -236,13 +254,14 @@ mod tests {
     #[test]
     fn standard_is_lean_and_creator_is_full() {
         let standard = get(STANDARD).unwrap();
-        assert!(standard.harness.contains(&"todo_add".to_string()));
-        assert!(standard.harness.contains(&"todo_update".to_string()));
-        assert!(standard.harness.contains(&"artifact_read".to_string()));
-        for advanced in ["workflow_run", "ralph_run",
-            "docker_exec", "preset_guide", "list_subagent_models"] {
-            assert!(!standard.harness.contains(&advanced.to_string()), "{advanced} should be Creator-only");
+        assert_eq!(standard.harness, assistant_catalog().map(str::to_string).to_vec());
+        for advanced in ["workflow_run", "ralph_run", "subagent", "ptc_run",
+            "docker_exec", "preset_guide", "list_subagent_models", "terminal_send"] {
+            assert!(!standard.harness.contains(&advanced.to_string()), "{advanced} is not in the assistant catalog");
         }
+        assert_eq!(canonical_tool("web_fetch"), "web_read");
+        assert!(historical_tool_readable("workflow_run"));
+        assert!(historical_tool_readable("web_open"));
         let creator = get(CREATOR).unwrap();
         for alias in &standard.harness {
             assert!(creator.harness.contains(alias), "creator should include standard {alias}");

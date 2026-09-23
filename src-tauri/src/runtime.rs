@@ -198,8 +198,8 @@ impl Runtime {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Older Prism builds predate --no-agent. They default to no tools;
-        // runtime_command removes LLAMA_* overrides for both old and new builds.
+        // Older llama-server builds predate --no-agent and default to no
+        // tools; runtime_command removes LLAMA_* overrides either way.
         if flags.no_agent {
             command.arg("--no-agent");
         }
@@ -364,11 +364,6 @@ fn validate_model_context(path: &Path, config: &RuntimeConfig) -> Result<(), Str
             return Err("GPU layer selection exceeds the model's layer count. Choose Automatic or reduce the manual count in Runtime.".into());
         }
     }
-    if path.file_name().and_then(|name| name.to_str()) == Some(crate::model_catalog::BONSAI_FILENAME)
-        && config.context_length > crate::model_catalog::BONSAI_CONTEXT_LENGTH
-    {
-        return Err("Bonsai Q2_0 supports at most 65,536 context tokens. Set Context window to 65,536 or less in Runtime, save settings, then load again.".into());
-    }
     Ok(())
 }
 
@@ -416,27 +411,13 @@ mod tests {
         assert_eq!(startup_attempts(6 * 1024 * 1024 * 1024), 1200);
     }
 
-    #[test]
-    fn bonsai_rejects_oversized_context_before_starting_runtime() {
-        let bonsai = Path::new(crate::model_catalog::BONSAI_FILENAME);
-        let mut config = RuntimeConfig { context_length: 131_072, ..RuntimeConfig::default() };
-        assert!(validate_model_context(bonsai, &config).unwrap_err().contains("65,536 or less"));
-        config.context_length = 65536;
-        assert!(validate_model_context(bonsai, &config).is_ok());
-        config.context_length = 4096;
-        assert!(validate_model_context(bonsai, &config).is_ok());
-        assert!(validate_model_context(Path::new(crate::model_catalog::MODEL_FILENAME), &RuntimeConfig::default()).is_ok());
-    }
-
     #[tokio::test]
-    #[ignore = "requires cached upstream and Prism Windows CUDA runtime installations"]
-    async fn recognizes_old_prism_and_current_runtime_flags() {
+    #[ignore = "requires a cached upstream Windows CUDA runtime installation"]
+    async fn recognizes_current_runtime_flags() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let current = inspect_runtime(&root.join(".local/runtime/llama-server.exe")).await.unwrap();
         assert!(current.no_agent);
         assert!(current.fit);
-        let prism = inspect_runtime(&root.join(".local/runtime-prism-b9601-68faa14/llama-server.exe")).await.unwrap();
-        assert!(!prism.no_agent);
     }
 
     #[test]

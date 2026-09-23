@@ -34,6 +34,56 @@ pub struct ResearchStateSummary {
     pub updated_at: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCheckpoint {
+    pub version: u8,
+    pub original_request: String,
+    pub constraints: Vec<String>,
+    pub completed_operation_ids: Vec<String>,
+    pub findings: Vec<String>,
+    pub source_refs: Vec<String>,
+    pub unresolved: Vec<String>,
+    pub next_action: Option<String>,
+    pub archive_ids: Vec<String>,
+}
+
+/// Constraints are sentences the user stated. Completed ids come from tool
+/// audits (`tool_call_id`), not from model claims.
+pub fn checkpoint_from_audits(
+    original_request: &str,
+    constraints: &[String],
+    completed_operation_ids: &[String],
+    findings: &[String],
+    source_refs: &[String],
+    unresolved: &[String],
+    archive_ids: &[String],
+) -> TaskCheckpoint {
+    TaskCheckpoint {
+        version: 1,
+        original_request: original_request.to_string(),
+        constraints: constraints.iter().take(20).cloned().collect(),
+        completed_operation_ids: completed_operation_ids.to_vec(),
+        findings: findings.iter().take(50).cloned().collect(),
+        source_refs: source_refs.iter().take(50).cloned().collect(),
+        unresolved: unresolved.to_vec(),
+        next_action: unresolved.first().cloned(),
+        archive_ids: archive_ids.to_vec(),
+    }
+}
+
+pub fn explicit_constraints(request: &str) -> Vec<String> {
+    request
+        .split(['.', '\n'])
+        .map(str::trim)
+        .filter(|sentence| {
+            let lower = sentence.to_ascii_lowercase();
+            lower.contains("must") || lower.contains("do not") || lower.contains("don't") || lower.contains("never") || lower.contains("only ")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn summarize_research_state(
     requirements: &[String],
     findings: &[String],
@@ -368,6 +418,30 @@ mod tests {
         assert!(should_compact(700, 100, 1000));
         assert!(should_compact(u64::MAX, 100, 1000));
         assert!(!should_compact(100, 100, 0));
+    }
+
+    #[test]
+    fn checkpoint_keeps_the_request_constraints_and_audited_operations() {
+        let request = "Compare the two reports. You must cite a page. Do not repeat a completed write.";
+        let constraints = explicit_constraints(request);
+        assert!(constraints.iter().any(|line| line.contains("must cite")));
+        assert!(constraints.iter().any(|line| line.to_lowercase().contains("do not")));
+        let checkpoint = checkpoint_from_audits(
+            request,
+            &constraints,
+            &["call-1".into()],
+            &["The value is 19.99 on page 2".into()],
+            &["doc-1:page:2".into()],
+            &["Second source was not opened".into()],
+            &["art_1".into()],
+        );
+        assert_eq!(checkpoint.version, 1);
+        assert_eq!(checkpoint.original_request, request);
+        assert_eq!(checkpoint.completed_operation_ids, vec!["call-1".to_string()]);
+        assert_eq!(checkpoint.unresolved, vec!["Second source was not opened".to_string()]);
+        assert_eq!(checkpoint.next_action.as_deref(), Some("Second source was not opened"));
+        let again = checkpoint_from_audits(request, &constraints, &["call-1".into()], &[], &[], &checkpoint.unresolved, &["art_1".into()]);
+        assert_eq!(again.completed_operation_ids, checkpoint.completed_operation_ids);
     }
 
     #[test]

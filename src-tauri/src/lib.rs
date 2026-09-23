@@ -1,5 +1,8 @@
 pub mod agent_run;
 mod arex;
+pub mod continuation;
+pub mod local_only;
+pub mod tool_compat;
 pub mod approval;
 pub mod artifacts;
 pub mod capabilities;
@@ -49,6 +52,8 @@ pub mod sessions;
 pub mod skills;
 mod sse;
 mod store;
+mod inspector_browser;
+mod terminal_ui;
 mod tool_envelope;
 mod research_tasks;
 pub mod web_search;
@@ -77,11 +82,14 @@ pub struct AppState {
     runtime: tokio::sync::Mutex<runtime::Runtime>,
     operation: tokio::sync::Mutex<()>,
     cancel: tokio::sync::watch::Sender<bool>,
+    pub run_control: std::sync::Mutex<agent_run::RunControl>,
     connectors: tokio::sync::Mutex<connectors::McpHub>,
     oauth_operation: tokio::sync::Mutex<()>,
     oauth_cancel: tokio::sync::watch::Sender<bool>,
     pub subagents: std::sync::Arc<subagents::SubagentRegistry>,
     pub terminals: tokio::sync::Mutex<sandbox::TerminalRegistry>,
+    /// Interactive PTY shells for the inspector terminal panel.
+    pub pty_sessions: terminal_ui::PtyRegistry,
     /// Per-run web_search cache: (conversation_id, run_id, normalized question, mode) -> compact result.
     pub web_search_cache: Mutex<std::collections::HashMap<String, serde_json::Value>>,
     pub db_path: std::path::PathBuf,
@@ -157,15 +165,20 @@ pub fn run() {
                 runtime: tokio::sync::Mutex::new(runtime::Runtime::new(data.join("runtime.log"))),
                 operation: tokio::sync::Mutex::new(()),
                 cancel: tokio::sync::watch::channel(false).0,
+                run_control: std::sync::Mutex::new(agent_run::RunControl::default()),
                 connectors: tokio::sync::Mutex::new(connectors::McpHub::new(vault)),
                 oauth_operation: tokio::sync::Mutex::new(()),
                 oauth_cancel: tokio::sync::watch::channel(false).0,
                 subagents: subagents::global_registry(),
                 terminals: tokio::sync::Mutex::new(sandbox::TerminalRegistry::new()),
+                pty_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
                 web_search_cache: Mutex::new(std::collections::HashMap::new()),
                 db_path: data.join("locallm.sqlite"),
                 data_dir: data.clone(),
             });
+            if let Ok(store) = app.state::<AppState>().database() {
+                let _ = research_tasks::recover_interrupted(&store);
+            }
             let handle = app.handle().clone();
             let connector_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
@@ -267,8 +280,21 @@ pub fn run() {
             workspace_ui::remove_project,
             workspace_ui::save_task_meta,
             workspace_ui::workspace_inspect,
+            workspace_ui::workspace_search,
             workspace_ui::workspace_git,
-            workspace_ui::workspace_command,
+            terminal_ui::terminal_open,
+            terminal_ui::terminal_attach,
+            terminal_ui::terminal_input,
+            terminal_ui::terminal_resize,
+            terminal_ui::terminal_close,
+            inspector_browser::browser_show,
+            inspector_browser::browser_hide,
+            inspector_browser::browser_close,
+            inspector_browser::browser_navigate,
+            inspector_browser::browser_reload,
+            inspector_browser::browser_go_back,
+            inspector_browser::browser_go_forward,
+            inspector_browser::browser_url,
             sandbox::sandbox_status,
             sandbox::set_sandbox_provider,
             web_search::web_search_health,
@@ -279,7 +305,6 @@ pub fn run() {
             web_search::get_research_session,
             web_search::delete_research_session,
             commands::get_artifact,
-            commands::list_conversation_artifacts,
             runtime_log::read_runtime_log,
             model_catalog::model_download_info,
             model_library::search_hugging_face,
@@ -300,6 +325,9 @@ pub fn run() {
             chat::send_message,
             chat::context_preflight,
             chat::cancel_generation,
+            chat::pause_generation,
+            chat::resume_generation,
+            chat::restart_generation,
             approval::resolve_tool_approval,
             approval::resolve_ask_user,
             connectors::list_connectors,
@@ -318,6 +346,11 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
                 state.cancel.send_replace(true);
+                if let Ok(mut sessions) = state.pty_sessions.lock() {
+                    for (_, session) in sessions.drain() {
+                        session.kill();
+                    }
+                }
                 tauri::async_runtime::block_on(async {
                     let _ = state.runtime.lock().await.stop().await;
                 });

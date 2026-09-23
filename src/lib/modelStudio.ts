@@ -20,15 +20,8 @@ export function repoParts(repo: string) {
 
 export function quantLabel(filename: string) {
   const name = filename.split(/[\\/]/).pop() ?? filename;
-  // PTQ1_0 / PQ2_0 must win over the Q1_0 / Q2_0 substring match.
-  const match = name.match(/(PTQ1_0|PQ2_0|IQ\d+_[A-Z]+|Q\d+_K_[MSx]|Q\d+_K|Q\d+_[01]|[QF]16|F32|BF16)(?=[.\-_']|$)/i);
+  const match = name.match(/(IQ\d+_[A-Z]+|Q\d+_K_[MSx]|Q\d+_K|Q\d+_[01]|[QF]16|F32|BF16)(?=[.\-_']|$)/i);
   return match ? match[1].toUpperCase() : 'GGUF';
-}
-
-/** Ternary Bonsai 2 language weights. Needs the PrismML llama.cpp fork. */
-export function isBonsai2Filename(filename: string) {
-  const name = (filename.split(/[\\/]/).pop() ?? filename).toUpperCase();
-  return name.includes('PTQ1_0') || (name.includes('BONSAI-2') && name.includes('PQ2_0'));
 }
 
 export function weightFiles(files: HubFile[]) {

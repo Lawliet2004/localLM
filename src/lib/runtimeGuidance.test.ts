@@ -17,12 +17,12 @@ describe('runtime memory guidance', () => {
     expect(estimateMemory(model, { ...config, inferenceSlots: 2 }).kvBytes).toBe(short.kvBytes! * 2);
   });
   it('does not invent cache estimates for unknown or hybrid architectures', () => {
-    expect(estimateMemory({ ...model, architecture: 'zaya' }, defaultRuntimeConfig).kvBytes).toBeNull();
+    expect(estimateMemory({ ...model, architecture: 'hybridnet' }, defaultRuntimeConfig).kvBytes).toBeNull();
     expect(estimateMemory({ ...model, headCountKv: null }, defaultRuntimeConfig).kvBytes).toBeNull();
   });
   it('recommends bounded context and preserves special runtime requirements', () => {
     expect(recommendedConfig({ ...model, contextLength: 2048 }, null).contextLength).toBe(2048);
-    expect(recommendedConfig({ ...model, architecture: 'zaya' }, null)).toMatchObject({ gpuLayers: 0, flashAttention: false, cacheTypeV: 'f16' });
+    expect(recommendedConfig({ ...model, architecture: 'hybridnet' }, null)).toMatchObject({ gpuLayers: 0 });
     expect(recommendedConfig({ ...model, keyLength: 8, valueLength: 8 }, null)).toMatchObject({ cacheTypeK: 'f16', cacheTypeV: 'f16', flashAttention: false });
     expect(recommendedConfig(model, gpu(24 * 1024, 1024)).gpuLayers).toBe(-1);
     expect(recommendedConfig(model, null).gpuLayers).toBe(0);
@@ -34,7 +34,7 @@ describe('runtime memory guidance', () => {
     const tight = fittingGpuLayers(model, gpu(6 * 1024, 1024), config);
     expect(tight).toBeGreaterThan(0);
     expect(tight).toBeLessThan(33);
-    expect(fittingGpuLayers({ ...model, architecture: 'zaya' }, gpu(24 * 1024, 1024), config)).toBe(0);
+    expect(fittingGpuLayers({ ...model, architecture: 'hybridnet' }, gpu(24 * 1024, 1024), config)).toBe(0);
     expect(fittingGpuLayers(model, null, config)).toBe(0);
   });
 });

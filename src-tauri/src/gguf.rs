@@ -238,11 +238,11 @@ mod tests {
     fn reads_the_architecture_key_from_a_valid_header() {
         let directory = write_temp(
             "model.gguf",
-            &header(string_kv("general.architecture", "zaya"), 1, 3),
+            &header(string_kv("general.architecture", "testarch"), 1, 3),
         );
         assert_eq!(
             read_architecture(&directory.path().join("model.gguf")).unwrap(),
-            Some("zaya".to_string())
+            Some("testarch".to_string())
         );
     }
 
@@ -276,7 +276,7 @@ mod tests {
     fn unparseable_and_non_gguf_files_are_not_refused() {
         let directory = write_temp("model.gguf", b"not a gguf file at all");
         assert_eq!(read_architecture(&directory.path().join("model.gguf")).unwrap(), None);
-        let directory = write_temp("model.gguf", &header(string_kv("general.architecture", "zaya"), 1, 9));
+        let directory = write_temp("model.gguf", &header(string_kv("general.architecture", "testarch"), 1, 9));
         assert_eq!(read_architecture(&directory.path().join("model.gguf")).unwrap(), None, "unsupported GGUF version is left to the runtime");
         assert!(read_architecture(Path::new("Z:/missing/model.gguf")).is_err());
     }

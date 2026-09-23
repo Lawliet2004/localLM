@@ -219,11 +219,20 @@ export interface TokenStats {
   finalPromptTokens: number;
 }
 
+export type EvidenceAssessment =
+  | 'exact_excerpt'
+  | 'lexical_match'
+  | 'model_assessed'
+  | 'unresolved'
+  | 'conflicting';
+
 export interface VerifiedClaim {
   claim: string;
   status: ClaimStatus;
   sources: string[];
   explanation?: string;
+  /** How the status was decided. Lexical overlap is never a certification. */
+  assessment?: EvidenceAssessment;
 }
 
 export interface VerificationReport {

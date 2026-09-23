@@ -235,6 +235,24 @@ impl ResearchTask {
         Ok(())
     }
 
+    /// Pause at a tool boundary. The call is recorded and not started, so a
+    /// later restart can mark that in-flight row outcome-unknown.
+    pub fn pause_before_new_tool(&mut self, call_id: &str, call_name: &str) -> Result<(), String> {
+        self.operations.push(TaskOperation {
+            id: format!("op-{call_id}"),
+            kind: call_name.to_string(),
+            status: OperationStatus::Running,
+            attempts: 1,
+            result_summary: None,
+            error: None,
+            updated_at: crate::store::now(),
+        });
+        if !self.pending_work.iter().any(|item| item == call_name) {
+            self.pending_work.push(call_name.to_string());
+        }
+        self.pause()
+    }
+
     pub fn resume(&mut self) -> Result<(), String> {
         if self.status != TaskStatus::Paused {
             return Err("Only a paused task can be resumed.".into());
@@ -264,17 +282,43 @@ impl ResearchTask {
     /// Restart recovery: `running` operations from a previous process become
     /// `unknown` (never assumed complete, never auto-replayed); `pending`
     /// operations stay resumable.
-    pub fn mark_interrupted_for_recovery(&mut self) {
-        for op in &mut self.operations {
-            if matches!(op.status, OperationStatus::Running) {
+    /// Restart uses the shared ledger: completed work stays, in-flight work
+    /// becomes outcome-unknown, and nothing is replayed.
+    pub fn restart_from_ledger(&mut self) -> crate::agent_run::RestartReport {
+        let mut ops: Vec<crate::agent_run::LedgerOp> = self
+            .operations
+            .iter()
+            .map(|op| crate::agent_run::LedgerOp {
+                id: op.id.clone(),
+                kind: op.kind.clone(),
+                status: match op.status {
+                    OperationStatus::Completed => "succeeded",
+                    OperationStatus::Running => "running",
+                    OperationStatus::Pending => "planned",
+                    OperationStatus::Failed => "failed",
+                    OperationStatus::Unknown => "outcome_unknown",
+                    OperationStatus::Skipped => "skipped",
+                }
+                .into(),
+            })
+            .collect();
+        let report = crate::agent_run::restart_operations(&mut ops);
+        for (op, ledger) in self.operations.iter_mut().zip(ops.iter()) {
+            if ledger.status == "outcome_unknown" {
                 op.status = OperationStatus::Unknown;
                 op.error = Some("Interrupted by restart; outcome is unknown. Do not replay side effects automatically.".into());
+                op.updated_at = crate::store::now();
             }
         }
         if self.status == TaskStatus::Running {
             self.status = TaskStatus::Paused;
         }
         self.updated_at = crate::store::now();
+        report
+    }
+
+    pub fn mark_interrupted_for_recovery(&mut self) {
+        let _ = self.restart_from_ledger();
     }
 
     pub fn resumable_operations(&self) -> Vec<&TaskOperation> {
@@ -304,6 +348,24 @@ fn _storage_contract() {
     let _ = OperationStatus::Pending.as_str();
     let task = ResearchTask::new("c", "q", TaskBudgets::default()).unwrap();
     let _ = task.elapsed_exhausted();
+}
+
+/// Called from application startup and from `restart_generation`.
+pub fn recover_interrupted(store: &crate::store::Store) -> Result<crate::agent_run::RestartReport, String> {
+    let mut replayed = Vec::new();
+    let mut any_unknown = false;
+    for id in store.running_research_task_ids()? {
+        let Some(mut task) = store.research_task(&id)? else { continue };
+        let report = task.restart_from_ledger();
+        replayed.extend(report.replayed_write_ids);
+        any_unknown = true;
+        store.save_research_task(&task)?;
+    }
+    let _ = any_unknown;
+    Ok(crate::agent_run::RestartReport {
+        replayed_write_ids: replayed,
+        unconditional_success: false,
+    })
 }
 
 pub fn ensure_table(connection: &rusqlite::Connection) -> Result<(), String> {

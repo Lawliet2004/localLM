@@ -1097,14 +1097,7 @@ mod tests {
             known_source(crate::model_catalog::MODEL_FILENAME).as_deref(),
             Some("prithivMLmods/MiniCPM5-2B-GGUF")
         );
-        assert_eq!(
-            known_source(crate::model_catalog::BONSAI_FILENAME).as_deref(),
-            Some("prism-ml/Ternary-Bonsai-8B-gguf")
-        );
-        assert_eq!(
-            known_source(crate::model_catalog::ZAYA1_FILENAME).as_deref(),
-            Some("Abiray/ZAYA1-8B-GGUF")
-        );
+        assert_eq!(known_source("custom.gguf"), None);
     }
 
     #[test]

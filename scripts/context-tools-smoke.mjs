@@ -1,4 +1,4 @@
-// Native acceptance. Start LocalLM with CDP enabled and Bonsai loaded at 8192.
+// Native acceptance. Start LocalLM with CDP enabled and a local model loaded at 8192.
 // LOCALLM_CDP_URL can override the default WebView debugging endpoint.
 import { chromium, expect } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -13,7 +13,7 @@ try {
     const { api } = await import('/src/lib/api.ts');
     const state = await api.bootstrap();
     if (state.runtime.phase !== 'ready' || state.runtime.loadedConfig.contextLength !== 8192) {
-      throw new Error('Load Bonsai with 8192 context before this test.');
+      throw new Error('Load a local model with 8192 context before this test.');
     }
     const connectors = await api.listConnectors();
     if (connectors.some(item => ['parallel-web', 'deepwiki'].includes(item.id) && item.connected)) {

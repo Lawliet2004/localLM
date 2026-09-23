@@ -2,7 +2,7 @@
 
 Open **Models & runtime → Models** for an LM Studio-style workspace: **Discover**
 to browse Hugging Face, **My Models** to load or delete what you already have.
-The three existing catalog files appear in My Models as Hugging Face entries.
+The bundled catalog model appears in My Models as a Hugging Face entry.
 The chat picker also lists the downloaded library.
 
 ## Download, use, delete
@@ -43,13 +43,10 @@ build. Safetensors/PyTorch weights require external conversion. Projectors,
 adapters, embedding-only models, and other companion files are not standalone
 chat models. The harness does not execute downloaded model code.
 
-The existing runtime overrides remain: Bonsai Q2_0 uses Prism prism-b9601;
-Ternary Bonsai 2 (`PTQ1_0` / `PQ2_0`) uses Prism prism-b10709 or newer;
-ZAYA1 uses its custom build. Switching back to ordinary GGUF models resolves
-the standard runtime instead of retaining an incompatible special build. A
-missing required runtime produces an actionable error. **Model files** retains
-manual model and runtime paths, runtime installation, and the original pinned
-download controls.
+All models run on the standard llama.cpp runtime; when no executable is
+selected the app falls back to the managed runtime, and a missing runtime
+produces an actionable error. **Model files** retains manual model and runtime
+paths, runtime installation, and the original pinned download controls.
 
 ## Runtime guidance
 
