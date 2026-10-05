@@ -5,7 +5,8 @@ catalog, installer, model directory and PrismML runtime. Acquisition, ten cohere
 chat prompts, reasoning and a native read-only tool round-trip have passed.
 The five-repeat workload passed and its measured preset is published.
 Live streaming and the combined switching/failure recovery acceptance passed.
-All final ordinary checks passed. **The 30-minute soak is still in progress.**
+All final ordinary checks and the 30-minute repeated-chat soak passed. The feature
+is qualified on this laptop under the conditions and limits recorded below.
 Recorded on 2026-10-05 on branch `feat/experimental-bonsai-27b`.
 
 ## Using the opt-in feature
@@ -318,7 +319,41 @@ VRAM, 5,530,456,064-byte working set and 20,985,253,888 private bytes, dominated
 by the intentionally oversized allocation. These are not the chosen preset's
 ordinary memory requirements. Individual kill recovery passed in 19.09 seconds.
 
-The 30-minute soak remains pending; the final ordinary checks above passed.
+## Completed 30-minute soak
+
+`node scripts/bonsai-qualification.mjs soak` passed with 53 complete requests
+over 1829.362 seconds (30 minutes 29 seconds, including shutdown), after a
+successful managed load. The request loop recorded 1829.079 seconds. Every
+request had exactly 2000 input and 500 output tokens; all returned nonempty,
+well-formed text and the server remained ready. First, middle and last saved
+story passages were coherent. Normal prompt caching was enabled, but the changed
+record prefix meant the server reported zero cached input tokens in every round.
+Thinking was disabled and `ignore_eos:true` forced the measurement length, as in
+the five-repeat qualification. This is repeated chat, not a 30-minute filled
+context or general quality test.
+
+| Measurement | Actual result |
+| --- | ---: |
+| Mean prompt processing | 236.376 tokens/s |
+| Mean generation | 19.209 tokens/s |
+| Generation range | 18.592–19.913 tokens/s |
+| First five / last five mean generation | 19.637 / 18.907 tokens/s |
+| Sampled peak device VRAM | 3855 MiB |
+| Sampled peak resident working set | 4,436,283,392 bytes (4.132 GiB) |
+| Sampled peak private commitment | 5,430,984,704 bytes (5.058 GiB) |
+| Median working set, minutes 5–10 / final 5 minutes | 3.889 / 3.738 GiB |
+| Median private commitment, minutes 5–10 / final 5 minutes | 5.056740 / 5.057693 GiB |
+
+The first-to-last five-request mean fell by 3.72%; the final three were slower
+than the earlier plateau. The cause of that variation was not measured. There
+was no crash or throughput collapse. Median private commitment increased by
+0.977 MiB between the comparison windows, while resident memory decreased.
+No sustained leak was detected in this bounded test; this does not prove absence
+of leaks over longer runs. Device memory returned to 8 MiB after shutdown and no
+llama-server process remained. The laptop still reported AC power and the same
+Balanced plan; no builds or browser tests ran alongside the soak. Raw records,
+500 ms samples and the summary are retained in `.local/bonsai-evidence/soak.json`,
+`qa-soak-memory.json`, `qa-soak-result.json` and `soak-summary.json`.
 
 <!-- BENCHMARK TABLE START -->
 ## Complete benchmark sweep
@@ -495,3 +530,10 @@ MiniCPM path and runtime and preserved its 32k saved/default load configuration.
    overlap with the user's existing work. Also remove only the added
    `bonsai_installer: Default::default()` compatibility line from the pre-existing
    `web_search.rs` fixture; do not restore that whole file.
+
+The task started from commit `5eb2ba3`; its first commit is `43dc035`. At delivery,
+`git log --oneline 5eb2ba3..feat/experimental-bonsai-27b` identifies the task
+commits and `git diff 5eb2ba3..feat/experimental-bonsai-27b` shows only their
+committed changes. Review that list before reverting if more work has since
+landed on the branch. The dirty working tree additionally contains the preserved
+user work and the one compatibility line described above.

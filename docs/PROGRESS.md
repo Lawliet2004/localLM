@@ -4,8 +4,8 @@
 
 Work is isolated on `feat/experimental-bonsai-27b`; the user requested a stop on
 an unresolved acquisition/inference blocker. The off-by-default feature is wired
-into Models settings, with a published measured preset. The 30-minute soak
-remains pending. Existing local changes are preserved.
+into Models settings, with a published measured preset. The 30-minute soak and
+all final ordinary checks passed. Existing local changes are preserved.
 
 Before implementation: Vitest 455 passed / 1 skipped, Rust 407 passed / 2 ignored,
 build, strict Clippy, typecheck and lint passed; Edge Playwright 10 passed and
@@ -38,6 +38,18 @@ Final ordinary checks: Vitest 460 passed / 1 skipped, Rust 415 passed / 4 ignore
 Edge Playwright 11 passed, script tests 39 passed, and build, strict Clippy,
 typecheck and lint passed. A resource-heavy parallel run hit UI test timeouts;
 unchanged full Vitest/Edge reruns passed after compilation finished.
+
+The actual soak completed 53 exact 2000-input/500-output requests over 1829.362
+seconds, averaging 236.376 pp / 19.209 tg tokens/s. Peak samples were 3855 MiB
+device VRAM, 4.132 GiB resident memory and 5.058 GiB private commitment. Median
+private commitment changed by under 1 MiB between minutes 5–10 and the final five
+minutes; resident memory fell. No sustained leak or crash was detected in that
+bounded run. First/last five mean generation was 19.637/18.907 tokens/s; the cause
+of the small late slowdown was not measured. The server stopped, VRAM returned
+to 8 MiB, and AC power/Balanced plan remained unchanged. Native GUI download/click
+acceptance, packaged installation, a filled 262k history and a clean checkout
+containing only task commits remain unverified. The existing uncommitted test
+fixture's one installer-field compatibility line is intentionally unstaged.
 
 ## 2026-09-16
 Context window save/load and first-turn overflow.

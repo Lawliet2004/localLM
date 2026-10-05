@@ -12,7 +12,9 @@ capability 8.6. Actual managed CUDA inference, ten coherent chat prompts,
 reasoning and a read-only native tool round-trip passed. The feature is wired
 behind Experimental models, off by default. The measured 4k/Q8/65-layer preset
 passed five repeated 2000-input/500-output chats; combined switching, streaming
-and failure recovery passed. The 30-minute soak remains in progress.
+and failure recovery passed. The 30-minute soak passed 53 exact 2000-input/
+500-output requests, averaging 19.209 generation tokens/s without a crash;
+device VRAM returned to idle after shutdown.
 The fork uses the same CUDA 12.4 driver requirement
 as the standard runtime.
 
