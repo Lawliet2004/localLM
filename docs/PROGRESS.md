@@ -1,10 +1,11 @@
 # Evidence and remaining work
 
-## 2026-10-05 — Bonsai-27B acquisition and baseline
+## 2026-10-05 — Bonsai-27B opt-in acceptance
 
 Work is isolated on `feat/experimental-bonsai-27b`; the user requested a stop on
-an unresolved acquisition/inference blocker. No opt-in application feature or
-measured preset is delivered yet. Existing local changes are preserved.
+an unresolved acquisition/inference blocker. The off-by-default feature is wired
+into Models settings, with a published measured preset. The 30-minute soak
+remains pending. Existing local changes are preserved.
 
 Before implementation: Vitest 455 passed / 1 skipped, Rust 407 passed / 2 ignored,
 build, strict Clippy, typecheck and lint passed; Edge Playwright 10 passed and
@@ -17,10 +18,26 @@ code, and confirmed server/bench startup and RTX 2050 CUDA0 detection. Default
 MiniCPM files, runtime, settings and database schema remain unchanged.
 
 A new model network transfer was cancelled after the 32 MiB threshold and retained
-its partial file. Restart/full-transfer verification is in progress. Isolated
-benchmark and managed-Runtime chat/reasoning/read-only-tool acceptance helpers
-are prepared, but have not run against the complete model. Full details and
-remaining work: [Bonsai acceptance](BONSAI_EXPERIMENTAL.md).
+its 33,566,054-byte partial file. Restart resumed and completed the 3,803,452,480-byte
+model with the pinned SHA-256 verified. Actual managed inference passed ten
+coherent prompts, separate reasoning and a native system_time round-trip. The
+layer/cache/context/batch/thread/mmap/mlock sweep completed on CUDA0. The chosen
+4096-context, Q8 GPU KV, 65/65-layer preset averaged 242.296 pp and 19.531 tg
+tokens/s over five exact 2000-input/500-output requests. Sampled peaks were
+3855 MiB device VRAM, 4.137 GiB resident working set and 5.059 GiB private
+commitment. Combined real switching, reasoning SSE, CUDA OOM restoration,
+missing-runtime refusal and mid-generation kill/recovery passed. MiniCPM
+answered Paris before and after recovery. Q4 allocated the advertised 262k
+window and answered a 2500-token workload; a filled 262k history remains
+unverified. The unchanged stock b10855 runtime also passed all ten prompts,
+reasoning and the real tool: the requested assumption that it cannot handle
+Q1_0 was disproved. The separate pinned fork remains this feature's qualified
+runtime. Full evidence and limits: [Bonsai acceptance](BONSAI_EXPERIMENTAL.md).
+
+Final ordinary checks: Vitest 460 passed / 1 skipped, Rust 415 passed / 4 ignored,
+Edge Playwright 11 passed, script tests 39 passed, and build, strict Clippy,
+typecheck and lint passed. A resource-heavy parallel run hit UI test timeouts;
+unchanged full Vitest/Edge reruns passed after compilation finished.
 
 ## 2026-09-16
 Context window save/load and first-turn overflow.
