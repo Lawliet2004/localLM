@@ -230,6 +230,14 @@ async fn managed_chat_acceptance() -> Result<(), String> {
         serde_json::to_vec_pretty(&tool_record).unwrap(),
     )
     .map_err(|e| e.to_string())?;
+    if tool_record["result"].is_null()
+        || tool_record["continuation"]["choices"][0]["message"]["content"]
+            .as_str()
+            .is_none_or(|s| s.trim().is_empty())
+    {
+        runtime.stop().await?;
+        return Err("The model did not complete the structured native system_time round-trip; tool support is not validated.".into());
+    }
     runtime.stop().await?;
     Ok(())
 }

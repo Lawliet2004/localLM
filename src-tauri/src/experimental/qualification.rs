@@ -127,6 +127,7 @@ async fn laptop_qualification() -> Result<(), String> {
             runtime.stop().await?;
             result.map(|_| ())
         }
+        Ok("kill") => kill_only().await,
         _ => Err("Select workload, soak, integration, or max-context explicitly.".into()),
     }
 }
@@ -289,8 +290,19 @@ async fn integration() -> Result<(), String> {
     assert!(missing.contains("missing or incomplete"));
     assert_eq!(state.runtime.lock().await.inspect().phase, "ready");
     record["missingRuntimeError"] = json!(missing);
+    write("integration.json", &record)?;
 
     let _ = activate_inner(&state, true).await?;
+    kill_and_recover(&state, &client, &mut record).await?;
+    write("integration.json", &record)?;
+    Ok(())
+}
+
+async fn kill_and_recover(
+    state: &crate::AppState,
+    client: &reqwest::Client,
+    record: &mut Value,
+) -> Result<(), String> {
     // The QA driver kills this exact isolated process after the first streamed token.
     let runtime = state.runtime.lock().await;
     let mut stream = client.post(format!("{}/v1/chat/completions", runtime.endpoint)).bearer_auth(&runtime.api_key)
@@ -330,25 +342,115 @@ async fn integration() -> Result<(), String> {
     if !interrupted {
         return Err("QA driver did not interrupt the real generation.".into());
     }
-    let status = state.runtime.lock().await.inspect();
+    let waiting = Instant::now();
+    let status = loop {
+        let status = state.runtime.lock().await.inspect();
+        if status.phase == "error" || waiting.elapsed() > Duration::from_secs(5) {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert_eq!(status.phase, "error");
-    record["killedMidGeneration"] = json!({"firstChunkBytes":first.len(),"status":status});
-    set_enabled_inner(&state, false).await?;
-    crate::commands::load_selected_model(&state).await?;
-    record["miniAfterKill"] = short_chat(&client, &*state.runtime.lock().await).await?;
+    record["killedMidGeneration"] = json!({"firstChunkBytes":first.len(),"exitNotificationWaitMs":waiting.elapsed().as_millis(),"status":status});
+    set_enabled_inner(state, false).await?;
+    crate::commands::load_selected_model(state).await?;
+    record["miniAfterKill"] = short_chat(client, &*state.runtime.lock().await).await?;
     state.runtime.lock().await.stop().await?;
-    write("integration.json", &record)?;
+    Ok(())
+}
+
+async fn kill_only() -> Result<(), String> {
+    let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let state = crate::web_search::tests::test_state(directory.path());
+    let mini = Preferences {
+        model_path: development()
+            .join("models/MiniCPM5-2B.Q6_K.gguf")
+            .to_string_lossy()
+            .into_owned(),
+        runtime_path: development()
+            .join("runtime/llama-server.exe")
+            .to_string_lossy()
+            .into_owned(),
+        ..Default::default()
+    };
+    let config = RuntimeConfig::default();
+    state.database()?.save_model_runtime(&mini, &config)?;
+    crate::commands::load_selected_model(&state).await?;
+    let previous = Previous {
+        preferences: state.database()?.preferences()?,
+        config,
+        was_ready: true,
+    };
+    set_enabled_inner(&state, true).await?;
+    state
+        .database()?
+        .save_setting(PREVIOUS_KEY, &Some(previous))?;
+    // These same owned weights already passed complete acquisition and activation hashes.
+    state
+        .database()?
+        .save_model_runtime(&preferences()?, &candidate()?)?;
+    crate::commands::load_selected_model(&state).await?;
+    let mut record = json!({});
+    kill_and_recover(&state, &client()?, &mut record).await?;
+    write("kill-recovery.json", &record)?;
     Ok(())
 }
 
 async fn max_context() -> Result<(), String> {
     let mut records = Vec::new();
-    for context in [262144, 131072, 65536] {
-        let config = RuntimeConfig {
-            context_length: context,
-            ..candidate()?
-        };
-        let mut runtime = Runtime::new(evidence().join(format!("max-context-{context}.log")));
+    let base = candidate()?;
+    use crate::runtime_config::CacheType::Q4_0;
+    let variants = [
+        (
+            "262144-q8-gpu",
+            RuntimeConfig {
+                context_length: 262144,
+                ..base.clone()
+            },
+        ),
+        (
+            "262144-q4-gpu",
+            RuntimeConfig {
+                context_length: 262144,
+                cache_type_k: Q4_0,
+                cache_type_v: Q4_0,
+                ..base.clone()
+            },
+        ),
+        (
+            "262144-q4-cpu",
+            RuntimeConfig {
+                context_length: 262144,
+                gpu_layers: 56,
+                cache_type_k: Q4_0,
+                cache_type_v: Q4_0,
+                offload_kv_cache: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "131072-q4-cpu",
+            RuntimeConfig {
+                context_length: 131072,
+                gpu_layers: 56,
+                cache_type_k: Q4_0,
+                cache_type_v: Q4_0,
+                offload_kv_cache: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "65536-q4-gpu",
+            RuntimeConfig {
+                context_length: 65536,
+                cache_type_k: Q4_0,
+                cache_type_v: Q4_0,
+                ..base
+            },
+        ),
+    ];
+    for (name, config) in variants {
+        let mut runtime = Runtime::new(evidence().join(format!("max-context-{name}.log")));
         let result = async {
             let status = runtime.load(&preferences()?, &config).await?;
             let client = client()?;
@@ -358,16 +460,24 @@ async fn max_context() -> Result<(), String> {
                 &workload_payload(&client, &runtime, 0, false).await?,
             )
             .await?;
+            if response["usage"]["prompt_tokens"] != 2000
+                || response["usage"]["completion_tokens"] != 500
+            {
+                return Err(format!(
+                    "Unexpected maximum-context usage: {}",
+                    response["usage"]
+                ));
+            }
             Ok::<_, String>(json!({"status":status,"response":response}))
         }
         .await;
         runtime.stop().await?;
         println!(
-            "Context {context}: {}",
+            "Context {name}: {}",
             if result.is_ok() { "passed" } else { "failed" }
         );
         records.push(
-            json!({"context":context,"result":result.as_ref().ok(),"error":result.as_ref().err()}),
+            json!({"name":name,"config":config,"result":result.as_ref().ok(),"error":result.as_ref().err()}),
         );
         write("max-context.json", &json!(records))?;
         if result.is_ok() {

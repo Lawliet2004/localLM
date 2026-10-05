@@ -447,7 +447,7 @@ async fn activate_inner(
                 restore(state, fallback.as_ref().unwrap_or(&previous), true).await
             {
                 return Err(format!(
-                    "Bonsai failed: {error}. Previous settings restored; reload failed: {recovery}"
+                    "Bonsai failed: {error}. Could not restore the previous model: {recovery}"
                 ));
             }
             Err(format!(
@@ -465,7 +465,7 @@ fn preserve_load_error(state: &crate::AppState, error: &str) -> String {
         .is_ok();
     let lower = String::from_utf8_lossy(&log).to_lowercase();
     let details = if saved {
-        format!(" See {}.", destination.display())
+        format!(" See {}", destination.display())
     } else {
         String::new()
     };
@@ -498,7 +498,7 @@ pub(crate) async fn recover_selected_failure(state: &crate::AppState, error: Str
     match restore(state, &previous, true).await {
         Ok(()) => format!("Bonsai failed: {error}. Previous model settings restored."),
         Err(recovery) => {
-            format!("Bonsai failed: {error}. Previous settings restored; reload failed: {recovery}")
+            format!("Bonsai failed: {error}. Could not restore the previous model: {recovery}")
         }
     }
 }

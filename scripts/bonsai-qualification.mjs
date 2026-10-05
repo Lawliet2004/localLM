@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const mode = process.argv[2];
-if (!['workload', 'soak', 'integration', 'max-context', 'streaming'].includes(mode)) throw new Error('Choose workload, soak, integration, max-context, or streaming.');
+if (!['workload', 'soak', 'integration', 'max-context', 'streaming', 'kill'].includes(mode)) throw new Error('Choose workload, soak, integration, max-context, streaming, or kill.');
 const root = path.resolve('.local/experimental/bonsai-27b');
 const bundle = fs.readdirSync(root).find(n => n.startsWith('prism-b10754-2459f68-cuda12.4-'));
 if (!bundle) throw new Error('Acquire the isolated pinned runtime first.');
@@ -41,7 +41,7 @@ child.stdout.on('data', bytes => {
     killed = true;
     // The human requested a mid-generation kill. Match the exact experimental executable first.
     const kill = spawn('powershell.exe', ['-NoProfile', '-Command',
-      `$bonsaiTargets=@(Get-Process -Name llama-server -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq '${quoted}' }); if ($bonsaiTargets.Count -ne 1) { throw 'Expected exactly one isolated Bonsai process' }; $bonsaiTargets | ForEach-Object { Write-Output "Killed isolated Bonsai PID $($_.Id)"; Stop-Process -Id $_.Id -Force }`], { windowsHide: true });
+      `$bonsaiTargets=@(Get-Process -Name llama-server -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq '${quoted}' }); if ($bonsaiTargets.Count -ne 1) { throw 'Expected exactly one isolated Bonsai process' }; $bonsaiTargets | ForEach-Object { Stop-Process -Id $_.Id -Force; Write-Output "Killed isolated Bonsai PID $($_.Id)" }`], { windowsHide: true });
     kill.stdout.on('data', b => process.stdout.write(b)); kill.stderr.on('data', b => process.stderr.write(b));
   }
 });
