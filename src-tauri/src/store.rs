@@ -1853,6 +1853,18 @@ impl Store {
         preferences.validate()?;
         self.save_setting("preferences", preferences)
     }
+    /// Experimental activation must not publish half a model selection.
+    pub(crate) fn save_model_runtime(&self, preferences: &Preferences, config: &RuntimeConfig) -> Result<()> {
+        preferences.validate()?;
+        config.validate()?;
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        for (key, value) in [("preferences", serde_json::to_string(preferences)), ("runtime", serde_json::to_string(config))] {
+            let text = value.map_err(|e| e.to_string())?;
+            transaction.execute("INSERT INTO settings VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, text]).map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)
+    }
+
     pub fn local_tool_calling_supported(
         &self,
         runtime_path: &str,
@@ -2044,6 +2056,17 @@ fn tool_calling_key(runtime_path: &str, model_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn experimental_model_selection_rolls_back_both_settings_on_storage_failure() {
+        let store = Store::open_memory().unwrap();
+        let previous = serde_json::to_value(store.preferences().unwrap()).unwrap();
+        let previous_config = store.runtime_config().unwrap();
+        store.connection.execute_batch("CREATE TRIGGER reject_runtime BEFORE INSERT ON settings WHEN NEW.key='runtime' BEGIN SELECT RAISE(ABORT,'simulated storage failure'); END;").unwrap();
+        let next = Preferences { model_path: "experimental-model.gguf".into(), ..Default::default() };
+        assert!(store.save_model_runtime(&next, &RuntimeConfig::default()).is_err());
+        assert_eq!(serde_json::to_value(store.preferences().unwrap()).unwrap(), previous);
+        assert_eq!(store.runtime_config().unwrap(), previous_config);
+    }
 
     #[test]
     fn research_tasks_survive_restart_from_checkpoint() {

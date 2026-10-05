@@ -180,6 +180,9 @@ impl Runtime {
             // Newer llama-server may auto-discover an mmproj beside the GGUF.
             command.arg("--no-mmproj");
         }
+        if let Some(arguments) = crate::experimental::bonsai::launch_arguments(&model, &executable) {
+            command.args(arguments);
+        }
         command.args([
                 "--host",
                 "127.0.0.1",

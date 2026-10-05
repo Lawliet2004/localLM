@@ -827,6 +827,15 @@ fn profile_path(state: &AppState, path: &str) -> PathBuf {
     profile_path_for(&state.data_dir, path)
 }
 
+pub(crate) fn saved_profile_config(state: &AppState, path: &str) -> Result<Option<crate::runtime_config::RuntimeConfig>, String> {
+    match std::fs::read(profile_path(state, path)) {
+        Ok(bytes) => serde_json::from_slice::<Profile>(&bytes).map(|profile| Some(profile.config))
+            .map_err(|_| "Saved model profile is invalid.".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn paths_match(left: &str, right: &str) -> bool {
     if left.eq_ignore_ascii_case(right) {
         return true;

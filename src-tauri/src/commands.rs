@@ -310,6 +310,7 @@ fn configure_local_model_runtime(
     preferences: &mut crate::store::Preferences,
     state: &AppState,
 ) -> Result<(), String> {
+    crate::experimental::bonsai::configure_runtime(state, preferences)?;
     if !preferences.runtime_path.is_empty() {
         return Ok(());
     }

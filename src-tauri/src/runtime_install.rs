@@ -33,6 +33,16 @@ pub async fn install(
         return Err("Runtime installation cancelled.".into());
     }
     let assets = runtime_archive::catalog()?;
+    install_bundle(root, assets, "llama-b10855-cuda12.4", cancel, progress).await
+}
+
+pub(crate) async fn install_bundle(
+    root: &Path,
+    assets: Vec<runtime_archive::RuntimeAsset>,
+    prefix: &str,
+    cancel: watch::Receiver<bool>,
+    progress: impl Fn(&str, u64, u64),
+) -> Result<PathBuf, String> {
     tokio::fs::create_dir_all(root)
         .await
         .map_err(|error| error.to_string())?;
@@ -101,7 +111,7 @@ pub async fn install(
     {
         return Err("Runtime bundle is missing llama-server.exe.".into());
     }
-    let destination = root.join(format!("llama-b10855-cuda12.4-{}", uuid::Uuid::new_v4()));
+    let destination = root.join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
     tokio::fs::rename(&output, &destination)
         .await
         .map_err(|error| format!("Could not publish complete runtime: {error}"))?;

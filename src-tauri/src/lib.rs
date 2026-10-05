@@ -73,6 +73,7 @@ pub struct AppState {
     installation_operation: tokio::sync::Mutex<()>,
     runtime_installer: model_install::Installer,
     model_installer: model_install::Installer,
+    bonsai_installer: experimental::bonsai::Installer,
     daytona_vault: std::sync::Arc<vault::Vault>,
     daytona_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
     daytona_journal: std::sync::Arc<Mutex<daytona_journal::Journal>>,
@@ -153,6 +154,7 @@ pub fn run() {
                 installation_operation: tokio::sync::Mutex::new(()),
                 runtime_installer: model_install::Installer::default(),
                 model_installer: model_install::Installer::default(),
+                bonsai_installer: experimental::bonsai::Installer::default(),
                 daytona_vault: vault.clone(),
                 daytona_operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 daytona_journal: std::sync::Arc::new(Mutex::new(
@@ -202,6 +204,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            experimental::bonsai::bonsai_enabled,
+            experimental::bonsai::set_bonsai_enabled,
+            experimental::bonsai::bonsai_info,
+            experimental::bonsai::install_bonsai,
+            experimental::bonsai::bonsai_install_status,
+            experimental::bonsai::cancel_bonsai_install,
+            experimental::bonsai::activate_bonsai,
             daytona_settings::has_daytona_key,
             daytona_settings::save_daytona_key,
             daytona_settings::forget_daytona_key,
