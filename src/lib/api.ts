@@ -62,6 +62,13 @@ export interface ModelDownloadInfo {
 }
 
 export const api = {
+  bonsaiEnabled: () => invoke<boolean>('bonsai_enabled'),
+  setBonsaiEnabled: (enabled: boolean) => invoke<boolean>('set_bonsai_enabled', { enabled }),
+  bonsaiInfo: () => invoke<import('../features/bonsai/types').BonsaiInfo | null>('bonsai_info'),
+  installBonsai: (asset: import('../features/bonsai/types').BonsaiAsset) => invoke<ModelInstallStatus>('install_bonsai', { asset }),
+  bonsaiInstallStatus: (asset: import('../features/bonsai/types').BonsaiAsset) => invoke<ModelInstallStatus>('bonsai_install_status', { asset }),
+  cancelBonsaiInstall: (asset: import('../features/bonsai/types').BonsaiAsset) => invoke<void>('cancel_bonsai_install', { asset }),
+  activateBonsai: (usePreset?: boolean) => invoke<RuntimeStatus>('activate_bonsai', { usePreset }),
   workspaceIndex: () => invoke<WorkspaceIndex>('workspace_index'),
   saveProject: (project: Project) => invoke<WorkspaceIndex>('save_project', { project }),
   removeProject: (id: string) => invoke<WorkspaceIndex>('remove_project', { id }),

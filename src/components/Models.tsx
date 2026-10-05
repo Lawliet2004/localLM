@@ -11,6 +11,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { localModels } from '../lib/localModels';
 import { api, nativeAvailable } from '../lib/api';
 import { ModelLibrary } from './ModelLibrary';
+import { BonsaiSettings } from '../features/bonsai/BonsaiSettings';
 import { samePath } from '../lib/pathUtils';
 
 interface Props {
@@ -137,6 +138,9 @@ export function Models({ config, preferences, runtime, busy, onSaveConfig, onSav
     <div className="tabs" role="tablist" aria-label="Model settings">{(['library','runtime','generation','model','diagnostics'] as const).map(value => <button role="tab" aria-selected={tab === value} key={value} onClick={() => { setTab(value); setNotice(''); }}>{value === 'library' ? 'Models' : value === 'model' ? 'Model files' : value === 'runtime' ? 'Runtime' : value === 'generation' ? 'Generation' : 'Diagnostics'}</button>)}</div>
     {notice && <p className="success" role="status">{notice}</p>}
     {error && <p className="error" role="alert">{error}</p>}
+    {(['library', 'runtime', 'model'] as Tab[]).includes(tab) && <BonsaiSettings busy={busy} modelPath={preferences.modelPath}
+      onActivated={async () => { await onSaveSelection({ providerId: null, modelId: '' }); await onRefresh?.(); await refreshLibrary(); }}
+      onRefresh={async () => { await onRefresh?.(); await refreshLibrary(); }} onPreset={async preset => { await onSaveConfig(preset); if (runtime.phase === 'ready' || runtime.phase === 'error') onLoad(); }} />}
     {tab === 'library' ? <ModelLibrary models={installed} loading={libraryLoading} busy={busy || switching} selectedPath={preferences.modelPath} loadedPath={runtime.modelPath} onRefresh={refreshLibrary} onUse={useModel} onDeleted={async () => { await onRefresh?.(); }} /> : <>
     {tab === 'model' && localModels.some(m => m.filename === localFilename) && <ModelDownload key={localFilename} filename={localFilename} busy={busy} onSelect={path => { updateDraft(current => ({ ...current, modelPath: path })); setNotice('Verified model selected. Save settings to apply it, then load the model.'); }} />}
     {tab === 'model' && <RuntimeDownload busy={busy} onSelect={path => { updateDraft(current => ({ ...current, runtimePath: path })); setNotice('Installed runtime selected. Save settings to apply it.'); }} />}
