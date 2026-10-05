@@ -87,6 +87,7 @@ export function BonsaiSettings({ busy, modelPath, onActivated, onPreset, onRefre
         try { await onPreset(details.preset!); } catch (e) { setError(errorMessage(e)); } finally { setPending(false); }
       }}>Apply measured Bonsai preset</button>}
       <ModelDownload filename={filename} label="Bonsai text weights" backend={modelBackend}
+        verifiedMessage="Model verified. Use it below to load Bonsai with its separate runtime."
         busy={busy || pending || !details?.runtimePath} onSelect={() => void activate()} />
       <RuntimeDownload backend={runtimeBackend} title="PrismML · CUDA 12.4" selectable={false}
         description="Install the pinned PrismML runtime in a separate directory. Verify the text weights, then use the verified model."

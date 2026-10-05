@@ -8,7 +8,7 @@ export interface ModelDownloadBackend {
   install: (filename: string) => Promise<ModelInstallStatus>;
   cancel: () => Promise<void>;
 }
-export function ModelDownload({ busy, onSelect, filename = localModels[0].filename, backend, label }: { busy: boolean; onSelect: (path: string) => void; filename?: string; backend?: ModelDownloadBackend; label?: string }) {
+export function ModelDownload({ busy, onSelect, filename = localModels[0].filename, backend, label, verifiedMessage }: { busy: boolean; onSelect: (path: string) => void; filename?: string; backend?: ModelDownloadBackend; label?: string; verifiedMessage?: string }) {
   const [info, setInfo] = useState<ModelDownloadInfo | null>(null);
   const [status, setStatus] = useState<ModelInstallStatus | null>(null);
   const [error, setError] = useState('');
@@ -49,7 +49,7 @@ export function ModelDownload({ busy, onSelect, filename = localModels[0].filena
     {insufficient && <p role="alert">Not enough disk space for this download.</p>}
     {error && <p role="alert">{error}</p>}{status?.error && <p role={status.phase === 'cancelled' ? 'status' : 'alert'}>{status.phase === 'cancelled' ? 'Installation cancelled. You can try again when ready.' : status.error}</p>}
     {active && <div role="status"><p>{status?.phase === 'verifying' ? 'Verifying existing model' : 'Downloading model'} · {gib(status?.received ?? 0)} / {gib(status?.total || info?.bytes || 0)}</p><progress aria-label="Model installation progress" max={status?.total || info?.bytes || 1} value={status?.received ?? 0} /></div>}
-    {verified && <p role="status">Model verified. Select it below, then save your model settings.</p>}
+    {verified && <p role="status">{verifiedMessage ?? 'Model verified. Select it below, then save your model settings.'}</p>}
     <div className="connector-actions"><button type="button" className="secondary" disabled={!nativeAvailable || !info || active || Boolean(insufficient)} onClick={() => void install()}>{info?.destinationExists ? 'Verify managed model' : 'Download model'}</button>
       {active && <button type="button" className="secondary" disabled={cancelling} onClick={async () => { setCancelling(true); try { await (backend ? backend.cancel() : api.cancelModelInstall()); } catch (e) { setError(errorMessage(e)); } finally { setCancelling(false); } }}>Cancel installation</button>}
       {verified && status?.path && <button type="button" className="primary" disabled={busy || Boolean(active)} onClick={() => onSelect(status.path!)}>Use verified model</button>}</div>

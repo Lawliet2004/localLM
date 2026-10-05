@@ -64,6 +64,7 @@ async fn workload_payload(
 ) -> Result<Value, String> {
     let mut lo = 0;
     let mut hi = 3000;
+    let mut below = None;
     while lo <= hi {
         let padding = (lo + hi) / 2;
         let mut payload = json!({"messages":[{"role":"user","content":format!("Record {round}. Context: {}\nWrite a long coherent story about a gardener who teaches a child to grow an apple tree. Continue with practical observations and keep writing until the reply limit.", " orchard".repeat(padding))}],
@@ -76,11 +77,31 @@ async fn workload_payload(
             return Ok(payload);
         }
         if tokens < 2000 {
+            below = Some(payload);
             lo = padding + 1;
         } else if padding == 0 {
             break;
         } else {
             hi = padding - 1;
+        }
+    }
+    // A word may split into multiple BPE tokens; bridge the remaining gap with
+    // text whose actual token count is checked rather than assuming its length.
+    if let Some(payload) = below {
+        for suffix in [" a", " x", " b", " 1", ".", "!", " a a", " x x"] {
+            let mut filled = payload.clone();
+            let content = filled["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .replace("\nWrite", &format!("{suffix}\nWrite"));
+            filled["messages"][0]["content"] = json!(content);
+            if crate::context::count_only(client, &runtime.endpoint, &runtime.api_key, &filled)
+                .await?
+                == 2000
+            {
+                filled["id_slot"] = json!(0);
+                return Ok(filled);
+            }
         }
     }
     Err("Could not construct an exactly 2000-token chat input with the embedded template.".into())
