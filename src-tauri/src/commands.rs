@@ -262,7 +262,10 @@ pub async fn load_model(state: State<'_, AppState>) -> Result<RuntimeStatus, Str
         .operation
         .try_lock()
         .map_err(|_| "A model operation is already in progress.")?;
-    load_selected_model(&state).await
+    match load_selected_model(&state).await {
+        Ok(status) => Ok(status),
+        Err(error) => Err(crate::experimental::bonsai::recover_selected_failure(&state, error).await),
+    }
 }
 
 pub(crate) async fn load_selected_model(state: &AppState) -> Result<RuntimeStatus, String> {

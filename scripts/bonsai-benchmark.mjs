@@ -90,6 +90,29 @@ if (mode === 'probe') {
 } else if (mode === 'setting') {
   const config = { ...base, ...JSON.parse(process.argv[3] ?? '{}') };
   await benchmark(process.argv[4] ?? 'setting', config, 512, 128, 3);
+} else if (mode === 'matrix') {
+  const full = { ...base, layers: 65, context: 4096 };
+  const variants = [
+    ['ctx4096-f16', {}],
+    ['ctx4096-q8', { k: 'q8_0', v: 'q8_0' }],
+    ['ctx4096-q4', { k: 'q4_0', v: 'q4_0' }],
+    ['ctx8192-f16', { context: 8192 }],
+    ['ctx8192-q8', { context: 8192, k: 'q8_0', v: 'q8_0' }],
+    ['ctx8192-q4', { context: 8192, k: 'q4_0', v: 'q4_0' }],
+    ['ctx16384-q4', { context: 16384, k: 'q4_0', v: 'q4_0' }],
+    ['ctx32768-q4', { context: 32768, k: 'q4_0', v: 'q4_0' }],
+    ['cpu-kv-q8', { k: 'q8_0', v: 'q8_0', kvCpu: true }],
+    ['flash-off-f16', { flash: 'off' }],
+    ['batch64-ub32', { batch: 64, ubatch: 32 }],
+    ['batch256-ub128', { batch: 256, ubatch: 128 }],
+    ['batch512-ub256', { batch: 512, ubatch: 256 }],
+    ['threads12', { threads: 12 }],
+    ['no-mmap', { load: 'none' }],
+    ['mlock', { load: 'mlock' }],
+  ];
+  for (const [name, changes] of variants) {
+    await benchmark(name, { ...full, ...changes }, 512, 128, 3);
+  }
 } else {
-  throw new Error('Choose probe, layers, or setting with a JSON configuration.');
+  throw new Error('Choose probe, layers, matrix, or setting with a JSON configuration.');
 }

@@ -478,6 +478,30 @@ fn preserve_load_error(state: &crate::AppState, error: &str) -> String {
     }
 }
 
+/// The existing Runtime settings reload button must recover experimental failures too.
+pub(crate) async fn recover_selected_failure(state: &crate::AppState, error: String) -> String {
+    let selection = (|| -> Result<_, String> {
+        let store = state.database()?;
+        Ok((
+            owns_model(state, &store.preferences()?.model_path),
+            store.setting::<Option<Previous>>(PREVIOUS_KEY)?,
+        ))
+    })();
+    let Ok((true, Some(previous))) = selection else {
+        return error;
+    };
+    if let Err(stop) = state.runtime.lock().await.stop().await {
+        return format!("{error}. Cannot stop failed runtime: {stop}");
+    }
+    let error = preserve_load_error(state, &error);
+    match restore(state, &previous, true).await {
+        Ok(()) => format!("Bonsai failed: {error}. Previous model settings restored."),
+        Err(recovery) => {
+            format!("Bonsai failed: {error}. Previous settings restored; reload failed: {recovery}")
+        }
+    }
+}
+
 fn choose_config(
     state: &crate::AppState,
     preferences: &crate::store::Preferences,
@@ -706,3 +730,6 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "qualification.rs"]
+mod qualification;
