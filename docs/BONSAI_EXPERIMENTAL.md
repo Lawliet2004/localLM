@@ -1,7 +1,8 @@
 # Bonsai-27B experimental acceptance
 
-Status: acquisition and feasibility checks in progress. **The application feature
-has not been enabled or integrated. No preset or local throughput is validated.**
+Status: the runtime has been acquired and verified; model transfer and inference
+feasibility checks are in progress. **The application feature has not been enabled
+or integrated. No preset or local throughput is validated.**
 Recorded on 2026-10-05 on branch `feat/experimental-bonsai-27b`.
 
 ## Baseline before changes
@@ -67,8 +68,9 @@ and the [release page](https://github.com/PrismML-Eng/llama.cpp/releases/tag/pri
 The selected runtime uses the same CUDA version as MiniCPM's runtime. NVIDIA's
 [CUDA 12.4 release notes](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-toolkit-release-notes/index.html)
 list Windows driver 551.61 for CUDA 12.4 GA and 528.33 for CUDA 12.x minor-version
-compatibility, which has restrictions. Local inference has not yet confirmed
-runtime compatibility. No CUDA Toolkit source build has been attempted.
+compatibility, which has restrictions. Both executables start successfully and
+report CUDA0 as the RTX 2050, compute capability 8.6. Inference compatibility is
+still pending. No CUDA Toolkit source build has been attempted.
 
 ## Machine and measurement conditions
 
@@ -91,8 +93,31 @@ from the verified ZIPs, rather than invented.
 
 ## Acceptance still required
 
-Runtime acquisition/launch, full model transfer/hash verification, benchmark
-sweep, coherent chat and reasoning/tool acceptance, cancellation/resume,
+Both runtime archives were downloaded and passed SHA-256 verification, then
+extracted with the production bounded extractor. The primary archive has 71
+entries (724,707,328 expanded bytes), including `llama-server.exe` and
+`llama-bench.exe`; the CUDA DLL archive has 3 entries (574,138,880 expanded bytes).
+`--help` for both executables and server `--list-devices` exited 0. No stock
+runtime or model files were modified.
+
+`model-cancel` exercised a real fresh transfer and returned `Download cancelled.`
+after its 32 MiB threshold; the partial file remained and `model` restarted it.
+The complete model has not yet been published or hash verified.
+
+The added `scripts/bonsai-benchmark.mjs` uses only flags discovered in the fork's
+help. It samples device-wide NVIDIA memory and process working/private memory
+every 500 ms; reported peaks will be sampled lower bounds. The pinned bench
+source allocates `n_prompt + n_gen + n_depth` context, so separate pp/tg runs
+set depth to hold their requested context constant. No performance run is claimed.
+
+The ignored Rust test `experimental::acceptance::managed_chat_acceptance` uses
+the existing `Runtime::load`/`stop`, authenticated token preflight and embedded
+Jinja template, with ten prompts plus reasoning and a native `system_time` tool
+round-trip. Its test-only module is the only current application source touch.
+It has compiled and passed strict Clippy; the real model run is pending.
+
+Full model transfer/hash verification, benchmark
+sweep, coherent chat and reasoning/tool acceptance, completed resume,
 failure recovery, model switching, 30-minute soak, opt-in integration and its
 automated checks are pending. No benchmark numbers or stable preset are claimed.
 

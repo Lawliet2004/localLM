@@ -1,5 +1,22 @@
 # Runtime provenance
 
+## Isolated Bonsai-27B acceptance (not yet integrated)
+
+The experimental acceptance helper downloads PrismML's Windows x64 CUDA 12.4
+release `prism-b10754-2459f68`, commit
+`2459f68b5c0eb26261fd5a81682004b93cd645ba`. Both release archives have been
+downloaded, SHA-256 verified through the production downloader, and extracted
+through the bounded runtime extractor into `.local/experimental/bonsai-27b`.
+Its server and benchmark executables start and identify CUDA0 as the RTX 2050,
+compute capability 8.6. This is acquisition/driver evidence; inference, a stable
+preset and app integration remain pending.
+
+[Bonsai acceptance](BONSAI_EXPERIMENTAL.md) records the model revision, archive
+names, exact hashes, licenses, baseline checks and remaining acceptance work.
+The standard b10855 runtime, MiniCPM catalog and application settings are unchanged.
+
+## Standard MiniCPM runtime
+
 Development runtime: ggml-org/llama.cpp release b10855, Windows x64 CUDA 12.4. Archives and SHA-256 digests are pinned in scripts/prepare-runtime.ps1 using GitHub release asset metadata.
 
 llama-server is launched with `--parallel` from Runtime **Inference slots** (default 1). Local chat completions send `cache_prompt: true` and `id_slot: 0` for the parent conversation; subagents use `id_slot: 1` when two slots are enabled. Token counting (`/v1/chat/completions/input_tokens`) omits both fields so preflight cannot evict the generation slot. Two slots roughly double KV memory — keep 1 on 4 GB GPUs.

@@ -1,5 +1,27 @@
 # Evidence and remaining work
 
+## 2026-10-05 — Bonsai-27B acquisition and baseline
+
+Work is isolated on `feat/experimental-bonsai-27b`; the user requested a stop on
+an unresolved acquisition/inference blocker. No opt-in application feature or
+measured preset is delivered yet. Existing local changes are preserved.
+
+Before implementation: Vitest 455 passed / 1 skipped, Rust 407 passed / 2 ignored,
+build, strict Clippy, typecheck and lint passed; Edge Playwright 10 passed and
+script tests 39 passed. Existing diagnostic warnings did not fail checks.
+
+Confirmed the HF repository, immutable model revision, Q1_0 file's LFS size/hash,
+Apache-2.0 model license, and the fork's CUDA Q1_0 kernels. Acquired and verified
+both PrismML CUDA 12.4 ZIPs, extracted all 74 entries through existing production
+code, and confirmed server/bench startup and RTX 2050 CUDA0 detection. Default
+MiniCPM files, runtime, settings and database schema remain unchanged.
+
+A new model network transfer was cancelled after the 32 MiB threshold and retained
+its partial file. Restart/full-transfer verification is in progress. Isolated
+benchmark and managed-Runtime chat/reasoning/read-only-tool acceptance helpers
+are prepared, but have not run against the complete model. Full details and
+remaining work: [Bonsai acceptance](BONSAI_EXPERIMENTAL.md).
+
 ## 2026-09-16
 Context window save/load and first-turn overflow.
 

@@ -18,13 +18,19 @@ async fn main() -> Result<(), String> {
         .parent().ok_or("Project root missing.")?.join(".local/experimental/bonsai-27b");
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let client = download::client()?;
-    let (_sender, cancel) = tokio::sync::watch::channel(false);
-    if mode == "model" {
+    let (sender, cancel) = tokio::sync::watch::channel(false);
+    if mode == "model" || mode == "model-cancel" {
         let directory = root.join("models");
         std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
         let destination = directory.join(MODEL_NAME);
+        if mode == "model-cancel" && destination.exists() {
+            return Err("Cancellation acceptance requires an absent final model file.".into());
+        }
         let mut last = 0;
         let progress = |n| {
+            if mode == "model-cancel" && n >= 32 * 1024 * 1024 {
+                let _ = sender.send(true);
+            }
             if n >= last + 128 * 1024 * 1024 || n == MODEL.bytes {
                 println!("model: {n}/{} bytes", MODEL.bytes);
                 last = n;
@@ -38,7 +44,7 @@ async fn main() -> Result<(), String> {
         println!("Verified model: {} SHA-256 {}", destination.display(), MODEL.sha256);
         return Ok(());
     }
-    if mode != "runtime" { return Err("Choose runtime or model.".into()); }
+    if mode != "runtime" { return Err("Choose runtime, model or model-cancel.".into()); }
     let archives = [
         ("llama-prism-b10754-2459f68-bin-win-cuda-12.4-x64.zip", 312_971_133,
          "200842b4c689fe092a8a1684ef1e185d8d025a0bfae6908737607a0f29560b96"),
