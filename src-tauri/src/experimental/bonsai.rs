@@ -433,7 +433,8 @@ async fn activate_inner(
     if !selected {
         next.temperature = 0.7;
         next.top_p = 0.95;
-        next.max_tokens = 512;
+        // The 500-token benchmark excludes thinking; real replies need room for it.
+        next.max_tokens = 2048;
     }
     state.database()?.save_model_runtime(&next, &config)?;
     match crate::commands::load_selected_model(state).await {

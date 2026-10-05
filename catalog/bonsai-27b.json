@@ -13,5 +13,25 @@
   "runtimeTag": "prism-b10754-2459f68",
   "runtimeCommit": "2459f68b5c0eb26261fd5a81682004b93cd645ba",
   "runtimeLicense": "MIT",
-  "cudaVersion": "12.4"
+  "cudaVersion": "12.4",
+  "preset": {
+    "batchSize": 128,
+    "cacheTypeK": "q8_0",
+    "cacheTypeV": "q8_0",
+    "contextLength": 4096,
+    "cpuThreads": 6,
+    "flashAttention": true,
+    "gpuLayers": 65,
+    "inferenceSlots": 1,
+    "microBatchSize": 64,
+    "mmap": true,
+    "offloadKvCache": true
+  },
+  "presetAcceptance": {
+    "date": "2026-10-05",
+    "inputTokens": 2000,
+    "outputTokens": 500,
+    "repetitions": 5,
+    "meanGenerationTokensPerSecond": 19.5308565112844
+  }
 }

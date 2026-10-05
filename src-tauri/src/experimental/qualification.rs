@@ -116,6 +116,17 @@ async fn laptop_qualification() -> Result<(), String> {
         Ok("soak") => workload(true).await,
         Ok("integration") => integration().await,
         Ok("max-context") => max_context().await,
+        Ok("streaming") => {
+            let mut runtime = Runtime::new(evidence().join("streaming-runtime.log"));
+            runtime.load(&preferences()?, &candidate()?).await?;
+            let max = std::env::var("BONSAI_QA_STREAM_TOKENS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2048);
+            let result = streaming_thinking(&client()?, &runtime, max).await;
+            runtime.stop().await?;
+            result.map(|_| ())
+        }
         _ => Err("Select workload, soak, integration, or max-context explicitly.".into()),
     }
 }
@@ -235,42 +246,15 @@ async fn integration() -> Result<(), String> {
     let mut record = json!({"miniBefore":before,"miniAnswer":mini_answer,"offError":missing_flag_error,"bonsai":bonsai,"bonsaiAnswer":bonsai_answer,"miniAfter":mini_after,"bonsaiAgain":bonsai_again});
     write("integration.json", &record)?;
 
-    // Real SSE includes reasoning deltas; the existing parser already accepts this field.
-    let runtime = state.runtime.lock().await;
-    let unauthorized = client
-        .get(format!("{}/v1/models", runtime.endpoint))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .status();
-    assert_eq!(unauthorized.as_u16(), 401);
-    let mut stream = client.post(format!("{}/v1/chat/completions", runtime.endpoint)).bearer_auth(&runtime.api_key)
-        .json(&json!({"messages":[{"role":"user","content":"Calculate 17+25 and explain briefly."}],"stream":true,"max_tokens":512,"chat_template_kwargs":{"enable_thinking":true}}))
-        .send().await.map_err(|e| e.to_string())?.bytes_stream();
-    let mut sse = String::new();
-    while let Some(bytes) = stream.next().await {
-        sse.push_str(
-            std::str::from_utf8(&bytes.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?,
-        );
-    }
-    let mut thought = String::new();
-    let mut answer = String::new();
-    for line in sse.lines().filter_map(|l| l.strip_prefix("data: ")) {
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            let delta = &value["choices"][0]["delta"];
-            thought.push_str(delta["reasoning_content"].as_str().unwrap_or(""));
-            answer.push_str(delta["content"].as_str().unwrap_or(""));
-        }
-    }
-    assert!(!thought.is_empty());
-    assert!(answer.contains("42"));
-    assert!(!answer.contains("<think>"));
-    record["streaming"] = json!({"unauthorizedStatus":401,"reasoning":thought,"content":answer});
-    std::fs::write(evidence().join("thinking.sse.txt"), sse).map_err(|e| e.to_string())?;
-    drop(runtime);
+    record["streaming"] = streaming_thinking(&client, &*state.runtime.lock().await, 2048).await?;
     write("integration.json", &record)?;
 
     // Simulate insufficient VRAM with the maximum model context and full F16 cache.
+    std::fs::copy(
+        directory.path().join("runtime.log"),
+        evidence().join("integration-bonsai-runtime.log"),
+    )
+    .map_err(|e| e.to_string())?;
     let oom = RuntimeConfig {
         context_length: 262144,
         cache_type_k: crate::runtime_config::CacheType::F16,
@@ -287,6 +271,11 @@ async fn integration() -> Result<(), String> {
     assert_eq!(state.database()?.runtime_config()?, config);
     assert_eq!(state.runtime.lock().await.inspect().phase, "ready");
     record["oomError"] = json!(oom_error);
+    std::fs::copy(
+        directory.path().join(ROOT).join("last-load-failure.log"),
+        evidence().join("forced-oom-runtime.log"),
+    )
+    .map_err(|e| e.to_string())?;
     record["miniAfterOom"] = short_chat(&client, &*state.runtime.lock().await).await?;
     write("integration.json", &record)?;
 
@@ -389,4 +378,63 @@ async fn max_context() -> Result<(), String> {
         return Err("No extended context passed.".into());
     }
     Ok(())
+}
+
+async fn streaming_thinking(
+    client: &reqwest::Client,
+    runtime: &Runtime,
+    max: u32,
+) -> Result<Value, String> {
+    let unauthorized = client
+        .get(format!("{}/v1/models", runtime.endpoint))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .status();
+    if unauthorized.as_u16() != 401 {
+        return Err(format!(
+            "Unauthenticated model access returned {unauthorized}"
+        ));
+    }
+    let mut stream = client.post(format!("{}/v1/chat/completions", runtime.endpoint)).bearer_auth(&runtime.api_key)
+        .json(&json!({"messages":[{"role":"user","content":"Calculate 17+25 and explain briefly."}],"stream":true,"max_tokens":max,"temperature":0.7,"top_p":0.95,"chat_template_kwargs":{"enable_thinking":true}}))
+        .send().await.map_err(|e| e.to_string())?.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
+    }
+    let sse = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+    let mut thought = String::new();
+    let mut answer = String::new();
+    let mut finish = Value::Null;
+    for line in sse.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            let delta = &value["choices"][0]["delta"];
+            thought.push_str(
+                delta["reasoning_content"]
+                    .as_str()
+                    .or_else(|| delta["reasoning"].as_str())
+                    .unwrap_or(""),
+            );
+            answer.push_str(delta["content"].as_str().unwrap_or(""));
+            if !value["choices"][0]["finish_reason"].is_null() {
+                finish = value["choices"][0]["finish_reason"].clone();
+            }
+        }
+    }
+    let record = json!({"maxTokens":max,"unauthorizedStatus":401,"reasoning":thought,"content":answer,"finishReason":finish});
+    write(&format!("streaming-{max}.json"), &record)?;
+    std::fs::write(evidence().join(format!("thinking-{max}.sse.txt")), sse)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "Streaming {max}: finish {finish}, reasoning {} chars, answer {answer}",
+        thought.len()
+    );
+    if thought.is_empty() || !answer.contains("42") || answer.contains("<think>") {
+        return Err(
+            "Reasoning stream did not complete the expected final answer; raw evidence preserved."
+                .into(),
+        );
+    }
+    Ok(record)
 }

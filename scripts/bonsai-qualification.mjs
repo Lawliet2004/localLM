@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const mode = process.argv[2];
-if (!['workload', 'soak', 'integration', 'max-context'].includes(mode)) throw new Error('Choose workload, soak, integration, or max-context.');
+if (!['workload', 'soak', 'integration', 'max-context', 'streaming'].includes(mode)) throw new Error('Choose workload, soak, integration, max-context, or streaming.');
 const root = path.resolve('.local/experimental/bonsai-27b');
 const bundle = fs.readdirSync(root).find(n => n.startsWith('prism-b10754-2459f68-cuda12.4-'));
 if (!bundle) throw new Error('Acquire the isolated pinned runtime first.');

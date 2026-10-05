@@ -53,16 +53,23 @@ async fn managed_chat_acceptance() -> Result<(), String> {
         model_path: model.to_string_lossy().into_owned(),
         ..Default::default()
     };
-    let config = RuntimeConfig {
-        context_length: 4096,
-        gpu_layers: 32,
-        cpu_threads: 6,
-        batch_size: 128,
-        micro_batch_size: 64,
-        flash_attention: true,
-        cache_type_k: CacheType::F16,
-        cache_type_v: CacheType::F16,
-        ..Default::default()
+    let config = if std::env::var("BONSAI_ACCEPTANCE_PRESET").as_deref() == Ok("1") {
+        let catalog: Value = serde_json::from_str(include_str!("../../../catalog/bonsai-27b.json"))
+            .map_err(|e| e.to_string())?;
+        serde_json::from_value::<RuntimeConfig>(catalog["preset"].clone())
+            .map_err(|e| e.to_string())?
+    } else {
+        RuntimeConfig {
+            context_length: 4096,
+            gpu_layers: 32,
+            cpu_threads: 6,
+            batch_size: 128,
+            micro_batch_size: 64,
+            flash_attention: true,
+            cache_type_k: CacheType::F16,
+            cache_type_v: CacheType::F16,
+            ..Default::default()
+        }
     };
     let started = Instant::now();
     let status = runtime.load(&preferences, &config).await?;
@@ -153,7 +160,7 @@ async fn managed_chat_acceptance() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let thinking = json!({"messages":[{"role":"user","content":"Calculate 17 + 25 and explain briefly."}],
-        "stream":false,"max_tokens":512,"chat_template_kwargs":{"enable_thinking":true}});
+        "stream":false,"max_tokens":2048,"chat_template_kwargs":{"enable_thinking":true}});
     let response: Value = client
         .post(format!("{}/v1/chat/completions", runtime.endpoint))
         .bearer_auth(&runtime.api_key)
