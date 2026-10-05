@@ -1,0 +1,314 @@
+[
+  {
+    "bytes": 312971133,
+    "files": [
+      {
+        "bytes": 674304,
+        "name": "ggml-base.dll"
+      },
+      {
+        "bytes": 980480,
+        "name": "ggml-cpu-alderlake.dll"
+      },
+      {
+        "bytes": 1217536,
+        "name": "ggml-cpu-cannonlake.dll"
+      },
+      {
+        "bytes": 1218560,
+        "name": "ggml-cpu-cascadelake.dll"
+      },
+      {
+        "bytes": 983040,
+        "name": "ggml-cpu-haswell.dll"
+      },
+      {
+        "bytes": 1218560,
+        "name": "ggml-cpu-icelake.dll"
+      },
+      {
+        "bytes": 889856,
+        "name": "ggml-cpu-sandybridge.dll"
+      },
+      {
+        "bytes": 1217536,
+        "name": "ggml-cpu-skylakex.dll"
+      },
+      {
+        "bytes": 809984,
+        "name": "ggml-cpu-sse42.dll"
+      },
+      {
+        "bytes": 825856,
+        "name": "ggml-cpu-ssse3.dll"
+      },
+      {
+        "bytes": 811008,
+        "name": "ggml-cpu-x64.dll"
+      },
+      {
+        "bytes": 685603328,
+        "name": "ggml-cuda.dll"
+      },
+      {
+        "bytes": 86016,
+        "name": "ggml-rpc-server.exe"
+      },
+      {
+        "bytes": 124416,
+        "name": "ggml-rpc.dll"
+      },
+      {
+        "bytes": 66560,
+        "name": "ggml.dll"
+      },
+      {
+        "bytes": 128512,
+        "name": "llama-batched-bench-impl.dll"
+      },
+      {
+        "bytes": 10752,
+        "name": "llama-batched-bench.exe"
+      },
+      {
+        "bytes": 37888,
+        "name": "llama-batched.exe"
+      },
+      {
+        "bytes": 886272,
+        "name": "llama-bench-impl.dll"
+      },
+      {
+        "bytes": 10752,
+        "name": "llama-bench.exe"
+      },
+      {
+        "bytes": 2016256,
+        "name": "llama-cli-impl.dll"
+      },
+      {
+        "bytes": 10752,
+        "name": "llama-cli.exe"
+      },
+      {
+        "bytes": 9590272,
+        "name": "llama-common.dll"
+      },
+      {
+        "bytes": 246272,
+        "name": "llama-completion-impl.dll"
+      },
+      {
+        "bytes": 10752,
+        "name": "llama-completion.exe"
+      },
+      {
+        "bytes": 128000,
+        "name": "llama-debug.exe"
+      },
+      {
+        "bytes": 57344,
+        "name": "llama-diffusion-cli.exe"
+      },
+      {
+        "bytes": 57344,
+        "name": "llama-embedding.exe"
+      },
+      {
+        "bytes": 30720,
+        "name": "llama-eval-callback.exe"
+      },
+      {
+        "bytes": 31744,
+        "name": "llama-finetune.exe"
+      },
+      {
+        "bytes": 104960,
+        "name": "llama-fit-params-impl.dll"
+      },
+      {
+        "bytes": 10752,
+        "name": "llama-fit-params.exe"
+      },
+      {
+        "bytes": 26624,
+        "name": "llama-gemma3-cli.exe"
+      },
+      {
+        "bytes": 72704,
+        "name": "llama-gen-docs.exe"
+      },
+      {
+        "bytes": 65536,
+        "name": "llama-gguf-hash.exe"
+      },
+      {
+        "bytes": 49664,
+        "name": "llama-gguf-split.exe"
+      },
+      {
+        "bytes": 29696,
+        "name": "llama-gguf.exe"
+      },
+      {
+        "bytes": 31744,
+        "name": "llama-idle.exe"
+      },
+      {
+        "bytes": 195584,
+        "name": "llama-imatrix.exe"
+      },
+      {
+        "bytes": 48640,
+        "name": "llama-kv-mean-center.exe"
+      },
+      {
+        "bytes": 26624,
+        "name": "llama-llava-cli.exe"
+      },
+      {
+        "bytes": 42496,
+        "name": "llama-lookahead.exe"
+      },
+      {
+        "bytes": 31744,
+        "name": "llama-lookup-create.exe"
+      },
+      {
+        "bytes": 17920,
+        "name": "llama-lookup-merge.exe"
+      },
+      {
+        "bytes": 36864,
+        "name": "llama-lookup-stats.exe"
+      },
+      {
+        "bytes": 41472,
+        "name": "llama-lookup.exe"
+      },
+      {
+        "bytes": 26624,
+        "name": "llama-minicpmv-cli.exe"
+      },
+      {
+        "bytes": 67584,
+        "name": "llama-mtmd-cli.exe"
+      },
+      {
+        "bytes": 44544,
+        "name": "llama-mtmd-debug.exe"
+      },
+      {
+        "bytes": 75264,
+        "name": "llama-parallel.exe"
+      },
+      {
+        "bytes": 39936,
+        "name": "llama-passkey.exe"
+      },
+      {
+        "bytes": 342528,
+        "name": "llama-perplexity-impl.dll"
+      },
+      {
+        "bytes": 10752,
+        "name": "llama-perplexity.exe"
+      },
+      {
+        "bytes": 331264,
+        "name": "llama-quantize-impl.dll"
+      },
+      {
+        "bytes": 10752,
+        "name": "llama-quantize.exe"
+      },
+      {
+        "bytes": 26624,
+        "name": "llama-qwen2vl-cli.exe"
+      },
+      {
+        "bytes": 37888,
+        "name": "llama-results.exe"
+      },
+      {
+        "bytes": 74752,
+        "name": "llama-retrieval.exe"
+      },
+      {
+        "bytes": 27648,
+        "name": "llama-rs-rollback-multi.exe"
+      },
+      {
+        "bytes": 20992,
+        "name": "llama-rs-rollback.exe"
+      },
+      {
+        "bytes": 7484416,
+        "name": "llama-server-impl.dll"
+      },
+      {
+        "bytes": 10752,
+        "name": "llama-server.exe"
+      },
+      {
+        "bytes": 27136,
+        "name": "llama-simple-chat.exe"
+      },
+      {
+        "bytes": 24064,
+        "name": "llama-simple.exe"
+      },
+      {
+        "bytes": 40448,
+        "name": "llama-speculative-simple.exe"
+      },
+      {
+        "bytes": 64000,
+        "name": "llama-speculative.exe"
+      },
+      {
+        "bytes": 51712,
+        "name": "llama-tokenize.exe"
+      },
+      {
+        "bytes": 33792,
+        "name": "llama-tts.exe"
+      },
+      {
+        "bytes": 2574848,
+        "name": "llama.dll"
+      },
+      {
+        "bytes": 67584,
+        "name": "llama.exe"
+      },
+      {
+        "bytes": 2377728,
+        "name": "mtmd.dll"
+      }
+    ],
+    "name": "llama-prism-b10754-2459f68-bin-win-cuda-12.4-x64.zip",
+    "sha256": "200842b4c689fe092a8a1684ef1e185d8d025a0bfae6908737607a0f29560b96",
+    "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10754-2459f68/llama-prism-b10754-2459f68-bin-win-cuda-12.4-x64.zip"
+  },
+  {
+    "bytes": 391443627,
+    "files": [
+      {
+        "bytes": 100033536,
+        "name": "cublas64_12.dll"
+      },
+      {
+        "bytes": 473551360,
+        "name": "cublasLt64_12.dll"
+      },
+      {
+        "bytes": 553984,
+        "name": "cudart64_12.dll"
+      }
+    ],
+    "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+    "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10754-2459f68/cudart-llama-bin-win-cuda-12.4-x64.zip"
+  }
+]
