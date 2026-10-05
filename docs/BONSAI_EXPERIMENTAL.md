@@ -496,8 +496,12 @@ The Edge test exercised actual browser UI with mocked IPC; hardware acceptance
 exercised actual managed Rust/server paths with isolated temporary databases.
 The combined native GUI download/click path, packaged installer and another
 machine/older driver were not tested. Checks run against the existing dirty
-working tree, whose unrelated settings and test-fixture work was preserved;
-a clean checkout containing only this task's commits has not been validated.
+working tree. The task's code uses the user's pre-existing uncommitted
+`Settings.tsx` components and shared Rust test fixture; those files were not
+swept into this task's commits. A checkout containing only the task commit stack
+is therefore not a self-contained snapshot of the tested tree. Reconcile/commit
+the user's baseline work before expecting standalone checkout checks. That
+checkout has not been validated.
 
 The existing MiniCPM GGUF still hashes to its pinned
 `d39e78a06dbb9b28ed9a9118b1370e992caf862003c925264ea33789b3e416bc`

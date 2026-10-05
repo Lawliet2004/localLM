@@ -48,7 +48,9 @@ bounded run. First/last five mean generation was 19.637/18.907 tokens/s; the cau
 of the small late slowdown was not measured. The server stopped, VRAM returned
 to 8 MiB, and AC power/Balanced plan remained unchanged. Native GUI download/click
 acceptance, packaged installation, a filled 262k history and a clean checkout
-containing only task commits remain unverified. The existing uncommitted test
+containing only task commits remain unverified. The commit stack uses the user's
+pre-existing uncommitted Settings components and shared Rust fixture; those must
+be reconciled before a standalone checkout represents the tested tree. The
 fixture's one installer-field compatibility line is intentionally unstaged.
 
 ## 2026-09-16
