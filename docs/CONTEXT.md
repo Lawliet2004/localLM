@@ -20,6 +20,28 @@ Compaction is a bounded checkpoint plus recent complete turns, never a deletion.
 
 The Tools page offers explicit Standard, Chat, Research, and Coding profiles. Chat injects a minimal harness (no web, shell, or subagents); Research exposes selected live search/fetch connectors with repository documentation tools opt-in; Coding focuses on workspace editing and execution. Profiles are per-conversation config patches over tool visibility: switching conversations preserves each conversation's saved profile and custom connector selections, and a profile chosen for a new chat is persisted before its first turn.
 
+## Project context: rules, repo map, and memory
+
+Three context sources share one builder (`memory::turn_context`), which both `assemble_turn` and the `context_preview` command call — the Workspace inspector's Context tab lists the same items the model will actually receive, with a reason and a rough token count (chars/4) per item.
+
+### Rule files
+
+Each turn re-reads rule files fresh (no cache), so an edit takes effect on the next turn. Precedence is: the project's `AGENTS.md` first, then other project-level rule files (`CLAUDE.md`, `.cursorrules`, `.devin/rules/*.md`, sorted by name), then user-level rules in `~/.devin/rules/*.md`. Files are capped individually and in total; oversized files are truncated on a UTF-8 boundary. Rule text is injected as a `rules` scratchpad item labelled "context only" — it cannot change the interaction mode, permissions, or available tools, and a test asserts a "you have full access" rule/memory never widens `effective_capabilities`.
+
+### Repo map
+
+`repo_map(root, token_budget)` (default 1,500 tokens, chars/4) summarizes the workspace: key files (README, AGENTS.md, CLAUDE.md, PRODUCT.md, DESIGN.md, package.json, Cargo.toml, pyproject.toml, Makefile, …), a per-directory file-count layout, contributor commands (package.json scripts, Makefile targets, Cargo/pyproject markers), and a capped skim of top-level declarations (`fn`, `struct`, `class`, `def`, `export function`, `const`) in small source files. File discovery uses `git ls-files -co --exclude-standard` in a git repo and a bounded walk otherwise (skips `.git`, `node_modules`, `target`, `dist`, `.venv`, `__pycache__`, `vendor`). Caps: 20,000 files and a 2-second wall clock; when a cap or clock cuts the scan, the map is marked *partial* rather than silently wrong. Results cache on (root, HEAD, `git status` hash) — any commit or edit invalidates; non-git roots key on a cheap top-level metadata hash.
+
+### Memory
+
+Facts live in `memory_facts` with normalized scopes — `user`, `project:<id>` (or `project:<path>` for pre-project rows), `conversation:<id>` — and an origin of `user`, `agent`, or `survey`. A turn injects only the scopes matching its conversation (user + its project + itself): facts in one project never reach another, `excluded` facts are never injected, and deletion takes effect immediately (facts are read fresh each turn; nothing is cached). Each turn's injected fact ids are recorded in a `memory_used` session event, surfaced in the chat as a "Used N memories" disclosure and in the Context tab.
+
+Write paths run a credential check (private-key blocks, `sk-`/`ghp_`/`xox`/`AKIA` tokens, `password=`/`token=`/`api_key=` assignments, long high-entropy tokens) — matching content is refused with an explicit error, for agent and user writes alike. The `memory.autoRetain` setting (default on, Settings → Data or the Context tab) makes agent memory tools decline to store anything when off; existing memories remain listed and injectable until deleted.
+
+Staleness is computed at read, never stored: a file-derived fact is *stale* when its `source_path` is missing or its hash changed; a project fact that recorded `source_branch` is stale when the project has moved branches. Stale facts are still injected — staleness is a visible signal in the UI, not a silent drop — so check the Context tab when a fact stops matching the project.
+
+Existing rows migrate additively: `global` becomes `user`, a path matching a saved project becomes `project:<id>`, and any other path becomes `project:<path>` — scopes can narrow or stay equivalent, never widen. New columns (`reason`, `source_conversation_id`, `source_path`, `source_hash`, `source_branch`, `pinned`, `excluded`) are added by `ALTER TABLE` with safe defaults.
+
 ## Tool output Bounding & Artifact Store
 
 Tool outputs inserted into the conversation context are strictly bounded by `artifacts::bound_tool_result()`. The excerpt budget follows the tokens still free after the counted input and the response reserve (at most half of the remainder, clamped to 512–8,192 characters); any output beyond it is trimmed into a structured preview snippet, while the unabridged payload is persisted with its sha256 checksum in the SQLite `artifacts` table. The message history retains `_artifactId` and byte sizing metadata, allowing the model (`artifact_read`) and the user (Inspect artifact) to reach the full result without blowing the context budget.

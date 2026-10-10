@@ -216,11 +216,15 @@ async function main() {
             }
           } else if (name === 'visit') {
             const urls = asList(callArgs.url);
-            const out = await runWorker({ action: 'fetch-urls', urls: urls.slice(0, 4) });
+            // goal drives the per-page extraction sub-call; localModel exercises
+            // the same model-compressed path the app uses (briefs, not raw text).
+            const out = await runWorker({
+              action: 'fetch-urls', urls: urls.slice(0, 4), goal: String(callArgs.goal || QUESTION).slice(0, 4000),
+              localModel: { baseUrl: BASE, modelName: 'arex', timeoutMs: 45000, maxInputTokens: 6000 },
+            });
             for (const p of out.pages || []) if (p.text) evidence.push({ url: p.url, claim: p.text.slice(0, 1000) });
-            // Keep the model-visible payload tight so the small context lasts.
-            const pages = (out.pages || []).map((p) => p.isError ? p : { ...p, text: (p.text || '').slice(0, 3000), links: (p.links || []).slice(0, 8) });
-            console.log(`         -> pages: ${(out.pages || []).map((p) => p.isError ? 'ERR:' + (p.message || '').slice(0, 60) : `${(p.text || '').length}ch`).join(' | ')}`);
+            const pages = out.pages || [];
+            console.log(`         -> pages: ${pages.map((p) => p.isError ? 'ERR:' + (p.message || '').slice(0, 60) : `${(p.text || '').length}ch`).join(' | ')}`);
             result = { goal: callArgs.goal, pages };
           } else if (name === 'update_context') {
             // Mirror arex::checkpoint: drop prior exchanges, keep the original

@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({
   open: vi.fn(),
   openPath: vi.fn(),
   closeTerminalForTab: vi.fn(),
+  closeBrowserTab: vi.fn(() => Promise.resolve()),
+  browserCloseAll: vi.fn(() => Promise.resolve()),
   terminalMounts: [] as string[],
 }));
 
@@ -20,6 +22,7 @@ vi.mock('../lib/api', () => ({
     getWorkspace: mocks.getWorkspace,
     workspaceGit: mocks.workspaceGit,
     setWorkspace: mocks.setWorkspace,
+    browserCloseAll: mocks.browserCloseAll,
   },
 }));
 
@@ -38,7 +41,7 @@ vi.mock('./TerminalPanel', async () => {
     closeTerminalForTab: mocks.closeTerminalForTab,
   };
 });
-vi.mock('./BrowserPanel', () => ({ BrowserPanel: () => <div data-testid="browser-panel" /> }));
+vi.mock('./BrowserPanel', () => ({ BrowserPanel: () => <div data-testid="browser-panel" />, closeBrowserTab: mocks.closeBrowserTab }));
 vi.mock('./FilesPanel', () => ({
   WorkspaceTree: () => <div data-testid="workspace-tree" />,
   FileView: () => null,
@@ -94,6 +97,8 @@ describe('WorkspacePanel', () => {
     await waitFor(() => expect(mocks.workspaceGit).toHaveBeenCalled());
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(screen.queryByRole('complementary', { name: 'Workspace inspector' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Toggle workspace panel' }));
+    expect(screen.getByRole('complementary', { name: 'Workspace inspector' })).not.toHaveClass('panel-expanded');
   });
 
   it('mounts a distinct TerminalPanel per terminal tab and kills that tab\'s session on close', async () => {
@@ -115,7 +120,7 @@ describe('WorkspacePanel', () => {
     expect(mocks.terminalMounts[2]).toBe(firstKey);
     expect(screen.getByTestId('terminal-panel')).toHaveTextContent(firstKey);
     fireEvent.click(screen.getAllByRole('button', { name: 'Close Terminal' })[1]);
-    expect(mocks.closeTerminalForTab).toHaveBeenCalledWith(secondKey);
+    await waitFor(() => expect(mocks.closeTerminalForTab).toHaveBeenCalledWith(secondKey));
   });
 
   it('refetches git status when the conversation revision changes', async () => {

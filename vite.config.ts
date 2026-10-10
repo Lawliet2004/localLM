@@ -14,6 +14,7 @@ export default defineConfig(() => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
+    warmup: { clientFiles: ['./src/App.tsx', './src/components/Models.tsx'] },
     port: 1420,
     strictPort: true,
     host: host || false,

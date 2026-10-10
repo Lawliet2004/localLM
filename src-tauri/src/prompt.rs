@@ -12,6 +12,10 @@ use sha2::{Digest, Sha256};
 
 pub const RESPONSE_STYLE: &str = "For completed work, lead with the concrete result. Use short paragraphs and bold only key outcomes. Briefly state what changed and report only checks actually performed and their outcomes. Mention remaining work or failures clearly. Do not invent file edits, tests, timing, or successful execution: rely on recorded tool results. Keep intermediate updates concise and put the final user-facing summary after tool work is complete. Follow the user's requested format when it differs.";
 
+/// Shared, frozen guidance keeps factuality checks present without adding an
+/// unconditional verifier model round or changing the cache between turns.
+pub const FACTUALITY_GUIDANCE: &str = "Verify important user premises before relying on them. Use evidence and tools for current, disputed, or uncertain facts; prefer primary sources. If confidence is low, sources conflict, or only snippets support a claim, cross-check multiple independent sources for that claim. Confidence is not evidence. Cite only retrieved sources; separate facts, inference, and unresolved claims. Before finishing, correct details unsupported by evidence. Reuse gathered evidence and the fastest suitable read tools; batch independent reads when supported. Fill important gaps with bounded, targeted follow-ups within the tool budget, then answer or state uncertainty. Do not repeat equivalent searches.";
+
 pub const CONTINUE_INSTRUCTION: &str = "Continue the interrupted answer from its last sentence without repeating earlier text. The user request is unchanged. Finish naturally when complete.";
 
 /// Frozen when `local_run_code` is in the tool catalog. Short on purpose: small
@@ -21,13 +25,17 @@ pub const CODE_EXECUTION_GUIDANCE: &str = "When the question needs exact arithme
 /// Injection kinds that ride on the current user draft. Anything pushed into
 /// `TurnPlan.injections` under a kind absent from this list is logged as a
 /// context_injection but silently never reaches the model.
-pub const VOLATILE_KINDS: [&str; 6] = [
+pub const VOLATILE_KINDS: [&str; 10] = [
     "unavailable_tools",
     "memory",
+    "rules",
+    "repo_map",
     "plan",
     "plan_mode",
+    "ask_mode",
     "arex_research",
     "system_time",
+    "followup",
 ];
 
 pub fn frozen_system(system_prompt: &str, skill_instructions: &str, ptc_sdk: Option<&str>) -> String {
@@ -48,6 +56,7 @@ pub fn frozen_system_with_guidance(
         ));
     }
     parts.push(RESPONSE_STYLE.to_string());
+    parts.push(FACTUALITY_GUIDANCE.to_string());
     if let Some(guidance) = tool_guidance.filter(|text| !text.is_empty()) {
         parts.push(guidance.to_string());
     }
@@ -148,7 +157,7 @@ pub fn selection_hash(
     hasher.update([u8::from(system_time), u8::from(tool_schemas_suppressed)]);
     // Bump when model-visible tool schemas/descriptions change so existing
     // conversations pick up the new run_code notebook contract.
-    hasher.update(b"code-repl-v1-arex-research-v1");
+    hasher.update(b"code-repl-v1-arex-research-v1-workspace-batch-v1");
     format!("{:x}", hasher.finalize())
 }
 
@@ -223,6 +232,15 @@ mod tests {
     }
 
     #[test]
+    fn followup_guidance_reaches_the_current_turn_without_changing_history() {
+        let history = vec![json!({"role":"assistant","content":"Terminal-Bench 4.0: 66.4%, 57.9%"})];
+        let note = volatile_scratchpad(&[("followup".into(), "Use prior results for those benchmarks.".into())]);
+        let messages = build_turn_messages("You are helpful.", &history, note.as_deref(), &draft("List their scores"));
+        assert_eq!(messages[1], history[0]);
+        assert!(messages[2]["content"].as_str().unwrap().contains("Use prior results for those benchmarks."));
+    }
+
+    #[test]
     fn memory_and_unavailable_tools_stay_out_of_the_prefix() {
         let frozen = frozen_system("You are helpful.", "skill body", None);
         let history = vec![json!({"role": "user", "content": "q"})];
@@ -270,6 +288,26 @@ mod tests {
         let messages = build_turn_messages(&frozen, &[], None, &draft("go"));
         assert_eq!(messages.len(), 2);
         assert_eq!(cache_prefix(&messages).len(), 1);
+    }
+
+    #[test]
+    fn factuality_guidance_reaches_plain_and_tool_enabled_turns() {
+        for system in [
+            frozen_system("base", "", None),
+            frozen_system_with_guidance("base", "", Some("sdk"), Some(CODE_EXECUTION_GUIDANCE)),
+        ] {
+            let history = vec![json!({"role": "assistant", "content": "Earlier evidence"})];
+            let first = build_turn_messages(&system, &history, None, &draft("Is this true?"));
+            let next = build_turn_messages(&system, &history, Some("New evidence"), &draft("Check again"));
+            let guidance = first[0]["content"].as_str().unwrap();
+            assert!(guidance.contains("Verify important user premises"));
+            assert!(guidance.contains("independent sources"));
+            assert!(guidance.contains("Confidence is not evidence"));
+            assert!(guidance.contains("Reuse gathered evidence"));
+            assert_eq!(cache_prefix(&first), cache_prefix(&next));
+            assert!(strict_template_ok(&first).is_ok());
+            assert!(strict_template_ok(&next).is_ok());
+        }
     }
 
     #[test]

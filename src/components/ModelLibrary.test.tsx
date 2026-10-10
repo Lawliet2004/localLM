@@ -8,18 +8,31 @@ const mock = vi.hoisted(() => ({
   huggingFaceFiles: vi.fn(),
   downloadHuggingFaceModel: vi.fn(),
   deleteInstalledModel: vi.fn(),
-  modelInstallStatus: vi.fn(async (): Promise<ModelInstallStatus> => ({ busy: false, phase: 'idle', received: 0, total: 0, path: null, error: null })),
+  downloadJobs: vi.fn(async (): Promise<ModelInstallStatus[]> => []),
   cancelModelInstall: vi.fn(),
   hardwareStatus: vi.fn(async () => ({ logicalCpus: 8, memoryTotalBytes: 16 * 2 ** 30, memoryAvailableBytes: 8 * 2 ** 30, gpuStatus: 'ok', sampledAt: 0, gpus: [{ name: 'GPU', uuid: 'g', memoryUsedMib: 0, memoryTotalMib: 4096, utilizationPercent: 0, driverVersion: '1' }] })),
 }));
 vi.mock('../lib/api', () => ({ api: mock, nativeAvailable: true, errorMessage: String }));
 const model: InstalledModel = { id: 'C:/models/new.gguf', path: 'C:/models/new.gguf', filename: 'new.gguf', bytes: 1024, repo: 'publisher/new-GGUF', revision: 'a'.repeat(40), files: ['C:/models/new.gguf'], complete: true };
+const job = (over: Partial<ModelInstallStatus>): ModelInstallStatus => ({
+  busy: false, phase: 'idle', received: 0, total: 0, path: null, error: null,
+  jobId: 0, key: '', label: '', asset: null, assetIndex: 0, assetCount: 0,
+  assetReceived: 0, assetTotal: 0, saved: 0, attempt: 0, notice: null, updatedAt: 0,
+  ...over,
+});
 beforeEach(() => {
   vi.clearAllMocks();
   mock.searchHuggingFace.mockResolvedValue([]);
-  mock.modelInstallStatus.mockResolvedValue({ busy: false, phase: 'idle', received: 0, total: 0, path: null, error: null });
+  mock.downloadJobs.mockResolvedValue([]);
 });
 const props = { models: [model], loading: false, busy: false, selectedPath: '', loadedPath: null, onRefresh: vi.fn(async () => {}), onUse: vi.fn(async () => {}), onDeleted: vi.fn(async () => {}) };
+it('offers an external K2 model for use without offering deletion', () => {
+  render(<ModelLibrary {...props} models={[{ ...model, filename: 'K2-Horizon-4B-Q4_K_M.gguf', external: true }]} />);
+  fireEvent.click(screen.getByRole('tab', { name: /My Models/ }));
+  expect(screen.getByText('K2 Horizon 3.7B · Q4_K_M')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Use model' })).toBeEnabled();
+  expect(screen.queryByRole('button', { name: /Delete K2 Horizon/ })).not.toBeInTheDocument();
+});
 it('uses any downloaded model and requires an explicit delete action', async () => {
   render(<ModelLibrary {...props} />);
   fireEvent.click(screen.getByRole('tab', { name: /My Models/ }));
@@ -164,7 +177,7 @@ it('can use a complete model while a resumed download is still pending', async (
 
 it('shows live bytes for an active partial file and keeps completed models usable', async () => {
   const partial = { ...model, id: 'partial', filename: 'partial.gguf', path: 'C:/models/partial.gguf.part', complete: false, received: 128 };
-  mock.modelInstallStatus.mockResolvedValue({ busy: true, phase: 'resuming', received: 768, total: 1024, path: 'C:/models/partial.gguf', error: null });
+  mock.downloadJobs.mockResolvedValue([job({ busy: true, phase: 'resuming', received: 768, total: 1024, jobId: 3, key: `model:hf:${model.repo}@${model.revision}:partial.gguf`, label: 'partial.gguf' })]);
   render(<ModelLibrary {...props} models={[model, partial]} />);
   fireEvent.click(screen.getByRole('tab', { name: /My Models/ }));
   expect(await screen.findByText('Downloading')).toBeVisible();
@@ -173,4 +186,12 @@ it('shows live bytes for an active partial file and keeps completed models usabl
   expect(screen.getAllByRole('button', { name: 'Use model' })[0]).toBeEnabled();
   expect(screen.getAllByRole('button', { name: 'Use model' })[1]).toBeDisabled();
   expect(screen.getByRole('button', { name: 'Downloading…' })).toBeDisabled();
+});
+it('shows a failed job error and marks imported models as unverified', async () => {
+  mock.downloadJobs.mockResolvedValue([job({ phase: 'failed', jobId: 5, key: `model:hf:${model.repo}@${model.revision}:${model.filename}`, label: model.filename, error: 'Access denied by the download host (HTTP 403).' })]);
+  const imported = { ...model, id: 'imported', filename: 'imported.gguf', repo: null, revision: null, external: true };
+  render(<ModelLibrary {...props} models={[model, imported]} />);
+  fireEvent.click(screen.getByRole('tab', { name: /My Models/ }));
+  expect(await screen.findByText('Access denied by the download host (HTTP 403).')).toBeVisible();
+  expect(screen.getByText('Imported · not verified')).toBeVisible();
 });

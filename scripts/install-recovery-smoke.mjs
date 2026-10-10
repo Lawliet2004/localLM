@@ -1,7 +1,13 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { connectSmoke } from './smoke-lib.mjs';
+
+if (process.env.LOCALLM_NATIVE_SMOKE_ISOLATED !== '1') {
+  console.error("Refusing to run: this smoke drives the running app's real app-data. Set LOCALLM_NATIVE_SMOKE_ISOLATED=1 only against an isolated debug instance.");
+  process.exit(1);
+}
 const record = 'test-results/install-recovery-fixture.json';
 if (process.argv.includes('--prepare')) {
   // Run only after the native app is closed, before launching the new build.
@@ -15,11 +21,9 @@ if (process.argv.includes('--prepare')) {
   writeFileSync(record, JSON.stringify({ model, runtime }));
 } else {
   const fixture = JSON.parse(readFileSync(record, 'utf8'));
-  const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
+  let { browser, page } = await connectSmoke();
   try {
-    let page;
-    await expect.poll(() => { page = browser.contexts()[0].pages().find(value => value.url().includes('1420')); return Boolean(page); }).toBe(true);
-    const inventory = await page.evaluate(async () => { const { invoke } = await import('/node_modules/@tauri-apps/api/core.js'); return invoke('list_installed_runtimes'); });
+        const inventory = await page.evaluate(async () => { const { invoke } = await import('/node_modules/@tauri-apps/api/core.js'); return invoke('list_installed_runtimes'); });
     expect(existsSync(fixture.model)).toBe(false);
     expect(existsSync(fixture.runtime)).toBe(false);
     expect(inventory.some(item => item.complete)).toBe(true);

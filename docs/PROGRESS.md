@@ -1,57 +1,5 @@
 # Evidence and remaining work
 
-## 2026-10-05 — Bonsai-27B opt-in acceptance
-
-Work is isolated on `feat/experimental-bonsai-27b`; the user requested a stop on
-an unresolved acquisition/inference blocker. The off-by-default feature is wired
-into Models settings, with a published measured preset. The 30-minute soak and
-all final ordinary checks passed. Existing local changes are preserved.
-
-Before implementation: Vitest 455 passed / 1 skipped, Rust 407 passed / 2 ignored,
-build, strict Clippy, typecheck and lint passed; Edge Playwright 10 passed and
-script tests 39 passed. Existing diagnostic warnings did not fail checks.
-
-Confirmed the HF repository, immutable model revision, Q1_0 file's LFS size/hash,
-Apache-2.0 model license, and the fork's CUDA Q1_0 kernels. Acquired and verified
-both PrismML CUDA 12.4 ZIPs, extracted all 74 entries through existing production
-code, and confirmed server/bench startup and RTX 2050 CUDA0 detection. Default
-MiniCPM files, runtime, settings and database schema remain unchanged.
-
-A new model network transfer was cancelled after the 32 MiB threshold and retained
-its 33,566,054-byte partial file. Restart resumed and completed the 3,803,452,480-byte
-model with the pinned SHA-256 verified. Actual managed inference passed ten
-coherent prompts, separate reasoning and a native system_time round-trip. The
-layer/cache/context/batch/thread/mmap/mlock sweep completed on CUDA0. The chosen
-4096-context, Q8 GPU KV, 65/65-layer preset averaged 242.296 pp and 19.531 tg
-tokens/s over five exact 2000-input/500-output requests. Sampled peaks were
-3855 MiB device VRAM, 4.137 GiB resident working set and 5.059 GiB private
-commitment. Combined real switching, reasoning SSE, CUDA OOM restoration,
-missing-runtime refusal and mid-generation kill/recovery passed. MiniCPM
-answered Paris before and after recovery. Q4 allocated the advertised 262k
-window and answered a 2500-token workload; a filled 262k history remains
-unverified. The unchanged stock b10855 runtime also passed all ten prompts,
-reasoning and the real tool: the requested assumption that it cannot handle
-Q1_0 was disproved. The separate pinned fork remains this feature's qualified
-runtime. Full evidence and limits: [Bonsai acceptance](BONSAI_EXPERIMENTAL.md).
-
-Final ordinary checks: Vitest 460 passed / 1 skipped, Rust 415 passed / 4 ignored,
-Edge Playwright 11 passed, script tests 39 passed, and build, strict Clippy,
-typecheck and lint passed. A resource-heavy parallel run hit UI test timeouts;
-unchanged full Vitest/Edge reruns passed after compilation finished.
-
-The actual soak completed 53 exact 2000-input/500-output requests over 1829.362
-seconds, averaging 236.376 pp / 19.209 tg tokens/s. Peak samples were 3855 MiB
-device VRAM, 4.132 GiB resident memory and 5.058 GiB private commitment. Median
-private commitment changed by under 1 MiB between minutes 5–10 and the final five
-minutes; resident memory fell. No sustained leak or crash was detected in that
-bounded run. First/last five mean generation was 19.637/18.907 tokens/s; the cause
-of the small late slowdown was not measured. The server stopped, VRAM returned
-to 8 MiB, and AC power/Balanced plan remained unchanged. Native GUI download/click
-acceptance, packaged installation, a filled 262k history and a clean checkout
-containing only task commits remain unverified. The commit stack uses the user's
-pre-existing uncommitted Settings components and shared Rust fixture; those must
-be reconciled before a standalone checkout represents the tested tree. The
-fixture's one installer-field compatibility line is intentionally unstaged.
 
 ## 2026-09-16
 Context window save/load and first-turn overflow.
@@ -65,7 +13,7 @@ Context window save/load and first-turn overflow.
 Hugging Face model library and Runtime limits dashboard.
 
 - Models tab loads popular GGUF repositories on open, searches by name, and browses any `owner/repository`. Search hits include download counts. GGUF files are chosen as cards. Incomplete downloads expose Retry when provenance is known.
-- MiniCPM, Bonsai, and ZAYA1 appear as Hugging Face library entries with Use and Delete. Delete unloads a running copy, removes listed files, leftover `model.json`, empty managed hash directories, and saved runtime profiles. Conversations stay.
+- MiniCPM and ZAYA1 appear as Hugging Face library entries with Use and Delete. Delete unloads a running copy, removes listed files, leftover `model.json`, empty managed hash directories, and saved runtime profiles. Conversations stay.
 - Runtime tab shows model layer count vs layers estimated to fit in free VRAM, full GGUF context vs harness cap, live GPU/RAM/cache estimates, and recommended vs current settings. Saving a context above the known model limit is blocked. Unknown/hybrid caches stay unknown.
 - Verification: 115 frontend tests, `npm run build`, 203 Rust lib tests (2 ignored as before), Clippy `-D warnings`, and both Playwright checks including Runtime at 320/768/1024/1440. Native WebView2 confirmation of a live Hugging Face download was not repeated in this slice.
 

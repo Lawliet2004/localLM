@@ -43,21 +43,21 @@ export function todosFromPlanEvents(events: SessionEvent[]): TodoItem[] {
 }
 
 export function useConversationTodos(conversationId: string, generating: boolean, fallback: TodoItem[] = []) {
-  const [todos, setTodos] = useState<TodoItem[]>([]);
+  const [stored, setStored] = useState({ conversationId, items: [] as TodoItem[] });
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     if (!nativeAvailable || conversationId === 'new' || !api.getTodos) {
-      setTodos([]);
       return;
     }
     async function load() {
       try {
         const items = await api.getTodos(conversationId);
-        if (!disposed) setTodos(items);
-      } catch {
-        if (!disposed) setTodos([]);
-      }
+        if (!disposed) setStored(current => current.conversationId === conversationId
+          && current.items.length === items.length
+          && current.items.every((item, i) => item.text === items[i].text && item.status === items[i].status && item.updatedAt === items[i].updatedAt)
+          ? current : { conversationId, items });
+      } catch { /* Retain the last known checklist on a transient failure. */ }
       if (!disposed && generating) timer = setTimeout(() => void load(), 500);
     }
     void load();
@@ -66,6 +66,7 @@ export function useConversationTodos(conversationId: string, generating: boolean
       if (timer) clearTimeout(timer);
     };
   }, [conversationId, generating]);
+  const todos = stored.conversationId === conversationId ? stored.items : [];
   return todos.length ? todos : fallback;
 }
 
@@ -142,7 +143,7 @@ export function PlanChecklist({
         <span className="plan-checklist-count">{countLabel}</span>
         {todos.length > 0 && (
           <span className="plan-checklist-meter" aria-hidden="true">
-            <span className="plan-checklist-meter-fill" style={{ width: `${percent}%` }} />
+            <span className="plan-checklist-meter-fill" style={{ transform: `scaleX(${percent / 100})` }} />
           </span>
         )}
         {!open && current && !allDone && (

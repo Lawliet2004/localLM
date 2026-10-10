@@ -1,11 +1,12 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
-const browser=await chromium.connectOverCDP('http://127.0.0.1:9223');
-const page=browser.contexts()[0].pages().find(value=>value.url().includes('1420'));
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
+let { browser, page } = await connectSmoke()
+
 if(!page) throw new Error('Native LocalLM webview is unavailable.');
 page.setDefaultTimeout(15000);
 try {
-  await page.getByRole('button',{name:'Models & runtime',exact:true}).click();
+  await openSettingsSection(page, 'Models');
   const panel=page.getByRole('region',{name:'Hardware status'});
   await expect(panel.getByText('NVIDIA GeForce RTX 2050',{exact:true})).toBeVisible();
   await expect(panel.getByRole('progressbar',{name:'NVIDIA GeForce RTX 2050 VRAM usage'})).toBeVisible();
@@ -30,7 +31,7 @@ try {
   expect(samples.some(sample=>sample.gpus.some(gpu=>gpu.utilizationPercent>0))).toBe(true);
   if(await page.getByRole('button',{name:'Stop response'}).count()) await page.getByRole('button',{name:'Stop response'}).click();
   await expect(page.getByRole('button',{name:'Stop response'})).toHaveCount(0,{timeout:15000});
-  await page.getByRole('button',{name:'Models & runtime',exact:true}).click();
+  await openSettingsSection(page, 'Models');
   await expect(panel.getByText('NVIDIA GeForce RTX 2050',{exact:true})).toBeVisible();
   mkdirSync('test-results',{recursive:true}); await page.screenshot({path:'test-results/native-hardware.png'});
   const report={testedAt:new Date().toISOString(),before,samples}; writeFileSync('test-results/hardware-smoke.json',JSON.stringify(report,null,2));

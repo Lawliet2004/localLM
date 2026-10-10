@@ -2,6 +2,115 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
 
+/// Typed inference failure so the chat loop can pick a recovery path instead
+/// of parsing message text. `Display`/`From` keep `Result<_, String>` call
+/// sites working; only code that reacts to the kind matches on the enum.
+#[derive(Debug)]
+pub enum LlmError {
+    /// The prompt does not fit the loaded context window (llama.cpp
+    /// `exceed_context_size`, OpenAI `context_length_exceeded`, …).
+    ContextOverflow(String),
+    Timeout(String),
+    RateLimit { message: String, retry_after: Option<Duration> },
+    /// Connect, DNS, or body-read failures — the server may have stopped.
+    Transport(String),
+    /// The stream completed cleanly but produced no content or tool calls.
+    EmptyResponse,
+    Other(String),
+}
+
+impl LlmError {
+    /// Re-sending the identical request can succeed. Context overflow only
+    /// recovers through compaction, which the caller drives explicitly.
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::Transport(_) | Self::Timeout(_) | Self::RateLimit { .. })
+    }
+
+    /// A reqwest send/read failure: an elapsed deadline is a timeout;
+    /// connect, DNS, and body failures are transport problems.
+    pub fn from_reqwest(error: &reqwest::Error, timeout: &'static str, transport: impl Into<String>) -> Self {
+        if error.is_timeout() {
+            Self::Timeout(timeout.into())
+        } else {
+            Self::Transport(transport.into())
+        }
+    }
+
+    /// Classify a non-success HTTP response. `detail` is the raw response body
+    /// when the caller already read it; `message` is the sanitized
+    /// user-facing text the error should display.
+    pub fn from_response(status: reqwest::StatusCode, retry_after: Option<Duration>, detail: &str, message: String) -> Self {
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Self::RateLimit { message, retry_after };
+        }
+        if Self::context_wording(detail) || Self::context_wording(&message) {
+            return Self::ContextOverflow(message);
+        }
+        Self::Other(message)
+    }
+
+    /// Classify a provider error surfaced mid-stream from the SSE body.
+    pub fn from_message(message: String) -> Self {
+        if Self::context_wording(&message) {
+            Self::ContextOverflow(message)
+        } else {
+            Self::Other(message)
+        }
+    }
+
+    /// Wording llama.cpp, OpenAI-compatible servers, and Anthropic use when a
+    /// prompt does not fit the context window.
+    pub fn context_wording(text: &str) -> bool {
+        let text = text.to_ascii_lowercase();
+        const MARKERS: &[&str] = &[
+            "context_length_exceeded",
+            "exceed_context_size",
+            "n_ctx",
+            "context window",
+            "context size",
+            "context length",
+            "maximum context",
+            "too many tokens",
+            "prompt is too long",
+            "input is too long",
+        ];
+        MARKERS.iter().any(|marker| text.contains(marker))
+    }
+}
+
+impl std::fmt::Display for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ContextOverflow(message)
+            | Self::Timeout(message)
+            | Self::Transport(message)
+            | Self::Other(message)
+            | Self::RateLimit { message, .. } => f.write_str(message),
+            Self::EmptyResponse => {
+                f.write_str("The model stream ended without producing a response.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LlmError {}
+
+impl From<LlmError> for String {
+    fn from(error: LlmError) -> String {
+        error.to_string()
+    }
+}
+
+/// `Retry-After` in seconds. The HTTP-date form is ignored — the providers
+/// this sees (llama.cpp, OpenAI-compatible, subscriptions) send seconds.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
 #[async_trait]
 pub trait InferenceProvider: Send + Sync {
     fn payload(&self, payload: &Value) -> Value;
@@ -14,7 +123,7 @@ pub trait InferenceProvider: Send + Sync {
     /// runtimes return the exact tokenizer count; remote providers return a
     /// character-derived estimate.
     async fn count_tokens(&self, payload: &Value) -> Result<u64, String>;
-    async fn stream(&self, payload: &Value) -> Result<reqwest::Response, String>;
+    async fn stream(&self, payload: &Value) -> Result<reqwest::Response, LlmError>;
 }
 
 pub enum Backend {
@@ -290,7 +399,7 @@ impl InferenceProvider for Backend {
         }
     }
 
-    async fn stream(&self, payload: &Value) -> Result<reqwest::Response, String> {
+    async fn stream(&self, payload: &Value) -> Result<reqwest::Response, LlmError> {
         match self {
             Self::Local {
                 client,
@@ -298,24 +407,35 @@ impl InferenceProvider for Backend {
                 key,
                 ..
             } => {
+                let mut request = payload.clone();
+                request["stream_options"] = serde_json::json!({"include_usage": true});
                 let response = client
                     .post(crate::providers::endpoint(endpoint, "chat/completions"))
                     .bearer_auth(key)
-                    .json(payload)
+                    .json(&request)
                     .send()
                     .await
-                    .map_err(|_| {
-                        "The local model did not respond. Check that llama.cpp is still running."
-                            .to_string()
+                    .map_err(|error| {
+                        LlmError::from_reqwest(
+                            &error,
+                            "The local model did not respond in time. Check that llama.cpp is still running.",
+                            "The local model did not respond. Check that llama.cpp is still running.",
+                        )
                     })?;
                 if response.status().is_success() {
                     Ok(response)
                 } else {
                     let status = response.status();
+                    let retry_after = parse_retry_after(response.headers());
                     let body = crate::providers::bounded_body(response, 16_384)
                         .await
                         .unwrap_or_default();
-                    Err(crate::context::runtime_prompt_error(status, &body, key))
+                    Err(LlmError::from_response(
+                        status,
+                        retry_after,
+                        &body,
+                        crate::context::runtime_prompt_error(status, &body, key),
+                    ))
                 }
             }
             Self::OpenAi {
@@ -332,17 +452,19 @@ impl InferenceProvider for Backend {
                     request = request.bearer_auth(key);
                 }
                 let response = request.send().await.map_err(|error| {
-                    if error.is_timeout() {
-                        "Provider request timed out.".to_string()
-                    } else {
-                        "Could not reach provider. Check the HTTPS base URL and network connection."
-                            .to_string()
-                    }
+                    LlmError::from_reqwest(
+                        &error,
+                        "Provider request timed out.",
+                        "Could not reach provider. Check the HTTPS base URL and network connection.",
+                    )
                 })?;
                 if response.status().is_success() {
                     Ok(response)
                 } else {
-                    Err(crate::providers::response_error(response, key).await)
+                    let status = response.status();
+                    let retry_after = parse_retry_after(response.headers());
+                    let message = crate::providers::response_error(response, key).await;
+                    Err(LlmError::from_response(status, retry_after, "", message))
                 }
             }
             Self::Claude {
@@ -362,17 +484,19 @@ impl InferenceProvider for Backend {
                     .send()
                     .await
                     .map_err(|error| {
-                        if error.is_timeout() {
-                            "Claude request timed out.".to_string()
-                        } else {
-                            "Could not reach Claude. Check the HTTPS base URL and network connection."
-                                .to_string()
-                        }
+                        LlmError::from_reqwest(
+                            &error,
+                            "Claude request timed out.",
+                            "Could not reach Claude. Check the HTTPS base URL and network connection.",
+                        )
                     })?;
                 if response.status().is_success() {
                     Ok(response)
                 } else {
-                    Err(crate::providers::response_error(response, key).await)
+                    let status = response.status();
+                    let retry_after = parse_retry_after(response.headers());
+                    let message = crate::providers::response_error(response, key).await;
+                    Err(LlmError::from_response(status, retry_after, "", message))
                 }
             }
             Self::Subscription {
@@ -394,29 +518,34 @@ impl InferenceProvider for Backend {
                 }
 
                 let response = req.send().await.map_err(|error| {
-                    if error.is_timeout() {
-                        "Subscription provider request timed out.".to_string()
-                    } else {
-                        format!("Could not reach {provider_name} subscription service. Check network connection.")
-                    }
+                    LlmError::from_reqwest(
+                        &error,
+                        "Subscription provider request timed out.",
+                        format!("Could not reach {provider_name} subscription service. Check network connection."),
+                    )
                 })?;
 
                 let status = response.status();
                 if status.is_success() {
                     return Ok(response);
                 }
+                let retry_after = parse_retry_after(response.headers());
 
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    return Err(format!(
-                        "{provider_name} subscription rate limit or quota reached. Your rolling quota was exceeded. Try again later or switch to your local model."
-                    ));
+                    return Err(LlmError::RateLimit {
+                        message: format!(
+                            "{provider_name} subscription rate limit or quota reached. Your rolling quota was exceeded. Try again later or switch to your local model."
+                        ),
+                        retry_after,
+                    });
                 }
                 if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-                    return Err(format!(
+                    return Err(LlmError::Other(format!(
                         "{provider_name} subscription authorization expired. Re-authenticate in Providers."
-                    ));
+                    )));
                 }
-                Err(crate::providers::response_error(response, access_token).await)
+                let message = crate::providers::response_error(response, access_token).await;
+                Err(LlmError::from_response(status, retry_after, "", message))
             }
         }
     }
@@ -776,7 +905,200 @@ mod tests {
             .stream(&json!({"messages":[{"role":"system","content":"a"},{"role":"system","content":"b"}]}))
             .await
             .unwrap_err();
-        assert!(error.contains("System message must be at the beginning"));
+        assert!(error.to_string().contains("System message must be at the beginning"));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn retryability_depends_on_failure_kind() {
+        assert!(LlmError::Transport("lost".into()).retryable());
+        assert!(LlmError::Timeout("late".into()).retryable());
+        assert!(LlmError::RateLimit { message: "slow".into(), retry_after: None }.retryable());
+        // Context overflow retries only through the explicit compact path.
+        assert!(!LlmError::ContextOverflow("full".into()).retryable());
+        assert!(!LlmError::EmptyResponse.retryable());
+        assert!(!LlmError::Other("bad".into()).retryable());
+        // The String conversion keeps `?`/`map_err` call sites unchanged.
+        let text: String = LlmError::Transport("lost".into()).into();
+        assert_eq!(text, "lost");
+        assert_eq!(
+            LlmError::EmptyResponse.to_string(),
+            "The model stream ended without producing a response."
+        );
+    }
+
+    #[test]
+    fn http_failures_classify_by_status_and_provider_wording() {
+        use reqwest::StatusCode;
+        match LlmError::from_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(Duration::from_secs(7)),
+            "",
+            "Provider rate limit or quota was exceeded.".into(),
+        ) {
+            LlmError::RateLimit { message, retry_after } => {
+                assert_eq!(message, "Provider rate limit or quota was exceeded.");
+                assert_eq!(retry_after, Some(Duration::from_secs(7)));
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+        for wording in [
+            // llama.cpp `exceed_context_size_error` message and type fields
+            "the request exceeds the available context size. try increasing it",
+            r#"{"error":{"code":400,"type":"exceed_context_size_error"}}"#,
+            // OpenAI `context_length_exceeded`
+            "This model's maximum context length is 8192 tokens",
+            // Anthropic 400 invalid_request_error
+            "prompt is too long: 200001 tokens > 200000 maximum",
+            "n_ctx: 8192",
+        ] {
+            assert!(
+                matches!(
+                    LlmError::from_response(StatusCode::BAD_REQUEST, None, wording, "Provider request failed (400).".into()),
+                    LlmError::ContextOverflow(_)
+                ),
+                "{wording}"
+            );
+        }
+        assert!(matches!(
+            LlmError::from_response(StatusCode::INTERNAL_SERVER_ERROR, None, "CUDA error", "Provider returned 500.".into()),
+            LlmError::Other(_)
+        ));
+        assert!(matches!(
+            LlmError::from_response(StatusCode::UNAUTHORIZED, None, "", "Provider rejected the authorization or API key.".into()),
+            LlmError::Other(_)
+        ));
+        // A mid-stream error event with context wording is also an overflow.
+        assert!(matches!(
+            LlmError::from_message("Model error: the request exceeds the available context size".into()),
+            LlmError::ContextOverflow(_)
+        ));
+        assert!(matches!(
+            LlmError::from_message("Model error: internal error".into()),
+            LlmError::Other(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reqwest_failures_split_timeout_from_transport() {
+        // Refused connection: connect error → Transport.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            LlmError::from_reqwest(&error, "timed out", "unreachable"),
+            LlmError::Transport(_)
+        ));
+        // A socket that accepts but never answers: elapsed deadline → Timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout());
+        assert!(matches!(
+            LlmError::from_reqwest(&error, "timed out", "unreachable"),
+            LlmError::Timeout(_)
+        ));
+        hold.abort();
+    }
+
+    #[tokio::test]
+    async fn local_stream_failures_are_typed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (status_line, body, extra_headers, expect) in [
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":400,"message":"the request exceeds the available context size. try increasing it","type":"exceed_context_size_error"}}"#,
+                "",
+                "overflow",
+            ),
+            ("429 Too Many Requests", "{}", "Retry-After: 30\r\n", "rate_limit"),
+            ("500 Internal Server Error", r#"{"error":{"message":"decode failed"}}"#, "", "other"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 2048];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            let sent: Value = serde_json::from_slice(&request[end + 4..end + 4 + length]).unwrap();
+                            assert_eq!(sent["stream_options"]["include_usage"], true);
+                            let response = format!(
+                                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            return;
+                        }
+                    }
+                }
+            });
+            let backend = Backend::local(format!("http://{address}"), "local-key".into(), 8192).unwrap();
+            let error = backend
+                .stream(&json!({"messages":[{"role":"user","content":"hi"}],"stream":true}))
+                .await
+                .unwrap_err();
+            match expect {
+                "overflow" => assert!(matches!(error, LlmError::ContextOverflow(_)), "{error:?}"),
+                "rate_limit" => match error {
+                    LlmError::RateLimit { retry_after, .. } => {
+                        assert_eq!(retry_after, Some(Duration::from_secs(30)))
+                    }
+                    other => panic!("expected RateLimit, got {other:?}"),
+                },
+                _ => assert!(matches!(error, LlmError::Other(_)), "{error:?}"),
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_stream_refused_connection_is_transport() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let backend = Backend::local(format!("http://127.0.0.1:{port}"), "local-key".into(), 8192).unwrap();
+        let error = backend
+            .stream(&json!({"messages":[{"role":"user","content":"hi"}],"stream":true}))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Transport(_)), "{error:?}");
     }
 }

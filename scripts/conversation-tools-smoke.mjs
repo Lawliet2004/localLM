@@ -1,7 +1,7 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { writeFileSync } from 'node:fs';
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-const page = browser.contexts()[0].pages().find(page => page.url().includes('1420'));
+import { connectSmoke } from './smoke-lib.mjs';
+let { browser, page } = await connectSmoke();
 page.setDefaultTimeout(15000);
 let chats = [];
 const suffix = Date.now();

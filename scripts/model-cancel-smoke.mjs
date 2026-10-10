@@ -1,21 +1,25 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { statSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
+
+if (process.env.LOCALLM_NATIVE_SMOKE_ISOLATED !== '1') {
+  console.error("Refusing to run: this smoke drives the running app's real app-data. Set LOCALLM_NATIVE_SMOKE_ISOLATED=1 only against an isolated debug instance.");
+  process.exit(1);
+}
+let { browser, page } = await connectSmoke();
 try {
-  let page;
-  await expect.poll(() => { page = browser.contexts()[0].pages().find(value => value.url().includes('1420')); return Boolean(page); }).toBe(true);
-  const invoke = command => page.evaluate(async command => { const { invoke } = await import('/node_modules/@tauri-apps/api/core.js'); return invoke(command); }, command);
+    const invoke = command => page.evaluate(async command => { const { invoke } = await import('/node_modules/@tauri-apps/api/core.js'); return invoke(command); }, command);
   const metadata = await invoke('model_download_info');
   expect(metadata.destinationExists).toBe(true);
   expect((await invoke('model_install_status')).busy).toBe(false);
   const before = statSync(metadata.destination);
   const preferences = (await invoke('bootstrap')).preferences;
-  await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
+  await openSettingsSection(page, 'Models');
   const panel = page.getByRole('region', { name: 'Recommended model download' });
   await panel.getByRole('button', { name: 'Verify managed model' }).click();
   await expect.poll(async () => (await invoke('model_install_status')).received).toBeGreaterThan(0);
-  await panel.getByRole('button', { name: 'Cancel installation', exact: true }).click();
+  await panel.getByRole('button', { name: 'Pause download', exact: true }).click();
   await expect.poll(async () => (await invoke('model_install_status')).busy).toBe(false);
   const status = await invoke('model_install_status');
   expect(status.error).toContain('cancelled');

@@ -1,18 +1,22 @@
-import { type Dispatch, type SetStateAction, type ReactNode, useEffect, useRef, useState } from 'react';
-import { ArrowDown, Check, ChevronDown, ChevronRight, Copy, Cpu, FileText, Folder, ListTodo, MessageSquare, Plus, SendHorizontal, Square, Terminal, WandSparkles, X } from 'lucide-react';
+import { localInferenceProvider } from '../lib/providerCapabilities';
+import { type Dispatch, type SetStateAction, type ReactNode, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { ArrowDown, ArrowUpRight, Check, ChevronDown, ChevronRight, Copy, Cpu, FileText, Folder, FolderGit2, ListTodo, MessageSquare, Plus, SendHorizontal, ShieldCheck, Square, Terminal, WandSparkles, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { attachmentAccept, composeMessage, readAttachment, type Attachment } from '../lib/attachments';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import { modelLabel as localModelLabel } from '../lib/localModels';
-import type { Message, ContextUsage, ModelSelection, ProviderConnection, PreflightBreakdown, ToolSelection } from '../lib/types';
+import type { SessionEvent, Message, ContextUsage, ModelSelection, ProviderConnection, PreflightBreakdown, TaskWorkspace, ToolSelection, TurnMetrics, InteractionMode } from '../lib/types';
 import type { InstalledModel } from '../lib/types';
-import { WorkSummary } from './WorkSummary';
 import { ActivityTimeline, useSessionActivity } from './ActivityTimeline';
-import { TraceIcon, groupKindOf, toolKindOf, type TraceKind } from './TraceIcon';
+import { Evidence } from './Evidence';
+import { ReadinessCard } from './Qualification';
+import { TraceIcon } from './TraceIcon';
+import { Segmented } from './Settings';
 import { ContextControl } from './ContextControl';
 import { CommandRunCard } from './CommandRunCard';
-import { PlanChecklist, isPlanStateTool, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
+import { PlanChecklist, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
 import type { RunRecord } from '../lib/types';
 
 interface Props {
@@ -22,6 +26,7 @@ interface Props {
   onAttachmentDraftsChange?: Dispatch<SetStateAction<Record<string, Attachment[]>>>;
   contextUsage?: ContextUsage;
   modelLabel?: string;
+  modelKey?: string;
   selectionIssue?: boolean;
   draft?: string;
   onDraftChange?: (value: string | ((previous: string) => string)) => void;
@@ -33,14 +38,23 @@ interface Props {
   preset?: string;
   connectorIds?: string[];
   connectorTools?: ToolSelection[];
-  onSend: (content: string) => Promise<void>;
+  onSend: (content: string, modeOverride?: InteractionMode) => Promise<void>;
+  /** Enter while a task runs: queue the draft as a follow-up task. */
+  onQueue?: (content: string) => Promise<void>;
+  /** Send the draft to the running task as a steering note. */
+  onSteer?: (content: string) => Promise<void>;
   onCancel: () => void;
-  onPause?: () => void;
-  onResume?: () => void;
-  paused?: boolean;
   onConfigure: () => void;
-  planMode?: boolean;
-  onPlanModeChange?: (next: boolean) => void;
+  /** Ask/Plan/Act for this conversation, enforced by the backend. */
+  interactionMode?: InteractionMode;
+  onInteractionModeChange?: (mode: InteractionMode) => void;
+  /** The conversation's active isolated task workspace, if one exists. */
+  taskWorkspace?: TaskWorkspace | null;
+  /** Create an isolated task workspace for this conversation. */
+  onIsolateTask?: () => void;
+  /** A Plan turn completed; offer the Act follow-up that runs it. */
+  planReady?: boolean;
+  onImplementPlan?: () => void;
   onConfigureLocalModel?: (filename: string) => void;
   liveActivity?: { state?: string; activity?: string } | null;
   providers?: ProviderConnection[];
@@ -149,134 +163,6 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
   );
 }
 
-function toolNameOf(message: Message): string {
-  try {
-    const value = JSON.parse(message.content);
-    const request = value.request || value;
-    return typeof request.name === 'string' ? request.name : '';
-  } catch {
-    return '';
-  }
-}
-
-function TurnTools({ tools, onCancel }: { tools: Message[]; onCancel: () => void }) {
-  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
-  tools = tools.filter(message => !isPlanStateTool(toolNameOf(message)));
-  if (!tools.length) return null;
-
-  // Segment tools into edits vs non-edits
-  const segments: { type: 'edit' | 'group'; tools: Message[]; title?: string; icon?: TraceKind; key: string }[] = [];
-  let currentGroup: Message[] = [];
-
-  const flushGroup = () => {
-    if (!currentGroup.length) return;
-    const groupTools = [...currentGroup];
-    let fileCount = 0;
-    let searchCount = 0;
-    let folderCount = 0;
-    let taskCount = 0;
-    let commandCount = 0;
-    const kinds: TraceKind[] = [];
-    const isStreaming = groupTools.some(t => t.status === 'streaming');
-
-    for (const msg of groupTools) {
-      try {
-        const val = JSON.parse(msg.content);
-        const req = val.request || val;
-        const res = val.result || {};
-        const name = req.name || '';
-        const args = req.arguments || {};
-        kinds.push(toolKindOf(name, args, res));
-        if (/search|grep|find|locate/.test(name)) searchCount++;
-        else if (/list_dir|list_files|browse_dir/.test(name)) folderCount++;
-        else if (name === 'manage_task') taskCount++;
-        else if (args.command || args.CommandLine || /exec|run_code|terminal|run_command/.test(name)) commandCount++;
-        else fileCount++;
-      } catch {
-        fileCount++;
-      }
-    }
-
-    let title = '';
-    if (commandCount > 0 && fileCount === 0 && searchCount === 0 && folderCount === 0 && taskCount === 0) {
-      const prefix = isStreaming ? 'Running' : 'Ran';
-      title = `${prefix} ${commandCount} ${commandCount === 1 ? 'command' : 'commands'}`;
-    } else {
-      const parts: string[] = [];
-      if (fileCount > 0) parts.push(`${fileCount} ${fileCount === 1 ? 'file' : 'files'}`);
-      if (folderCount > 0) parts.push(`${folderCount} ${folderCount === 1 ? 'folder' : 'folders'}`);
-      if (searchCount > 0) parts.push(`${searchCount} ${searchCount === 1 ? 'search' : 'searches'}`);
-      if (taskCount > 0) parts.push(`${taskCount} ${taskCount === 1 ? 'task' : 'tasks'}`);
-      if (!parts.length && commandCount > 0) parts.push(`${commandCount} ${commandCount === 1 ? 'command' : 'commands'}`);
-      if (!parts.length) parts.push(`${groupTools.length} ${groupTools.length === 1 ? 'item' : 'items'}`);
-      const prefix = isStreaming ? 'Exploring' : 'Explored';
-      title = `${prefix} ${parts.join(', ')}`;
-    }
-
-    segments.push({
-      type: 'group',
-      tools: groupTools,
-      title,
-      icon: groupKindOf(kinds),
-      key: `grp-${groupTools[0].id}`,
-    });
-    currentGroup = [];
-  };
-
-  for (const tool of tools) {
-    let isEdit = false;
-    try {
-      const val = JSON.parse(tool.content);
-      const req = val.request || val;
-      const res = val.result || {};
-      const name = req.name || '';
-      isEdit = /edit|create_file|write_to_file|replace/.test(name) || Boolean(res.diff);
-    } catch { /* ignore */ }
-
-    if (isEdit) {
-      flushGroup();
-      segments.push({ type: 'edit', tools: [tool], key: `edit-${tool.id}` });
-    } else {
-      currentGroup.push(tool);
-    }
-  }
-  flushGroup();
-
-  return (
-    <div className="activity-feed">
-      {segments.map((seg, segIdx) => {
-        if (seg.type === 'edit') {
-          return <ToolMessage key={seg.key} message={seg.tools[0]} onStop={onCancel} />;
-        }
-        const isLast = segIdx === segments.length - 1;
-        const isStreaming = seg.tools.some(t => t.status === 'streaming');
-        const defaultExpanded = isStreaming || isLast || seg.tools.length <= 1;
-        const isExpanded = openGroups[seg.key] ?? defaultExpanded;
-        return (
-          <div key={seg.key} className={`activity-group ${isStreaming && isLast ? 'is-live' : ''}`}>
-            <button
-              type="button"
-              className={`activity-group-header ${isExpanded ? 'expanded' : ''}`}
-              onClick={() => setOpenGroups(curr => ({ ...curr, [seg.key]: !isExpanded }))}
-              aria-expanded={isExpanded}
-            >
-              <TraceIcon kind={seg.icon ?? 'explore'} size={13} />
-              <span className="activity-group-title">{seg.title}</span>
-              <span className="activity-group-count">{seg.tools.length}</span>
-              <ChevronRight size={13} className="activity-group-chevron" />
-            </button>
-            <div className="activity-group-items" style={{ display: isExpanded ? 'flex' : 'none' }}>
-              {seg.tools.map(tool => (
-                <ToolMessage key={tool.id} message={tool} onStop={onCancel} />
-              ))}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function MarkdownCodeBlock({ language, code }: { language: string; code: string }) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -318,36 +204,60 @@ function MarkdownCodeBlock({ language, code }: { language: string; code: string 
 
 function ImageLightbox({ src, alt }: { src?: string; alt?: string }) {
   const [isOpen, setIsOpen] = useState(false);
+  const preview = useRef<HTMLButtonElement>(null);
+  const close = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (isOpen) close.current?.focus();
+  }, [isOpen]);
+  function closePreview() {
+    setIsOpen(false);
+    requestAnimationFrame(() => preview.current?.focus());
+  }
   if (!src) return <span className="image-reference">Image: {alt || 'image'}</span>;
   return (
     <>
-      <span className="image-preview-wrapper" onClick={() => setIsOpen(true)} title="Click to enlarge">
+      <button ref={preview} type="button" className="image-preview-wrapper" onClick={() => setIsOpen(true)} aria-label={`Enlarge ${alt || 'image'}`}>
         <img src={src} alt={alt || 'Image preview'} className="image-preview-thumb" />
-      </span>
-      {isOpen && (
-        <div className="image-lightbox-overlay" onClick={() => setIsOpen(false)}>
-          <div className="image-lightbox-modal" onClick={e => e.stopPropagation()}>
+      </button>
+      {isOpen && createPortal(
+        <div className="image-lightbox-overlay" role="dialog" aria-modal="true" aria-label={alt || 'Image preview'}
+          onClick={e => { if (e.target === e.currentTarget) closePreview(); }}
+          onKeyDown={e => {
+            if (e.key === 'Escape') closePreview();
+            if (e.key === 'Tab') { e.preventDefault(); close.current?.focus(); }
+          }}>
+          <div className="image-lightbox-modal">
             <img src={src} alt={alt || 'Enlarged image'} className="lightbox-img" />
             <button
+              ref={close}
               type="button"
               className="lightbox-close-btn"
-              onClick={() => setIsOpen(false)}
+              onClick={closePreview}
               aria-label="Close preview"
             >
               <X size={18} />
             </button>
           </div>
-        </div>
+        </div>, document.body
       )}
     </>
   );
 }
 
-function MessageBody({ message }: { message: Message }) {
+const perfSpeed = (v?: number | null) => v == null ? '—' : `${v >= 100 ? Math.round(v) : v.toFixed(1)} t/s`;
+const perfSecs = (v?: number | null) => v == null ? '—' : `${v < 10 ? v.toFixed(2) : v.toFixed(1)} s`;
+
+function MessageBody({ message, perf, variant = 'final' }: { message: Message; perf?: TurnMetrics; variant?: 'final' | 'step' }) {
   let attached: { name: string; imageUrl?: string; content?: string }[] = [];
   let displayContent = message.content;
   if (message.role === 'user') {
-    try { const envelope = JSON.parse(message.content); if (envelope.kind === 'locallm-attachments-v1') { displayContent = envelope.text; attached = envelope.attachments; } } catch { /* Ordinary text message. */ }
+    try {
+      const envelope = JSON.parse(message.content);
+      if (envelope?.kind === 'locallm-attachments-v1' && typeof envelope.text === 'string' && Array.isArray(envelope.attachments)) {
+        displayContent = envelope.text;
+        attached = envelope.attachments.filter((file: unknown) => file && typeof file === 'object' && 'name' in file && typeof file.name === 'string');
+      }
+    } catch { /* Ordinary text message. */ }
   }
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState('');
@@ -358,10 +268,12 @@ function MessageBody({ message }: { message: Message }) {
   const [finalDuration, setFinalDuration] = useState<string | null>(null);
   const [isOpen, setIsOpen] = useState(message.status === 'streaming');
   const userToggled = useRef(false);
+  const hasReasoning = Boolean(message.reasoning);
 
   useEffect(() => () => clearTimeout(timer.current), []);
 
   useEffect(() => {
+    if (!hasReasoning) return;
     if (message.status === 'streaming') {
       isStreamingInitially.current = true;
       setIsOpen(true);
@@ -369,7 +281,7 @@ function MessageBody({ message }: { message: Message }) {
       const interval = setInterval(() => {
         const secs = ((Date.now() - startTime.current) / 1000).toFixed(1);
         setElapsed(secs);
-      }, 100);
+      }, 1000);
       return () => clearInterval(interval);
     } else {
       if (isStreamingInitially.current && !finalDuration) {
@@ -380,7 +292,7 @@ function MessageBody({ message }: { message: Message }) {
         setIsOpen(false);
       }
     }
-  }, [message.status]);
+  }, [message.status, hasReasoning]);
 
   const thoughtSummary = message.status === 'streaming'
     ? `Thinking (${elapsed}s)…`
@@ -389,7 +301,7 @@ function MessageBody({ message }: { message: Message }) {
     : 'Thought';
 
   return (
-    <article data-message-id={message.id} className={`message message-${message.role}`} aria-label={`${message.role} message`}>
+    <article data-message-id={message.id} className={`message message-${message.role}${variant === 'step' ? ' message-step' : ''}`} aria-label={`${message.role} message`}>
       <div className="message-byline">{message.role === 'user' ? 'You' : <><span className="mini-mark">L</span>LocalLM</>}</div>
       {message.reasoning && (
         <details
@@ -436,29 +348,65 @@ function MessageBody({ message }: { message: Message }) {
       {(message.status === 'interrupted' || message.status === 'error') && (
         <p className="message-state">{message.error || (message.status === 'interrupted' ? 'Response stopped' : 'Response interrupted by an error')}</p>
       )}
-      {message.content && (
-        <button
-          className="icon-button copy-message"
-          aria-label="Copy message"
-          title="Copy message"
-          onClick={async () => {
-            try {
-              await navigator.clipboard.writeText(message.content);
-              setCopied(true);
-              clearTimeout(timer.current);
-              timer.current = setTimeout(() => setCopied(false), 2000);
-            } catch {
-              setCopyError('Could not access the clipboard. Select the text to copy it.');
-            }
-          }}
-        >
-          {copied ? <Check size={14} /> : <Copy size={14} />}
-        </button>
+      {variant === 'final' && message.content && message.status !== 'streaming' && (
+        <div className="message-actions">
+          <button
+            className="icon-button copy-message"
+            aria-label="Copy message"
+            title="Copy message"
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(message.role === 'user' ? displayContent : message.content);
+                setCopied(true);
+                clearTimeout(timer.current);
+                timer.current = setTimeout(() => setCopied(false), 2000);
+              } catch {
+                setCopyError('Could not access the clipboard. Select the text to copy it.');
+              }
+            }}
+          >
+            {copied ? <Check size={14} /> : <Copy size={14} />}
+          </button>
+          {perf && message.role === 'assistant' && message.status === 'complete' && (
+            <p className="message-perf" title="Prompt processing speed · time to first token · token generation speed">
+              PPS {perfSpeed(perf.promptTokPerSec)} · TTFT {perfSecs(perf.ttftSecs)} · TGS {perfSpeed(perf.genTokPerSec)}
+            </p>
+          )}
+        </div>
       )}
       {copyError && <small role="alert">{copyError}</small>}
     </article>
   );
 }
+
+const sameItems = <T,>(a: T[], b: T[]) => a.length === b.length && a.every((item, i) => item === b[i]);
+const ConversationTurn = memo(function ConversationTurn({ messages, events, run, onStop }: {
+  messages: Message[]; events: SessionEvent[]; run: RunRecord | null; onStop: () => void;
+}) {
+  const user = messages.find(message => message.role === 'user');
+  // `memory_used` events name exactly which facts the turn injected — shown
+  // as a disclosure so recalled memory is visible, not silent.
+  const usedMemories = events
+    .filter(event => event.eventType === 'memory_used')
+    .flatMap(event => {
+      const facts = (event.payload as { facts?: { id: string; fact: string }[] }).facts;
+      return Array.isArray(facts) ? facts : [];
+    });
+  return <div className="conversation-turn">
+    {user && <MessageBody message={user} />}
+    <ActivityTimeline compact events={events} messages={messages} run={run}
+      renderMessage={(message, final) => <MessageBody message={message} variant={final ? 'final' : 'step'} perf={final ? message.metrics ?? undefined : undefined} />}
+      renderTool={message => <ToolMessage message={message} onStop={onStop} />} />
+    {usedMemories.length > 0 && <details className="memory-used">
+      <summary>Used {usedMemories.length} {usedMemories.length === 1 ? 'memory' : 'memories'}</summary>
+      <ul>{usedMemories.map(fact => <li key={fact.id}>{fact.fact}</li>)}</ul>
+    </details>}
+  </div>;
+}, (previous, next) => previous.run === next.run && previous.onStop === next.onStop && sameItems(previous.messages, next.messages) && sameItems(previous.events, next.events));
+
+const EMPTY_CONNECTORS: string[] = [];
+const EMPTY_TOOLS: ToolSelection[] = [];
+const EMPTY_ATTACHMENTS: Attachment[] = [];
 
 export function Chat({
   attachmentDrafts: controlledAttachments,
@@ -467,6 +415,7 @@ export function Chat({
   conversationKey = 'new',
   contextUsage,
   modelLabel = 'Local model',
+  modelKey = modelLabel,
   selectionIssue = false,
   messages,
   generating,
@@ -474,16 +423,19 @@ export function Chat({
   loading,
   disabled = false,
   preset = 'standard',
-  connectorIds = [],
-  connectorTools = [],
+  connectorIds = EMPTY_CONNECTORS,
+  connectorTools = EMPTY_TOOLS,
   onSend,
+  onQueue,
+  onSteer,
   onCancel,
-  onPause,
-  onResume,
-  paused = false,
   onConfigure,
-  planMode = false,
-  onPlanModeChange,
+  interactionMode = 'act',
+  onInteractionModeChange,
+  taskWorkspace = null,
+  onIsolateTask,
+  planReady = false,
+  onImplementPlan,
   onConfigureLocalModel,
   draft: controlledDraft,
   onDraftChange,
@@ -495,9 +447,14 @@ export function Chat({
   onDismissError,
   projectName,
 }: Props) {
+  const stopRef = useRef(onCancel);
+  stopRef.current = onCancel;
+  const stopGeneration = useCallback(() => stopRef.current(), []);
+  const planMode = interactionMode === 'plan';
   const sessionActivity = useSessionActivity(conversationKey, generating);
   const planFallback = todosFromPlanEvents(sessionActivity);
   const todos = useConversationTodos(conversationKey, generating, planFallback);
+  const completedPlan = todos.length > 0 && todos.every(todo => todo.status === 'completed');
   const [localAttachments, setLocalAttachments] = useState<Record<string, Attachment[]>>({});
   const [latestRun, setLatestRun] = useState<RunRecord | null>(null);
   useEffect(() => {
@@ -511,7 +468,7 @@ export function Chat({
   const setAttachmentDrafts = onAttachmentDraftsChange ?? setLocalAttachments;
   const latestConversation = useRef(conversationKey);
   latestConversation.current = conversationKey;
-  const attachments = attachmentDrafts[conversationKey] ?? [];
+  const attachments = attachmentDrafts[conversationKey] ?? EMPTY_ATTACHMENTS;
   const [attachmentError, setAttachmentError] = useState('');
   useEffect(() => {
     setAttachmentError('');
@@ -559,6 +516,11 @@ export function Chat({
   const draft = controlledDraft ?? localDraft;
   const setDraft = onDraftChange ?? setLocalDraft;
   const [preflight, setPreflight] = useState<{ breakdown: PreflightBreakdown; draft: string } | null>(null);
+  const composedDraft = useMemo(() => {
+    try { return composeMessage(draft, attachments); } catch { return ''; }
+  }, [draft, attachments]);
+  const preflightRevision = useRef(0);
+  const [contextRevision, setContextRevision] = useState(0);
   const [compacting, setCompacting] = useState(false);
   const [compactionNotice, setCompactionNotice] = useState<string | null>(null);
   const preflightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -574,11 +536,7 @@ export function Chat({
     try {
       const outcome = await api.compactConversation(conversationKey);
       setCompactionNotice(outcome.note);
-      if (draft.trim()) {
-        void api.contextPreflight(conversationKey, draft, preset, connectorIds, connectorTools, planMode).then(result => {
-          if (result.available) setPreflight({ breakdown: result.breakdown!, draft });
-        });
-      }
+      setContextRevision(value => value + 1);
     } catch (e) {
       setCompactionNotice(errorMessage(e));
     } finally {
@@ -593,12 +551,29 @@ export function Chat({
     ['error', 'interrupted'].includes(lastResponse.status) ||
     (lastTool && ['error', 'streaming'].includes(lastTool.status))
   );
-  const turns: Message[][] = [];
-  for (const message of messages) {
-    if (message.role === 'user' || !turns.length) turns.push([]);
-    turns[turns.length - 1].push(message);
-  }
-
+  const turns = useMemo(() => {
+    const grouped: Message[][] = [];
+    for (const message of messages) {
+      if (message.role === 'user' || !grouped.length) grouped.push([]);
+      grouped[grouped.length - 1].push(message);
+    }
+    return grouped;
+  }, [messages]);
+  const activityByTurn = useMemo(() => {
+    const buckets: SessionEvent[][] = turns.map(() => []);
+    const starts = turns.map(turn => turn.find(message => message.role === 'user')?.createdAt ?? 0);
+    for (const event of sessionActivity) {
+      // Binary search handles timestamps independent of event sequence order.
+      let low = 0, high = starts.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (starts[middle] <= event.createdAt) low = middle + 1;
+        else high = middle;
+      }
+      if (low > 0) buckets[low - 1].push(event);
+    }
+    return buckets;
+  }, [turns, sessionActivity]);
 
   async function retry() {
     if (!lastPrompt || !ready || generating || loading || disabled || submitting.current) return;
@@ -626,24 +601,45 @@ export function Chat({
   }, [draft, conversationKey]);
 
   useEffect(() => {
-    if (preflightTimer.current) clearTimeout(preflightTimer.current);
-    if (!draft.trim() || !ready) { setPreflight(null); return; }
+    const revision = ++preflightRevision.current;
+    setPreflight(null);
+    if (!composedDraft.trim() || !ready || generating || loading || disabled) return;
     preflightTimer.current = setTimeout(() => {
-      void api.contextPreflight(conversationKey === 'new' ? null : conversationKey, draft, preset, connectorIds, connectorTools, planMode).then(result => {
-        if (result.available) setPreflight({ breakdown: result.breakdown!, draft });
-        else setPreflight(null);
-      }).catch(() => setPreflight(null));
+      void api.contextPreflight(conversationKey === 'new' ? null : conversationKey, composedDraft, preset, connectorIds, connectorTools, false, interactionMode).then(result => {
+        if (preflightRevision.current !== revision) return;
+        setPreflight(result.available ? { breakdown: result.breakdown!, draft: composedDraft } : null);
+      }).catch(() => { if (preflightRevision.current === revision) setPreflight(null); });
     }, 400);
-    return () => { if (preflightTimer.current) clearTimeout(preflightTimer.current); };
-  }, [draft, ready, conversationKey, connectorIds, connectorTools, preset, planMode]);
+    return () => {
+      ++preflightRevision.current;
+      if (preflightTimer.current) clearTimeout(preflightTimer.current);
+    };
+  }, [composedDraft, ready, generating, loading, disabled, messages, conversationKey, connectorIds, connectorTools, preset, interactionMode, modelKey, contextRevision]);
 
   async function submit() {
-    if ((!draft.trim() && !attachments.length) || !ready || generating || loading || disabled || reading.current || submitting.current) return;
+    if ((!draft.trim() && !attachments.length) || !ready || loading || disabled || reading.current || submitting.current) return;
     let content: string;
     try {
       content = composeMessage(draft, attachments);
     } catch (error) {
       setAttachmentError((error as Error).message);
+      return;
+    }
+    if (generating) {
+      // A task is already running: Enter queues the draft as a follow-up
+      // instead of touching the running task.
+      if (!onQueue) return;
+      submitting.current = true;
+      const originalDraft = draft;
+      setDraft('');
+      try {
+        await onQueue(content);
+      } catch {
+        setDraft(current => current || originalDraft);
+      } finally {
+        submitting.current = false;
+      }
+      input.current?.focus();
       return;
     }
     submitting.current = true;
@@ -681,38 +677,26 @@ export function Chat({
         ) : messages.length || generating ? (
           <div className="messages">
             {turns.map((turn, turnIndex) => {
-              const assistants = turn.filter(message => message.role === 'assistant');
               const user = turn.find(message => message.role === 'user');
               const recordedRun = user?.id === lastPrompt?.id && latestRun?.conversationId === conversationKey && latestRun.createdAt >= (user?.createdAt ?? 0) ? latestRun : null;
-              const activity = sessionActivity.filter(e => e.createdAt >= (user?.createdAt ?? 0) && e.createdAt < (turns[turnIndex + 1]?.[0].createdAt ?? Infinity));
-              if (activity.length > 0) return <div key={turn[0].id} className="conversation-turn">
-                {user && <MessageBody message={user} />}
-                <ActivityTimeline events={activity} messages={turn} renderMessage={m => <MessageBody message={m} />} renderTool={m => <ToolMessage message={m} onStop={onCancel} />} />
-              </div>;
-              return <div key={turn[0].id} className="conversation-turn">
-                {user && <MessageBody message={user} />}
-                <TurnTools tools={turn.filter(message => message.role === 'tool')} onCancel={onCancel} />
-                {assistants.map((message, index) => index === assistants.length - 1 && message.status !== 'streaming'
-                  ? <WorkSummary key={message.id} messages={turn} run={recordedRun}><MessageBody message={message} /></WorkSummary>
-                  : <MessageBody key={message.id} message={message} />)}
-              </div>;
+              return <ConversationTurn key={turn[0].id} messages={turn} events={activityByTurn[turnIndex]} run={recordedRun} onStop={stopGeneration} />;
             })}
+            {!generating && lastResponse && <Evidence conversation={conversationKey} tick={messages.length} />}
             {generating && (
               <div className="activity-live" role="status">
-                <span className="activity-dot" />
+                <span className="activity-dot" aria-hidden="true" />
                 <span className="activity-live-text">{liveActivity?.activity || 'Generating response…'}</span>
-                {liveActivity?.state && <span className="activity-badge">{liveActivity.state}</span>}
               </div>
             )}
           </div>
         ) : (
-          <div className="sr-only">
-              <div className="welcome-mark"><span /> <span /> <span /></div>
-              <p className="eyebrow">YOUR LOCAL WORKSPACE</p>
-              <h1>A little model.<br />Room for big ideas.</h1>
-              <p className="welcome-description">
-                Think out loud, work through a problem, or start something new.<br className="wide-only" /> Your model runs right here, on your computer.
-              </p>
+          <div className="welcome">
+              <h1>Start a local conversation</h1>
+              {ready
+                ? <p className="welcome-description">
+                    {projectName ? `Ask a question or work on ${projectName}.` : 'Ask a question, attach a file, or make a plan.'}
+                  </p>
+                : <ReadinessCard onAction={onConfigure} />}
               <div className="suggestions">
                 {[
                   { icon: MessageSquare, title: 'Think it through', prompt: 'Help me think through an idea. Start by asking me what I want to achieve.' },
@@ -726,9 +710,9 @@ export function Chat({
                       input.current?.focus();
                     }}
                   >
-                    <Icon size={18} />
+                    <Icon size={16} aria-hidden="true" />
                     <span>{title}</span>
-                    <span className="suggestion-arrow">↗</span>
+                    <ArrowUpRight size={14} className="suggestion-arrow" aria-hidden="true" />
                   </button>
                 ))}
               </div>
@@ -771,25 +755,52 @@ export function Chat({
             <button disabled={!ready || loading || disabled} onClick={() => void retry()}>Retry last prompt</button>
           </div>
         )}
-        {!ready && (
+        {!ready && messages.length === 0 && (
           <div className="setup-hint">
             <Cpu size={15} />
-            <span>{selectionIssue ? 'Choose a tested provider and configure its model limits, or select the local model.' : 'Load a local model or choose a tested API provider to start a conversation.'}</span>
-            <button onClick={onConfigure}>Open Models <span>↗</span></button>
+            <span>{selectionIssue ? 'Select a local model or a tested loopback provider with configured model limits.' : 'Load a local model or choose a tested loopback provider to start a conversation.'}</span>
+            <button onClick={onConfigure}>Open Models <ArrowUpRight size={13} aria-hidden="true" /></button>
           </div>
         )}
         <div className="codex-composer-wrapper">
-          <PlanChecklist
+          {!completedPlan && <PlanChecklist
             todos={todos}
             generating={generating}
             drafting={planMode && generating && todos.length === 0}
             conversationId={conversationKey}
-          />
+          />}
+          {planReady && !generating && onImplementPlan && (
+            <button
+              type="button"
+              className="implement-plan"
+              disabled={!ready || loading || disabled}
+              onClick={() => onImplementPlan?.()}
+            >
+              <ListTodo size={14} aria-hidden="true" /> Implement plan
+            </button>
+          )}
           <div className="composer-meta-bar">
             <div className="composer-meta-item">
               <Folder size={13} className="composer-meta-icon" />
               <span>{projectName || 'No workspace'}</span>
             </div>
+            {taskWorkspace
+              ? <span className="composer-meta-item task-active" title={`Isolated task (${taskWorkspace.kind === 'git-worktree' ? 'git worktree' : 'snapshot copy'}) — review and apply changes in the Review tab`}>
+                  <ShieldCheck size={13} className="composer-meta-icon" />
+                  Isolated{taskWorkspace.branch ? ` · ${taskWorkspace.branch.split('/').pop()}` : ' copy'}
+                </span>
+              : onIsolateTask && <button
+                  type="button"
+                  className="composer-meta-item task-isolate"
+                  aria-label="Isolate task"
+                  title="Work in an isolated copy of this workspace so changes can be reviewed and applied later"
+                  disabled={generating || loading || disabled}
+                  onClick={onIsolateTask}
+                >
+                  <FolderGit2 size={13} className="composer-meta-icon" /> Isolate task
+                </button>}
+            {completedPlan && <div className="composer-plan-compact"><PlanChecklist todos={todos} conversationId={conversationKey} /></div>}
+            {!ready && messages.length > 0 && <button type="button" className="composer-setup-link" onClick={onConfigure} title={selectionIssue ? 'Choose a loopback provider or select the local model' : 'Load a local model or choose a tested loopback provider'}><Cpu size={13} /> Set up model</button>}
           </div>
           <form
             className={`composer codex-composer-body ${dragging ? 'composer-dragging' : ''}`}
@@ -887,18 +898,18 @@ export function Chat({
               >
                 <Plus size={20} />
               </button>
-              <button
-                type="button"
-                className={`icon-button plan-toggle ${planMode ? 'active' : ''}`}
-                aria-pressed={planMode}
-                aria-label="Plan mode"
-                title={planMode ? 'Plan mode is on: write a checklist, then complete one task at a time' : 'Plan mode: write a checklist first, then complete one task at a time'}
-                disabled={generating || loading || disabled}
-                onClick={() => onPlanModeChange?.(!planMode)}
-              >
-                <ListTodo size={16} />
-                {planMode && <span className="plan-toggle-label">Plan</span>}
-              </button>
+              {/* Ask/Plan/Act is backend-enforced and saved per conversation;
+                  keep it visually separate from the permission selector. */}
+              <Segmented<InteractionMode>
+                label="Interaction mode"
+                value={interactionMode}
+                onChange={mode => onInteractionModeChange?.(mode)}
+                options={[
+                  { value: 'ask', label: 'Ask' },
+                  { value: 'plan', label: 'Plan' },
+                  { value: 'act', label: 'Act' },
+                ]}
+              />
               <div className="composer-tools">{composerTools}</div>
             </div>
             <div className="composer-send" style={{ position: 'relative' }}>
@@ -937,7 +948,7 @@ export function Chat({
                   </div>
                   <div className="composer-model-list">
                     {libraryError && <p className="error" role="alert">{libraryError}</p>}
-                    {onConfigureLocalModel && downloadedModels.filter(model => model.complete).map(model => <button type="button" className="composer-model-option" key={model.id} onClick={() => { setShowModelPicker(false); onConfigureLocalModel(model.id); }}><strong>{localModelLabel(model.filename)}</strong><small>{model.repo ?? "Local GGUF"} · Use model</small></button>)}
+                    {onConfigureLocalModel && downloadedModels.filter(model => model.complete).map(model => <button type="button" className="composer-model-option" key={model.id} onClick={() => { setShowModelPicker(false); onConfigureLocalModel(model.id); }}><strong>{localModelLabel(model.filename)}</strong><small>{model.filename === 'K2-Horizon-4B-Q4_K_M.gguf' && model.external ? 'K2 custom llama.cpp runtime' : 'Local llama.cpp runtime'} · Use model</small></button>)}
                     <button
                       type="button"
                       className="composer-model-option"
@@ -949,7 +960,7 @@ export function Chat({
                       <strong>Local model</strong>
                       <small>llama.cpp local runtime</small>
                     </button>
-                    {providers?.filter(p => p.verified).map(p => (
+                    {providers?.filter(p => p.verified && localInferenceProvider(p)).map(p => (
                       <div key={p.id} className="composer-provider-group">
                         <span className="composer-provider-title">{p.name}</span>
                         {p.models.map(m => (
@@ -977,16 +988,33 @@ export function Chat({
                         onConfigure();
                       }}
                     >
-                      Configure in Models & runtime ↗
+                      Model settings…
                     </button>
                   </div>
                 </div>
               )}
 
-              {paused && onResume && <button type="button" className="send-button" aria-label="Resume response" onClick={onResume}>Resume</button>}
               {generating ? (
                 <>
-                  {onPause && <button type="button" className="send-button send-stop" aria-label="Pause response" onClick={onPause}>Pause</button>}
+                  {onSteer && (
+                    <button
+                      type="button"
+                      className="send-button send-steer"
+                      aria-label="Steer the running task with this text"
+                      title="Steer the running task with this text"
+                      disabled={!draft.trim() || loading || disabled}
+                      onClick={() => {
+                        const text = draft.trim();
+                        if (!text || !onSteer) return;
+                        const original = draft;
+                        setDraft('');
+                        void onSteer(text).catch(() => setDraft(original));
+                      }}
+                    >
+                      <WandSparkles size={14} aria-hidden="true" />
+                      <span className="send-steer-label">Steer</span>
+                    </button>
+                  )}
                   <button type="button" className="send-button send-stop" aria-label="Stop response" onClick={onCancel}>
                     <Square size={15} fill="currentColor" />
                   </button>

@@ -411,7 +411,18 @@ function defaultLookup(hostname) {
 }
 
 async function defaultLaunchBrowser({ executablePath, timeoutMs }) {
-  const { chromium } = await import('playwright');
+  // The worker runs extracted under %APPDATA% with no node_modules beside it;
+  // when the host passes LOCALLM_NODE_MODULES, resolve playwright from there
+  // (ESM bare imports ignore NODE_PATH, so anchor a require at that dir).
+  let playwright;
+  if (process.env.LOCALLM_NODE_MODULES) {
+    const { createRequire } = await import('node:module');
+    const { join } = await import('node:path');
+    playwright = createRequire(join(process.env.LOCALLM_NODE_MODULES, 'package.json'))('playwright');
+  } else {
+    playwright = await import('playwright');
+  }
+  const { chromium } = playwright;
   return chromium.launch({
     executablePath,
     headless: true,

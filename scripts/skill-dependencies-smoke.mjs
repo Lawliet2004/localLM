@@ -1,9 +1,8 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { writeFileSync } from 'node:fs';
+import { connectSmoke } from './smoke-lib.mjs';
 
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-let page;
-await expect.poll(() => { page = browser.contexts()[0].pages().find(value => value.url().includes('1420')); return Boolean(page); }).toBe(true);
+let { browser, page } = await connectSmoke();
 page.setDefaultTimeout(15000);
 const invoke = (command, args = {}) => page.evaluate(async ({ command, args }) => {
   const { invoke } = await import('/node_modules/@tauri-apps/api/core.js');

@@ -46,23 +46,18 @@ export function levenshteinSimilarity(a: string, b: string): number {
   if (s1 === s2) return 1.0;
   if (s1.length === 0 || s2.length === 0) return 0.0;
 
-  const m = s1.length;
-  const n = s2.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+  const [short, long] = s1.length <= s2.length ? [s1, s2] : [s2, s1];
+  const row = Array.from({ length: short.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= long.length; i++) {
+    let diagonal = row[0];
+    row[0] = i;
+    for (let j = 1; j <= short.length; j++) {
+      const above = row[j];
+      row[j] = Math.min(above + 1, row[j - 1] + 1, diagonal + (long[i - 1] === short[j - 1] ? 0 : 1));
+      diagonal = above;
     }
   }
-
-  const distance = dp[m][n];
-  const maxLength = Math.max(m, n);
-  return 1 - distance / maxLength;
+  return 1 - row[short.length] / long.length;
 }
 
 export function deduplicateSearchResults(results: SearchResult[]): SearchResult[] {

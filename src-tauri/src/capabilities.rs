@@ -1,9 +1,5 @@
-//! Capability registry and microkernel seam (DSH Phase 0).
-//!
-//! Provides dynamic capability discovery, dependency tracking, runtime mounting/unmounting,
-//! and temporal composability mirroring Cordis `ctx.effect()` / `ctx.on()`.
-//! Capability configuration is seeded from `capabilities.json` and overlaid
-//! with user modifications in SQLite `settings`.
+//! Capability registry: parses `capabilities.json`, overlays the user's
+//! disabled set from SQLite `settings`, and answers enable/disable queries.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -55,124 +51,44 @@ struct CapabilitiesConfig {
     capabilities: Vec<Capability>,
 }
 
-/// Dynamic capability registry supporting dependencies (`requires`) and
-/// lifecycle hooks (`effects`).
+/// Static capability catalog seeded from `capabilities.json`.
 #[derive(Clone, Debug)]
 pub struct Registry {
     capabilities: HashMap<String, Capability>,
-    dependencies: HashMap<String, Vec<String>>,
-    effects: HashMap<String, Vec<String>>,
     presets: HashMap<String, Preset>,
     default_preset: String,
 }
 
 impl Default for Registry {
     fn default() -> Self {
-        Self::from_json(include_str!("../capabilities.json"))
-            .unwrap_or_else(|_| Self::minimal_fallback())
+        Self::from_json(include_str!("../capabilities.json")).unwrap_or_else(|_| Self {
+            capabilities: HashMap::new(),
+            presets: HashMap::new(),
+            default_preset: "standard".into(),
+        })
     }
 }
 
 impl Registry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn from_json(raw: &str) -> Result<Self, String> {
         let parsed: CapabilitiesConfig =
             serde_json::from_str(raw).map_err(|e| format!("Failed to parse capabilities.json: {e}"))?;
 
-        let mut capabilities = HashMap::new();
-        let mut dependencies = HashMap::new();
-        let mut effects = HashMap::new();
-
-        for cap in parsed.capabilities {
-            // Register known default dependency relationships
-            let reqs = match cap.id.as_str() {
-                "skills_reader" => vec!["session_log".to_string()],
-                "cloud_execution" => vec!["storage_sqlite".to_string()],
-                "subagents" => vec!["session_log".to_string(), "agent_loop".to_string()],
-                "workflows" => vec!["agent_loop".to_string(), "subagents".to_string()],
-                "compaction" => vec!["session_log".to_string()],
-                _ => vec![],
-            };
-            let effs = match cap.id.as_str() {
-                "system_time" => vec!["tool:system_time".to_string(), "prompt:system_time".to_string()],
-                "workspace_files" => vec!["tool:workspace".to_string()],
-                "local_execution" => vec!["tool:local_exec".to_string()],
-                "cloud_execution" => vec!["tool:daytona".to_string()],
-                "skills_reader" => vec!["tool:skill_reader".to_string()],
-                _ => vec![],
-            };
-
-            dependencies.insert(cap.id.clone(), reqs);
-            effects.insert(cap.id.clone(), effs);
-            capabilities.insert(cap.id.clone(), cap);
-        }
+        let capabilities = parsed
+            .capabilities
+            .into_iter()
+            .map(|cap| (cap.id.clone(), cap))
+            .collect();
 
         Ok(Self {
             capabilities,
-            dependencies,
-            effects,
             presets: parsed.presets,
             default_preset: parsed.default_preset,
         })
     }
 
-    fn minimal_fallback() -> Self {
-        let mut reg = Self {
-            capabilities: HashMap::new(),
-            dependencies: HashMap::new(),
-            effects: HashMap::new(),
-            presets: HashMap::new(),
-            default_preset: "standard".into(),
-        };
-        reg.register(
-            Capability {
-                id: "system_time".into(),
-                kind: CapabilityKind::Tool,
-                version: VERSION,
-                enabled: true,
-                description: "Local clock for the model.".into(),
-                config: json!({}),
-            },
-            vec![],
-            vec!["tool:system_time".into()],
-        );
-        reg
-    }
-
-    pub fn register(&mut self, capability: Capability, requires: Vec<String>, effects: Vec<String>) {
-        let id = capability.id.clone();
-        self.capabilities.insert(id.clone(), capability);
-        self.dependencies.insert(id.clone(), requires);
-        self.effects.insert(id, effects);
-    }
-
-    pub fn dispose(&mut self, id: &str) -> Option<Capability> {
-        self.dependencies.remove(id);
-        self.effects.remove(id);
-        self.capabilities.remove(id)
-    }
-
     pub fn get(&self, id: &str) -> Option<&Capability> {
         self.capabilities.get(id)
-    }
-
-    pub fn requires(&self, id: &str) -> &[String] {
-        self.dependencies.get(id).map(|v| v.as_slice()).unwrap_or(&[])
-    }
-
-    pub fn effects(&self, id: &str) -> &[String] {
-        self.effects.get(id).map(|v| v.as_slice()).unwrap_or(&[])
-    }
-
-    pub fn presets(&self) -> &HashMap<String, Preset> {
-        &self.presets
-    }
-
-    pub fn default_preset(&self) -> &str {
-        &self.default_preset
     }
 }
 
@@ -296,7 +212,7 @@ pub async fn dump_config(
 
     Ok(json!({
         "preset": active_preset,
-        "presets": registry.presets,
+        "presets": &registry.presets,
         "capabilityVersion": VERSION,
         "capabilities": capabilities,
         "conversationTools": conversation_tools,
@@ -314,12 +230,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_parses_json_and_resolves_dependencies() {
+    fn registry_parses_json_catalog() {
         let registry = Registry::default();
         assert!(registry.get("system_time").is_some());
         assert_eq!(registry.get("system_time").unwrap().kind, CapabilityKind::Tool);
-        assert!(registry.effects("system_time").contains(&"tool:system_time".to_string()));
-        assert!(registry.requires("workflows").contains(&"subagents".to_string()));
+        assert!(registry.presets.contains_key("standard"));
     }
 
     #[test]
@@ -344,24 +259,4 @@ mod tests {
         assert!(validate_id("unknown_tool_xyz").is_err());
     }
 
-    #[test]
-    fn dynamic_register_and_dispose_effects() {
-        let mut registry = Registry::minimal_fallback();
-        let custom = Capability {
-            id: "custom_plug".into(),
-            kind: CapabilityKind::Sandbox,
-            version: 1,
-            enabled: true,
-            description: "Custom sandbox plugin".into(),
-            config: json!({"timeoutSecs": 30}),
-        };
-        registry.register(custom, vec!["storage_sqlite".into()], vec!["sandbox:isolate".into()]);
-        assert_eq!(registry.requires("custom_plug"), &["storage_sqlite".to_string()]);
-        assert_eq!(registry.effects("custom_plug"), &["sandbox:isolate".to_string()]);
-
-        let disposed = registry.dispose("custom_plug");
-        assert!(disposed.is_some());
-        assert!(registry.get("custom_plug").is_none());
-        assert!(registry.requires("custom_plug").is_empty());
-    }
 }

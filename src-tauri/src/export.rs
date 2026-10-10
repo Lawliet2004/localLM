@@ -152,6 +152,7 @@ mod tests {
             messages: vec![
                 Message {
                     error: None,
+                    metrics: None,
                     id: "assistant".into(),
                     conversation_id: "chat".into(),
                     role: "assistant".into(),
@@ -162,6 +163,7 @@ mod tests {
                 },
                 Message {
                     error: None,
+                    metrics: None,
                     id: "tool".into(),
                     conversation_id: "chat".into(),
                     role: "tool".into(),

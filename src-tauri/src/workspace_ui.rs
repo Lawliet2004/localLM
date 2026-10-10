@@ -1,7 +1,7 @@
 //! Desktop workspace operations. Metadata lives in the existing SQLite settings store.
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -13,30 +13,26 @@ pub struct TaskMeta { pub project_id: Option<String>, pub archived: bool, pub pi
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceIndex { pub projects: Vec<Project>, pub tasks: BTreeMap<String, TaskMeta> }
 
-fn index(store: &crate::store::Store) -> Result<WorkspaceIndex, String> {
+pub(crate) fn index(store: &crate::store::Store) -> Result<WorkspaceIndex, String> {
     let mut data: WorkspaceIndex = store.setting("workspace_index_v1")?;
     // Chats always file under a folder: a conversation whose task meta is
     // missing or points at a deleted project is healed into the first project
     // on the next index read (covers script-created and otherwise unfiled rows).
     if let Some(project) = data.projects.first() {
+        let project_ids: HashSet<_> = data.projects.iter().map(|project| project.id.as_str()).collect();
         let mut healed = false;
         for conversation in store.list_conversations()? {
             let filed = data
                 .tasks
                 .get(&conversation.id)
                 .and_then(|task| task.project_id.as_ref())
-                .map_or(false, |id| data.projects.iter().any(|p| &p.id == id));
+                .is_some_and(|id| project_ids.contains(id.as_str()));
             if !filed {
                 data.tasks.entry(conversation.id).or_default().project_id = Some(project.id.clone());
                 healed = true;
             }
         }
         if healed {
-            // ponytail: this write doesn't take the operation lock (index is
-            // read during generation, so it can't). A save_task_meta landing
-            // mid-heal could be clobbered; that chat self-heals into the first
-            // project on the next read. Upgrade: a tasks table instead of one
-            // JSON blob.
             store.save_setting("workspace_index_v1", &data)?;
         }
     }
@@ -68,7 +64,7 @@ pub fn inherit_task_meta(store: &crate::store::Store, source_id: &str, new_id: &
     let valid = meta
         .project_id
         .as_ref()
-        .map_or(false, |id| data.projects.iter().any(|p| &p.id == id));
+        .is_some_and(|id| data.projects.iter().any(|p| &p.id == id));
     if !valid {
         meta.project_id = data.projects.first().map(|p| p.id.clone());
     }
@@ -76,10 +72,21 @@ pub fn inherit_task_meta(store: &crate::store::Store, source_id: &str, new_id: &
     store.save_setting("workspace_index_v1", &data)
 }
 
-pub fn task_workspace(store: &crate::store::Store, id: &str) -> Result<Option<String>, String> {
+/// The conversation's project folder, ignoring any isolated task workspace.
+pub fn project_workspace(store: &crate::store::Store, id: &str) -> Result<Option<String>, String> {
     let data = index(store)?;
     let project = data.tasks.get(id).and_then(|t| t.project_id.as_ref());
     Ok(data.projects.iter().find(|p| Some(&p.id) == project).map(|p| p.path.clone()))
+}
+
+/// The workspace root every tool/terminal/execution path should resolve for
+/// this conversation: its isolated task root while one is active, otherwise
+/// the project folder.
+pub fn task_workspace(store: &crate::store::Store, id: &str) -> Result<Option<String>, String> {
+    if let Some(task) = store.active_task_workspace(id)? {
+        return Ok(Some(task.isolated_root));
+    }
+    project_workspace(store, id)
 }
 
 #[tauri::command]
@@ -182,48 +189,73 @@ fn stamp(mut value: Value, id: &str, root: &str, revision: u64) -> Value {
     value
 }
 
+async fn read_workspace(
+    state: &crate::AppState,
+    tool: &'static str,
+    arguments: Value,
+    workspace_id: Option<String>,
+    root: Option<String>,
+) -> Result<Value, String> {
+    let (id, bound, revision) = {
+        let store = state.database()?;
+        resolve_search_root(&index(&store)?, &store.workspace_path()?, workspace_id.as_deref(), root.as_deref())?
+    };
+    // Directory traversal can take seconds. Keep it off the IPC/runtime thread
+    // and release the shared database before touching the filesystem.
+    tokio::task::spawn_blocking(move || {
+        let value = crate::workspace::Workspace::open(&bound)?.call(tool, arguments)?;
+        Ok(stamp(value, &id, &bound, revision))
+    }).await.map_err(|_| "Workspace reader stopped.".to_string())?
+}
+
 #[tauri::command]
-pub fn workspace_inspect(
+pub async fn workspace_inspect(
     state: tauri::State<'_, crate::AppState>,
     path: String,
     directory: bool,
     workspace_id: Option<String>,
     root: Option<String>,
 ) -> Result<Value, String> {
-    let store = state.database()?;
-    let saved = store.workspace_path()?;
-    let index = index(&store)?;
-    let (id, bound, revision) = resolve_search_root(&index, &saved, workspace_id.as_deref(), root.as_deref())?;
-    let value = crate::workspace::Workspace::open(&bound)?.call(
+    read_workspace(&state,
         if directory { "list_files" } else { "read_file" },
         if directory { json!({"path": path}) } else { json!({"path": path, "line_count": 500}) },
-    )?;
-    Ok(stamp(value, &id, &bound, revision))
+        workspace_id, root,
+    ).await
 }
 
 #[tauri::command]
-pub fn workspace_search(
+pub async fn workspace_search(
     state: tauri::State<'_, crate::AppState>,
     query: String,
     workspace_id: Option<String>,
     root: Option<String>,
 ) -> Result<Value, String> {
-    let store = state.database()?;
-    let saved = store.workspace_path()?;
-    let index = index(&store)?;
-    let (id, bound, revision) = resolve_search_root(&index, &saved, workspace_id.as_deref(), root.as_deref())?;
-    let value = crate::workspace::Workspace::open(&bound)?.call("search_files", json!({"query": query}))?;
-    Ok(stamp(value, &id, &bound, revision))
+    read_workspace(&state, "search_files", json!({"query": query}), workspace_id, root).await
 }
 
 async fn git(root: &str, args: &[&str]) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C").arg(root).args(args).kill_on_drop(true);
+    cmd.arg("-C").arg(root).args(args).kill_on_drop(true)
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     #[cfg(windows)] cmd.creation_flags(0x08000000);
-    let out = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await
+    let mut child = cmd.spawn().map_err(|e| format!("Cannot run Git: {e}"))?;
+    let stdout = child.stdout.take().ok_or("Git output unavailable.")?;
+    let stderr = child.stderr.take().ok_or("Git diagnostics unavailable.")?;
+    let (stdout, stderr, status) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::try_join!(capture_git(stdout, 400_000), capture_git(stderr, 8_000), child.wait())
+    }).await
         .map_err(|_| "Git timed out.")?.map_err(|e| format!("Cannot run Git: {e}"))?;
-    if !out.status.success() { return Err(String::from_utf8_lossy(&out.stderr).chars().take(2000).collect()); }
-    Ok(String::from_utf8_lossy(&out.stdout).chars().take(100_000).collect())
+    if !status.success() { return Err(String::from_utf8_lossy(&stderr).chars().take(2000).collect()); }
+    Ok(String::from_utf8_lossy(&stdout).chars().take(100_000).collect())
+}
+
+async fn capture_git<R: tokio::io::AsyncRead + Unpin>(mut reader: R, limit: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    (&mut reader).take(limit).read_to_end(&mut bytes).await?;
+    // Keep draining both pipes so a large diff cannot deadlock the process.
+    tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+    Ok(bytes)
 }
 
 #[tauri::command]
@@ -237,15 +269,27 @@ pub async fn workspace_git(state: tauri::State<'_, crate::AppState>, branch: Opt
         // Never force checkout, reset, or discard changes.
         git(&root, &["switch", &branch]).await?;
     }
+    git_snapshot(&root).await
+}
+
+async fn git_snapshot(root: &str) -> Result<Value, String> {
     // Working tree versus HEAD covers staged and unstaged edits; a repository
     // without commits has no HEAD, so fall back to the unstaged diff there.
-    let diff = match git(&root, &["diff", "--no-ext-diff", "--no-color", "HEAD"]).await {
-        Ok(diff) => diff,
-        Err(_) => git(&root, &["diff", "--no-ext-diff", "--no-color"]).await?,
+    let diff = async {
+        match git(root, &["diff", "--no-ext-diff", "--no-color", "HEAD"]).await {
+            Ok(diff) => Ok(diff),
+            Err(_) => git(root, &["diff", "--no-ext-diff", "--no-color"]).await,
+        }
     };
-    Ok(json!({"branch":git(&root, &["branch","--show-current"]).await?.trim(),
-        "branches":git(&root, &["for-each-ref","--format=%(refname:short)","refs/heads/"]).await?.lines().collect::<Vec<_>>(),
-        "status":git(&root, &["status","--short"]).await?,
+    let (diff, branch, branches, status) = tokio::try_join!(
+        diff,
+        git(root, &["branch", "--show-current"]),
+        git(root, &["for-each-ref", "--format=%(refname:short)", "refs/heads/"]),
+        git(root, &["status", "--short"]),
+    )?;
+    Ok(json!({"branch":branch.trim(),
+        "branches":branches.lines().collect::<Vec<_>>(),
+        "status":status,
         "diff":diff}))
 }
 
@@ -254,6 +298,68 @@ pub async fn workspace_git(state: tauri::State<'_, crate::AppState>, branch: Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn git_capture_drains_large_output_and_keeps_only_the_bounded_prefix() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(16);
+        let producer = tokio::spawn(async move { writer.write_all(&vec![b'x'; 4096]).await.unwrap(); });
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), capture_git(reader, 32)).await.unwrap().unwrap();
+        producer.await.unwrap();
+        assert_eq!(bytes, vec![b'x'; 32]);
+    }
+
+    #[tokio::test]
+    async fn git_snapshot_preserves_branch_status_diff_truncation_and_diagnostics() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap();
+        git(root, &["init", "-b", "main"]).await.unwrap();
+        let path = directory.path().join("sample.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        git(root, &["add", "sample.txt"]).await.unwrap();
+        git(root, &["-c", "user.name=LocalLM Test", "-c", "user.email=test@example.invalid", "commit", "--no-verify", "-m", "fixture"]).await.unwrap();
+        git(root, &["branch", "other"]).await.unwrap();
+        std::fs::write(path, "界".repeat(150_000)).unwrap();
+        let value = git_snapshot(root).await.unwrap();
+        assert_eq!(value["branch"], "main");
+        assert_eq!(value["branches"], json!(["main", "other"]));
+        assert_eq!(value["status"], " M sample.txt\n");
+        let mut command = tokio::process::Command::new("git");
+        command.arg("-C").arg(root).args(["diff", "--no-ext-diff", "--no-color", "HEAD"]);
+        #[cfg(windows)] command.creation_flags(0x08000000);
+        let full = command.output().await.unwrap();
+        let expected: String = String::from_utf8_lossy(&full.stdout).chars().take(100_000).collect();
+        assert_eq!(value["diff"], expected);
+        assert_eq!(expected.chars().count(), 100_000);
+        assert!(git(root, &["show", "missing-ref"]).await.unwrap_err().contains("missing-ref"));
+    }
+
+    #[tokio::test]
+    async fn workspace_reader_keeps_project_binding_and_releases_the_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("sample.txt"), "audit needle\n").unwrap();
+        let state = crate::web_search::tests::test_state(temp.path());
+        let data = WorkspaceIndex { projects: vec![Project {
+            id: "bound".into(), name: "Bound".into(), path: root.to_string_lossy().into_owned(),
+        }], tasks: Default::default() };
+        state.database().unwrap().save_setting("workspace_index_v1", &data).unwrap();
+        let search = read_workspace(&state, "search_files", json!({"query":"sample"}), Some("bound".into()), None);
+        tokio::pin!(search);
+        let value = tokio::select! {
+            result = &mut search => result.unwrap(),
+            _ = tokio::task::yield_now() => {
+                assert!(state.store.try_lock().is_ok(), "filesystem work must not hold the chat database");
+                search.await.unwrap()
+            },
+        };
+        assert_eq!(value["workspaceId"], "bound");
+        assert_eq!(value["root"], data.projects[0].path);
+        assert!(value.to_string().contains("sample.txt"));
+        assert!(read_workspace(&state, "read_file", json!({"path":"../outside.txt"}), Some("bound".into()), None).await.is_err());
+    }
+
     #[test]
     fn project_association_survives_reopen_and_isolated_tasks_do_not_inherit_it() {
         let temp = tempfile::tempdir().unwrap();

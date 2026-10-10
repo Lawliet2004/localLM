@@ -1,0 +1,45 @@
+{
+  "serverPath": "C:\\Users\\Papan Ghosh\\AppData\\Roaming\\app.locallm.desktop\\runtimes\\llama-b10855-cuda12.4-89ecea3d-f0f2-4389-b40c-e51060da4cd0\\llama-server.exe",
+  "modelPath": "C:\\Users\\Papan Ghosh\\AppData\\Roaming\\app.locallm.desktop\\models\\MiniCPM5-2B.Q6_K.gguf",
+  "recordedAt": "2026-09-26T11:10:40.701Z",
+  "results": [
+    {
+      "contextLength": 131072,
+      "startupMs": 26289,
+      "offloadedLayers": null,
+      "totalLayers": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 456,
+        "prompt_ms": 2987.459,
+        "prompt_per_token_ms": 6.551445175438596,
+        "prompt_per_second": 152.63807804558994,
+        "predicted_n": 128,
+        "predicted_ms": 7378.264,
+        "predicted_per_token_ms": 58.09656692913386,
+        "predicted_per_second": 17.21272104115548
+      },
+      "tokensPredicted": 128,
+      "error": null
+    },
+    {
+      "contextLength": 16384,
+      "startupMs": 5032,
+      "offloadedLayers": null,
+      "totalLayers": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 456,
+        "prompt_ms": 417.386,
+        "prompt_per_token_ms": 0.9153201754385966,
+        "prompt_per_second": 1092.5138840306095,
+        "predicted_n": 128,
+        "predicted_ms": 3906.658,
+        "predicted_per_token_ms": 30.761086614173227,
+        "predicted_per_second": 32.508604541272874
+      },
+      "tokensPredicted": 128,
+      "error": null
+    }
+  ]
+}

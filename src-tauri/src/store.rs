@@ -5,6 +5,25 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, String>;
+/// One `session_events` row inside a repair window:
+/// (run_id, step_id, tool_call_id, event_type, payload JSON).
+type TailEvent = (Option<String>, Option<String>, Option<String>, String, String);
+/// A persisted `model_qualifications` row. `stale` is computed at read by
+/// comparing identity_hash to the live identity — never stored.
+pub struct QualificationRow {
+    pub id: String,
+    pub identity_hash: String,
+    pub model_id: String,
+    pub model_path: Option<String>,
+    pub model_fingerprint: Option<String>,
+    pub runtime_version: Option<String>,
+    pub provider_id: Option<String>,
+    pub config_json: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub results_json: String,
+    pub status: String,
+}
 const LOCAL_TOOL_CALLING_SUPPORT_KEY: &str = "local_tool_calling_support";
 const TOOL_COMPATIBILITY_KEY: &str = "tool_compatibility_v2";
 
@@ -45,6 +64,7 @@ pub struct Conversation {
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub error: Option<String>,
+    pub metrics: Option<serde_json::Value>,
     pub id: String,
     pub conversation_id: String,
     pub role: String,
@@ -112,6 +132,10 @@ pub struct Store {
 pub struct ConversationTools {
     #[serde(default)]
     pub access_mode: crate::permissions::AccessMode,
+    /// Ask/Plan/Act. Rows saved before the mode existed default to Act, so
+    /// old conversations keep working with their existing permission mode.
+    #[serde(default)]
+    pub interaction_mode: crate::permissions::InteractionMode,
     pub sources: Vec<String>,
     pub tools: Vec<crate::connectors::ToolSelection>,
 }
@@ -129,6 +153,9 @@ pub struct PromptFreeze {
 pub struct RememberedTools {
     #[serde(default)]
     pub access_mode: crate::permissions::AccessMode,
+    /// Last explicitly chosen interaction mode — the default for new chats.
+    #[serde(default)]
+    pub interaction_mode: crate::permissions::InteractionMode,
     pub sources: Vec<String>,
     pub tools: Vec<crate::connectors::ToolSelection>,
 }
@@ -203,6 +230,7 @@ impl Store {
     ) -> Result<Message> {
         let message = Message {
             error: None,
+            metrics: None,
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: conversation_id.into(),
             role: role.into(),
@@ -223,6 +251,35 @@ impl Store {
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(db_error)?;
+        // Refuse data written by a newer session format before any migration
+        // or repair touches it: opening anyway could silently misread the log.
+        let has_settings: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if has_settings {
+            let stamped: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM settings WHERE key='session_format_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_error)?;
+            if let Some(text) = stamped {
+                let version: u32 = serde_json::from_str(&text)
+                    .map_err(|_| "Saved session format version is invalid.".to_string())?;
+                if version > crate::sessions::SESSION_FORMAT_VERSION {
+                    return Err(format!(
+                        "This data was written by a newer version of LocalLM (session format {version}); this build understands up to {}. Update LocalLM before opening this data.",
+                        crate::sessions::SESSION_FORMAT_VERSION
+                    ));
+                }
+            }
+        }
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, title TEXT NOT NULL, updated_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -231,6 +288,7 @@ impl Store {
             CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id,created_at);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS conversation_tools(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS conversation_skills(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, name TEXT NOT NULL, api_format TEXT NOT NULL, base_url TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, last_tested_at INTEGER, models TEXT NOT NULL DEFAULT '[]');
             CREATE TABLE IF NOT EXISTS runs(
                 id TEXT PRIMARY KEY,
@@ -280,6 +338,41 @@ impl Store {
             CREATE TABLE IF NOT EXISTS memory_facts(id TEXT PRIMARY KEY, scope TEXT NOT NULL, fact TEXT NOT NULL,
                 origin TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS memory_facts_scope ON memory_facts(scope, updated_at);
+            CREATE TABLE IF NOT EXISTS tasks(
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                interaction_mode TEXT NOT NULL DEFAULT 'act',
+                status TEXT NOT NULL CHECK(status IN ('queued','running','waiting_approval','waiting_resource','paused','interrupted','failed','completed','awaiting_review','cancelled')),
+                position INTEGER,
+                run_id TEXT,
+                wait_reason TEXT,
+                error TEXT,
+                next_action TEXT,
+                parent_task_id TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS tasks_conversation ON tasks(conversation_id, created_at);
+            CREATE INDEX IF NOT EXISTS tasks_queue ON tasks(status, position);
+            CREATE TABLE IF NOT EXISTS task_transitions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                from_status TEXT NOT NULL,
+                to_status TEXT NOT NULL,
+                reason TEXT,
+                at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS task_transitions_task ON task_transitions(task_id, id);
+            CREATE TABLE IF NOT EXISTS steering_messages(
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                applied_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS steering_messages_task ON steering_messages(task_id, applied_at);
             CREATE TABLE IF NOT EXISTS compaction(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
                 cutoff INTEGER NOT NULL, artifact_id TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS conversation_prompt_freeze (
@@ -325,11 +418,111 @@ impl Store {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS research_tasks_conversation ON research_tasks(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS task_workspaces(
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                source_root TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('git-worktree','snapshot')),
+                isolated_root TEXT NOT NULL,
+                branch TEXT,
+                baseline_commit TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('active','applied','discarded')),
+                exclusions_json TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS task_workspaces_one_active
+                ON task_workspaces(conversation_id) WHERE status='active';
+            CREATE TABLE IF NOT EXISTS task_applies(
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES task_workspaces(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                backup_dir TEXT NOT NULL,
+                files_json TEXT NOT NULL,
+                undone_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS task_applies_task ON task_applies(task_id, created_at);
+            CREATE TABLE IF NOT EXISTS task_criteria(
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                origin TEXT NOT NULL CHECK(origin IN ('user','agent')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS task_criteria_conversation ON task_criteria(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS verification_records(
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                criterion_id TEXT REFERENCES task_criteria(id) ON DELETE SET NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('command','browser','research','calculation','data','manual')),
+                method TEXT NOT NULL,
+                command TEXT,
+                environment TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER NOT NULL,
+                exit_code INTEGER,
+                output_excerpt TEXT NOT NULL DEFAULT '',
+                output_artifact TEXT,
+                output_truncated INTEGER NOT NULL DEFAULT 0,
+                artifacts_json TEXT NOT NULL DEFAULT '[]',
+                result TEXT NOT NULL CHECK(result IN ('passed','failed','unavailable','inconclusive')),
+                limitations TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS verification_records_conversation ON verification_records(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS model_qualifications(
+                id TEXT PRIMARY KEY,
+                identity_hash TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_path TEXT,
+                model_fingerprint TEXT,
+                runtime_version TEXT,
+                provider_id TEXT,
+                config_json TEXT NOT NULL DEFAULT '{}',
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                results_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL CHECK(status IN ('passed','partial','failed','cancelled'))
+            );
+            CREATE TABLE IF NOT EXISTS recipes(
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                interval_minutes INTEGER,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                next_run_at INTEGER,
+                last_run_at INTEGER,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS doc_collections(
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                root TEXT NOT NULL UNIQUE,
+                file_count INTEGER NOT NULL DEFAULT 0,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                indexed_at INTEGER,
+                error TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks USING fts5(
+                content,
+                path UNINDEXED,
+                collection_id UNINDEXED,
+                line_start UNINDEXED,
+                line_end UNINDEXED
+            );
+            CREATE TABLE IF NOT EXISTS isolation_grants(
+                path TEXT NOT NULL,
+                profile TEXT NOT NULL,
+                granted_at INTEGER NOT NULL,
+                PRIMARY KEY(path, profile)
+            );
+            CREATE INDEX IF NOT EXISTS model_qualifications_identity ON model_qualifications(identity_hash, started_at);
             CREATE INDEX IF NOT EXISTS session_events_conv_seq ON session_events(conversation_id, seq);
             CREATE INDEX IF NOT EXISTS session_events_run ON session_events(run_id);
-            CREATE INDEX IF NOT EXISTS session_events_type ON session_events(event_type);
-            UPDATE messages SET status='interrupted' WHERE status='streaming';
-            UPDATE runs SET status='cancelled' WHERE status IN ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round');").map_err(db_error)?;
+            CREATE INDEX IF NOT EXISTS session_events_type ON session_events(event_type);").map_err(db_error)?;
         let has_error: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='error')",
@@ -341,6 +534,16 @@ impl Store {
             connection
                 .execute("ALTER TABLE messages ADD COLUMN error TEXT", [])
                 .map_err(db_error)?;
+        }
+        let has_metrics: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='metrics')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if !has_metrics {
+            connection.execute("ALTER TABLE messages ADD COLUMN metrics TEXT", []).map_err(db_error)?;
         }
         for (column, definition) in [
             ("provider_id", "TEXT"),
@@ -360,10 +563,34 @@ impl Store {
                     .map_err(db_error)?;
             }
         }
+        for (column, definition) in [
+            ("reason", "TEXT"),
+            ("source_conversation_id", "TEXT"),
+            ("source_path", "TEXT"),
+            ("source_hash", "TEXT"),
+            ("source_branch", "TEXT"),
+            ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+            ("excluded", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('memory_facts') WHERE name=?1)",
+                    [column],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if !exists {
+                connection
+                    .execute(&format!("ALTER TABLE memory_facts ADD COLUMN {column} {definition}"), [])
+                    .map_err(db_error)?;
+            }
+        }
         let store = Self { connection };
+        store.migrate_fact_scopes()?;
         store.seed_remembered_tools()?;
         store.seed_subscription_providers()?;
         Self::migrate_historical_to_session_events(&store.connection)?;
+        store.save_setting("session_format_version", &crate::sessions::SESSION_FORMAT_VERSION)?;
         Ok(store)
     }
     /// One-time migration: without a saved preference, seed the remembered
@@ -398,14 +625,16 @@ impl Store {
             let mut remembered: RememberedTools = serde_json::from_str(&existing)
                 .map_err(|_| "Saved remembered tool selection is invalid.")?;
             // Upgrade pre-permission defaults without replacing the saved tools.
-            remembered.access_mode = saved.as_deref()
-                .and_then(|text| serde_json::from_str::<ConversationTools>(text).ok())
-                .map(|tools| tools.access_mode).unwrap_or_default();
+            let upgraded = saved.as_deref()
+                .and_then(|text| serde_json::from_str::<ConversationTools>(text).ok());
+            remembered.access_mode = upgraded.as_ref().map(|tools| tools.access_mode).unwrap_or_default();
+            remembered.interaction_mode = upgraded.map(|tools| tools.interaction_mode).unwrap_or_default();
             self.save_remembered_tools(&remembered)?;
         } else if let Some(text) = saved {
             if let Ok(settings) = serde_json::from_str::<ConversationTools>(&text) {
                 let remembered = RememberedTools {
                     access_mode: settings.access_mode,
+                    interaction_mode: settings.interaction_mode,
                     sources: settings.sources,
                     tools: settings.tools,
                 };
@@ -440,6 +669,11 @@ impl Store {
                 params![content, reasoning, status, error, id],
             )
             .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn save_message_metrics(&self, id: &str, metrics: &serde_json::Value) -> Result<()> {
+        let encoded = serde_json::to_string(metrics).map_err(|error| error.to_string())?;
+        self.connection.execute("UPDATE messages SET metrics=?1 WHERE id=?2", params![encoded, id]).map_err(db_error)?;
         Ok(())
     }
     pub fn save_run(&self, run: &crate::agent_run::RunRecord) -> Result<()> {
@@ -480,6 +714,21 @@ impl Store {
                 params![status.as_str(), error, checkpoint, now(), id],
             )
             .map_err(db_error)?;
+        // A run waiting on approval puts its task into `waiting_approval`;
+        // active run states map back to `running` (a task's own terminal and
+        // `waiting_resource`/`paused` states are owned by the task driver).
+        if status == crate::agent_run::RunState::AwaitingApproval {
+            self.connection
+                .execute("UPDATE tasks SET status='waiting_approval' WHERE run_id=?1 AND status='running'", [id])
+                .map_err(db_error)?;
+        } else if !status.is_terminal() {
+            self.connection
+                .execute(
+                    "UPDATE tasks SET status='running', wait_reason=NULL WHERE run_id=?1 AND status IN ('waiting_approval','running')",
+                    [id],
+                )
+                .map_err(db_error)?;
+        }
         Ok(())
     }
     pub fn run(&self, id: &str) -> Result<Option<crate::agent_run::RunRecord>> {
@@ -795,30 +1044,36 @@ impl Store {
     }
     pub fn save_todos(&self, conversation_id: &str, todos: &[crate::plans::Todo]) -> Result<()> {
         crate::plans::validate_todos(todos)?;
-        self.connection
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        transaction
             .execute("DELETE FROM todos WHERE conversation_id=?1", [conversation_id])
             .map_err(db_error)?;
         for (index, todo) in todos.iter().enumerate() {
-            self.connection
+            transaction
                 .execute(
                     "INSERT INTO todos(conversation_id, idx, text, status, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![conversation_id, index as i64, todo.text, todo.status, todo.updated_at],
                 )
                 .map_err(db_error)?;
         }
+        transaction.commit().map_err(db_error)?;
         Ok(())
     }
     /// Append one todo item without re-emitting the full list (~30 tokens).
     pub fn add_todo(&self, conversation_id: &str, text: &str) -> Result<crate::plans::Todo> {
         let mut todos = self.todos(conversation_id)?;
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(existing) = todos.iter().find(|todo| todo.text.split_whitespace().collect::<Vec<_>>().join(" ") == normalized) {
+            return Ok(existing.clone());
+        }
         if todos.len() >= 50 {
             return Err("At most 50 todo items are kept per conversation.".into());
         }
-        if text.trim().is_empty() || text.len() > 500 {
+        if normalized.is_empty() || normalized.len() > 500 {
             return Err("Each todo needs 1-500 characters of text.".into());
         }
         let todo = crate::plans::Todo {
-            text: text.to_string(),
+            text: normalized,
             status: crate::plans::PENDING.to_string(),
             updated_at: now(),
         };
@@ -835,7 +1090,8 @@ impl Store {
         text: Option<&str>,
     ) -> Result<Vec<crate::plans::Todo>> {
         let mut todos = self.todos(conversation_id)?;
-        let todo = todos.get_mut(index).ok_or("Unknown todo index.")?;
+        let count = todos.len();
+        let todo = todos.get_mut(index).ok_or_else(|| format!("Unknown todo index {index}. Current list has {count} item(s), indexed from 0. Use the latest todo list returned by the tool."))?;
         if let Some(status) = status {
             if ![crate::plans::PENDING, crate::plans::IN_PROGRESS, crate::plans::COMPLETED].contains(&status) {
                 return Err(format!("Unknown todo status '{status}'. Use pending, in_progress, or completed."));
@@ -879,47 +1135,185 @@ impl Store {
             .map_err(db_error)?;
         Ok(())
     }
+    /// One-time normalization of pre-scoped memory rows. Old scopes were a
+    /// workspace path or `global`. `global` maps to `user` (identical reach);
+    /// a path matching a saved project maps to `project:<id>`; any other path
+    /// maps to `project:<path>` so it recalls only under that same workspace —
+    /// never widened to user scope. Origins normalize to user/agent/survey.
+    fn migrate_fact_scopes(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "UPDATE memory_facts SET origin='user' WHERE origin='ui';
+                 UPDATE memory_facts SET origin='survey' WHERE origin='auto-survey';
+                 UPDATE memory_facts SET origin='agent' WHERE origin NOT IN ('user','agent','survey');
+                 UPDATE memory_facts SET scope='user' WHERE scope='global';",
+            )
+            .map_err(db_error)?;
+        let paths: Vec<(String, String)> = self
+            .setting::<serde_json::Value>("workspace_index_v1")
+            .ok()
+            .and_then(|value| {
+                value.get("projects")?.as_array().map(|projects| {
+                    projects
+                        .iter()
+                        .filter_map(|project| Some((project.get("id")?.as_str()?.to_string(), project.get("path")?.as_str()?.to_string())))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, scope FROM memory_facts WHERE scope<>'user' AND scope NOT LIKE 'project:%' AND scope NOT LIKE 'conversation:%'")
+            .map_err(db_error)?;
+        let rows: Vec<(String, String)> = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(db_error)?
+            .flatten()
+            .collect();
+        for (id, scope) in rows {
+            let key = scope.replace('\\', "/").trim_end_matches('/').to_lowercase();
+            let project = paths
+                .iter()
+                .find(|(_, path)| path.replace('\\', "/").trim_end_matches('/').to_lowercase() == key);
+            let normalized = match project {
+                Some((id, _)) => format!("project:{id}"),
+                None => format!("project:{scope}"),
+            };
+            self.connection
+                .execute("UPDATE memory_facts SET scope=?2 WHERE id=?1", params![id, normalized])
+                .map_err(db_error)?;
+        }
+        Ok(())
+    }
+    const FACT_COLUMNS: &'static str =
+        "id, scope, fact, origin, reason, source_conversation_id, source_path, source_hash, source_branch, pinned, excluded, created_at, updated_at";
+    fn fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::memory::Fact> {
+        Ok(crate::memory::Fact {
+            id: row.get("id")?,
+            scope: row.get("scope")?,
+            fact: row.get("fact")?,
+            origin: row.get("origin")?,
+            reason: row.get("reason")?,
+            source_conversation_id: row.get("source_conversation_id")?,
+            source_path: row.get("source_path")?,
+            source_hash: row.get("source_hash")?,
+            source_branch: row.get("source_branch")?,
+            pinned: row.get::<_, i64>("pinned")? != 0,
+            excluded: row.get::<_, i64>("excluded")? != 0,
+            stale: false,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+        })
+    }
     pub fn teach_fact(&self, scope: &str, fact: &str, origin: &str) -> Result<crate::memory::Fact> {
+        self.teach_fact_ex(scope, fact, origin, None, None, None, None, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn teach_fact_ex(
+        &self,
+        scope: &str,
+        fact: &str,
+        origin: &str,
+        reason: Option<&str>,
+        source_conversation_id: Option<&str>,
+        source_path: Option<&str>,
+        source_hash: Option<&str>,
+        source_branch: Option<&str>,
+    ) -> Result<crate::memory::Fact> {
         let record = crate::memory::Fact {
             id: uuid::Uuid::new_v4().to_string(),
-            scope: crate::memory::normalize_scope(scope)?,
+            scope: crate::memory::validate_scope(scope)?.to_string(),
             fact: crate::memory::validate_fact(fact)?.to_string(),
-            origin: origin.to_string(),
+            origin: match origin {
+                "ui" | "user" => "user",
+                "auto-survey" | "survey" => "survey",
+                _ => "agent",
+            }
+            .to_string(),
+            reason: reason.map(|r| r.chars().take(300).collect()),
+            source_conversation_id: source_conversation_id.map(str::to_string),
+            source_path: source_path.map(str::to_string),
+            source_hash: source_hash.map(str::to_string),
+            source_branch: source_branch.map(str::to_string),
+            pinned: false,
+            excluded: false,
+            stale: false,
             created_at: now(),
             updated_at: now(),
         };
         self.connection
             .execute(
-                "INSERT INTO memory_facts(id, scope, fact, origin, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![record.id, record.scope, record.fact, record.origin, record.created_at, record.updated_at],
+                "INSERT INTO memory_facts(id, scope, fact, origin, reason, source_conversation_id, source_path, source_hash, source_branch, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    record.id, record.scope, record.fact, record.origin, record.reason,
+                    record.source_conversation_id, record.source_path, record.source_hash,
+                    record.source_branch, record.created_at, record.updated_at
+                ],
             )
             .map_err(db_error)?;
         Ok(record)
     }
-    pub fn recall_facts(&self, scope: &str, limit: usize) -> Result<Vec<crate::memory::Fact>> {
-        let scope = crate::memory::normalize_scope(scope)?;
-        let limit = limit.min(50) as i64;
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT id, scope, fact, origin, created_at, updated_at FROM memory_facts
-                 WHERE scope=?1 OR scope='global' ORDER BY updated_at DESC LIMIT ?2",
+    pub fn fact(&self, id: &str) -> Result<Option<crate::memory::Fact>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {} FROM memory_facts WHERE id=?1", Self::FACT_COLUMNS),
+                [id],
+                Self::fact_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn update_fact(&self, fact: &crate::memory::Fact) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE memory_facts SET fact=?2, reason=?3, updated_at=?4 WHERE id=?1",
+                params![fact.id, fact.fact, fact.reason, now()],
             )
             .map_err(db_error)?;
-        let rows = statement
-            .query_map(params![scope, limit], |row| {
-                Ok(crate::memory::Fact {
-                    id: row.get(0)?,
-                    scope: row.get(1)?,
-                    fact: row.get(2)?,
-                    origin: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                })
-            })
+        Ok(())
+    }
+    /// pinned/excluded toggles — column name comes from the two command
+    /// handlers only, never user input.
+    pub fn set_fact_flag(&self, id: &str, column: &str, value: bool) -> Result<()> {
+        if !["pinned", "excluded"].contains(&column) {
+            return Err("Unknown fact flag.".into());
+        }
+        self.connection
+            .execute(&format!("UPDATE memory_facts SET {column}=?2, updated_at=?3 WHERE id=?1"), params![id, value as i64, now()])
             .map_err(db_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db_error)
+        Ok(())
+    }
+    /// Facts in any of the given scopes, pinned first, newest otherwise.
+    /// Excluded facts never come back — they exist only for the memory list.
+    pub fn recall_facts_scoped(&self, scopes: &[String], limit: usize) -> Result<Vec<crate::memory::Fact>> {
+        self.recall_facts_in(scopes, limit.min(50), false)
+    }
+    pub fn recall_facts_scoped_include_excluded(&self, scopes: &[String], limit: usize) -> Result<Vec<crate::memory::Fact>> {
+        self.recall_facts_in(scopes, limit.min(200), true)
+    }
+    fn recall_facts_in(&self, scopes: &[String], limit: usize, include_excluded: bool) -> Result<Vec<crate::memory::Fact>> {
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = scopes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT {} FROM memory_facts WHERE scope IN ({marks}) {} ORDER BY pinned DESC, updated_at DESC LIMIT {}",
+            Self::FACT_COLUMNS,
+            if include_excluded { "" } else { "AND excluded=0" },
+            limit,
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(db_error)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(scopes.iter()), Self::fact_row)
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)
+    }
+    /// Legacy single-scope recall (settings tooling). Also honors the
+    /// exclusion flag so hidden facts stay out of every surface.
+    pub fn recall_facts(&self, scope: &str, limit: usize) -> Result<Vec<crate::memory::Fact>> {
+        let scope = crate::memory::validate_scope(scope)?.to_string();
+        self.recall_facts_in(&[scope, "user".to_string()], limit, false)
     }
     pub fn forget_fact(&self, id: &str) -> Result<bool> {
         let changed = self
@@ -928,6 +1322,289 @@ impl Store {
             .map_err(db_error)?;
         Ok(changed > 0)
     }
+    const TASK_COLUMNS: &'static str =
+        "id, conversation_id, content, interaction_mode, status, position, run_id, wait_reason, error, next_action, parent_task_id, created_at, started_at, ended_at";
+    fn task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::task_queue::Task> {
+        Ok(crate::task_queue::Task {
+            id: row.get("id")?,
+            conversation_id: row.get("conversation_id")?,
+            content: row.get("content")?,
+            interaction_mode: row.get("interaction_mode")?,
+            status: row.get("status")?,
+            position: row.get("position")?,
+            run_id: row.get("run_id")?,
+            wait_reason: row.get("wait_reason")?,
+            error: row.get("error")?,
+            next_action: row.get("next_action")?,
+            parent_task_id: row.get("parent_task_id")?,
+            created_at: row.get("created_at")?,
+            started_at: row.get("started_at")?,
+            ended_at: row.get("ended_at")?,
+        })
+    }
+    pub fn insert_task(&self, task: &crate::task_queue::Task) -> Result<()> {
+        self.connection
+            .execute(
+                &format!(
+                    "INSERT INTO tasks({}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    Self::TASK_COLUMNS
+                ),
+                params![
+                    task.id, task.conversation_id, task.content, task.interaction_mode, task.status,
+                    task.position, task.run_id, task.wait_reason, task.error, task.next_action,
+                    task.parent_task_id, task.created_at, task.started_at, task.ended_at
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn task(&self, id: &str) -> Result<Option<crate::task_queue::Task>> {
+        self.connection
+            .query_row(&format!("SELECT {} FROM tasks WHERE id=?1", Self::TASK_COLUMNS), [id], Self::task_row)
+            .optional()
+            .map_err(db_error)
+    }
+    /// Next queue position: monotonic, ignores NULL (non-queued rows).
+    pub fn next_task_position(&self) -> Result<i64> {
+        let position: i64 = self
+            .connection
+            .query_row("SELECT COALESCE(MAX(position),0)+1 FROM tasks", [], |row| row.get(0))
+            .map_err(db_error)?;
+        Ok(position)
+    }
+    pub fn next_queued_task(&self) -> Result<Option<crate::task_queue::Task>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {} FROM tasks WHERE status='queued' ORDER BY position LIMIT 1", Self::TASK_COLUMNS),
+                [],
+                Self::task_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn tasks(&self, statuses: &[&str]) -> Result<Vec<crate::task_queue::Task>> {
+        let sql = if statuses.is_empty() {
+            format!("SELECT {} FROM tasks ORDER BY created_at DESC LIMIT 200", Self::TASK_COLUMNS)
+        } else {
+            format!(
+                "SELECT {} FROM tasks WHERE status IN ({}) ORDER BY created_at DESC LIMIT 200",
+                Self::TASK_COLUMNS,
+                statuses.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",")
+            )
+        };
+        let mut statement = self.connection.prepare(&sql).map_err(db_error)?;
+        let rows = statement.query_map([], Self::task_row).map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)
+    }
+    /// Every status change goes through here so the row and its audit trail
+    /// always write together — never one without the other.
+    pub fn transition_task(&self, task_id: &str, to: &str, reason: Option<&str>) -> Result<()> {
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        let from: String = tx
+            .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |row| row.get(0))
+            .optional()
+            .map_err(db_error)?
+            .ok_or_else(|| "Unknown task.".to_string())?;
+        if from == to {
+            tx.commit().map_err(db_error)?;
+            return Ok(());
+        }
+        let terminal = matches!(to, "completed" | "failed" | "cancelled" | "interrupted" | "awaiting_review");
+        tx.execute(
+            "UPDATE tasks SET status=?2, wait_reason=?3, error=COALESCE(?4, error), next_action=COALESCE(?5, next_action), ended_at=CASE WHEN ?6 THEN ?7 ELSE ended_at END, started_at=CASE WHEN ?2='running' AND started_at IS NULL THEN ?7 ELSE started_at END WHERE id=?1",
+            params![task_id, to, if to == "waiting_resource" { reason } else { None }, if to == "failed" { reason } else { None }, if to == "awaiting_review" { reason } else { None }, terminal, now()],
+        )
+        .map_err(db_error)?;
+        tx.execute(
+            "INSERT INTO task_transitions(task_id, from_status, to_status, reason, at) VALUES (?1,?2,?3,?4,?5)",
+            params![task_id, from, to, reason, now()],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)
+    }
+    /// Clear a wait/error/review note without changing the status (e.g. a
+    /// resource wait resolving back to running).
+    pub fn clear_task_wait(&self, task_id: &str) -> Result<()> {
+        self.connection
+            .execute("UPDATE tasks SET wait_reason=NULL, next_action=NULL WHERE id=?1", [task_id])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// Requeue-position a task (resume/resolve paths) without a status change.
+    pub fn move_task_to_queue_tail(&self, task_id: &str, position: i64) -> Result<()> {
+        self.connection
+            .execute("UPDATE tasks SET position=?2 WHERE id=?1", params![task_id, position])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// Replace an interrupted task's replay content and clear its old run.
+    pub fn reset_task_for_resume(&self, task_id: &str, content: &str, position: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE tasks SET content=?2, position=?3, run_id=NULL, error=NULL, next_action=NULL WHERE id=?1",
+                params![task_id, content, position],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn set_task_run(&self, task_id: &str, run_id: &str) -> Result<()> {
+        self.connection
+            .execute("UPDATE tasks SET run_id=?2 WHERE id=?1", params![task_id, run_id])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// The task (if any) currently holding this conversation — used to queue
+    /// follow-ups without touching the running task.
+    pub fn running_task_for(&self, conversation_id: &str) -> Result<Option<crate::task_queue::Task>> {
+        self.connection
+            .query_row(
+                &format!(
+                    "SELECT {} FROM tasks WHERE conversation_id=?1 AND status IN ('running','waiting_approval','waiting_resource','paused') ORDER BY created_at DESC LIMIT 1",
+                    Self::TASK_COLUMNS
+                ),
+                [conversation_id],
+                Self::task_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn task_transitions(&self, task_id: &str) -> Result<Vec<crate::task_queue::TaskTransition>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT task_id, from_status, to_status, reason, at FROM task_transitions WHERE task_id=?1 ORDER BY id")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([task_id], |row| {
+                Ok(crate::task_queue::TaskTransition {
+                    task_id: row.get(0)?,
+                    from_status: row.get(1)?,
+                    to_status: row.get(2)?,
+                    reason: row.get(3)?,
+                    at: row.get(4)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)
+    }
+    pub fn add_steering(&self, task_id: &str, text: &str) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.connection
+            .execute(
+                "INSERT INTO steering_messages(id, task_id, text, created_at) VALUES (?1,?2,?3,?4)",
+                params![id, task_id, text, now()],
+            )
+            .map_err(db_error)?;
+        Ok(id)
+    }
+    /// Claim every unapplied steering note exactly once — the SELECT and the
+    /// mark-applied UPDATE commit together, so a restart or a racing read
+    /// cannot deliver a note twice.
+    pub fn claim_steering(&self, task_id: &str) -> Result<Vec<String>> {
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        let claimed: Vec<(String, String)> = {
+            let mut statement = tx
+                .prepare("SELECT id, text FROM steering_messages WHERE task_id=?1 AND applied_at IS NULL ORDER BY created_at")
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map([task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .map_err(db_error)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)?
+        };
+        if !claimed.is_empty() {
+            let ids = claimed.iter().map(|(id, _)| format!("'{id}'")).collect::<Vec<_>>().join(",");
+            tx.execute(
+                &format!("UPDATE steering_messages SET applied_at=?1 WHERE id IN ({ids}) AND applied_at IS NULL"),
+                params![now()],
+            )
+            .map_err(db_error)?;
+        }
+        tx.commit().map_err(db_error)?;
+        Ok(claimed.into_iter().map(|(_, text)| text).collect())
+    }
+    pub fn unapplied_steering(&self, task_id: &str) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM steering_messages WHERE task_id=?1 AND applied_at IS NULL",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+    /// Startup: tasks left active by an unclean exit.
+    pub fn active_tasks(&self) -> Result<Vec<crate::task_queue::Task>> {
+        self.tasks(&["running", "waiting_approval", "waiting_resource", "interrupted", "awaiting_review"])
+    }
+
+    // -- model qualification runs -------------------------------------------
+
+    pub fn insert_qualification(&self, row: &QualificationRow) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO model_qualifications(id, identity_hash, model_id, model_path, model_fingerprint, runtime_version, provider_id, config_json, started_at, ended_at, results_json, status)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    row.id, row.identity_hash, row.model_id, row.model_path, row.model_fingerprint,
+                    row.runtime_version, row.provider_id, row.config_json, row.started_at,
+                    row.ended_at, row.results_json, row.status
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn finalize_qualification(&self, id: &str, results_json: &str, status: &str, ended_at: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE model_qualifications SET results_json=?2, status=?3, ended_at=?4 WHERE id=?1",
+                params![id, results_json, status, ended_at],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    fn qualification_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QualificationRow> {
+        Ok(QualificationRow {
+            id: row.get(0)?,
+            identity_hash: row.get(1)?,
+            model_id: row.get(2)?,
+            model_path: row.get(3)?,
+            model_fingerprint: row.get(4)?,
+            runtime_version: row.get(5)?,
+            provider_id: row.get(6)?,
+            config_json: row.get(7)?,
+            started_at: row.get(8)?,
+            ended_at: row.get(9)?,
+            results_json: row.get(10)?,
+            status: row.get(11)?,
+        })
+    }
+
+    /// Latest qualification for one identity — staleness is computed by the
+    /// caller, not stored.
+    pub fn latest_qualification(&self, identity_hash: &str) -> Result<Option<QualificationRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, identity_hash, model_id, model_path, model_fingerprint, runtime_version, provider_id, config_json, started_at, ended_at, results_json, status
+                 FROM model_qualifications WHERE identity_hash=?1 ORDER BY started_at DESC LIMIT 1",
+                [identity_hash],
+                Self::qualification_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    pub fn latest_qualification_any(&self) -> Result<Option<QualificationRow>> {
+        self.connection
+            .query_row(
+                "SELECT id, identity_hash, model_id, model_path, model_fingerprint, runtime_version, provider_id, config_json, started_at, ended_at, results_json, status
+                 FROM model_qualifications ORDER BY started_at DESC LIMIT 1",
+                [],
+                Self::qualification_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
     pub fn compaction(&self, conversation_id: &str) -> Result<Option<crate::compaction::Checkpoint>> {
         self.connection
             .query_row(
@@ -1021,9 +1698,9 @@ impl Store {
             let id = uuid::Uuid::new_v4().to_string();
             self.connection
                 .execute(
-                    "INSERT INTO messages(id, conversation_id, role, content, reasoning, status, created_at, error)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![id, forked.id, message.role, message.content, message.reasoning, message.status, message.created_at, message.error],
+                    "INSERT INTO messages(id, conversation_id, role, content, reasoning, status, created_at, error, metrics)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![id, forked.id, message.role, message.content, message.reasoning, message.status, message.created_at, message.error, message.metrics.map(|value| value.to_string())],
                 )
                 .map_err(db_error)?;
             if message.id == through_message_id {
@@ -1173,6 +1850,14 @@ impl Store {
         Ok((max_seq.unwrap_or(0) + 1) as u64)
     }
     pub fn append_session_event(&self, event: &crate::sessions::SessionEvent) -> Result<u64> {
+        if !event.ignorable
+            && !crate::sessions::KNOWN_EVENT_TYPES.contains(&event.event_type.as_str())
+        {
+            return Err(format!(
+                "Unknown session event type '{}'.",
+                event.event_type
+            ));
+        }
         let seq = if event.seq > 0 {
             event.seq
         } else {
@@ -1238,8 +1923,21 @@ impl Store {
                 })
             })
             .map_err(db_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db_error)
+        let events = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        // Fail loud on a non-ignorable event this build cannot interpret;
+        // ignorable unknowns stay tolerated (forward-compatible audit data).
+        if let Some(event) = events.iter().find(|event| {
+            !event.ignorable
+                && !crate::sessions::KNOWN_EVENT_TYPES.contains(&event.event_type.as_str())
+        }) {
+            return Err(format!(
+                "Conversation has an unknown session event type '{}'; it may need a newer version of LocalLM.",
+                event.event_type
+            ));
+        }
+        Ok(events)
     }
     pub fn fork_session_events(
         &self,
@@ -1266,90 +1964,229 @@ impl Store {
             .map_err(db_error)?
             .ok_or_else(|| "Source conversation no longer exists.".to_string())?;
 
-        let events = self.session_events(source_id, Some(0), Some(10000))?;
-        let filtered: Vec<_> = events.into_iter().filter(|e| e.seq <= up_to_seq).collect();
-        if filtered.is_empty() {
-            return Err("No events found up to the specified sequence number.".into());
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        let mut events = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let batch = self.session_events(source_id, Some(cursor), Some(5000))?;
+            let last = batch.last().map(|event| event.seq);
+            events.extend(batch.into_iter().filter(|event| event.seq <= up_to_seq));
+            match last {
+                Some(seq) if seq < up_to_seq => cursor = seq + 1,
+                _ => break,
+            }
         }
+        if events.last().map(|event| event.seq) != Some(up_to_seq) {
+            return Err("The selected fork event no longer exists.".into());
+        }
+        let messages = crate::sessions::fork_messages(&events, &self.messages(source_id)?);
+        let forked = Conversation {
+            id: uuid::Uuid::new_v4().to_string(), title: format!("Fork of {}", source.title),
+            updated_at: now(), ..source
+        };
+        transaction.execute("INSERT INTO conversations(id,title,updated_at,provider_id,model_id,provider_selection_required) VALUES(?1,?2,?3,?4,?5,?6)", params![forked.id,forked.title,forked.updated_at,forked.provider_id,forked.model_id,forked.provider_selection_required]).map_err(db_error)?;
+        // Tool/model preferences are inherited; historical todos and goals are
+        // not copied from the future state of the source conversation.
+        for table in ["conversation_tools", "conversation_skills"] {
+            transaction.execute(&format!("INSERT INTO {table}(conversation_id,value) SELECT ?1,value FROM {table} WHERE conversation_id=?2"), params![forked.id,source_id]).map_err(db_error)?;
+        }
+        transaction.execute("INSERT INTO conversation_presets(conversation_id,preset) SELECT ?1,preset FROM conversation_presets WHERE conversation_id=?2", params![forked.id,source_id]).map_err(db_error)?;
+        transaction.execute("INSERT INTO conversation_prompt_freeze(conversation_id,selection_hash,tools_json,aliases_json,created_at) SELECT ?1,selection_hash,tools_json,aliases_json,created_at FROM conversation_prompt_freeze WHERE conversation_id=?2", params![forked.id,source_id]).map_err(db_error)?;
+        for message in messages {
+            transaction.execute("INSERT INTO messages(id,conversation_id,role,content,reasoning,status,created_at,error,metrics) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![uuid::Uuid::new_v4().to_string(),forked.id,message.role,message.content,message.reasoning,message.status,message.created_at,message.error,message.metrics.map(|value| value.to_string())]).map_err(db_error)?;
+        }
+        for event in &events {
+            transaction.execute("INSERT INTO session_events(id,conversation_id,run_id,seq,step_id,tool_call_id,event_type,payload,ignorable,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![uuid::Uuid::new_v4().to_string(),forked.id,event.run_id,event.seq as i64,event.step_id,event.tool_call_id,event.event_type,event.payload.to_string(),event.ignorable,event.created_at]).map_err(db_error)?;
+        }
+        crate::workspace_ui::inherit_task_meta(self, source_id, &forked.id)?;
+        transaction.commit().map_err(db_error)?;
+        Ok((forked, events.len() as u64))
+    }
 
-        let mut forked = self.create_conversation()?;
-        forked.title = format!("Fork of {}", source.title);
-        forked.provider_id = source.provider_id;
-        forked.model_id = source.model_id;
-        self.connection
-            .execute(
-                "UPDATE conversations SET title=?1, updated_at=?2, provider_id=?3, model_id=?4 WHERE id=?5",
-                params![forked.title, now(), forked.provider_id, forked.model_id, forked.id],
+    /// Called once at application startup, never when opening a helper connection.
+    pub fn recover_interrupted_runs(&self) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        transaction.execute("UPDATE runs SET status='outcome_unknown' WHERE status IN ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round')", []).map_err(db_error)?;
+        transaction.execute("UPDATE messages SET status='interrupted', error=CASE WHEN role='assistant' AND error IS NULL
+            THEN 'Stopped: the app closed while this reply was in progress. Send \"continue\" or Retry to resume.' ELSE error END
+            WHERE status='streaming'", []).map_err(db_error)?;
+        transaction.commit().map_err(db_error)
+    }
+
+    /// Startup repair for crash-truncated turns, called once from app setup.
+    /// The log is append-only, so an open tail — a `tool_call` with no
+    /// `tool_result`, a `step_start` with no `step_end`, a `turn_start` with
+    /// no `turn_end` — can only be closed by appending synthetic end events
+    /// marked as interrupted. Runs only at startup: `Store::open` is also used
+    /// mid-turn by subagent and catalog helpers, where a live tail must stay
+    /// open. Returns the number of synthetic events written.
+    pub fn repair_open_turn_tails(&self) -> Result<usize> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT conversation_id, run_id, step_id, tool_call_id, event_type,
+                        CASE WHEN event_type='tool_call' THEN payload ELSE '' END
+                 FROM session_events
+                 WHERE event_type IN ('turn_start','turn_end','step_start','step_end','tool_call','tool_result')
+                 ORDER BY conversation_id, seq",
             )
             .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?;
 
-        if let Ok(tools) = self.conversation_tools(source_id) {
-            let _ = self.save_conversation_tools(&forked.id, &tools);
-        }
-        if let Ok(Some(freeze)) = self.prompt_freeze(source_id) {
-            let _ = self.save_prompt_freeze(&PromptFreeze { conversation_id: forked.id.clone(), ..freeze });
-        }
-
-        // session_events.run_id references runs(id) with ON DELETE SET NULL:
-        // only preserve lineage when the run row actually exists (e.g. real
-        // turns). Test/ad-hoc events with dangling run ids must not fail fork.
-        let run_exists = |run_id: &Option<String>| -> bool {
-            match run_id {
-                None => true,
-                Some(id) => self.connection
-                    .query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1)", [id], |row| row.get::<_, bool>(0))
-                    .unwrap_or(false),
+        // Repair unfinished tails and any calls that were left unpaired even
+        // though their turn_end was recorded. A late tool_result still closes
+        // its call, so track call pairs across the whole conversation.
+        let mut repaired = 0usize;
+        let mut conversation: Option<String> = None;
+        let mut tail: Vec<TailEvent> = Vec::new();
+        let mut unpaired: Vec<(TailEvent, bool)> = Vec::new();
+        for row in rows {
+            if conversation.as_deref() != Some(row.0.as_str()) {
+                let completed = unpaired.drain(..).filter_map(|(event, ended)| ended.then_some(event)).collect();
+                repaired += self.repair_open_tail(conversation.as_deref(), completed)?;
+                repaired += self.repair_open_tail(conversation.as_deref(), std::mem::take(&mut tail))?;
+                conversation = Some(row.0);
             }
-        };
-        let count = filtered.len() as u64;
-        for ev in filtered {
-            let new_event = crate::sessions::SessionEvent {
-                id: uuid::Uuid::new_v4().to_string(),
-                conversation_id: forked.id.clone(),
-                run_id: if run_exists(&ev.run_id) { ev.run_id.clone() } else { None },
-                seq: ev.seq,
-                step_id: ev.step_id,
-                tool_call_id: ev.tool_call_id,
-                event_type: ev.event_type,
-                payload: ev.payload,
-                ignorable: ev.ignorable,
-                created_at: ev.created_at,
-            };
-            self.append_session_event(&new_event)?;
+            let event = (row.1, row.2, row.3, row.4, row.5);
+            match event.3.as_str() {
+                "tool_call" if event.2.is_some() => unpaired.push((event.clone(), false)),
+                "tool_result" if event.2.is_some() => {
+                    unpaired.retain(|(call, _)| call.0 != event.0 || call.2 != event.2);
+                }
+                "turn_end" => for (_, ended) in &mut unpaired { *ended = true; },
+                _ => {}
+            }
+            if event.3 == "turn_end" {
+                tail.clear();
+            } else {
+                tail.push(event);
+            }
         }
+        let completed = unpaired.drain(..).filter_map(|(event, ended)| ended.then_some(event)).collect();
+        repaired += self.repair_open_tail(conversation.as_deref(), completed)?;
+        repaired += self.repair_open_tail(conversation.as_deref(), tail)?;
+        Ok(repaired)
+    }
 
-        let source_messages = self.messages(source_id)?;
-        // The fork point is a sequence number, not a wall clock: events and
-        // messages share no timestamp domain (fixtures use fixed created_at),
-        // so the number of source messages covered is derived from the forked
-        // event count proportionally. In production the two streams advance
-        // together, so copying min(forked_events, all messages) is exact for
-        // the common case and never drops history in tests.
-        let take = (count as usize).min(source_messages.len());
-
-        for msg in source_messages.into_iter().take(take) {
-            let id = uuid::Uuid::new_v4().to_string();
-            let _ = self.connection.execute(
-                "INSERT INTO messages(id, conversation_id, role, content, reasoning, status, created_at, error)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![id, forked.id, msg.role, msg.content, msg.reasoning, msg.status, msg.created_at, msg.error],
+    fn repair_open_tail(
+        &self,
+        conversation_id: Option<&str>,
+        tail: Vec<TailEvent>,
+    ) -> Result<usize> {
+        // Fields: run_id, step_id, tool_call_id, event_type, payload JSON.
+        let Some(conversation_id) = conversation_id else {
+            return Ok(0);
+        };
+        let mut calls: Vec<(Option<String>, Option<String>, String, serde_json::Value)> =
+            Vec::new();
+        let mut steps: Vec<(Option<String>, String)> = Vec::new();
+        let mut turns: Vec<Option<String>> = Vec::new();
+        for (run_id, step_id, call_id, kind, payload) in &tail {
+            match kind.as_str() {
+                "turn_start" => turns.push(run_id.clone()),
+                "step_start" => {
+                    if let Some(step) = step_id {
+                        steps.push((run_id.clone(), step.clone()));
+                    }
+                }
+                "tool_call" => {
+                    if let Some(id) = call_id {
+                        let name = serde_json::from_str::<serde_json::Value>(payload)
+                            .ok()
+                            .and_then(|value| value.get("name").cloned())
+                            .unwrap_or(serde_json::Value::Null);
+                        calls.push((run_id.clone(), step_id.clone(), id.clone(), name));
+                    }
+                }
+                "tool_result" => {
+                    if let Some(id) = call_id {
+                        calls.retain(|(open_run, _, open_id, _)| open_run != run_id || open_id != id);
+                    }
+                }
+                "step_end" => {
+                    if let Some(step) = step_id {
+                        if let Some(pos) = steps.iter().rposition(|(open_run, open)| open_run == run_id && open == step) {
+                            steps.remove(pos);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut repaired = 0usize;
+        let now = now();
+        for (run_id, step_id, call_id, name) in calls {
+            if let Some(id) = run_id.as_deref() {
+                if self.run(id)?.is_some_and(|run| run.status == crate::agent_run::RunState::Completed) {
+                    self.update_run_status(id, crate::agent_run::RunState::OutcomeUnknown,
+                        Some("A tool call has no recorded result; its outcome may be unknown."), None)?;
+                }
+            }
+            self.append_session_event(&crate::sessions::SessionEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conversation_id.to_string(),
+                run_id,
+                seq: 0,
+                step_id,
+                tool_call_id: Some(call_id.clone()),
+                event_type: "tool_result".into(),
+                payload: serde_json::json!({"callId": call_id, "name": name, "decision": "unknown", "result": {"isError": true, "outcome": "unknown", "message": "The app stopped before this action's result was recorded. It may already have changed data. Do not automatically repeat it."}}),
+                ignorable: false,
+                created_at: now,
+            })?;
+            repaired += 1;
+        }
+        for (run_id, step_id) in steps {
+            self.append_session_event(&crate::sessions::SessionEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conversation_id.to_string(),
+                run_id,
+                seq: 0,
+                step_id: Some(step_id),
+                tool_call_id: None,
+                event_type: "step_end".into(),
+                payload: serde_json::json!({"interrupted": true}),
+                ignorable: false,
+                created_at: now,
+            })?;
+            repaired += 1;
+        }
+        for run_id in turns {
+            self.append_session_event(&crate::sessions::SessionEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conversation_id.to_string(),
+                run_id,
+                seq: 0,
+                step_id: None,
+                tool_call_id: None,
+                event_type: "turn_end".into(),
+                payload: serde_json::json!({"status": "interrupted"}),
+                ignorable: false,
+                created_at: now,
+            })?;
+            repaired += 1;
+        }
+        if repaired > 0 {
+            eprintln!(
+                "Startup repair closed {repaired} interrupted session event(s) in conversation {conversation_id}."
             );
         }
-
-        // Carry over conversation-scoped harness state so the fork keeps its
-        // preset, plan, goal, and tool choices (best-effort; never fails fork).
-        if let Ok(preset) = self.conversation_preset(source_id) {
-            let _ = self.save_conversation_preset(&forked.id, &preset);
-        }
-        if let Ok(todos) = self.todos(source_id) {
-            let _ = self.save_todos(&forked.id, &todos);
-        }
-        if let Ok(Some(goal)) = self.goal(source_id) {
-            let _ = self.save_goal(&forked.id, &goal);
-        }
-
-        Ok((forked, count))
+        Ok(repaired)
     }
+
     pub fn artifact(&self, id: &str) -> Result<Option<crate::artifacts::ArtifactRecord>> {
         self.connection
             .query_row(
@@ -1690,12 +2527,37 @@ pub fn default_subscription_providers() -> Vec<ProviderConnection> {
 }
 
 impl Store {
+    /// Research needs a small text window, not the complete chat and tool audits.
+    pub fn recent_chat_context(&self, id: &str) -> Result<String> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT role,content FROM messages WHERE conversation_id=?1 AND role IN ('user','assistant') ORDER BY created_at DESC,rowid DESC",
+        ).map_err(db_error)?;
+        let rows = statement.query_map([id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(db_error)?;
+        let mut recent = Vec::new();
+        for row in rows {
+            let (role, content) = row.map_err(db_error)?;
+            if content.trim().is_empty() { continue; }
+            recent.push(format!("{role}: {}", content.chars().take(500).collect::<String>()));
+            if recent.len() == 6 { break; }
+        }
+        recent.reverse();
+        Ok(recent.join("\n"))
+    }
+
+    pub fn latest_user_content(&self, id: &str) -> Result<Option<String>> {
+        self.connection.query_row(
+            "SELECT content FROM messages WHERE conversation_id=?1 AND role='user' ORDER BY created_at DESC,rowid DESC LIMIT 1",
+            [id], |row| row.get::<_, String>(0),
+        ).optional().map(|content| content.map(|text| text.chars().take(8000).collect())).map_err(db_error)
+    }
+
     pub fn messages(&self, id: &str) -> Result<Vec<Message>> {
-        let mut statement = self.connection.prepare("SELECT id,conversation_id,role,content,reasoning,status,created_at,error FROM messages WHERE conversation_id=?1 ORDER BY created_at,rowid").map_err(db_error)?;
+        let mut statement = self.connection.prepare("SELECT id,conversation_id,role,content,reasoning,status,created_at,error,metrics FROM messages WHERE conversation_id=?1 ORDER BY created_at,rowid").map_err(db_error)?;
         let rows = statement
             .query_map([id], |row| {
                 Ok(Message {
                     error: row.get(7)?,
+                    metrics: row.get::<_, Option<String>>(8)?.and_then(|text| serde_json::from_str(&text).ok()),
                     id: row.get(0)?,
                     conversation_id: row.get(1)?,
                     role: row.get(2)?,
@@ -1721,6 +2583,7 @@ impl Store {
         }
         let message = Message {
             error: None,
+            metrics: None,
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: conversation_id.into(),
             role: role.into(),
@@ -1754,6 +2617,7 @@ impl Store {
             status: "streaming".into(),
             created_at: now(),
             error: None,
+            metrics: None,
         };
         let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
         let existing: bool = transaction
@@ -1787,6 +2651,23 @@ impl Store {
         transaction.commit().map_err(db_error)?;
         Ok(assistant)
     }
+    /// Commit the three records of a finished turn together.
+    pub fn finish_turn(&self, message: &Message, run: &crate::agent_run::RunRecord, task: Option<&crate::research_tasks::ResearchTask>) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        self.finish_message(&message.id, &message.content, &message.reasoning, &message.status, message.error.as_deref())?;
+        self.update_run_status(&run.id, run.status, run.error.as_deref(), None)?;
+        if let Some(task) = task { self.save_research_task(task)?; }
+        transaction.commit().map_err(db_error)
+    }
+
+    pub fn stage_research_resume(&self, task: &crate::research_tasks::ResearchTask, checkpoint: &str) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        self.save_research_task(task)?;
+        self.save_setting(&format!("pending_resume:{}", task.conversation_id), &checkpoint)?;
+        self.save_setting(&format!("pending_resume_task:{}", task.conversation_id), &task.id)?;
+        transaction.commit().map_err(db_error)
+    }
+
     pub fn update_message(
         &self,
         id: &str,
@@ -1837,17 +2718,531 @@ impl Store {
     pub fn workspace_path(&self) -> Result<String> {
         self.setting("workspace_path")
     }
+    /// (path, profile name) ACEs the sandbox granted — revocable on disable.
+    pub fn isolation_grants(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path, profile FROM isolation_grants")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(db_error)?;
+        Ok(rows.flatten().collect())
+    }
+    pub fn record_isolation_grant(&self, path: &str, profile: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO isolation_grants(path, profile, granted_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![path, profile, now()],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn clear_isolation_grants(&self) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM isolation_grants", [])
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    // -- recipes ---------------------------------------------------------------
+
+    fn recipe_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::recipes::Recipe> {
+        Ok(crate::recipes::Recipe {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            prompt: row.get(2)?,
+            interval_minutes: row.get(3)?,
+            enabled: row.get::<_, i64>(4)? != 0,
+            next_run_at: row.get(5)?,
+            last_run_at: row.get(6)?,
+            created_at: row.get(7)?,
+        })
+    }
+    pub fn recipes_list(&self) -> Result<Vec<crate::recipes::Recipe>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, name, prompt, interval_minutes, enabled, next_run_at, last_run_at, created_at FROM recipes ORDER BY created_at")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], Self::recipe_row)
+            .map_err(db_error)?;
+        Ok(rows.flatten().collect())
+    }
+    pub fn recipe(&self, id: &str) -> Result<Option<crate::recipes::Recipe>> {
+        self.connection
+            .prepare("SELECT id, name, prompt, interval_minutes, enabled, next_run_at, last_run_at, created_at FROM recipes WHERE id = ?1")
+            .map_err(db_error)?
+            .query_row([id], Self::recipe_row)
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn recipe_save(&self, recipe: &crate::recipes::Recipe) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO recipes(id, name, prompt, interval_minutes, enabled, next_run_at, last_run_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![recipe.id, recipe.name, recipe.prompt, recipe.interval_minutes, recipe.enabled as i64, recipe.next_run_at, recipe.last_run_at, recipe.created_at],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn recipe_mark_fired(&self, id: &str, at: i64, next_run_at: Option<i64>) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE recipes SET last_run_at = ?2, next_run_at = ?3 WHERE id = ?1",
+                rusqlite::params![id, at, next_run_at],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn recipe_delete(&self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM recipes WHERE id = ?1", [id])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// Scheduled recipes that are due — enabled, with a past next_run_at.
+    pub fn recipes_due(&self, at: i64) -> Result<Vec<crate::recipes::Recipe>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, name, prompt, interval_minutes, enabled, next_run_at, last_run_at, created_at FROM recipes WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1 ORDER BY next_run_at")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([at], Self::recipe_row)
+            .map_err(db_error)?;
+        Ok(rows.flatten().collect())
+    }
+
+    // -- document collections --------------------------------------------------
+
+    fn doc_collection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::documents::DocCollection> {
+        Ok(crate::documents::DocCollection {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            root: row.get(2)?,
+            file_count: row.get(3)?,
+            chunk_count: row.get(4)?,
+            indexed_at: row.get(5)?,
+            error: row.get(6)?,
+            created_at: row.get(7)?,
+        })
+    }
+    pub fn doc_collections(&self) -> Result<Vec<crate::documents::DocCollection>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, name, root, file_count, chunk_count, indexed_at, error, created_at FROM doc_collections ORDER BY created_at")
+            .map_err(db_error)?;
+        let rows = statement.query_map([], Self::doc_collection_row).map_err(db_error)?;
+        Ok(rows.flatten().collect())
+    }
+    pub fn doc_collection(&self, id: &str) -> Result<Option<crate::documents::DocCollection>> {
+        self.connection
+            .prepare("SELECT id, name, root, file_count, chunk_count, indexed_at, error, created_at FROM doc_collections WHERE id = ?1")
+            .map_err(db_error)?
+            .query_row([id], Self::doc_collection_row)
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn doc_collection_save(&self, collection: &crate::documents::DocCollection) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO doc_collections(id, name, root, file_count, chunk_count, indexed_at, error, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![collection.id, collection.name, collection.root, collection.file_count, collection.chunk_count, collection.indexed_at, collection.error, collection.created_at],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// Atomically replace a collection's chunks and stats — a failed scan never
+    /// leaves a half-indexed set behind.
+    pub fn doc_chunks_replace(
+        &self,
+        collection_id: &str,
+        chunks: &[(String, i64, i64, String)],
+        file_count: i64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        transaction
+            .execute("DELETE FROM doc_chunks WHERE collection_id = ?1", [collection_id])
+            .map_err(db_error)?;
+        {
+            let mut statement = transaction
+                .prepare("INSERT INTO doc_chunks(collection_id, path, line_start, line_end, content) VALUES (?1, ?2, ?3, ?4, ?5)")
+                .map_err(db_error)?;
+            for (path, start, end, body) in chunks {
+                statement
+                    .execute(rusqlite::params![collection_id, path, start, end, body])
+                    .map_err(db_error)?;
+            }
+        }
+        transaction
+            .execute(
+                "UPDATE doc_collections SET file_count = ?2, chunk_count = ?3, indexed_at = ?4, error = ?5 WHERE id = ?1",
+                rusqlite::params![collection_id, file_count, chunks.len() as i64, now(), error],
+            )
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)
+    }
+    pub fn doc_collection_delete(&self, id: &str) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        transaction
+            .execute("DELETE FROM doc_chunks WHERE collection_id = ?1", [id])
+            .map_err(db_error)?;
+        transaction
+            .execute("DELETE FROM doc_collections WHERE id = ?1", [id])
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)
+    }
+    /// (collection_id, collection name, path, line_start, line_end, snippet)
+    pub fn doc_chunks_search(
+        &self,
+        match_query: &str,
+        collection_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<(String, String, String, i64, i64, String)>> {
+        let sql = match collection_id {
+            Some(_) => "SELECT c.id, c.name, doc_chunks.path, doc_chunks.line_start, doc_chunks.line_end, \
+                 snippet(doc_chunks, 0, '', '', '…', 40) FROM doc_chunks \
+                 JOIN doc_collections c ON c.id = doc_chunks.collection_id \
+                 WHERE doc_chunks MATCH ?1 AND doc_chunks.collection_id = ?2 \
+                 ORDER BY bm25(doc_chunks) LIMIT ?3",
+            None => "SELECT c.id, c.name, doc_chunks.path, doc_chunks.line_start, doc_chunks.line_end, \
+                 snippet(doc_chunks, 0, '', '', '…', 40) FROM doc_chunks \
+                 JOIN doc_collections c ON c.id = doc_chunks.collection_id \
+                 WHERE doc_chunks MATCH ?1 ORDER BY bm25(doc_chunks) LIMIT ?2",
+        };
+        let mut statement = self.connection.prepare(sql).map_err(db_error)?;
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, String, String, i64, i64, String)> {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+        };
+        let rows = match collection_id {
+            Some(id) => statement.query_map(rusqlite::params![match_query, id, limit], map_row),
+            None => statement.query_map(rusqlite::params![match_query, limit], map_row),
+        }
+        .map_err(db_error)?;
+        Ok(rows.flatten().collect())
+    }
     pub fn execution_config(&self) -> Result<crate::execution::ExecutionConfig> {
         self.setting("execution")
     }
     pub fn save_execution_config(&self, config: &crate::execution::ExecutionConfig) -> Result<()> {
         self.save_setting("execution", config)
     }
+    pub fn save_local_execution_config(&self, config: &crate::execution::ExecutionConfig) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        self.save_execution_config(config)?;
+        self.save_setting(crate::sandbox::PROVIDER_KEY, &"local")?;
+        transaction.commit().map_err(db_error)
+    }
     pub fn save_workspace_path(&self, path: &str) -> Result<()> {
         self.save_setting("workspace_path", &path)
     }
+
+    // ---- Task workspaces (isolated worktrees/snapshots; see task_workspace.rs) ----
+    fn task_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::task_workspace::TaskWorkspace> {
+        let exclusions_json: String = row.get("exclusions_json")?;
+        Ok(crate::task_workspace::TaskWorkspace {
+            id: row.get("id")?,
+            conversation_id: row.get("conversation_id")?,
+            source_root: row.get("source_root")?,
+            kind: row.get("kind")?,
+            isolated_root: row.get("isolated_root")?,
+            branch: row.get("branch")?,
+            baseline_commit: row.get("baseline_commit")?,
+            status: row.get("status")?,
+            exclusions: serde_json::from_str(&exclusions_json).unwrap_or_default(),
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+        })
+    }
+    const TASK_WORKSPACE_COLUMNS: &'static str =
+        "id, conversation_id, source_root, kind, isolated_root, branch, baseline_commit, status, exclusions_json, created_at, updated_at";
+    pub fn save_task_workspace(&self, task: &crate::task_workspace::TaskWorkspace) -> Result<()> {
+        let exclusions_json = serde_json::to_string(&task.exclusions).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO task_workspaces(id, conversation_id, source_root, kind, isolated_root, branch, baseline_commit, status, exclusions_json, created_at, updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                 ON CONFLICT(id) DO UPDATE SET status=excluded.status, exclusions_json=excluded.exclusions_json,
+                    baseline_commit=excluded.baseline_commit, branch=excluded.branch, updated_at=excluded.updated_at",
+                rusqlite::params![
+                    task.id, task.conversation_id, task.source_root, task.kind, task.isolated_root,
+                    task.branch, task.baseline_commit, task.status, exclusions_json,
+                    task.created_at, task.updated_at
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn task_workspace(&self, id: &str) -> Result<Option<crate::task_workspace::TaskWorkspace>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {} FROM task_workspaces WHERE id=?1", Self::TASK_WORKSPACE_COLUMNS),
+                [id],
+                Self::task_workspace_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    /// The conversation's live isolated workspace, if any. At most one row can
+    /// be `active` per conversation (partial unique index).
+    pub fn active_task_workspace(&self, conversation_id: &str) -> Result<Option<crate::task_workspace::TaskWorkspace>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {} FROM task_workspaces WHERE conversation_id=?1 AND status='active'", Self::TASK_WORKSPACE_COLUMNS),
+                [conversation_id],
+                Self::task_workspace_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    /// Same lookup keyed by the isolated root; lets tool/execution paths that
+    /// only know their resolved directory find their owning task.
+    pub fn active_task_workspace_by_root(&self, isolated_root: &str) -> Result<Option<crate::task_workspace::TaskWorkspace>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {} FROM task_workspaces WHERE isolated_root=?1 AND status='active'", Self::TASK_WORKSPACE_COLUMNS),
+                [isolated_root],
+                Self::task_workspace_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn save_task_apply(&self, apply: &crate::task_workspace::TaskApply) -> Result<()> {
+        let files_json = serde_json::to_string(&apply.files).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO task_applies(id, task_id, created_at, backup_dir, files_json, undone_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![apply.id, apply.task_id, apply.created_at, apply.backup_dir, files_json, apply.undone_at],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn task_apply(&self, id: &str) -> Result<Option<crate::task_workspace::TaskApply>> {
+        self.connection
+            .query_row(
+                "SELECT id, task_id, created_at, backup_dir, files_json, undone_at FROM task_applies WHERE id=?1",
+                [id],
+                Self::task_apply_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn task_applies(&self, task_id: &str) -> Result<Vec<crate::task_workspace::TaskApply>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, task_id, created_at, backup_dir, files_json, undone_at FROM task_applies WHERE task_id=?1 ORDER BY created_at")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([task_id], Self::task_apply_row)
+            .map_err(db_error)?;
+        let mut applies = Vec::new();
+        for row in rows {
+            applies.push(row.map_err(db_error)?);
+        }
+        Ok(applies)
+    }
+    pub fn mark_task_apply_undone(&self, id: &str, at: i64) -> Result<()> {
+        self.connection
+            .execute("UPDATE task_applies SET undone_at=?2 WHERE id=?1", rusqlite::params![id, at])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    fn task_apply_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::task_workspace::TaskApply> {
+        let files_json: String = row.get("files_json")?;
+        Ok(crate::task_workspace::TaskApply {
+            id: row.get("id")?,
+            task_id: row.get("task_id")?,
+            created_at: row.get("created_at")?,
+            backup_dir: row.get("backup_dir")?,
+            files: serde_json::from_str(&files_json).unwrap_or_default(),
+            undone_at: row.get("undone_at")?,
+        })
+    }
+    fn criterion_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::verification::TaskCriterion> {
+        Ok(crate::verification::TaskCriterion {
+            id: row.get("id")?,
+            conversation_id: row.get("conversation_id")?,
+            text: row.get("text")?,
+            origin: row.get("origin")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+        })
+    }
+    const CRITERION_COLUMNS: &'static str = "id, conversation_id, text, origin, created_at, updated_at";
+    /// Insert or update the text of a completion criterion for a conversation.
+    pub fn save_criterion(&self, criterion: &crate::verification::TaskCriterion) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO task_criteria(id, conversation_id, text, origin, created_at, updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(id) DO UPDATE SET text=excluded.text, updated_at=excluded.updated_at",
+                rusqlite::params![
+                    criterion.id,
+                    criterion.conversation_id,
+                    criterion.text,
+                    criterion.origin,
+                    criterion.created_at,
+                    criterion.updated_at
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn criterion(&self, id: &str) -> Result<Option<crate::verification::TaskCriterion>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {} FROM task_criteria WHERE id=?1", Self::CRITERION_COLUMNS),
+                [id],
+                Self::criterion_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn criteria_for(&self, conversation_id: &str) -> Result<Vec<crate::verification::TaskCriterion>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("SELECT {} FROM task_criteria WHERE conversation_id=?1 ORDER BY created_at", Self::CRITERION_COLUMNS))
+            .map_err(db_error)?;
+        let rows = statement.query_map([conversation_id], Self::criterion_row).map_err(db_error)?;
+        let mut criteria = Vec::new();
+        for row in rows {
+            criteria.push(row.map_err(db_error)?);
+        }
+        Ok(criteria)
+    }
+    /// Deleting a criterion detaches its records (`ON DELETE SET NULL`) rather
+    /// than erasing the evidence they captured.
+    pub fn delete_criterion(&self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM task_criteria WHERE id=?1", [id])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    fn verification_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::verification::VerificationRecord> {
+        let artifacts_json: String = row.get("artifacts_json")?;
+        Ok(crate::verification::VerificationRecord {
+            id: row.get("id")?,
+            conversation_id: row.get("conversation_id")?,
+            criterion_id: row.get("criterion_id")?,
+            kind: row.get("kind")?,
+            method: row.get("method")?,
+            command: row.get("command")?,
+            environment: row.get("environment")?,
+            started_at: row.get("started_at")?,
+            ended_at: row.get("ended_at")?,
+            exit_code: row.get("exit_code")?,
+            output_excerpt: row.get("output_excerpt")?,
+            output_artifact: row.get("output_artifact")?,
+            output_truncated: row.get::<_, i64>("output_truncated")? != 0,
+            artifacts: serde_json::from_str(&artifacts_json).unwrap_or_default(),
+            result: row.get("result")?,
+            limitations: row.get("limitations")?,
+            fingerprint: row.get("fingerprint")?,
+            created_at: row.get("created_at")?,
+            stale: false,
+        })
+    }
+    const VERIFICATION_COLUMNS: &'static str =
+        "id, conversation_id, criterion_id, kind, method, command, environment, started_at, ended_at, exit_code, output_excerpt, output_artifact, output_truncated, artifacts_json, result, limitations, fingerprint, created_at";
+    pub fn save_verification_record(&self, record: &crate::verification::VerificationRecord) -> Result<()> {
+        let artifacts_json = serde_json::to_string(&record.artifacts).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO verification_records(id, conversation_id, criterion_id, kind, method, command, environment, started_at, ended_at, exit_code, output_excerpt, output_artifact, output_truncated, artifacts_json, result, limitations, fingerprint, created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                rusqlite::params![
+                    record.id, record.conversation_id, record.criterion_id, record.kind, record.method,
+                    record.command, record.environment, record.started_at, record.ended_at, record.exit_code,
+                    record.output_excerpt, record.output_artifact, record.output_truncated as i64,
+                    artifacts_json, record.result, record.limitations, record.fingerprint, record.created_at
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn verification_record(&self, id: &str) -> Result<Option<crate::verification::VerificationRecord>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {} FROM verification_records WHERE id=?1", Self::VERIFICATION_COLUMNS),
+                [id],
+                Self::verification_record_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn verification_records_for(&self, conversation_id: &str) -> Result<Vec<crate::verification::VerificationRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("SELECT {} FROM verification_records WHERE conversation_id=?1 ORDER BY created_at", Self::VERIFICATION_COLUMNS))
+            .map_err(db_error)?;
+        let rows = statement.query_map([conversation_id], Self::verification_record_row).map_err(db_error)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(db_error)?);
+        }
+        Ok(records)
+    }
     pub fn save_active_skills(&self, ids: &[String]) -> Result<()> {
         self.save_setting("active_skills", &ids)
+    }
+    /// A conversation's own skill selection. A missing `conversation_skills`
+    /// row means the conversation never customized skills and inherits the
+    /// global list; a saved row is authoritative, even when it is empty.
+    /// Unsaved (brand-new or stale) ids resolve to the global list.
+    pub fn active_skills_for(&self, conversation_id: &str) -> Result<Vec<String>> {
+        let value: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT s.value FROM conversations c LEFT JOIN conversation_skills s ON s.conversation_id=c.id WHERE c.id=?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        match value {
+            Some(Some(text)) => serde_json::from_str(&text)
+                .map_err(|_| "Stored conversation skills are invalid.".into()),
+            _ => self.active_skills(),
+        }
+    }
+    /// Persist a conversation's own skill selection; writing any row marks
+    /// the conversation as customized so it stops inheriting global changes.
+    pub fn save_conversation_skills(&self, conversation_id: &str, ids: &[String]) -> Result<()> {
+        let value = serde_json::to_string(ids).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO conversation_skills(conversation_id, value) VALUES(?1,?2)
+                 ON CONFLICT(conversation_id) DO UPDATE SET value=excluded.value",
+                params![conversation_id, value],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// Drop a removed skill from every conversation's own selection so an
+    /// uninstalled package can never stay active.
+    pub fn forget_conversation_skill(&self, skill_id: &str) -> Result<()> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT conversation_id, value FROM conversation_skills")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        for (conversation_id, text) in rows {
+            let mut ids: Vec<String> = serde_json::from_str(&text)
+                .map_err(|_| "Stored conversation skills are invalid.")?;
+            if ids.iter().any(|id| id == skill_id) {
+                ids.retain(|id| id != skill_id);
+                self.save_conversation_skills(&conversation_id, &ids)?;
+            }
+        }
+        Ok(())
     }
     pub fn save_preferences(&self, preferences: &Preferences) -> Result<()> {
         preferences.validate()?;
@@ -2056,6 +3451,53 @@ fn tool_calling_key(runtime_path: &str, model_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn research_window_matches_history_without_loading_tool_audits_and_reasoning() {
+        let store = Store::open_memory().unwrap();
+        let id = store.create_conversation().unwrap().id;
+        let other = store.create_conversation().unwrap().id;
+        let transaction = store.connection.unchecked_transaction().unwrap();
+        for index in 0..1000 {
+            let role = ["user", "assistant", "tool"][index % 3];
+            store.connection.execute(
+                "INSERT INTO messages(id,conversation_id,role,content,reasoning,status,created_at) VALUES(?1,?2,?3,?4,?5,'complete',?6)",
+                params![format!("row-{index}"), id, role, format!("message {index}: {}", "界".repeat(600)), "private ".repeat(1000), (index / 3) as i64],
+            ).unwrap();
+        }
+        // Blank messages must not consume the six-message window; timestamps
+        // may tie, and another conversation must never contribute context.
+        store.insert_message_at(&id, "assistant", "\t\n\u{2003}", "complete", 1000).unwrap();
+        store.insert_message_at(&id, "assistant", "last answer", "complete", 1000).unwrap();
+        store.insert_message_at(&id, "user", &"界".repeat(8100), "complete", 1000).unwrap();
+        store.insert_message_at(&other, "user", "unrelated", "complete", 2000).unwrap();
+        transaction.commit().unwrap();
+        let legacy = || {
+            let mut recent: Vec<_> = store.messages(&id).unwrap().into_iter().rev()
+                .filter(|message| matches!(message.role.as_str(), "user" | "assistant") && !message.content.trim().is_empty())
+                .take(6).map(|message| format!("{}: {}", message.role, message.content.chars().take(500).collect::<String>())).collect();
+            recent.reverse();
+            let objective = store.messages(&id).unwrap().into_iter().rev().find(|message| message.role == "user")
+                .map(|message| message.content.chars().take(8000).collect::<String>());
+            (recent.join("\n"), objective)
+        };
+        assert_eq!((store.recent_chat_context(&id).unwrap(), store.latest_user_content(&id).unwrap()), legacy());
+        assert_eq!(store.recent_chat_context("missing").unwrap(), "");
+        assert!(store.latest_user_content("missing").unwrap().is_none());
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let _ = legacy();
+            before.push(start.elapsed());
+            let start = std::time::Instant::now();
+            let _ = (store.recent_chat_context(&id).unwrap(), store.latest_user_content(&id).unwrap());
+            after.push(start.elapsed());
+        }
+        before.sort(); after.sort();
+        eprintln!("Research history (1,003 messages, debug build): median {:?} full reads -> {:?} projected reads", before[2], after[2]);
+    }
+
     #[test]
     fn experimental_model_selection_rolls_back_both_settings_on_storage_failure() {
         let store = Store::open_memory().unwrap();
@@ -2066,6 +3508,24 @@ mod tests {
         assert!(store.save_model_runtime(&next, &RuntimeConfig::default()).is_err());
         assert_eq!(serde_json::to_value(store.preferences().unwrap()).unwrap(), previous);
         assert_eq!(store.runtime_config().unwrap(), previous_config);
+    }
+
+    #[test]
+    fn response_metrics_survive_reopening_a_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.sqlite");
+        let (conversation_id, message_id);
+        {
+            let store = Store::open(&path).unwrap();
+            conversation_id = store.create_conversation().unwrap().id;
+            message_id = store.append_message(&conversation_id, "assistant", "Done", "complete").unwrap().id;
+            store.save_message_metrics(&message_id, &serde_json::json!({
+                "promptTokPerSec": 125.4, "ttftSecs": 0.42, "genTokPerSec": 38.6
+            })).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let message = store.messages(&conversation_id).unwrap().remove(0);
+        assert_eq!(message.metrics.unwrap()["ttftSecs"], 0.42);
     }
 
     #[test]
@@ -2186,6 +3646,7 @@ mod tests {
         let second;
         let settings = ConversationTools {
             access_mode: crate::permissions::AccessMode::FullAccess,
+            interaction_mode: crate::permissions::InteractionMode::Act,
             sources: vec!["__workspace".into()],
             tools: vec![crate::connectors::ToolSelection {
                 connector_id: "deepwiki".into(),
@@ -2255,6 +3716,7 @@ mod tests {
     fn conversation_tools_reject_duplicates_and_excessive_combined_tools() {
         let mut settings = ConversationTools {
             access_mode: crate::permissions::AccessMode::Ask,
+            interaction_mode: crate::permissions::InteractionMode::Act,
             sources: vec!["__workspace".into(), "__execution".into()],
             tools: (0..26)
                 .map(|index| crate::connectors::ToolSelection {
@@ -2289,6 +3751,7 @@ mod tests {
         let path = dir.path().join("remembered.sqlite");
         let selection = RememberedTools {
             access_mode: crate::permissions::AccessMode::Ask,
+            interaction_mode: crate::permissions::InteractionMode::Act,
             sources: vec!["__workspace".into()],
             tools: vec![crate::connectors::ToolSelection {
                 connector_id: "deepwiki".into(),
@@ -2347,8 +3810,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("remembered-permissions.sqlite");
         for mode in ["fullAccess", "autoApprove", "ask"] {
+            // Old rows lack interactionMode; it deserializes to Act and is
+            // written back on save.
             let expected = serde_json::json!({
                 "accessMode": mode,
+                "interactionMode": "act",
                 "sources": [],
                 "tools": [{ "connectorId": "deepwiki", "toolName": "read_wiki_structure" }]
             });
@@ -2430,6 +3896,7 @@ mod tests {
                     &first,
                     &ConversationTools {
                         access_mode: crate::permissions::AccessMode::FullAccess,
+                        interaction_mode: crate::permissions::InteractionMode::Act,
                         sources: vec!["__workspace".into()],
                         tools: vec![crate::connectors::ToolSelection {
                             connector_id: "deepwiki".into(),
@@ -2455,6 +3922,7 @@ mod tests {
         // conversations after the user changed it.
         let replaced = RememberedTools {
             access_mode: crate::permissions::AccessMode::Ask,
+            interaction_mode: crate::permissions::InteractionMode::Act,
             sources: vec!["__daytona".into()],
             tools: vec![],
         };
@@ -2547,6 +4015,28 @@ mod tests {
         );
         assert_eq!(store.messages(&id).unwrap()[0].content, "Hello");
     }
+    #[test]
+    fn adding_the_same_todo_does_not_create_duplicate_work() {
+        let store = Store::open_memory().unwrap();
+        let id = store.create_conversation().unwrap().id;
+        let first = store.add_todo(&id, "Read the paper").unwrap();
+        let again = store.add_todo(&id, "  Read   the paper  ").unwrap();
+        assert_eq!(first.text, again.text);
+        assert_eq!(store.todos(&id).unwrap().len(), 1);
+    }
+    #[test]
+    fn failed_todo_save_preserves_the_previous_list() {
+        let store = Store::open_memory().unwrap();
+        let id = store.create_conversation().unwrap().id;
+        store.add_todo(&id, "Keep this task").unwrap();
+        store.connection.execute_batch("CREATE TRIGGER reject_todo BEFORE INSERT ON todos WHEN NEW.text='fail' BEGIN SELECT RAISE(ABORT, 'fail'); END;").unwrap();
+        let replacement = vec![
+            crate::plans::Todo { text: "New task".into(), status: crate::plans::PENDING.into(), updated_at: now() },
+            crate::plans::Todo { text: "fail".into(), status: crate::plans::PENDING.into(), updated_at: now() },
+        ];
+        assert!(store.save_todos(&id, &replacement).is_err());
+        assert_eq!(store.todos(&id).unwrap()[0].text, "Keep this task");
+    }
 
     #[test]
     fn deletion_removes_messages_and_unknown_conversations_fail() {
@@ -2576,6 +4066,7 @@ mod tests {
                 .unwrap();
         }
         let store = Store::open(&path).unwrap();
+        store.recover_interrupted_runs().unwrap();
         let messages = store.messages(&id).unwrap();
         assert_eq!(messages[0].status, "interrupted");
         assert_eq!(messages[0].content, "Partial response");
@@ -2614,6 +4105,28 @@ mod tests {
         };
         assert!(store.save_runtime_config(&invalid).is_err());
         assert_eq!(store.runtime_config().unwrap().cpu_threads, 4);
+    }
+
+    #[test]
+    fn audit_secondary_connection_preserves_live_run_and_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sqlite");
+        let store = Store::open(&path).unwrap();
+        let conversation = store.create_conversation().unwrap();
+        let reply = store.append_message(&conversation.id, "assistant", "Working", "streaming").unwrap();
+        store.save_run(&crate::agent_run::RunRecord {
+            id: "live-run".into(), conversation_id: conversation.id.clone(),
+            status: crate::agent_run::RunState::ExecutingTools,
+            model_provider: None, model_id: None, checkpoint: None, error: None,
+            created_at: now(), updated_at: now(),
+        }).unwrap();
+        let second = Store::open(&path).unwrap();
+        let messages = second.messages(&conversation.id).unwrap();
+        assert_eq!(messages[0].id, reply.id);
+        assert_eq!(messages[0].status, "streaming");
+        assert!(messages[0].error.is_none());
+        let status: String = second.connection.query_row("SELECT status FROM runs WHERE id='live-run'", [], |row| row.get(0)).unwrap();
+        assert_eq!(status, "executing_tools");
     }
 
     #[test]
@@ -2716,6 +4229,100 @@ mod tests {
     }
 
     #[test]
+    fn audit_fork_excludes_later_turns_and_unseen_assistant_output() {
+        let store = Store::open_memory().unwrap();
+        let conv = store.create_conversation().unwrap();
+        for (role, content) in [("user", "First request"), ("assistant", "First answer"), ("user", "Future request"), ("assistant", "Future answer")] {
+            store.append_message(&conv.id, role, content, "complete").unwrap();
+        }
+        for (seq, event_type, payload) in [
+            (1, "user_msg", serde_json::json!({"role":"user","content":"First request"})),
+            (2, "system_prompt", serde_json::json!({"content":"System"})),
+            (3, "step_start", serde_json::json!({"round":0})),
+            (4, "model_response", serde_json::json!({"content":"First answer","final":true})),
+            (5, "step_end", serde_json::json!({"content":"First answer"})),
+            (6, "turn_end", serde_json::json!({"status":"complete"})),
+            (7, "user_msg", serde_json::json!({"content":"Future request"})),
+            (8, "model_response", serde_json::json!({"content":"Future answer","final":true})),
+        ] {
+            store.append_session_event(&crate::sessions::SessionEvent {
+                id: format!("audit-{seq}"), conversation_id: conv.id.clone(), run_id: None,
+                seq, step_id: None, tool_call_id: None, event_type: event_type.into(),
+                payload, ignorable: false, created_at: 1000,
+            }).unwrap();
+        }
+        let (partial, _) = store.fork_session_events(&conv.id, 3).unwrap();
+        let messages = store.messages(&partial.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "First request");
+        let (complete, _) = store.fork_session_events(&conv.id, 6).unwrap();
+        let messages = store.messages(&complete.id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "First answer");
+    }
+
+    #[test]
+    fn audit_large_fork_is_complete_and_failed_copy_rolls_back() {
+        let store = Store::open_memory().unwrap();
+        let conv = store.create_conversation().unwrap();
+        let transaction = store.connection.unchecked_transaction().unwrap();
+        for seq in 1..=5001 {
+            store.append_session_event(&crate::sessions::SessionEvent {
+                id: format!("large-{seq}"), conversation_id: conv.id.clone(), run_id: None,
+                seq, step_id: None, tool_call_id: None, event_type: "note".into(),
+                payload: serde_json::json!({}), ignorable: true, created_at: 1000,
+            }).unwrap();
+        }
+        transaction.commit().unwrap();
+        let (forked, copied) = store.fork_session_events(&conv.id, 5001).unwrap();
+        assert_eq!(copied, 5001);
+        assert_eq!(store.session_events(&forked.id, Some(5001), None).unwrap()[0].seq, 5001);
+        let count = || store.connection.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get::<_, i64>(0)).unwrap();
+        let before = count();
+        store.connection.execute_batch("CREATE TRIGGER reject_fork BEFORE INSERT ON session_events BEGIN SELECT RAISE(ABORT, 'injected copy failure'); END;").unwrap();
+        assert!(store.fork_session_events(&conv.id, 5001).is_err());
+        assert_eq!(count(), before);
+    }
+
+    #[test]
+    fn audit_finish_turn_is_atomic_and_survives_restart() {
+        use crate::{agent_run::{RunRecord, RunState}, research_tasks::{ResearchTask, TaskBudgets, TaskStatus}};
+        let store = Store::open_memory().unwrap();
+        let conv = store.create_conversation().unwrap();
+        let mut message = store.append_message(&conv.id, "assistant", "", "streaming").unwrap();
+        let mut task = ResearchTask::new(&conv.id, "Research", TaskBudgets::default()).unwrap();
+        store.save_research_task(&task).unwrap();
+        let mut run = RunRecord { id: "atomic-turn".into(), conversation_id: conv.id.clone(), status: RunState::Generating, model_provider: None, model_id: None, checkpoint: None, error: None, created_at: now(), updated_at: now() };
+        store.save_run(&run).unwrap();
+        message.status = "complete".into(); message.content = "Finished".into();
+        run.status = RunState::Completed; task.finish_turn("complete");
+        store.connection.execute_batch("CREATE TRIGGER reject_finish BEFORE UPDATE ON research_tasks BEGIN SELECT RAISE(ABORT, 'injected task failure'); END;").unwrap();
+        assert!(store.finish_turn(&message, &run, Some(&task)).is_err());
+        assert_eq!(store.messages(&conv.id).unwrap()[0].status, "streaming");
+        store.connection.execute_batch("DROP TRIGGER reject_finish;").unwrap();
+        store.finish_turn(&message, &run, Some(&task)).unwrap();
+        store.recover_interrupted_runs().unwrap();
+        crate::research_tasks::recover_interrupted(&store).unwrap();
+        assert_eq!(store.messages(&conv.id).unwrap()[0].status, "complete");
+        assert_eq!(store.research_task(&task.id).unwrap().unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn audit_failed_resume_does_not_consume_the_paused_checkpoint() {
+        use crate::research_tasks::{ResearchTask, TaskBudgets, TaskStatus};
+        let store = Store::open_memory().unwrap();
+        let conv = store.create_conversation().unwrap();
+        let mut task = ResearchTask::new(&conv.id, "Research", TaskBudgets::default()).unwrap();
+        task.pause().unwrap(); store.save_research_task(&task).unwrap();
+        task.resume().unwrap();
+        store.connection.execute_batch("CREATE TRIGGER reject_resume BEFORE INSERT ON settings WHEN NEW.key LIKE 'pending_resume%' BEGIN SELECT RAISE(ABORT, 'injected checkpoint failure'); END;").unwrap();
+        assert!(store.stage_research_resume(&task, "Checkpoint").is_err());
+        assert_eq!(store.research_task(&task.id).unwrap().unwrap().status, TaskStatus::Paused);
+        let marker: String = store.setting(&format!("pending_resume_task:{}", conv.id)).unwrap();
+        assert!(marker.is_empty());
+    }
+
+    #[test]
     fn forked_conversation_keeps_message_history_and_run_lineage() {
         let store = Store::open_memory().unwrap();
         let conv = store.create_conversation().unwrap();
@@ -2747,7 +4354,7 @@ mod tests {
         let messages = store.messages(&forked.id).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
-        let history = crate::history::model_history(&messages).unwrap();
+        let history = crate::history::model_history_with_cutoff(&messages, None).unwrap();
         assert!(history.iter().any(|m| m["role"] == "user"));
         let events = store.session_events(&forked.id, None, None).unwrap();
         assert!(events.iter().all(|e| e.run_id.as_deref() == Some("run-1")));
@@ -2769,5 +4376,288 @@ mod tests {
 
         let no_hits = store.search_sessions("nonexistent_needle_xyz", 10).unwrap();
         assert!(no_hits.is_empty());
+    }
+
+    #[test]
+    fn startup_repair_closes_a_crash_truncated_turn_tail_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repair.sqlite");
+        let conversation_id;
+        {
+            let store = Store::open(&path).unwrap();
+            let conversation = store.create_conversation().unwrap();
+            conversation_id = conversation.id;
+            store
+                .save_run(&crate::agent_run::RunRecord {
+                    id: "run-1".into(),
+                    conversation_id: conversation_id.clone(),
+                    status: crate::agent_run::RunState::ExecutingTools,
+                    model_provider: None,
+                    model_id: None,
+                    checkpoint: None,
+                    error: None,
+                    created_at: 1000,
+                    updated_at: 1000,
+                })
+                .unwrap();
+            // Open tail: turn_start + step_start + one answered and one
+            // unanswered tool_call, then nothing — the app stopped mid-turn.
+            for (event_type, step_id, call_id, payload) in [
+                ("turn_start", None, None, serde_json::json!({"model": "m"})),
+                ("step_start", Some("step-0"), None, serde_json::json!({"round": 0})),
+                ("tool_call", Some("step-0"), Some("call-done"), serde_json::json!({"callId": "call-done", "name": "file_read"})),
+                ("tool_result", Some("step-0"), Some("call-done"), serde_json::json!({"callId": "call-done", "name": "file_read", "result": "ok"})),
+                ("tool_call", Some("step-0"), Some("call-open"), serde_json::json!({"callId": "call-open", "name": "file_write"})),
+            ] {
+                store
+                    .append_session_event(&crate::sessions::SessionEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        conversation_id: conversation_id.clone(),
+                        run_id: Some("run-1".into()),
+                        seq: 0,
+                        step_id: step_id.map(str::to_string),
+                        tool_call_id: call_id.map(str::to_string),
+                        event_type: event_type.into(),
+                        payload,
+                        ignorable: false,
+                        created_at: 1000,
+                    })
+                    .unwrap();
+            }
+            // A tool audit whose request was recorded but never got a result.
+            store
+                .connection
+                .execute(
+                    "INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES('audit-open',?1,'tool','{\"request\":{\"name\":\"file_write\",\"arguments\":{},\"callId\":\"call-open\"}}','streaming',1000)",
+                    [&conversation_id],
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES('reply-open',?1,'assistant','','streaming',2000)",
+                    [&conversation_id],
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        store.recover_interrupted_runs().unwrap();
+        let reply = store.messages(&conversation_id).unwrap().remove(1);
+        assert_eq!(reply.status, "interrupted");
+        assert!(reply.error.as_deref().unwrap_or("").contains("app closed"));
+        // Startup recovery flips the stale run to outcome_unknown and the in-flight
+        // audit row to interrupted, which replays as an unknown outcome.
+        assert_eq!(
+            store.run("run-1").unwrap().unwrap().status,
+            crate::agent_run::RunState::OutcomeUnknown
+        );
+        let audit = store.messages(&conversation_id).unwrap().remove(0);
+        assert_eq!(audit.status, "interrupted");
+        let history = crate::history::model_history_with_cutoff(&[audit], None).unwrap();
+        assert!(history[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("may already have changed data"));
+
+        let before = store.session_events(&conversation_id, None, None).unwrap().len();
+        assert_eq!(store.repair_open_turn_tails().unwrap(), 3);
+        let events = store.session_events(&conversation_id, None, None).unwrap();
+        assert_eq!(events.len(), before + 3);
+        let result = events
+            .iter()
+            .find(|e| {
+                e.event_type == "tool_result"
+                    && e.tool_call_id.as_deref() == Some("call-open")
+            })
+            .unwrap();
+        assert_eq!(result.payload["decision"], "unknown");
+        assert_eq!(result.payload["result"]["outcome"], "unknown");
+        assert_eq!(
+            result.payload["result"]["message"],
+            "The app stopped before this action's result was recorded. It may already have changed data. Do not automatically repeat it."
+        );
+        assert_eq!(result.run_id.as_deref(), Some("run-1"));
+        assert_eq!(result.step_id.as_deref(), Some("step-0"));
+        let step_end = events.iter().find(|e| e.event_type == "step_end").unwrap();
+        assert_eq!(step_end.payload, serde_json::json!({"interrupted": true}));
+        assert_eq!(step_end.step_id.as_deref(), Some("step-0"));
+        let turn_end = events.iter().find(|e| e.event_type == "turn_end").unwrap();
+        assert_eq!(turn_end.payload, serde_json::json!({"status": "interrupted"}));
+        // Synthetic events keep the per-conversation sequence monotonic.
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]));
+        // Idempotent: a second pass and a later restart append nothing.
+        assert_eq!(store.repair_open_turn_tails().unwrap(), 0);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.repair_open_turn_tails().unwrap(), 0);
+    }
+
+    #[test]
+    fn startup_repair_pairs_a_call_left_open_inside_a_completed_turn() {
+        let store = Store::open_memory().unwrap();
+        let conversation = store.create_conversation().unwrap();
+        store.save_run(&crate::agent_run::RunRecord {
+            id: "run-complete".into(), conversation_id: conversation.id.clone(),
+            status: crate::agent_run::RunState::Completed, model_provider: None, model_id: None,
+            checkpoint: None, error: None, created_at: 1000, updated_at: 1000,
+        }).unwrap();
+        for (event_type, call_id) in [
+            ("turn_start", None), ("tool_call", Some("call-orphan")), ("turn_end", None),
+            ("turn_start", None), ("tool_call", Some("call-late")), ("turn_end", None),
+            ("tool_result", Some("call-late")),
+        ] {
+            store.append_session_event(&crate::sessions::SessionEvent {
+                id: uuid::Uuid::new_v4().to_string(), conversation_id: conversation.id.clone(),
+                run_id: Some("run-complete".into()), seq: 0, step_id: Some("step-0".into()),
+                tool_call_id: call_id.map(str::to_string), event_type: event_type.into(),
+                payload: serde_json::json!({"callId":call_id,"name":"file_write"}),
+                ignorable: false, created_at: 1000,
+            }).unwrap();
+        }
+        assert_eq!(store.repair_open_turn_tails().unwrap(), 1);
+        let events = store.session_events(&conversation.id, None, None).unwrap();
+        let result = events.last().unwrap();
+        assert_eq!(result.event_type, "tool_result");
+        assert_eq!(result.tool_call_id.as_deref(), Some("call-orphan"));
+        assert_eq!(result.payload["result"]["outcome"], "unknown");
+        assert_eq!(store.run("run-complete").unwrap().unwrap().status, crate::agent_run::RunState::OutcomeUnknown);
+        assert_eq!(store.repair_open_turn_tails().unwrap(), 0);
+    }
+
+    #[test]
+    fn session_event_types_and_format_version_are_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("versioned.sqlite");
+        {
+            let store = Store::open(&path).unwrap();
+            // Open stamps the current format version.
+            let stamped: u32 = store.setting("session_format_version").unwrap();
+            assert_eq!(stamped, crate::sessions::SESSION_FORMAT_VERSION);
+            let conv = store.create_conversation().unwrap();
+            let event = |kind: &str, ignorable: bool| crate::sessions::SessionEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conv.id.clone(),
+                run_id: None,
+                seq: 0,
+                step_id: None,
+                tool_call_id: None,
+                event_type: kind.into(),
+                payload: serde_json::json!({}),
+                ignorable,
+                created_at: 1000,
+            };
+            // Unknown non-ignorable types are rejected at write time.
+            assert!(store.append_session_event(&event("brand_new_typo", false)).is_err());
+            // Ignorable unknowns stay tolerated for forward compatibility.
+            store.append_session_event(&event("brand_new_typo", true)).unwrap();
+            assert_eq!(store.session_events(&conv.id, None, None).unwrap().len(), 1);
+            // A non-ignorable unknown row that bypassed validation fails reads.
+            store
+                .connection
+                .execute(
+                    "INSERT INTO session_events(id,conversation_id,seq,event_type,payload,ignorable,created_at) VALUES('mystery',?1,99,'future_type','{}',0,1)",
+                    [&conv.id],
+                )
+                .unwrap();
+            assert!(store.session_events(&conv.id, None, None).is_err());
+            store
+                .save_setting(
+                    "session_format_version",
+                    &(crate::sessions::SESSION_FORMAT_VERSION + 1),
+                )
+                .unwrap();
+        }
+        match Store::open(&path) {
+            Ok(_) => panic!("a newer session format must not open"),
+            Err(error) => assert!(error.contains("newer version"), "{error}"),
+        }
+    }
+
+    #[test]
+    fn skill_activation_is_per_conversation_and_inherits_global_until_customized() {
+        let store = Store::open_memory().unwrap();
+        let a = store.create_conversation().unwrap();
+        let b = store.create_conversation().unwrap();
+        store.save_active_skills(&["wiki-qa".into()]).unwrap();
+        // Uncustomized conversations (and unsaved/empty ids) inherit the global set.
+        assert_eq!(store.active_skills_for(&a.id).unwrap(), vec!["wiki-qa"]);
+        assert_eq!(store.active_skills_for("").unwrap(), vec!["wiki-qa"]);
+        // Customizing A leaves B on the inherited global set.
+        store.save_conversation_skills(&a.id, &["sentry".into()]).unwrap();
+        assert_eq!(store.active_skills_for(&a.id).unwrap(), vec!["sentry"]);
+        assert_eq!(store.active_skills_for(&b.id).unwrap(), vec!["wiki-qa"]);
+        // An explicitly empty set stays empty rather than re-inheriting.
+        store.save_conversation_skills(&a.id, &[]).unwrap();
+        assert!(store.active_skills_for(&a.id).unwrap().is_empty());
+        // Removing a package scrubs it from every conversation's own set.
+        store
+            .save_conversation_skills(&b.id, &["sentry".into(), "wiki-qa".into()])
+            .unwrap();
+        store.forget_conversation_skill("sentry").unwrap();
+        assert_eq!(store.active_skills_for(&b.id).unwrap(), vec!["wiki-qa"]);
+        // Deleting a conversation cascades its customization row.
+        store.delete_conversation(&a.id).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM conversation_skills WHERE conversation_id=?1",
+                    [&a.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_fact_rows_normalize_scopes_and_origins_without_widening() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("app.db");
+        let work = dir.path().join("work-a");
+        std::fs::create_dir_all(&work).unwrap();
+        {
+            let store = Store::open(&db).unwrap();
+            // Rows as written by the pre-scoped schema: 'global', raw paths,
+            // legacy origins.
+            for (scope, origin) in [("global", "ui"), (work.to_str().unwrap(), "model"), ("D:\\elsewhere", "model")] {
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO memory_facts(id, scope, fact, origin, created_at, updated_at) VALUES (?1,?2,'f',?3,0,0)",
+                        params![uuid::Uuid::new_v4().to_string(), scope, origin],
+                    )
+                    .unwrap();
+            }
+            // A project exists at `work` so its path maps to the id form.
+            store
+                .save_setting(
+                    "workspace_index_v1",
+                    &serde_json::json!({
+                        "projects": [{"id": "pa", "name": "A", "path": work.to_string_lossy()}],
+                        "tasks": {},
+                    }),
+                )
+                .unwrap();
+            store.migrate_fact_scopes().unwrap();
+            let rows: Vec<(String, String)> = store
+                .connection
+                .prepare("SELECT scope, origin FROM memory_facts ORDER BY scope")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(rows.contains(&("user".to_string(), "user".to_string())), "{rows:?}");
+            assert!(rows.contains(&("project:pa".to_string(), "agent".to_string())), "{rows:?}");
+            assert!(
+                rows.contains(&(format!("project:{}", "D:\\elsewhere"), "agent".to_string())),
+                "{rows:?}"
+            );
+        }
+        // Reopening is additive-safe: columns exist, rows keep their scopes.
+        let reopened = Store::open(&db).unwrap();
+        assert_eq!(reopened.recall_facts("user", 10).unwrap().len(), 1);
     }
 }

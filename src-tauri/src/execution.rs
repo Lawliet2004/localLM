@@ -1,4 +1,3 @@
-use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -168,6 +167,7 @@ struct CodeRequest {
 fn default_timeout() -> u64 {
     60
 }
+
 pub type ChunkCallback = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Name of the structured result channel. `locallm_result(...)` still wins.
@@ -193,26 +193,42 @@ fn default_command_timeout() -> u64 {
 pub struct LocalExecution {
     config: ExecutionConfig,
     directory: PathBuf,
+    isolation: crate::isolation::IsolationSettings,
+    db_path: Option<PathBuf>,
     _workspace: crate::workspace::Workspace,
 }
 impl LocalExecution {
     pub fn new(config: ExecutionConfig, directory: &str) -> Result<Self, String> {
+        Self::with_policy(config, directory, Default::default(), None)
+    }
+    /// `store` supplies the isolation policy; `db_path` lets the sandbox
+    /// record ACE grants it makes for later revocation.
+    pub fn with_policy(
+        config: ExecutionConfig,
+        directory: &str,
+        isolation: crate::isolation::IsolationSettings,
+        db_path: Option<PathBuf>,
+    ) -> Result<Self, String> {
         config.validate()?;
         Ok(Self {
             config,
             directory: PathBuf::from(directory),
+            isolation,
+            db_path,
             _workspace: crate::workspace::Workspace::open(directory)?,
         })
     }
     pub fn tool(self: std::sync::Arc<Self>) -> crate::connectors::AgentTool {
-        crate::connectors::AgentTool::execution(self,crate::connectors::ToolView { name:"run_code".into(),description:"Run code in the selected workspace. Python is the default (also javascript, powershell). NOT sandboxed: same files and network as this Windows user. Timeout 1–90 seconds. For exact math, dates, parsing, or data work, use this instead of calculating by hand. Write plain source — no markdown fences. The last expression, last assignment, or printed output is the answer. locallm_result(value) is optional JSON. Example: {\"language\":\"python\",\"code\":\"round(19.99 * 1.08, 2)\"}".into(),input_schema:json!({"type":"object","properties":{"language":{"type":"string","enum":["python","javascript","powershell"],"description":"Defaults to python. py, js, and pwsh aliases are accepted."},"code":{"type":"string","description":"Source to run. Last expression, last assignment, or print is the answer. Do not wrap in markdown fences."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":90}},"required":["code"],"additionalProperties":false}) })
+        let description = "Run code in the selected workspace. Python is the default (also javascript, powershell). NOT sandboxed: same files and network as this Windows user. Timeout 1–90 seconds. For exact math, dates, parsing, or data work, use this instead of calculating by hand. Write plain source — no markdown fences. The last expression, last assignment, or printed output is the answer. locallm_result(value) is optional JSON. Example: {\"language\":\"python\",\"code\":\"round(19.99 * 1.08, 2)\"}";
+        crate::connectors::AgentTool::execution(self,crate::connectors::ToolView { name:"run_code".into(),description:description.into(),input_schema:json!({"type":"object","properties":{"language":{"type":"string","enum":["python","javascript","powershell"],"description":"Defaults to python. py, js, and pwsh aliases are accepted."},"code":{"type":"string","description":"Source to run. Last expression, last assignment, or print is the answer. Do not wrap in markdown fences."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":90}},"required":["code"],"additionalProperties":false}) })
     }
     pub fn command_tool(self: std::sync::Arc<Self>) -> crate::connectors::AgentTool {
+        let description = "Execute a shell command (CLI, build tool, test runner, git, etc.) locally in the workspace directory. Requires approval. Output is bounded; timeout is 1–300 seconds. Do not use this for calculations — call local_run_code with Python instead.";
         crate::connectors::AgentTool::execution(
             self,
             crate::connectors::ToolView {
                 name: "execute_command".into(),
-                description: "Execute a shell command (CLI, build tool, test runner, git, etc.) locally in the workspace directory. Requires approval. Output is bounded; timeout is 1–300 seconds. Do not use this for calculations — call local_run_code with Python instead.".into(),
+                description: description.into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -282,52 +298,17 @@ impl LocalExecution {
                 "Configure this language's interpreter on the Execution page first.".into(),
             );
         }
-        let mut command = tokio::process::Command::new(program);
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        command
-            .args(&arg_refs)
-            .current_dir(&self.directory)
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for name in [
-            "SystemRoot",
-            "WINDIR",
-            "TEMP",
-            "TMP",
-            "PATH",
-            "PATHEXT",
-            "COMSPEC",
-            "USERPROFILE",
-            "HOME",
-            "APPDATA",
-            "LOCALAPPDATA",
-            "TERM",
-            "COLORTERM",
-        ] {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
-        command
-            .env("PYTHONIOENCODING", "utf-8")
-            .env("PYTHONUTF8", "1");
-        let mut command = CommandWrap::from(command);
-        command.wrap(KillOnDrop);
-        #[cfg(windows)]
-        {
-            command.wrap(process_wrap::tokio::CreationFlags(
-                windows::Win32::System::Threading::CREATE_NO_WINDOW,
-            ));
-            command.wrap(process_wrap::tokio::JobObject);
-        }
-        #[cfg(unix)]
-        {
-            command.wrap(process_wrap::tokio::ProcessGroup::leader());
-        }
-        let mut child = command
-            .spawn()
+        let spec = crate::isolation::SpawnSpec {
+            program: program.to_string(),
+            args: args.iter().map(String::as_str).map(String::from).collect(),
+            cwd: self.directory.clone(),
+            env: crate::isolation::SpawnSpec::standard_env(&[]),
+            stdin: true,
+            stderr: true,
+            writable: vec![self.directory.clone()],
+            cpu_seconds: request.timeout_seconds as u32,
+        };
+        let mut child = crate::isolation::spawn(&spec, &self.isolation, self.db_path.as_deref())
             .map_err(|error| format!("Interpreter launch failed: {error}"))?;
         let mut input = child.stdin().take().ok_or("Missing process input pipe.")?;
         let output = child
@@ -410,18 +391,16 @@ impl LocalExecution {
 
         let target_dir = if let Some(sub) = &request.cwd {
             let p = Path::new(sub);
-            if p.is_absolute() {
-                if !p.starts_with(&self.directory) {
-                    return Err("cwd must be within the workspace directory.".into());
-                }
+            let joined = if p.is_absolute() {
                 p.to_path_buf()
             } else {
-                let joined = self.directory.join(p);
-                if !joined.starts_with(&self.directory) {
-                    return Err("cwd must be within the workspace directory.".into());
-                }
-                joined
+                self.directory.join(p)
+            };
+            // Canonical containment — a junction or `..` cannot reach outside.
+            if !crate::isolation::inside_root(&self.directory, &joined) {
+                return Err("cwd must be within the workspace directory.".into());
             }
+            joined
         } else {
             self.directory.clone()
         };
@@ -430,55 +409,32 @@ impl LocalExecution {
             return Err("Specified working directory does not exist.".into());
         }
 
-        let mut cmd = if cfg!(windows) {
-            let shell = if !self.config.powershell_path.is_empty() && Path::new(&self.config.powershell_path).is_file() {
-                &self.config.powershell_path
+
+        let spec = crate::isolation::SpawnSpec {
+            program: if cfg!(windows) {
+                if !self.config.powershell_path.is_empty()
+                    && Path::new(&self.config.powershell_path).is_file()
+                {
+                    self.config.powershell_path.clone()
+                } else {
+                    "powershell.exe".into()
+                }
             } else {
-                "powershell.exe"
-            };
-            let mut c = tokio::process::Command::new(shell);
-            c.args(["-NoProfile", "-NonInteractive", "-Command", &request.command]);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("sh");
-            c.args(["-c", &request.command]);
-            c
+                "sh".into()
+            },
+            args: if cfg!(windows) {
+                vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), request.command.clone()]
+            } else {
+                vec!["-c".into(), request.command.clone()]
+            },
+            cwd: target_dir.clone(),
+            env: crate::isolation::SpawnSpec::standard_env(&[]),
+            stdin: false,
+            stderr: true,
+            writable: vec![self.directory.clone()],
+            cpu_seconds: request.timeout_seconds as u32,
         };
-
-        cmd.current_dir(&target_dir)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        for name in [
-            "SystemRoot", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT",
-            "COMSPEC", "USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA",
-            "TERM", "COLORTERM",
-        ] {
-            if let Some(value) = std::env::var_os(name) {
-                cmd.env(name, value);
-            }
-        }
-        cmd.env("PYTHONIOENCODING", "utf-8")
-           .env("PYTHONUTF8", "1");
-
-        let mut command = CommandWrap::from(cmd);
-        command.wrap(KillOnDrop);
-        #[cfg(windows)]
-        {
-            command.wrap(process_wrap::tokio::CreationFlags(
-                windows::Win32::System::Threading::CREATE_NO_WINDOW,
-            ));
-            command.wrap(process_wrap::tokio::JobObject);
-        }
-        #[cfg(unix)]
-        {
-            command.wrap(process_wrap::tokio::ProcessGroup::leader());
-        }
-
-        let mut child = command
-            .spawn()
+        let mut child = crate::isolation::spawn(&spec, &self.isolation, self.db_path.as_deref())
             .map_err(|error| format!("Command launch failed: {error}"))?;
 
         let output = child
@@ -849,7 +805,7 @@ pub async fn save_execution_config(
         .try_lock()
         .map_err(|_| "Wait for the model operation to finish.")?;
     config.validate()?;
-    state.database()?.save_execution_config(&config)
+    state.database()?.save_local_execution_config(&config)
 }
 
 #[tauri::command]

@@ -48,7 +48,7 @@ export class SearchService {
         });
       } catch (err: any) {
         lastError = String(err?.message || err);
-        if (/retry-after/i.test(lastError)) break;
+        if (/retry-after|fixture results/i.test(lastError)) break;
         if (attempt < this.retries) await new Promise((r) => setTimeout(r, this.retryDelayMs));
       }
     }

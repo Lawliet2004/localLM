@@ -9,20 +9,23 @@ export interface WeatherReport {
 }
 export class WeatherProvider implements VerticalProvider<string, WeatherReport> {
   extractLocation(query: string): string {
-    const match = query.match(/(?:weather(?:\s+report)?|temperature|forecast)(?:\s+(?:in|for|at))\s+([^?!]+)/i)
-      || query.match(/(?:in|for|at)\s+([^?!]+)/i)
+    const match = query.match(/(?:weather(?:\s+report)?|temperature|forecast)(?:\s+(?:in|for|at|of))\s+([^?!]+)/i)
+      || query.match(/\b(?:in|for|at)\s+([^?!]+)/i)
       || query.match(/^([^?!]+)\s+weather/i);
     const location = match?.[1].replace(/\b(today|tomorrow|now|tonight|this week|current)\b/gi, '').replace(/[.]+$/, '').trim();
     if (!location) throw new Error('Please specify a location for weather.');
     return location;
   }
   async geocode(name: string) {
-    const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=5&language=en&format=json`;
+    // "Kokata" also names a place in Bolivia, so correct the common Kolkata
+    // misspelling only when the query does not explicitly point elsewhere.
+    const place = /^kokata(?:,\s*(?:india|west bengal(?:,\s*india)?))?$/i.test(name.trim()) ? 'Kolkata' : name;
+    const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=5&language=en&format=json`;
     const res = await fetch(url, {signal: AbortSignal.timeout(8000)});
     if (!res.ok) throw new Error(`Geocoding unavailable (HTTP ${res.status})`);
     const data = await res.json();
     const first = data.results?.[0];
-    if (!first || !Number.isFinite(first.latitude) || !Number.isFinite(first.longitude)) throw new Error(`Could not resolve location: ${name}`);
+    if (!first || !Number.isFinite(first.latitude) || !Number.isFinite(first.longitude)) throw new Error(`Could not resolve location: ${place}`);
     return {name: String(first.name).normalize('NFD').replace(/[\u0300-\u036f]/g, ''), region: first.admin1, country: first.country, lat: first.latitude, lon: first.longitude};
   }
   async execute(query: string): Promise<WeatherReport> {

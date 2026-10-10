@@ -60,7 +60,7 @@ interface ToolLikeArgs {
  * Precedence mirrors the verb logic in CommandRunCard so icon and label agree.
  */
 export function toolKindOf(name: string, args: ToolLikeArgs = {}, result: ToolLikeArgs = {}): TraceKind {
-  if (/web_search|web_open|web_find|web_fetch/.test(name)) return 'web';
+  if (/web_search|web_open|web_find|web_fetch|^browser$/.test(name)) return 'web';
   if (/edit|create_file|write_to_file|replace/.test(name) || typeof result.diff === 'string') return 'edit';
   if (name === 'manage_task') return 'task';
   const hasPath = Boolean(args.path ?? args.AbsolutePath ?? args.TargetFile ?? args.file);

@@ -1,22 +1,27 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { resolve } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
+
+if (process.env.LOCALLM_NATIVE_SMOKE_ISOLATED !== '1') {
+  console.error("Refusing to run: this smoke drives the running app's real app-data. Set LOCALLM_NATIVE_SMOKE_ISOLATED=1 only against an isolated debug instance.");
+  process.exit(1);
+}
 
 // Launch the debug Tauri binary with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223 first.
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-const page = browser.contexts()[0].pages().find(page => page.url().includes('1420'));
+let { browser, page } = await connectSmoke();
 if (!page) throw new Error('LocalLM native webview is not running.');
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 try {
   await expect(page.getByText('Browser preview', { exact: false })).toHaveCount(0);
-  await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
-  await page.getByRole('tab', { name: 'Model files', exact: true }).click();
+  await openSettingsSection(page, 'Models');
+  await openSettingsSection(page, 'Model files');
   await page.getByRole('textbox', { name: 'llama-server executable' }).fill(resolve('.local/runtime/llama-server.exe'));
   await page.getByRole('textbox', { name: 'GGUF model file' }).fill(resolve('.local/models/MiniCPM5-2B.Q6_K.gguf'));
   await page.getByRole('button', { name: 'Save settings' }).click();
   await expect(page.getByText('Settings saved.', { exact: true })).toBeVisible();
-  await page.getByRole('tab', { name: 'Generation', exact: true }).click();
+  await openSettingsSection(page, 'Generation');
   await page.getByRole('spinbutton', { name: 'Maximum response tokens' }).fill('512');
   await page.getByRole('button', { name: 'Save settings' }).click();
   const started = Date.now();

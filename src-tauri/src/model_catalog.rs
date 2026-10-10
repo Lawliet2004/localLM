@@ -45,6 +45,8 @@ pub struct ModelDownloadInfo {
     destination: String,
     available_bytes: u64,
     required_bytes: u64,
+    saved_bytes: u64,
+    remaining_bytes: u64,
     destination_exists: bool,
 }
 
@@ -60,15 +62,30 @@ pub async fn model_download_info(app: tauri::AppHandle, filename: Option<String>
         .await
         .map_err(|error| format!("Could not prepare model directory: {error}"))?;
     let destination = directory.join(filename);
+    let destination_exists = tokio::fs::try_exists(&destination)
+        .await
+        .map_err(|error| error.to_string())?;
+    let saved = if destination_exists {
+        asset.bytes
+    } else {
+        tokio::fs::metadata(crate::download::partial_path(&destination))
+            .await
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len().min(asset.bytes))
+            .unwrap_or(0)
+    };
+    let remaining = asset.bytes - saved;
+    let storage = crate::download::storage(&directory, remaining, 0)?;
     Ok(ModelDownloadInfo {
         filename,
         bytes: asset.bytes,
         sha256: asset.sha256,
         destination: destination.to_string_lossy().into_owned(),
-        available_bytes: crate::download::available_space(&directory)?,
-        required_bytes: crate::download::required_space(asset.bytes)?,
-        destination_exists: tokio::fs::try_exists(&destination)
-            .await
-            .map_err(|error| error.to_string())?,
+        available_bytes: storage.available,
+        required_bytes: storage.required,
+        saved_bytes: saved,
+        remaining_bytes: remaining,
+        destination_exists,
     })
 }

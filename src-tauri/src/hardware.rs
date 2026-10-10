@@ -16,7 +16,7 @@ pub struct Gpu {
 #[serde(rename_all = "camelCase")]
 pub struct Hardware {
     logical_cpus: usize,
-    memory_total_bytes: Option<u64>,
+    pub memory_total_bytes: Option<u64>,
     memory_available_bytes: Option<u64>,
     gpus: Vec<Gpu>,
     gpu_status: String,

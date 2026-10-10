@@ -34,4 +34,9 @@ describe('Request Normalizer (Section 8)', () => {
     expect(res.urls).toContain('https://react.dev/blog/2024/12/05/react-19');
     expect(res.entities.some((e) => e.type === 'url')).toBe(true);
   });
+
+  it('does not classify room-temperature superconductivity as weather', () => {
+    const res = normalizeRequest('Recent room-temperature superconductivity research');
+    expect(res.questionType).not.toBe('weather');
+  });
 });

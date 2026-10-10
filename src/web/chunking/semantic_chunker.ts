@@ -78,7 +78,14 @@ export function chunkDocument(
 
     let accumulatedText = '';
     let accumulatedTokens = 0;
-    let headingPrefix = section.headingPath.length > 0 ? `[Section: ${section.headingPath.join(' > ')}]\n` : '';
+    const headingPrefix = section.headingPath.length > 0 ? `[Section: ${section.headingPath.join(' > ')}]\n` : '';
+    const emitChunk = () => {
+      const text = `${headingPrefix}${accumulatedText}`.trim();
+      chunks.push({
+        id: `${doc.id}:C${chunkIndex++}`, documentId: doc.id, url: doc.url, title: doc.title,
+        headingPath: section.headingPath, text, tokenCount: defaultTokenCounter.count(text), publishedAt: doc.publishedAt,
+      });
+    };
 
     for (let pIndex = 0; pIndex < paragraphs.length; pIndex++) {
       const p = paragraphs[pIndex].trim();
@@ -90,18 +97,7 @@ export function chunkDocument(
         for (const sentence of sentences) {
           const sTokens = defaultTokenCounter.count(sentence);
           if (accumulatedTokens + sTokens > targetTokens && accumulatedTokens > 0) {
-            // Emit chunk
-            const fullText = `${headingPrefix}${accumulatedText}`.trim();
-            chunks.push({
-              id: `${doc.id}:C${chunkIndex++}`,
-              documentId: doc.id,
-              url: doc.url,
-              title: doc.title,
-              headingPath: section.headingPath,
-              text: fullText,
-              tokenCount: defaultTokenCounter.count(fullText),
-              publishedAt: doc.publishedAt,
-            });
+            emitChunk();
 
             // Start new chunk with trailing overlap
             accumulatedText = sentence;
@@ -112,23 +108,12 @@ export function chunkDocument(
           }
         }
       } else if (accumulatedTokens + pTokens > targetTokens && accumulatedTokens > 0) {
-        // Emit chunk
-        const fullText = `${headingPrefix}${accumulatedText}`.trim();
-        chunks.push({
-          id: `${doc.id}:C${chunkIndex++}`,
-          documentId: doc.id,
-          url: doc.url,
-          title: doc.title,
-          headingPath: section.headingPath,
-          text: fullText,
-          tokenCount: defaultTokenCounter.count(fullText),
-          publishedAt: doc.publishedAt,
-        });
+        emitChunk();
 
         // Compute overlap from the end of the current accumulated text
         const words = accumulatedText.split(/\s+/);
-        const overlapWords = words.slice(-Math.min(words.length, Math.floor(overlapTokens * 0.75)));
-        const overlapText = overlapWords.join(' ');
+        const overlapCount = Math.min(words.length, Math.max(0, Math.floor(overlapTokens * 0.75)));
+        const overlapText = overlapCount ? words.slice(-overlapCount).join(' ') : '';
 
         accumulatedText = overlapText ? `${overlapText}\n\n${p}` : p;
         accumulatedTokens = defaultTokenCounter.count(accumulatedText);
@@ -140,17 +125,7 @@ export function chunkDocument(
 
     // Emit remaining accumulated text for this section
     if (accumulatedText.trim().length > 0) {
-      const fullText = `${headingPrefix}${accumulatedText}`.trim();
-      chunks.push({
-        id: `${doc.id}:C${chunkIndex++}`,
-        documentId: doc.id,
-        url: doc.url,
-        title: doc.title,
-        headingPath: section.headingPath,
-        text: fullText,
-        tokenCount: defaultTokenCounter.count(fullText),
-        publishedAt: doc.publishedAt,
-      });
+      emitChunk();
     }
   }
 

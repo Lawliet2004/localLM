@@ -1,61 +1,67 @@
-import { useEffect, useRef, useState } from 'react';
-import { api, errorMessage, nativeAvailable, type ModelInstallStatus } from '../lib/api';
+import { useEffect, useState } from 'react';
+import { api, errorMessage, nativeAvailable } from '../lib/api';
+import { refreshDownloadJobs, useDownloadJob } from '../lib/downloadJobs';
+import { JobProgress } from './JobProgress';
 const gib = (bytes: number) => `${(bytes / 1073741824).toFixed(2)} GiB`;
 export interface RuntimeDownloadBackend {
   info: typeof api.runtimeDownloadInfo;
-  status: typeof api.runtimeInstallStatus;
   install: typeof api.installRuntime;
   cancel: typeof api.cancelRuntimeInstall;
-  list: typeof api.listInstalledRuntimes;
+  list?: typeof api.listInstalledRuntimes;
 }
-export function RuntimeDownload({ busy, onSelect, backend, title = 'llama.cpp · CUDA 12.4', description = 'Install the pinned b10855 Windows runtime and CUDA libraries. Each installation uses a new directory; existing runtimes are preserved.', selectable = true }: { busy: boolean; onSelect: (path: string) => void; backend?: RuntimeDownloadBackend; title?: string; description?: string; selectable?: boolean }) {
+export function RuntimeDownload({ busy, onSelect, backend, title = 'llama.cpp · CUDA 12.4', description = 'Install the pinned b10855 Windows runtime and CUDA libraries. An installed pinned runtime is reused instead of downloading again.', selectable = true, jobKey = 'runtime:standard' }: { busy: boolean; onSelect: (path: string) => void; backend?: RuntimeDownloadBackend; title?: string; description?: string; selectable?: boolean; jobKey?: string }) {
   const [info, setInfo] = useState<Awaited<ReturnType<typeof api.runtimeDownloadInfo>> | null>(null);
-  const [status, setStatus] = useState<ModelInstallStatus | null>(null);
+  const [infoError, setInfoError] = useState('');
   const [error, setError] = useState('');
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [revision, setRevision] = useState(0);
   const [installed, setInstalled] = useState<Awaited<ReturnType<typeof api.listInstalledRuntimes>>>([]);
+  const job = useDownloadJob(jobKey);
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
-    (backend ? backend.list() : api.listInstalledRuntimes()).then(value => { if (!disposed) setInstalled(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
+    (backend?.list ? backend.list() : api.listInstalledRuntimes()).then(value => { if (!disposed) setInstalled(value); }).catch(() => {});
     return () => { disposed = true; };
   }, [revision, backend]);
-  const version = useRef(0);
+  // Job status comes from the shared store; info is this panel's own concern.
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     async function refresh() {
-      const current = version.current;
       try {
-        const [nextInfo, nextStatus] = await Promise.all([backend ? backend.info() : api.runtimeDownloadInfo(), backend ? backend.status() : api.runtimeInstallStatus()]);
-        if (!disposed && current === version.current) { setInfo(nextInfo); setStatus(nextStatus); }
-      } catch (e) { if (!disposed && current === version.current) setError(errorMessage(e)); }
-      finally { if (!disposed) timer = setTimeout(() => void refresh(), 1000); }
+        const next = await (backend ? backend.info() : api.runtimeDownloadInfo());
+        if (!disposed) { setInfo(next); setInfoError(''); }
+      } catch (e) { if (!disposed) setInfoError(errorMessage(e)); }
+      finally { if (!disposed) timer = setTimeout(() => void refresh(), 5000); }
     }
     void refresh();
     return () => { disposed = true; clearTimeout(timer); };
   }, [revision, backend]);
   async function install() {
-    version.current++; setStarting(true); setError('');
-    try { setStatus(await (backend ? backend.install() : api.installRuntime())); }
+    setStarting(true); setError('');
+    try { await (backend ? backend.install() : api.installRuntime()); }
     catch (e) { setError(errorMessage(e)); }
-    finally { version.current++; setStarting(false); setRevision(value => value + 1); }
+    finally { setStarting(false); setRevision(value => value + 1); refreshDownloadJobs(); }
   }
-  const active = Boolean(starting || status?.busy);
-  const insufficient = info && info.availableBytes < info.requiredBytes;
+  const active = Boolean(starting || job?.busy);
+  const insufficient = info && info.requiredBytes > 0 && info.availableBytes < info.requiredBytes;
+  const primary = info?.reusable ? 'Use installed runtime'
+    : (info && info.savedBytes > 0) || job?.phase === 'cancelled' || job?.phase === 'interrupted' ? 'Resume runtime download'
+    : 'Install CUDA runtime';
+  const showJob = job && (job.busy || ['failed', 'cancelled', 'interrupted', 'ready'].includes(job.phase));
+  const ready = job?.phase === 'ready' && job.path;
   return <section className="catalog-notice" aria-label="CUDA runtime download">
     <h2>{title}</h2><p>{description}</p>
-    {info && <p>{gib(info.bytes)} download · {gib(info.requiredBytes)} required for download, extraction and reserve · {gib(info.availableBytes)} free</p>}
+    {info && <p>{gib(Math.max(0, info.bytes - info.savedBytes))} to download · {gib(info.savedBytes)} saved · {gib(info.requiredBytes)} required incl. reserve · {gib(info.availableBytes)} free</p>}
     {insufficient && !active && <p role="alert">Not enough disk space to install the runtime.</p>}
-    {error && <p role="alert">{error}</p>}{status?.error && <p role={status.phase === 'cancelled' ? 'status' : 'alert'}>{status.phase === 'cancelled' ? 'Installation cancelled. You can try again when ready.' : status.error}</p>}
-    {active && <div role="status"><p>{status?.phase === 'extracting' ? 'Verifying and extracting runtime files…' : 'Downloading runtime archive…'}</p>{status?.phase !== 'extracting' && <progress aria-label="Runtime archive download progress" max={status?.total || 1} value={status?.received || 0} />}</div>}
-    <div className="connector-actions"><button type="button" className="secondary" disabled={!nativeAvailable || !info || active || Boolean(insufficient)} onClick={() => void install()}>Install CUDA runtime</button>
-      {active && <button type="button" className="secondary" disabled={cancelling} onClick={async () => { setCancelling(true); try { await (backend ? backend.cancel() : api.cancelRuntimeInstall()); } catch (e) { setError(errorMessage(e)); } finally { setCancelling(false); } }}>Cancel runtime installation</button>}
-      {selectable && !active && status?.phase === 'ready' && status.path && <button type="button" className="primary" disabled={busy} onClick={() => onSelect(status.path!)}>Use installed runtime</button>}</div>
-    {!active && status?.phase === 'ready' && <p role="status">{selectable ? 'Runtime installed. Select it, then save settings to use it.' : 'Runtime installed. Verify the text weights, then use the model.'}</p>}
+    {infoError && <p role="alert">{infoError}</p>}{error && <p role="alert">{error}</p>}
+    {showJob && job && <JobProgress job={job} />}
+    <div className="connector-actions"><button type="button" className="secondary" disabled={!nativeAvailable || !info || active || Boolean(insufficient)} onClick={() => void install()}>{primary}</button>
+      {job?.busy && <button type="button" className="secondary" disabled={cancelling} onClick={async () => { setCancelling(true); try { await (backend ? backend.cancel(job.jobId) : api.cancelRuntimeInstall(job.jobId)); } catch (e) { setError(errorMessage(e)); } finally { setCancelling(false); refreshDownloadJobs(); } }}>Pause download</button>}
+      {selectable && ready && <button type="button" className="primary" disabled={busy} onClick={() => onSelect(job.path!)}>Use installed runtime</button>}</div>
+    {ready && <p role="status">{selectable ? 'Runtime installed. Select it, then save settings to use it.' : 'Runtime installed. Verify the text weights, then use the model.'}</p>}
     {installed.length > 0 && <details><summary>Installed runtimes ({installed.length})</summary><p>Checks file presence and sizes; does not recheck file hashes.</p>{installed.map(item => <div key={item.id}><p className="download-path">{item.id}</p>{item.problem && <p>{item.problem}</p>}{selectable && <button type="button" className="secondary" disabled={busy || active || !item.complete} onClick={() => onSelect(item.path)}>Select {item.id.slice(-8)}</button>}</div>)}</details>}
   </section>;
 }

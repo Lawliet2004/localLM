@@ -1,0 +1,10 @@
+# Git hooks via lefthook (https://github.com/evilmartians/lefthook).
+# Install once with `npm i -D lefthook && npx lefthook install`.
+pre-commit:
+  commands:
+    whitespace:
+      run: git diff --cached --check
+pre-push:
+  commands:
+    typecheck:
+      run: npm run typecheck

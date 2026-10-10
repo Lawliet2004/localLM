@@ -38,6 +38,14 @@ describe('iterative research state', () => {
     expect(answered.some((r) => r.status === 'answered')).toBe(true);
   });
 
+  it('leaves a comparison subject unanswered when evidence covers only its counterpart', () => {
+    const state = initResearchState('Compare Alpha and Beta benchmarks');
+    const classified = classifyRequirements(state, [claim('Alpha benchmarks score 90 points.')]);
+    expect(classified.find(item => item.text.includes('Alpha'))?.status).toBe('answered');
+    expect(classified.find(item => item.text.includes('Beta'))?.status).toBe('blocked');
+    expect(classifyRequirements(state, [claim('Unrelated information about London weather.')]).every(item => item.status !== 'answered')).toBe(true);
+  });
+
   it('stops the loop on stagnation instead of burning budget', () => {
     const state = initResearchState('Obscure topic');
     state.roundsWithoutNewEvidence = 2;
@@ -49,8 +57,11 @@ describe('iterative research state', () => {
     expect(decision.shouldRetry).toBe(false);
   });
 
-  it('refuses to retry an already-tried targeted query', () => {
-    expect(isRepeatedQuery('Model X parameters benchmark', ['benchmark parameters model x'])).toBe(true);
+  it('deduplicates normalized repeats without erasing query word order', () => {
+    expect(isRepeatedQuery('Model X parameters benchmark', ['model x parameters benchmark'])).toBe(true);
+    expect(isRepeatedQuery('Model   X parameters benchmark', ['model x parameters benchmark'])).toBe(true);
+    expect(isRepeatedQuery('Model X parameters benchmark', ['benchmark parameters model x'])).toBe(false);
+    expect(isRepeatedQuery('C++ language', ['C language'])).toBe(false);
     const decision = evaluateResearchRetry(
       { claims: [{ claim: 'Model X parameters unknown', status: 'UNSUPPORTED', sources: [] }], allSupported: false, supportedCount: 0, unsupportedCount: 1, conflictingCount: 0 },
       0, 3, ['model parameters unknown'],
@@ -68,7 +79,7 @@ describe('iterative research state', () => {
 
   it('unanswerable questions produce explicit limitations', async () => {
     const { WebSearchEngine } = await import('../index');
-    const { MockSearchProvider } = await import('../search/provider');
+    const { MockSearchProvider } = await import('../test-fixtures');
     const engine = new WebSearchEngine({ searchProvider: new MockSearchProvider({}) });
     const session = await engine.research('What is the release date of NonExistentSuperModel-999B?');
     expect(session.requirements?.length).toBeGreaterThan(0);

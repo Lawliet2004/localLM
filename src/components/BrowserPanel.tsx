@@ -7,6 +7,19 @@ import { api, errorMessage, nativeAvailable } from '../lib/api';
 // Search engine for address-bar queries: DuckDuckGo (privacy-friendly default,
 // consistent with the app's self-hosted/privacy lean).
 const SEARCH_URL = 'https://duckduckgo.com/?q=';
+const browserOperations = new Map<string, Promise<void>>();
+
+function queueBrowserOperation(tabId: string, operation: () => Promise<void>) {
+  const previous = browserOperations.get(tabId) ?? Promise.resolve();
+  const next = previous.catch(() => {}).then(operation);
+  browserOperations.set(tabId, next);
+  void next.finally(() => { if (browserOperations.get(tabId) === next) browserOperations.delete(tabId); }).catch(() => {});
+  return next;
+}
+
+export function closeBrowserTab(tabId: string) {
+  return queueBrowserOperation(tabId, () => api.browserClose(tabId));
+}
 
 // ponytail: heuristic classifier for UX only — checked_url in inspector_browser.rs
 // is the real http/https boundary, so the loose host regexes below (no octet
@@ -47,11 +60,16 @@ export function BrowserPanel({ tabId, onNavigate, onError }: { tabId: string; on
   useEffect(() => {
     if (!nativeAvailable || !hostRef.current) return;
     const host = hostRef.current;
+    let disposed = false;
+    let hidden = false;
     // The child webview is a native surface overlaid on this rect: keep it
     // glued to the host through every layout change.
     const layout = () => {
+      if (disposed || hidden) return;
       const rect = host.getBoundingClientRect();
-      void api.browserShow(tabId, rect.left, rect.top, rect.width, rect.height).catch(e => errorRef.current(errorMessage(e)));
+      if (rect.width < 1 || rect.height < 1) return;
+      void queueBrowserOperation(tabId, () => api.browserShow(tabId, rect.left, rect.top, rect.width, rect.height))
+        .catch(e => errorRef.current(errorMessage(e)));
     };
     layout();
     void api.browserUrl(tabId).then(({ url }) => {
@@ -60,19 +78,24 @@ export function BrowserPanel({ tabId, onNavigate, onError }: { tabId: string; on
 
     const observer = new ResizeObserver(layout);
     observer.observe(host);
+    const workspace = host.closest('.workspace');
+    if (workspace) observer.observe(workspace);
+    const panel = host.closest('.workspace-panel');
+    const onPanelMotion = (event: Event) => { if (event.target === panel) layout(); };
+    panel?.addEventListener('animationend', onPanelMotion);
+    panel?.addEventListener('transitionend', onPanelMotion);
     window.addEventListener('resize', layout);
 
     // The overlay floats above the DOM and would swallow open menus and modal
     // dialogs; hide it while a *visible* one is up and restore once it closes.
     // CSS-only popovers (e.g. context-popover) stay in the DOM permanently, so
     // a bare presence check would keep the webview hidden forever.
-    let hidden = false;
     const updateVisibility = () => {
       const overlayed = [...document.querySelectorAll<HTMLElement>('.app-menu[open], [role="dialog"]')]
         .some(el => el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }));
       if (overlayed === hidden) return;
       hidden = overlayed;
-      if (hidden) void api.browserHide(tabId).catch(() => {});
+      if (hidden) void queueBrowserOperation(tabId, () => api.browserHide(tabId)).catch(() => {});
       else layout();
     };
     const overlays = new MutationObserver(updateVisibility);
@@ -86,11 +109,14 @@ export function BrowserPanel({ tabId, onNavigate, onError }: { tabId: string; on
     });
 
     return () => {
+      disposed = true;
       observer.disconnect();
       overlays.disconnect();
+      panel?.removeEventListener('animationend', onPanelMotion);
+      panel?.removeEventListener('transitionend', onPanelMotion);
       window.removeEventListener('resize', layout);
       void unlisten.then(stop => stop());
-      void api.browserHide(tabId).catch(() => {});
+      void queueBrowserOperation(tabId, () => api.browserHide(tabId)).catch(() => {});
     };
   }, [tabId]);
 
@@ -99,7 +125,7 @@ export function BrowserPanel({ tabId, onNavigate, onError }: { tabId: string; on
     if ('error' in resolved) { onError(resolved.error); return; }
     setCurrent(resolved.url);
     setAddress(resolved.url);
-    void api.browserNavigate(tabId, resolved.url).catch(e => onError(errorMessage(e)));
+    void queueBrowserOperation(tabId, () => api.browserNavigate(tabId, resolved.url)).catch(e => onError(errorMessage(e)));
   }
 
   if (!nativeAvailable) {

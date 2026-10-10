@@ -1,11 +1,15 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { writeFileSync } from 'node:fs';
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
+
+if (process.env.LOCALLM_NATIVE_SMOKE_ISOLATED !== '1') {
+  console.error("Refusing to run: this smoke drives the running app's real app-data. Set LOCALLM_NATIVE_SMOKE_ISOLATED=1 only against an isolated debug instance.");
+  process.exit(1);
+}
+let { browser, page } = await connectSmoke();
 try {
-  let page;
-  await expect.poll(() => { page = browser.contexts()[0].pages().find(value => value.url().includes('1420')); return Boolean(page); }).toBe(true);
-  await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
-  await page.getByRole('tab', { name: 'Model files' }).click();
+    await openSettingsSection(page, 'Models');
+  await openSettingsSection(page, 'Model files');
   const panel = page.getByRole('region', { name: 'Recommended model download' });
   await expect(panel.getByText(/GiB download/)).toBeVisible();
   await expect(panel.getByRole('alert')).toHaveCount(0);

@@ -170,6 +170,10 @@ export interface EvidenceClaim {
   status: 'supported' | 'conflicting' | 'unsupported';
   confidence: number;
   variants?: string[];
+  /** Grounding/corroboration heuristic, never a guarantee that a source is true. */
+  assessment?: 'single_source' | 'corroborated' | 'snippet_only' | 'conflicting';
+  /** Hostname groups (subdomains collapsed); publishers may share an upstream source. */
+  sourceDomains?: string[];
 }
 
 export interface SourceMeta {
@@ -180,6 +184,7 @@ export interface SourceMeta {
   publishedAt?: string;
   author?: string;
   snippet?: string;
+  evidenceKind?: 'page_excerpt' | 'search_snippet';
   sourceType?: SourceType;
   authorityScore?: number;
 }
@@ -236,6 +241,8 @@ export interface VerifiedClaim {
 }
 
 export interface VerificationReport {
+  /** Makes a grounding audit's subject explicit; it does not establish source truth. */
+  scope?: 'answer' | 'extracted_evidence';
   claims: VerifiedClaim[];
   allSupported: boolean;
   supportedCount: number;
@@ -253,6 +260,15 @@ export interface ResearchTrace {
   /** Per-query failures: healthy results are kept, failures stay visible. */
   queryFailures?: Array<{ query: string; error: string }>;
   searchFailureCount?: number;
+  /** Why a staged extractor accepted or rejected each attempted query. */
+  extractionDiagnostics?: Array<{
+    query: string;
+    outcome: 'accepted' | 'no_answer_found' | 'unverified_output' | 'no_snippets' | 'timeout' | 'model_error';
+    sourcesConsidered: number;
+    factsAccepted: number;
+    finishReason?: string;
+    outputChars?: number;
+  }>;
   searxngDiagnostics?: Record<string, unknown>;
   paginationPages?: number[];
   /** Pages recovered from the Wayback Machine after a failed live fetch. */
@@ -279,6 +295,7 @@ export interface ResearchTrace {
 }
 
 export interface ResearchSession {
+  clarificationQuestion?: string;
   coverage?: Array<{entity: string; dimension: string; covered: boolean}>;
   requirements?: Array<{ id: string; text: string; status: 'answered' | 'unresolved' | 'blocked'; reason?: string }>;
   researchState?: {
@@ -316,6 +333,7 @@ export interface GenerationRequest {
   userPrompt: string;
   temperature?: number;
   maxTokens?: number;
+  disableThinking?: boolean;
   stopSequences?: string[];
   responseSchema?: Record<string, unknown>;
 }
@@ -329,11 +347,6 @@ export interface GenerationResponse {
 export interface LLMProvider {
   countTokens?(text: string): Promise<number>;
   generate(request: GenerationRequest): Promise<GenerationResponse>;
-}
-
-export interface EmbeddingProvider {
-  embedQuery(text: string): Promise<number[]>;
-  embedDocuments(texts: string[]): Promise<number[][]>;
 }
 
 export interface TokenCounter {

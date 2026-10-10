@@ -9,11 +9,6 @@ use serde_json::{json, Value};
 /// Audits that store `callId` + `stepId` replay as the live shape: one assistant
 /// tool-call message per model round, original ids, and that round's content.
 /// Legacy rows without those fields keep one assistant+tool pair per audit.
-#[allow(dead_code)]
-pub fn model_history(history: &[Message]) -> Result<Vec<Value>, String> {
-    model_history_with_cutoff(history, None)
-}
-
 struct PendingCall {
     call_id: String,
     alias: String,
@@ -30,7 +25,7 @@ pub fn model_history_with_cutoff(history: &[Message], cutoff: Option<(i64, &str)
         if dropped > 0 {
             messages.push(json!({"role": "user", "content": format!(
                 "Context checkpoint: the first {dropped} messages were compacted into artifact {artifact_id} to fit context. \
-                 Audits and full history remain in the local database; ask before expanding anything back.")}));
+                 Audits and full history remain in the local database. If artifact_read is available, use it with that id when an earlier detail is needed; do not guess missing values.")}));
         }
     }
     let mut answer: Option<&Message> = None;
@@ -143,6 +138,7 @@ mod tests {
     fn row(id: &str, role: &str, content: &str, status: &str) -> Message {
         Message {
             error: None,
+            metrics: None,
             id: id.into(),
             conversation_id: "chat".into(),
             role: role.into(),
@@ -174,7 +170,7 @@ mod tests {
             ),
             row("u2", "user", "What was the code?", "complete"),
         ];
-        let messages = model_history(&history).unwrap();
+        let messages = model_history_with_cutoff(&history, None).unwrap();
         assert_eq!(
             messages
                 .iter()
@@ -196,14 +192,32 @@ mod tests {
             .contains("private reasoning"));
     }
     #[test]
+    fn followup_can_see_raw_scores_saved_in_a_prior_tool_call() {
+        let report = "Terminal-Bench 4.0: model A 66.4%, model B 57.9%";
+        let write = json!({"request":{
+            "connector":"Workspace","name":"create_file",
+            "arguments":{"path":"benchmarks.md","content":report},"decision":"allowed"
+        },"result":{"path":"benchmarks.md"}}).to_string();
+        let history = vec![
+            row("u1", "user", "Compare benchmark results", "complete"),
+            row("a1", "assistant", "Model A leads by 8.5 points", "complete"),
+            row("t1", "tool", &write, "complete"),
+            row("u2", "user", "What are their raw scores in those benchmarks?", "complete"),
+        ];
+        let replay = model_history_with_cutoff(&history, None).unwrap();
+        assert!(replay.iter().any(|message| message["tool_calls"][0]["function"]["arguments"]
+            .as_str().is_some_and(|args| args.contains(report))));
+        assert_eq!(replay.last().unwrap()["content"], "What are their raw scores in those benchmarks?");
+    }
+    #[test]
     fn interrupted_and_denied_actions_keep_their_outcomes_without_partial_answers() {
         let denied =
             json!({"connector":"x","name":"write","arguments":{},"decision":"denied"}).to_string();
-        let messages = model_history(&[
+        let messages = model_history_with_cutoff(&[
             row("a", "assistant", "Unfinished claim", "interrupted"),
             row("t", "tool", &audit(json!({"partial":true})), "interrupted"),
             row("t2", "tool", &denied, "complete"),
-        ])
+        ], None)
         .unwrap();
         assert_eq!(messages.len(), 4);
         assert!(messages[1]["content"].as_str().unwrap().contains("unknown"));
@@ -215,8 +229,8 @@ mod tests {
     }
     #[test]
     fn malformed_saved_tool_history_is_not_silently_discarded() {
-        assert!(model_history(&[row("t", "tool", "invalid JSON", "complete")]).is_err());
-        assert!(model_history(&[row("t", "tool", "{}", "complete")]).is_err());
+        assert!(model_history_with_cutoff(&[row("t", "tool", "invalid JSON", "complete")], None).is_err());
+        assert!(model_history_with_cutoff(&[row("t", "tool", "{}", "complete")], None).is_err());
     }
     #[test]
     fn grouped_step_replays_original_ids_and_round_content() {
@@ -226,7 +240,7 @@ mod tests {
             row("t1", "tool", &live_audit("call_a", "step-0", "Opening files", "read_file", json!({"text":"A"})), "complete"),
             row("t2", "tool", &live_audit("call_b", "step-0", "Opening files", "read_file", json!({"text":"B"})), "complete"),
         ];
-        let messages = model_history(&history).unwrap();
+        let messages = model_history_with_cutoff(&history, None).unwrap();
         assert_eq!(
             messages.iter().map(|m| m["role"].as_str().unwrap()).collect::<Vec<_>>(),
             ["user", "assistant", "tool", "tool", "assistant"]
@@ -241,10 +255,10 @@ mod tests {
     }
     #[test]
     fn legacy_audits_without_step_stay_one_pair_each() {
-        let messages = model_history(&[
+        let messages = model_history_with_cutoff(&[
             row("t1", "tool", &audit(json!({"a":1})), "complete"),
             row("t2", "tool", &audit(json!({"b":2})), "complete"),
-        ])
+        ], None)
         .unwrap();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["tool_calls"][0]["id"], "history_t1");

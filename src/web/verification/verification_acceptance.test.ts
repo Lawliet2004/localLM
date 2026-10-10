@@ -1,42 +1,20 @@
 import { describe, it, expect } from 'vitest';
-import { buildStructuredResult, renderReport } from './structured_result';
-import { WebSearchEvaluator } from '../evaluation/evaluator';
+import { WebSearchEvaluator, MockSearchProvider } from '../test-fixtures';
 import { WebSearchEngine } from '../index';
-import { MockSearchProvider } from '../search/provider';
 
 describe('evidence verification and structured output', () => {
-  const sources = {
-    S1: { id: 'S1', title: 'Model card', url: 'https://example.com/card', domain: 'example.com' },
-  };
-
-  it('cited passages must actually support the associated claims', () => {
-    const evidence = [{ id: 'CLM-1', claim: 'Model X has 8B parameters.', supportingSources: ['S1'], status: 'supported' as const, confidence: 0.9 }];
-    const result = buildStructuredResult('Model X has 9B parameters. [S1]', evidence, sources, undefined, [], []);
-    expect(result.claims[0].supported).toBe(false);
-    expect(result.completionStatus).not.toBe('complete');
+  it('cited passages must actually support the associated claims', async () => {
+    const { ClaimVerifier } = await import('./claim_verifier');
+    const claims = [{ id: 'CLM-1', claim: 'Model X has 8B parameters.', supportingSources: ['S1'], status: 'supported' as const, confidence: 0.9 }];
+    const report = new ClaimVerifier().verifyClaimsDeterministic(['Model X has 9B parameters.'], claims);
+    expect(report.allSupported).toBe(false);
   });
 
-  it('a registry hit alone never establishes citation correctness', () => {
-    const evidence = [{ id: 'CLM-1', claim: 'Unrelated fact about Y.', supportingSources: ['S1'], status: 'supported' as const, confidence: 0.9 }];
-    const result = buildStructuredResult('Claim about Z with invented specifics 9B parameters. [S1]', evidence, sources, undefined, [], []);
-    expect(result.claims.every((c) => c.supported)).toBe(false);
-  });
-
-  it('produces answer, claims, refs, sources, unresolved, limitations, status', () => {
-    const evidence = [{ id: 'CLM-1', claim: 'Model X has 8B parameters.', supportingSources: ['S1'], status: 'supported' as const, confidence: 0.9 }];
-    const result = buildStructuredResult(
-      'Model X has 8B parameters. [S1]',
-      evidence, sources, undefined,
-      [{ text: 'Release date', reason: 'not found' }],
-      ['Snippet-only evidence'],
-    );
-    expect(result.schemaVersion).toBe('locallm.research-result/1');
-    expect(result.evidenceRefs).toEqual(['S1']);
-    expect(result.sources[0].url).toBe('https://example.com/card');
-    expect(result.unresolvedRequirements).toHaveLength(1);
-    expect(result.limitations).toEqual(['Snippet-only evidence']);
-    expect(result.completionStatus).toBe('partial');
-    expect(renderReport(result)).toContain('**Status:** partial');
+  it('a registry hit alone never establishes citation correctness', async () => {
+    const { ClaimVerifier } = await import('./claim_verifier');
+    const claims = [{ id: 'CLM-1', claim: 'Unrelated fact about Y.', supportingSources: ['S1'], status: 'supported' as const, confidence: 0.9 }];
+    const report = new ClaimVerifier().verifyClaimsDeterministic(['Claim about Z with invented specifics 9B parameters.'], claims);
+    expect(report.allSupported).toBe(false);
   });
 
   it('prompt injection in retrieved content authorizes nothing', async () => {

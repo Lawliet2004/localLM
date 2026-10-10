@@ -1,8 +1,9 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
 
 // Local MCP chat acceptance: real MiniCPM -> local fixture tool -> approval ->
 // tool result -> completed response -> persisted records verified after reload.
@@ -33,9 +34,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
 const callsSeen = join(directory, 'calls.json');
 writeFileSync(callsSeen, '[]');
 
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-let page;
-await expect.poll(() => { page = browser.contexts()[0].pages().find(value => value.url().includes('1420')); return Boolean(page); }).toBe(true);
+let { browser, page } = await connectSmoke();
 page.setDefaultTimeout(15000);
 const invoke = (command, args = {}) => page.evaluate(async ({ command, args }) => {
   const { invoke } = await import('/node_modules/@tauri-apps/api/core.js');
@@ -61,7 +60,7 @@ try {
   originalPreferences = (await invoke('bootstrap')).preferences;
   originalActiveSkills = (await invoke('list_skills')).filter(item => item.active).map(item => item.id);
   for (const skill of originalActiveSkills) await invoke('set_skill_active', { id: skill, active: false });
-  await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
+  await openSettingsSection(page, 'Models');
   if (await page.getByRole('button', { name: 'Unload', exact: true }).count()) {
     // Model already loaded from an earlier smoke run; reuse it.
   } else {

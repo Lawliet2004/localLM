@@ -11,7 +11,7 @@ import { extractMainContent, computeContentHash } from '../extraction/main_conte
 import type { FetchOptions, FetchResult } from './http_fetcher';
 import { toGitHubRawCandidates, isUsableRawResponse } from './github_fast_path';
 import { fetchViaWayback } from './wayback';
-import { detectChallenge, CHALLENGE_MISS_REASON } from './challenge';
+import { detectChallenge, detectErrorPage, CHALLENGE_MISS_REASON } from './challenge';
 import type { DomainStatsStore } from './domain_stats';
 
 export type FetchMethod = 'github_raw' | 'live' | 'js_render' | 'wayback' | 'failed';
@@ -102,6 +102,7 @@ export async function fetchPageCascade(
   const titleHint = options.titleHint || url;
 
   let skippedLive = false;
+  let failedFetch: FetchResult | undefined;
   if (options.domainStats && domain) {
     const status = await options.domainStats.status(domain);
     if (status.chronic) skippedLive = true;
@@ -121,7 +122,7 @@ export async function fetchPageCascade(
   const tryRender = async (): Promise<CascadeOutcome | null> => {
     if (!options.jsRender) return null;
     const rendered = await options.jsRender(url).catch(() => null);
-    if (!rendered?.html || detectChallenge(200, rendered.html)) return null;
+    if (!rendered?.html || detectChallenge(200, rendered.html) || detectErrorPage(rendered.html)) return null;
     const document = fromHtml(rendered.html, titleHint, rendered.finalUrl || url, 'js_render');
     if (!document.text.trim()) return null;
     return { document, method: 'js_render' };
@@ -152,8 +153,19 @@ export async function fetchPageCascade(
         return { document: null, raw: live, method: 'live' };
       }
       const challenge = detectChallenge(live.status ?? 200, live.body);
-      if (challenge) {
+      const errorPage = detectErrorPage(live.body);
+      if (errorPage) {
+        failureDetail = `${errorPage}: no research content was retrieved`;
+        failedFetch = live;
+        await record(false, failureDetail);
+        const rendered = await tryRender();
+        if (rendered) {
+          await record(true);
+          return rendered;
+        }
+      } else if (challenge) {
         failureDetail = `${CHALLENGE_MISS_REASON}:${challenge.marker}`;
+        failedFetch = live;
         await record(false, failureDetail);
         const rendered = await tryRender();
         if (rendered) {
@@ -174,6 +186,7 @@ export async function fetchPageCascade(
       }
     } else {
       failureDetail = live.error || 'empty or thin response';
+      failedFetch = live;
       await record(false, live.error);
       // A browser render can outlive plain HTTP failures (TLS fingerprints,
       // transient errors) but must never bypass a robots.txt refusal.
@@ -219,6 +232,7 @@ export async function fetchPageCascade(
 
   return {
     document: null,
+    raw: failedFetch,
     method: 'failed',
     skippedLive,
     error: skippedLive ? 'chronic domain skipped live fetch' : (failureDetail || 'fetch failed'),

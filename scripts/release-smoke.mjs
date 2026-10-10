@@ -1,7 +1,7 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { writeFileSync } from 'node:fs';
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9224');
-let page;
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
+let { browser, page } = await connectSmoke('http://127.0.0.1:9224');
 await expect.poll(() => { page=browser.contexts()[0].pages().find(item=>item.url().includes('tauri.localhost')); return Boolean(page); }).toBe(true);
 const errors=[];
 page.on('pageerror',error=>errors.push(error.message));
@@ -10,7 +10,7 @@ let chat;
 const original=(await invoke('bootstrap')).preferences;
 try {
   await expect(page.getByText('Browser preview',{exact:false})).toHaveCount(0);
-  await page.getByRole('button',{name:'Models & runtime',exact:true}).click();
+  await openSettingsSection(page, 'Models');
   await page.getByRole('button',{name:'Load model',exact:true}).click();
   await expect(page.getByRole('button',{name:'Unload',exact:true})).toBeVisible({timeout:120000});
   await invoke('save_preferences',{preferences:{...original,temperature:0,maxTokens:2048}});

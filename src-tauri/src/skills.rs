@@ -44,6 +44,17 @@ pub struct SkillDependencyStatus {
     pub satisfied: bool,
     pub remedy: String,
 }
+
+pub fn unavailable_dependency_notice(id: &str, statuses: &[SkillDependencyStatus]) -> Option<String> {
+    let missing: Vec<String> = statuses.iter()
+        .filter(|status| !status.satisfied)
+        .map(|status| format!("{} {} ({})", status.dependency.kind, status.dependency.name, status.remedy))
+        .collect();
+    (!missing.is_empty()).then(|| format!(
+        "Selected skill {id} has unavailable requirements: {}. Do not attempt these capabilities; use the tools actually offered for this turn or explain the limitation.",
+        missing.join(", ")
+    ))
+}
 #[derive(Deserialize)]
 struct Catalog {
     skills: Vec<Skill>,
@@ -598,8 +609,12 @@ fn excerpt(text: &str, start: usize, count: usize) -> Result<serde_json::Value, 
 #[tauri::command]
 pub async fn list_skills(
     state: tauri::State<'_, crate::AppState>,
+    conversation_id: Option<String>,
 ) -> Result<Vec<SkillView>, String> {
-    let active = state.database()?.active_skills()?;
+    let active = match conversation_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(conversation_id) => state.database()?.active_skills_for(conversation_id)?,
+        None => state.database()?.active_skills()?,
+    };
     Ok(state.skills.lock().await.list(&active))
 }
 #[tauri::command]
@@ -622,13 +637,15 @@ pub async fn remove_skill(
     let store = state.database()?;
     let mut ids = store.active_skills()?;
     ids.retain(|value| value != &id);
-    store.save_active_skills(&ids)
+    store.save_active_skills(&ids)?;
+    store.forget_conversation_skill(&id)
 }
 #[tauri::command]
 pub async fn set_skill_active(
     state: tauri::State<'_, crate::AppState>,
     id: String,
     active: bool,
+    conversation_id: Option<String>,
 ) -> Result<(), String> {
     let _operation = state
         .operation
@@ -641,13 +658,23 @@ pub async fn set_skill_active(
         skill(&id)?;
     }
     let store = state.database()?;
-    let mut ids = store.active_skills()?;
+    let conversation_id = conversation_id.filter(|id| !id.is_empty());
+    // With a conversation the toggle edits that conversation's selection
+    // (starting from the inherited global set on the first explicit change);
+    // without one it keeps updating the global default.
+    let mut ids = match &conversation_id {
+        Some(conversation_id) => store.active_skills_for(conversation_id)?,
+        None => store.active_skills()?,
+    };
     ids.retain(|value| value != &id);
     if active {
         ids.push(id);
     }
     skills.instructions(&ids)?;
-    store.save_active_skills(&ids)
+    match &conversation_id {
+        Some(conversation_id) => store.save_conversation_skills(conversation_id, &ids),
+        None => store.save_active_skills(&ids),
+    }
 }
 #[tauri::command]
 pub async fn read_skill_file(
@@ -683,6 +710,19 @@ pub async fn skill_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_dependency_notice_names_missing_capabilities() {
+        let statuses = vec![SkillDependencyStatus {
+            dependency: SkillDependency { kind: "externalCli".into(), name: "tvly".into(), detail: "Run Tavily CLI".into() },
+            satisfied: false,
+            remedy: "Install tvly separately.".into(),
+        }];
+        let notice = unavailable_dependency_notice("tavily-research", &statuses).unwrap();
+        assert!(notice.contains("tavily-research"));
+        assert!(notice.contains("tvly"));
+        assert!(notice.contains("Do not attempt"));
+        assert!(unavailable_dependency_notice("tavily-research", &[]).is_none());
+    }
     #[test]
     fn versioned_update_status_distinguishes_missing_stale_and_damaged_packages() {
         let temp = tempfile::tempdir().unwrap();

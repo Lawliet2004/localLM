@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { GitFork, RefreshCw, AlertTriangle } from 'lucide-react';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import type { SessionEvent } from '../lib/types';
+import { moveWithinGroup } from '../lib/roving';
 
 export type EventCategory = 'all' | 'model' | 'tool' | 'system' | 'error';
 
@@ -57,26 +58,29 @@ export function Trajectory({
   const [loading, setLoading] = useState(false);
   const [forkingSeq, setForkingSeq] = useState<number | null>(null);
 
-  async function load() {
-    if (!nativeAvailable || !conversationId || loading) return;
-    setLoading(true);
-    setError('');
+  const revision = useRef(0);
+  const [hasMore, setHasMore] = useState(false);
+  async function load(cursor = 0, append = false) {
+    if (!nativeAvailable || !conversationId) return;
+    const request = ++revision.current;
+    setLoading(true); setError('');
     try {
-      const items = await api.getSessionEvents(conversationId);
-      setEvents(items);
+      const items = await api.getSessionEvents(conversationId, cursor, 200);
+      if (request !== revision.current) return;
+      setEvents(current => append ? [...current, ...items] : items);
+      setHasMore(items.length === 200);
     } catch (e) {
-      setError(errorMessage(e));
+      if (request === revision.current) setError(errorMessage(e));
     } finally {
-      setLoading(false);
+      if (request === revision.current) setLoading(false);
     }
   }
 
   useEffect(() => {
-    if (open && conversationId) {
-      void load();
-    } else if (!conversationId) {
-      setEvents([]);
-    }
+    ++revision.current;
+    setEvents([]); setHasMore(false); setLoading(false);
+    if (open && conversationId) void load();
+    return () => { ++revision.current; };
   }, [conversationId, open]);
 
   async function handleFork(seq: number) {
@@ -118,20 +122,24 @@ export function Trajectory({
       onToggle={e => {
         const isOpen = (e.target as HTMLDetailsElement).open;
         setOpen(isOpen);
-        if (isOpen) void load();
+
       }}
     >
       <summary className="trajectory-summary">
-        <span>Trajectory{conversationId ? ` · ${events.length} events` : ''}</span>
+        <span>Trajectory{conversationId && events.length ? ` · ${events.length} events` : ''}</span>
       </summary>
 
       <div className="trajectory-body">
         <div className="trajectory-toolbar">
-          <div className="trajectory-categories" role="tablist" aria-label="Event category filters">
+          <div className="trajectory-categories" role="tablist" aria-label="Event category filters"
+            onKeyDown={event => moveWithinGroup(event, ['all', 'model', 'tool', 'system', 'error'] as const, category, setCategory)}>
             {(['all', 'model', 'tool', 'system', 'error'] as const).map(cat => (
               <button
                 key={cat}
                 type="button"
+                role="tab"
+                aria-selected={category === cat}
+                tabIndex={category === cat ? 0 : -1}
                 className={`trajectory-tab ${category === cat ? 'active' : ''}`}
                 onClick={() => setCategory(cat)}
               >
@@ -161,6 +169,7 @@ export function Trajectory({
           </div>
         </div>
 
+        {hasMore && <button type="button" className="secondary" disabled={loading} onClick={() => void load(events[events.length - 1].seq + 1, true)}>{loading ? 'Loading…' : 'Load more events'}</button>}
         {error && (
           <div className="trajectory-error" role="alert">
             <AlertTriangle size={14} />

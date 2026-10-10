@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub const TASKS_TABLE: &str = "research_tasks";
+
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -58,19 +58,6 @@ pub enum OperationStatus {
     /// Interrupted with an uncertain outcome: must NOT be auto-replayed.
     Unknown,
     Skipped,
-}
-
-impl OperationStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            OperationStatus::Pending => "pending",
-            OperationStatus::Running => "running",
-            OperationStatus::Completed => "completed",
-            OperationStatus::Failed => "failed",
-            OperationStatus::Unknown => "unknown",
-            OperationStatus::Skipped => "skipped",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -202,16 +189,18 @@ impl ResearchTask {
         self.operations.push(TaskOperation {
             id: format!("op_{}", uuid::Uuid::new_v4().simple()),
             kind: kind.to_string(),
-            status,
+            status: status.clone(),
             attempts: 1,
             result_summary: summary.clone(),
             error: None,
             updated_at: crate::store::now(),
         });
-        if let Some(summary) = summary {
-            self.completed_results.push(json!({"kind": kind, "summary": summary}));
+        if status == OperationStatus::Completed {
+            if let Some(summary) = summary {
+                self.completed_results.push(json!({"kind": kind, "summary": summary}));
+            }
+            self.pending_work.retain(|work| work != kind);
         }
-        self.pending_work.retain(|work| work != kind);
         self.updated_at = crate::store::now();
         !self.budget_exhausted()
     }
@@ -220,10 +209,6 @@ impl ResearchTask {
         let searches = self.operations.iter().filter(|op| op.kind == "search").count();
         let rounds = self.operations.len();
         searches >= self.budgets.max_searches || rounds >= self.budgets.max_rounds
-    }
-
-    pub fn elapsed_exhausted(&self) -> bool {
-        crate::store::now().saturating_sub(self.created_at) > (self.budgets.task_timeout_secs as i64) * 1000
     }
 
     pub fn pause(&mut self) -> Result<(), String> {
@@ -235,14 +220,13 @@ impl ResearchTask {
         Ok(())
     }
 
-    /// Pause at a tool boundary. The call is recorded and not started, so a
-    /// later restart can mark that in-flight row outcome-unknown.
+    /// A call paused before dispatch is known not to have started.
     pub fn pause_before_new_tool(&mut self, call_id: &str, call_name: &str) -> Result<(), String> {
         self.operations.push(TaskOperation {
             id: format!("op-{call_id}"),
             kind: call_name.to_string(),
-            status: OperationStatus::Running,
-            attempts: 1,
+            status: OperationStatus::Pending,
+            attempts: 0,
             result_summary: None,
             error: None,
             updated_at: crate::store::now(),
@@ -269,9 +253,11 @@ impl ResearchTask {
             return Err("Task already reached a terminal state.".into());
         }
         for op in &mut self.operations {
-            if matches!(op.status, OperationStatus::Running | OperationStatus::Pending) {
+            if op.status == OperationStatus::Running {
                 op.status = OperationStatus::Unknown;
                 op.error = Some("Cancelled; the action may already have changed data.".into());
+            } else if op.status == OperationStatus::Pending {
+                op.status = OperationStatus::Skipped;
             }
         }
         self.status = TaskStatus::Cancelled;
@@ -321,6 +307,53 @@ impl ResearchTask {
         let _ = self.restart_from_ledger();
     }
 
+    pub fn record_tool_result(&mut self, call_id: &str, name: &str, result: &Value, allowed: bool) {
+        let message = result.get("message").or_else(|| result.get("error")).and_then(Value::as_str).unwrap_or_default();
+        let status = if !allowed || result["skipped"] == true {
+            OperationStatus::Skipped
+        } else if result["outcome"] == "unknown" || (result["isError"] == true && crate::continuation::classify_execution_failure(message).ambiguous) {
+            OperationStatus::Unknown
+        } else if result["isError"] == true {
+            OperationStatus::Failed
+        } else {
+            OperationStatus::Completed
+        };
+        let id = format!("op-{call_id}");
+        let existing = self.operations.iter().position(|op| op.id == id);
+        let already_completed = existing.is_some_and(|i| self.operations[i].status == OperationStatus::Completed);
+        // Full output belongs in the tool audit/artifact, not in every ledger save.
+        let summary: String = result.to_string().chars().take(2000).collect();
+        let operation = TaskOperation {
+            id: id.clone(), kind: name.into(), status: status.clone(), attempts: existing.map(|index| self.operations[index].attempts).unwrap_or(usize::from(allowed)),
+            result_summary: (status == OperationStatus::Completed).then(|| summary.clone()),
+            error: (status != OperationStatus::Completed).then(|| message.chars().take(2000).collect()), updated_at: crate::store::now(),
+        };
+        if let Some(index) = existing { self.operations[index] = operation; } else { self.operations.push(operation); }
+        if status == OperationStatus::Completed && !already_completed {
+            self.completed_results.push(json!({"operationId":id,"kind":name,"summary":summary,"artifactId":result["_artifactId"]}));
+            self.pending_work.retain(|work| work != name);
+        }
+        self.updated_at = crate::store::now();
+    }
+
+    pub fn finish_turn(&mut self, message_status: &str) {
+        self.status = match message_status {
+            "complete" => TaskStatus::Completed,
+            "paused" => TaskStatus::Paused,
+            "interrupted" => TaskStatus::Cancelled,
+            _ => TaskStatus::Failed,
+        };
+        for operation in &mut self.operations {
+            if operation.status == OperationStatus::Running {
+                operation.status = OperationStatus::Unknown;
+                operation.error = Some("The turn ended before this operation settled. Do not automatically repeat it.".into());
+            } else if operation.status == OperationStatus::Pending && self.status != TaskStatus::Paused {
+                operation.status = OperationStatus::Skipped;
+            }
+        }
+        self.updated_at = crate::store::now();
+    }
+
     pub fn resumable_operations(&self) -> Vec<&TaskOperation> {
         self.operations
             .iter()
@@ -339,15 +372,6 @@ impl ResearchTask {
             "partialResults": self.completed_results.len(),
         })
     }
-}
-
-#[allow(dead_code)]
-fn _storage_contract() {
-    let _ = TASKS_TABLE;
-    let _ = TaskStatus::parse("running");
-    let _ = OperationStatus::Pending.as_str();
-    let task = ResearchTask::new("c", "q", TaskBudgets::default()).unwrap();
-    let _ = task.elapsed_exhausted();
 }
 
 /// Called from application startup and from `restart_generation`.
@@ -394,6 +418,50 @@ pub fn ensure_table(connection: &rusqlite::Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_failed_operations_are_not_completed_results() {
+        let mut task = ResearchTask::new("conv", "Research", TaskBudgets::default()).unwrap();
+        task.pending_work = vec!["search".into()];
+        task.checkpoint_operation("search", OperationStatus::Failed, Some("Provider unavailable".into()));
+        assert!(task.completed_results.is_empty());
+        assert_eq!(task.pending_work, vec!["search"]);
+    }
+
+    #[test]
+    fn audit_pausing_before_dispatch_preserves_known_pending_outcome() {
+        let mut task = ResearchTask::new("conv", "Research", TaskBudgets::default()).unwrap();
+        task.pause_before_new_tool("not-dispatched", "file_write").unwrap();
+        task.restart_from_ledger();
+        assert_eq!(task.operations[0].status, OperationStatus::Pending);
+        assert_eq!(task.operations[0].attempts, 0);
+        task.cancel().unwrap();
+        assert_eq!(task.operations[0].status, OperationStatus::Skipped);
+    }
+
+    #[test]
+    fn audit_turn_outcomes_settle_tasks_without_replaying_tools() {
+        for (message_status, task_status) in [("complete", TaskStatus::Completed), ("paused", TaskStatus::Paused), ("interrupted", TaskStatus::Cancelled), ("error", TaskStatus::Failed)] {
+            let mut task = ResearchTask::new("conv", "Research", TaskBudgets::default()).unwrap();
+            task.record_tool_result("failed", "search", &json!({"isError":true,"message":"Provider unavailable"}), true);
+            task.record_tool_result("denied", "write", &json!({"message":"Permission denied"}), false);
+            task.record_tool_result("success", "read", &json!({"content":"Evidence"}), true);
+            task.record_tool_result("success", "read", &json!({"content":"Evidence"}), true);
+            assert_eq!(task.operations[0].status, OperationStatus::Failed);
+            assert_eq!(task.operations[1].status, OperationStatus::Skipped);
+            assert_eq!(task.completed_results.len(), 1);
+            task.finish_turn(message_status);
+            assert_eq!(task.status, task_status);
+        }
+    }
+
+    #[test]
+    fn audit_ledger_keeps_large_results_bounded() {
+        let mut task = ResearchTask::new("conv", "Research", TaskBudgets::default()).unwrap();
+        task.record_tool_result("large", "read", &json!({"content":"界".repeat(100_000)}), true);
+        assert_eq!(task.operations[0].result_summary.as_ref().unwrap().chars().count(), 2000);
+        assert!(serde_json::to_string(&task).unwrap().len() < 16_000);
+    }
 
     #[test]
     fn checkpoint_pause_resume_cancel_flow() {

@@ -15,7 +15,13 @@ pub struct RuntimeStatus {
     pub phase: String,
     pub message: String,
     pub model_path: Option<String>,
+    /// The requested/saved configuration that was loaded.
     pub loaded_config: Option<RuntimeConfig>,
+    /// The effective launch configuration after resolve_launch_config; differs
+    /// from loaded_config on runtimes that need a concrete GPU layer count.
+    pub launch_config: Option<RuntimeConfig>,
+    /// The context the server reported through /props.
+    pub loaded_context: Option<u32>,
     pub gpu_offload: Option<GpuOffload>,
 }
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -57,6 +63,8 @@ impl Default for RuntimeStatus {
             message: "No model loaded".into(),
             model_path: None,
             loaded_config: None,
+            launch_config: None,
+            loaded_context: None,
             gpu_offload: None,
         }
     }
@@ -65,6 +73,8 @@ impl Default for RuntimeStatus {
 pub struct Runtime {
     child: Option<Box<dyn ChildWrapper>>,
     pub status: RuntimeStatus,
+    /// Last status, readable while the runtime lock is held by a load.
+    published: std::sync::Arc<std::sync::Mutex<RuntimeStatus>>,
     pub endpoint: String,
     pub api_key: String,
     pub context_length: u32,
@@ -74,10 +84,27 @@ pub struct Runtime {
     log_tasks: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 impl Runtime {
+    /// Bounded tail of the runtime's stderr log — load-failure diagnostics
+    /// (OOM, missing CUDA) live here, not in the status message.
+    pub fn log_tail(&self, max_bytes: u64) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match std::fs::File::open(&self.log_path) {
+            Ok(file) => file,
+            Err(_) => return String::new(),
+        };
+        let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let start = size.saturating_sub(max_bytes);
+        let _ = file.seek(SeekFrom::Start(start));
+        let mut buffer = Vec::new();
+        let _ = file.read_to_end(&mut buffer);
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
     pub fn new(log_path: PathBuf) -> Self {
         Self {
             child: None,
             status: RuntimeStatus::default(),
+            published: std::sync::Arc::new(std::sync::Mutex::new(RuntimeStatus::default())),
             endpoint: String::new(),
             api_key: String::new(),
             context_length: 0,
@@ -85,6 +112,17 @@ impl Runtime {
             log_path,
             log_tasks: Vec::new(),
         }
+    }
+    /// A snapshot readable without the tokio lock (e.g. while a load holds it).
+    pub fn published(&self) -> std::sync::Arc<std::sync::Mutex<RuntimeStatus>> {
+        self.published.clone()
+    }
+    fn publish(&mut self) {
+        let mut slot = self
+            .published
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *slot = self.status.clone();
     }
     pub fn inspect(&mut self) -> RuntimeStatus {
         if let Some(child) = &mut self.child {
@@ -98,7 +136,11 @@ impl Runtime {
                             self.log_path.display()
                         ),
                         model_path: None,
-                        loaded_config: None,
+                        // Keep the config that was running: a mid-turn crash
+                        // reloads from it. Cleared on unload or a failed load.
+                        loaded_config: self.status.loaded_config.clone(),
+                        launch_config: self.status.launch_config.clone(),
+                        loaded_context: self.status.loaded_context,
                         gpu_offload: None,
                     };
                 }
@@ -108,6 +150,7 @@ impl Runtime {
                 Ok(None) => {}
             }
         }
+        self.publish();
         self.status.clone()
     }
     pub async fn stop(&mut self) -> Result<RuntimeStatus, String> {
@@ -128,6 +171,7 @@ impl Runtime {
         self.api_key.clear();
         self.endpoint.clear();
         self.supports_images = false;
+        self.publish();
         Ok(self.status.clone())
     }
     pub async fn load(
@@ -180,9 +224,6 @@ impl Runtime {
             // Newer llama-server may auto-discover an mmproj beside the GGUF.
             command.arg("--no-mmproj");
         }
-        if let Some(arguments) = crate::experimental::bonsai::launch_arguments(&model, &executable) {
-            command.args(arguments);
-        }
         command.args([
                 "--host",
                 "127.0.0.1",
@@ -195,6 +236,9 @@ impl Runtime {
             ]);
         if flags.fit {
             command.arg("--fit").arg(if config.automatic_gpu() { "on" } else { "off" });
+            if config.automatic_gpu() && model.file_name().is_some_and(|name| name == "K2-Horizon-4B-Q4_K_M.gguf") {
+                command.arg("--fit-ctx").arg(config.context_length.to_string());
+            }
         }
         command
             .env("LLAMA_API_KEY", &self.api_key)
@@ -241,8 +285,11 @@ impl Runtime {
             // a false model mismatch after every successful load.
             model_path: Some(preferences.model_path.clone()),
             loaded_config: None,
+            launch_config: None,
+            loaded_context: None,
             gpu_offload: None,
         };
+        self.publish();
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(2))
@@ -263,9 +310,17 @@ impl Runtime {
                     if let Ok(health) = client.get(format!("{}/health", self.endpoint)).send().await
                     {
                         if health.status().is_success() {
-                            self.context_length = config.context_length;
+                            self.context_length = match client.get(format!("{}/props", self.endpoint))
+                                .bearer_auth(&self.api_key).send().await {
+                                Ok(response) if response.status().is_success() => response.json::<serde_json::Value>().await.ok()
+                                    .and_then(|props| props["default_generation_settings"]["n_ctx"].as_u64())
+                                    .and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0).unwrap_or(config.context_length),
+                                _ => config.context_length,
+                            };
                             self.supports_images = projector.is_some();
                             self.status.loaded_config = Some(config.clone());
+                            self.status.launch_config = Some(launch.clone());
+                            self.status.loaded_context = Some(self.context_length);
                             self.status.gpu_offload = read_offload(&self.log_path);
                             self.status.phase = "ready".into();
                             self.status.message = if projector.is_some() {
@@ -273,6 +328,7 @@ impl Runtime {
                             } else {
                                 "Model ready".into()
                             };
+                            self.publish();
                             return Ok(self.status.clone());
                         }
                     }
@@ -283,6 +339,7 @@ impl Runtime {
         self.stop().await?;
         self.status.phase = "error".into();
         self.status.message = format!("Model startup timed out. See {}", self.log_path.display());
+        self.publish();
         Err(self.status.message.clone())
     }
 }

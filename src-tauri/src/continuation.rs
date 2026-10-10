@@ -32,12 +32,17 @@ pub fn classify_execution_failure(message: &str) -> FailureClass {
             || lower.contains("timeout")
             || lower.contains("may already have changed")
             || lower.contains("may be incomplete"));
+    let permanently_unavailable = lower.contains("docker is not available")
+        || lower.contains("not installed")
+        || lower.contains("does not exist here")
+        || lower.contains("failed to start (permanent")
+        || lower.contains("research worker stdout exceeded")
+        || lower.contains("research worker stderr exceeded")
+        || lower.contains("not configured");
     FailureClass {
-        retryable: !denied && !ambiguous,
+        retryable: !denied && !ambiguous && !permanently_unavailable,
         side_effect: if ambiguous {
             SideEffect::Possible
-        } else if denied {
-            SideEffect::None
         } else {
             SideEffect::None
         },
@@ -141,7 +146,7 @@ pub fn continuation_after_tool(
     if result["isError"] == Value::Bool(true) {
         let message = result["message"].as_str().unwrap_or("Tool failed.");
         let class = classify_execution_failure(message);
-        if class.denied || class.ambiguous {
+        if !class.retryable {
             return Continuation::Stop {
                 message: message.to_string(),
                 retryable: false,
@@ -197,6 +202,7 @@ pub fn malformed_call_disposition(valid: bool, repairs_used: u32, error: &str) -
 
 /// Research worker output is evidence for the main model, not a second answer.
 pub fn as_research_evidence(mut value: Value) -> Value {
+    if value["isError"] == Value::Bool(true) { return value; }
     if let Some(answer) = value.get("answer").cloned() {
         if !answer.is_null() {
             value["evidence"] = answer;
@@ -206,8 +212,10 @@ pub fn as_research_evidence(mut value: Value) -> Value {
     value
 }
 
+/// Stable per-call identity for blocked-call tracking. Canonical serialization
+/// means reordered object keys cannot produce a different signature.
 pub fn call_signature(name: &str, arguments: &Value) -> String {
-    format!("{name}:{}", arguments)
+    format!("{name}:{}", crate::sandbox::canonical_json(arguments))
 }
 
 #[cfg(test)]
@@ -238,6 +246,11 @@ mod tests {
         let result = json!({"isError": true, "message": "Page unavailable: HTTP 404"});
         let next = continuation_after_tool(false, "web_read", &result, &Budgets::default(), 0, false);
         assert!(matches!(next, Continuation::Proceed { .. }));
+    }
+    #[test]
+    fn research_error_is_never_copied_into_evidence() {
+        let result = as_research_evidence(json!({"isError":true,"answer":"Search backend unavailable"}));
+        assert!(result.get("evidence").is_none());
     }
 
     #[test]
@@ -280,6 +293,25 @@ mod tests {
             false,
         );
         assert!(matches!(denial, Continuation::Stop { retryable: false, .. }));
+    }
+    #[test]
+    fn missing_local_capability_is_not_retried() {
+        for message in ["Docker is not available", "tvly is not installed", "Tool 'tavily' does not exist here"] {
+            let failure = classify_execution_failure(message);
+            assert!(!failure.retryable, "{message}");
+            assert!(!failure.ambiguous, "{message}");
+            assert!(matches!(continuation_after_tool(false, "docker_exec", &json!({"isError":true,"message":message}), &Budgets::default(), 0, false), Continuation::Stop { retryable: false, .. }));
+        }
+    }
+
+    #[test]
+    fn worker_timeouts_and_output_limits_are_not_retried() {
+        let timeout = classify_execution_failure("Research worker timed out after 90s.");
+        assert!(timeout.ambiguous && !timeout.retryable);
+        for stream in ["stdout", "stderr"] {
+            let failure = classify_execution_failure(&format!("Research worker {stream} exceeded 64000 bytes."));
+            assert!(!failure.ambiguous && !failure.retryable);
+        }
     }
 
     #[test]

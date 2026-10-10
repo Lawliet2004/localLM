@@ -28,6 +28,7 @@ if (!args.length || args.includes('--help')) {
     config:{...config,enabled},databasePath:resolve('.local/web-research.sqlite'),
     localModel:process.env.LOCAL_LLM_BASE_URL?{baseUrl:process.env.LOCAL_LLM_BASE_URL,modelName:process.env.LOCAL_LLM_MODEL}:undefined}));
   let output='';
+  child.stdout.setEncoding('utf8');
   for await(const chunk of child.stdout) output+=chunk;
   const code=await new Promise(resolve=>child.on('close',resolve));
   if(code!==0) process.exitCode=1;

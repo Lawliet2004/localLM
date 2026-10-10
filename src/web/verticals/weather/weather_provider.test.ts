@@ -11,6 +11,9 @@ describe('Weather Vertical Provider', () => {
     expect(provider.extractLocation('What is the weather in Ranaghat today?')).toBe('Ranaghat');
     expect(provider.extractLocation('Current temperature in Tokyo')).toBe('Tokyo');
     expect(provider.extractLocation('Weather report for London UK tonight')).toBe('London UK');
+    expect(provider.extractLocation('What is the weather of Kolkata?')).toBe('Kolkata');
+    expect(provider.extractLocation('What is the current weather report data for Kolkata?')).toBe('Kolkata');
+    expect(provider.extractLocation("What is today's weather report for Kolkata?\n- Max temperature\n- Rain chance")).toBe('Kolkata');
   });
 
   it('returns compact structured weather report', async () => {
@@ -25,4 +28,12 @@ describe('Weather Vertical Provider', () => {
     // Compact: under 100 words
     expect(evidenceText.split(/\s+/).length).toBeLessThan(100);
   }, 15000);
+
+  it('resolves the common Kokata spelling to Kolkata before geocoding', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    await provider.execute('What is the weather of Kokata?');
+    expect(fetchSpy.mock.calls[0][0]).toContain('name=Kolkata');
+    await provider.geocode('Kokata, Bolivia');
+    expect(fetchSpy.mock.calls[2][0]).toContain('name=Kokata%2C%20Bolivia');
+  });
 });

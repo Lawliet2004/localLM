@@ -12,8 +12,11 @@ describe('Result Deduplicator', () => {
   });
 
   it('computes Levenshtein similarity', () => {
-    const sim = levenshteinSimilarity('hello world', 'hello world');
-    expect(sim).toBe(1.0);
+    expect(levenshteinSimilarity('hello world', 'hello world')).toBe(1);
+    expect(levenshteinSimilarity('kitten', 'sitting')).toBeCloseTo(4 / 7);
+    expect(levenshteinSimilarity('sitting', 'kitten')).toBeCloseTo(4 / 7);
+    expect(levenshteinSimilarity('', 'hello')).toBe(0);
+    expect(levenshteinSimilarity(' ALPHA ', 'alpha')).toBe(1);
   });
 
   it('deduplicates identical normalized URLs and merges query IDs', () => {

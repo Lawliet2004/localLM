@@ -24,23 +24,3 @@ export function fallbackSnippetExtraction(
     tables: [],
   };
 }
-
-export function ensureSufficientExtraction(
-  result: ExtractionResult,
-  fallbackSnippet?: string,
-  fallbackTitle?: string
-): ExtractionResult {
-  if (result.characters >= 150) {
-    return result;
-  }
-
-  if (fallbackSnippet && fallbackSnippet.trim().length > 0) {
-    return fallbackSnippetExtraction(
-      result.title || fallbackTitle || 'Web Result',
-      fallbackSnippet,
-      result.canonicalUrl || ''
-    );
-  }
-
-  return result;
-}

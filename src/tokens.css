@@ -1,107 +1,246 @@
 /* ------------------------------------------------------------------
-   LocalLM design tokens
-   Dark-first palette: deep layered neutrals, emerald brand accent.
+   LocalLM design tokens — Darkroom.
+   Warm umber-black layers under one safelight accent. The accent marks
+   only where you are and what is live. Stocks are neutral palettes
+   (html[data-stock]); safelights are accent palettes (html[data-accent]).
+   Scale attributes (density, contrast, motion, radius) are independent.
 ------------------------------------------------------------------- */
 :root {
   color-scheme: dark;
 
   /* Typography */
-  --font-sans: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif;
-  --font-mono: 'Cascadia Code', 'JetBrains Mono', Consolas, 'Liberation Mono', monospace;
+  --font-sans: 'Segoe UI Variable Text', 'Segoe UI Variable', 'Segoe UI', 'Inter', system-ui, -apple-system, sans-serif;
+  --font-serif: 'Sitka Text', Charter, 'Iowan Old Style', Georgia, serif;
+  --font-code: 'Cascadia Code', 'JetBrains Mono', Consolas, 'Liberation Mono', monospace;
+  --font-mono: var(--font-code, 'Cascadia Code', 'JetBrains Mono', Consolas, 'Liberation Mono', monospace);
+  --font-chat: var(--font-sans);
+  --code-ligatures: normal;
 
-  /* Surfaces — darkest at the edges, lighter as layers rise */
-  --background: #0a0c11;
-  --sidebar: #07090d;
-  --surface: #10141c;
-  --input: #12161f;
-  --elevated: #171c27;
-  --overlay: #1c222e;
+  /* Scale variables (applyAppearance sets these inline on <html>) */
+  --ui-scale: 1;
+  --radius-scale: 1;
+  --chat-font-size: 15px;
+  --chat-line-height: 1.7;
+  --chat-width: 760px;
+  --accent-custom: #f08a3c;
 
-  /* Text */
-  --text: #eceef4;
-  --foreground: #eceef4;
-  --secondary: #9aa2b4;
-  --muted: #676f84;
+  --text-xs: calc(11.5px * var(--ui-scale, 1));
+  --text-sm: calc(12.5px * var(--ui-scale, 1));
+  --text-md: calc(13.5px * var(--ui-scale, 1));
+  --text-lg: calc(15px * var(--ui-scale, 1));
+  --text-xl: calc(20px * var(--ui-scale, 1));
+  --text-2xl: calc(24px * var(--ui-scale, 1));
 
-  /* Lines & fills */
-  --border: #1d2330;
-  --border-strong: #2c3346;
-  --hover: #1a2029;
-  --active: #212839;
-
-  /* Brand & semantic */
-  --accent: #34d399;
-  --accent-strong: #6ee7b7;
-  --accent-subtle: #34d39914;
-  --accent-soft: #34d39921;
-  --accent-2: #818cf8;
-  --accent-3: #22d3ee;
-  --warn: #fbbf24;
-  --grad-accent: linear-gradient(135deg, var(--accent) 0%, var(--accent-3) 100%);
-  --folder: #d9a45b;
-  --focus-border: #34d399;
-
-  /* Buttons */
-  --button-bg: #f2f4f9;
-  --button-text: #11141b;
-
-  /* Feedback */
-  --error: #f87171;
-  --error-bg: #3a1518;
-  --error-subtle: #f8717114;
-
-  /* Radius scale */
-  --radius-xs: 5px;
-  --radius-sm: 8px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
-  --radius-xl: 20px;
+  /* Radius */
+  --radius-xs: calc(5px * var(--radius-scale, 1));
+  --radius-sm: calc(7px * var(--radius-scale, 1));
+  --radius-md: calc(10px * var(--radius-scale, 1));
+  --radius-lg: calc(14px * var(--radius-scale, 1));
+  --radius-xl: calc(18px * var(--radius-scale, 1));
   --radius-pill: 999px;
 
-  /* Elevation */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .28);
-  --shadow-md: 0 8px 28px rgba(0, 0, 0, .36);
-  --shadow-lg: 0 20px 56px rgba(0, 0, 0, .5);
+  /* Density (comfortable defaults; [data-density] overrides) */
+  --row-h: 30px;
+  --turn-gap: 40px;
+  --row-pad-y: 12px;
+
+  /* Surfaces — umber stock (the default dark) */
+  --sidebar: #110f0d;
+  --background: #161310;
+  --surface: #1d1915;
+  --input: #1a1612;
+  --elevated: #231e19;
+  --overlay: #29231d;
+  --code-bg: #100e0c;
+  --border: #29241e;
+  --border-strong: #3a322a;
+  --hover: #211c17;
+  --active: #2b251f;
+  --text: #efe7db;
+  --foreground: #efe7db;
+  --secondary: #b8ad9e;
+  --muted: #8f8576;
+  --chat-user-bubble: #262019;
+
+  /* Safelight — amber (the default accent) */
+  --accent: #f08a3c;
+  --accent-strong: #ffab6e;
+  --accent-subtle: color-mix(in srgb, var(--accent) 9%, transparent);
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-2: var(--accent);
+  --accent-3: var(--accent);
+  --grad-accent: var(--accent);
+  --folder: #b9a27d;
+  --focus-border: color-mix(in srgb, var(--accent) 45%, var(--border-strong));
+
+  /* Semantic */
+  --success: #6cc08f;
+  --success-subtle: color-mix(in srgb, var(--success) 10%, transparent);
+  --warn: #e3b94f;
+  --warn-subtle: color-mix(in srgb, var(--warn) 10%, transparent);
+  --error: #ec7f76;
+  --error-bg: #34201e;
+  --error-subtle: color-mix(in srgb, var(--error) 10%, transparent);
+
+  /* Buttons — primary is inverted ink */
+  --button-bg: var(--text);
+  --button-text: var(--background);
+
+  /* Elevation — menus and dialogs only */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, .35);
+  --shadow-lg: 0 18px 48px rgba(0, 0, 0, .45);
   --ring: 0 0 0 3px var(--accent-subtle);
   --ring-strong: 0 0 0 2px var(--accent);
 
   /* Motion */
-  --dur: .16s;
-  --ease: cubic-bezier(.22, .68, .32, 1);
+  --dur: .15s;
+  --ease: cubic-bezier(.22, 1, .36, 1);
+
+  /* Trace (agent work) */
+  --trace-line: var(--border-strong);
+  --trace-text: var(--secondary);
+  --trace-text-strong: var(--text);
+  --trace-panel-bg: var(--code-bg);
+  --trace-panel-border: var(--border);
+  --trace-emerald: var(--success);
+  --trace-red: var(--error);
+  --trace-amber: var(--warn);
+  --trace-blue: var(--accent);
+  --trace-sky: var(--accent);
+  --trace-violet: var(--accent);
+
+  /* Chat */
+  --chat-canvas: var(--background);
 }
+
+/* ------------------------------------------------------------------
+   Stocks. Bare attribute selectors so a swatch marked data-stock in the
+   Appearance proof previews the real palette on any element. Each stock
+   carries its own color-scheme, independent of data-theme.
+------------------------------------------------------------------- */
+[data-stock=umber] {
+  color-scheme: dark;
+  --sidebar: #110f0d; --background: #161310; --surface: #1d1915; --input: #1a1612;
+  --elevated: #231e19; --overlay: #29231d; --code-bg: #100e0c;
+  --border: #29241e; --border-strong: #3a322a; --hover: #211c17; --active: #2b251f;
+  --text: #efe7db; --foreground: #efe7db; --secondary: #b8ad9e; --muted: #8f8576;
+  --chat-user-bubble: #262019; --chat-canvas: var(--background);
+}
+[data-stock=graphite] {
+  color-scheme: dark;
+  --sidebar: #161615; --background: #1b1b1a; --surface: #222221; --input: #1f1f1e;
+  --elevated: #282827; --overlay: #2d2d2b; --code-bg: #171716;
+  --border: #2b2b29; --border-strong: #3a3a37; --hover: #272726; --active: #30302e;
+  --text: #ecebe8; --foreground: #ecebe8; --secondary: #b0afa9; --muted: #8a8983;
+  --chat-user-bubble: #2a2a28; --chat-canvas: var(--background);
+}
+[data-stock=ink] {
+  color-scheme: dark;
+  --sidebar: #0e1014; --background: #12151a; --surface: #191d23; --input: #161a1f;
+  --elevated: #1f242b; --overlay: #252a32; --code-bg: #0d0f12;
+  --border: #232830; --border-strong: #333a44; --hover: #1b1f26; --active: #242a32;
+  --text: #e6e9ee; --foreground: #e6e9ee; --secondary: #a9b0bb; --muted: #838b97;
+  --chat-user-bubble: #20252d; --chat-canvas: var(--background);
+}
+[data-stock=pitch] {
+  color-scheme: dark;
+  --sidebar: #000000; --background: #050505; --surface: #0e0e0e; --input: #0a0a0a;
+  --elevated: #151515; --overlay: #1b1b1b; --code-bg: #000000;
+  --border: #1e1e1e; --border-strong: #2e2e2e; --hover: #141414; --active: #1f1f1f;
+  --text: #ededed; --foreground: #ededed; --secondary: #b0b0b0; --muted: #8a8a8a;
+  --chat-user-bubble: #181818; --chat-canvas: var(--background);
+}
+[data-stock=fiber] {
+  color-scheme: light;
+  --sidebar: #efe9df; --background: #f7f3ec; --surface: #fdfbf7; --input: #fffdf9;
+  --elevated: #fffdf9; --overlay: #ffffff; --code-bg: #efeae1;
+  --border: #e3dccf; --border-strong: #d2c9b9; --hover: #ebe5da; --active: #e2dacd;
+  --text: #1f1a14; --foreground: #1f1a14; --secondary: #574e43; --muted: #6e6558;
+  --chat-user-bubble: #ebe4d8; --chat-canvas: var(--background);
+}
+[data-stock=glossy] {
+  color-scheme: light;
+  --sidebar: #f2f2ef; --background: #fafaf8; --surface: #ffffff; --input: #ffffff;
+  --elevated: #ffffff; --overlay: #ffffff; --code-bg: #f4f4f1;
+  --border: #e6e5e0; --border-strong: #d3d2cc; --hover: #efefeb; --active: #e6e6e1;
+  --text: #1d1d1b; --foreground: #1d1d1b; --secondary: #55554f; --muted: #6f6f68;
+  --chat-user-bubble: #efefeb; --chat-canvas: var(--background);
+}
+[data-stock=cool] {
+  color-scheme: light;
+  --sidebar: #eef1f5; --background: #f6f8fb; --surface: #ffffff; --input: #ffffff;
+  --elevated: #ffffff; --overlay: #ffffff; --code-bg: #eef1f5;
+  --border: #dfe4eb; --border-strong: #cbd2dc; --hover: #e9edf2; --active: #dfe5ec;
+  --text: #161a20; --foreground: #161a20; --secondary: #4d5562; --muted: #636c79;
+  --chat-user-bubble: #e8edf3; --chat-canvas: var(--background);
+}
+
+/* Light-mode semantic, buttons, and elevation follow the resolved theme. */
 :root[data-theme=light] {
   color-scheme: light;
-  --background: #f5f6f3;
-  --sidebar: #eceee8;
-  --surface: #ffffff;
-  --input: #ffffff;
-  --elevated: #ffffff;
-  --overlay: #ffffff;
-  --text: #22261f;
-  --foreground: #22261f;
-  --secondary: #4e564d;
-  --muted: #707769;
-  --border: #e0e3da;
-  --border-strong: #c8cdc0;
-  --hover: #e9ece2;
-  --active: #dde1d3;
-  --accent: #2e7d52;
-  --accent-strong: #1d6a44;
-  --accent-subtle: #2e7d5212;
-  --accent-soft: #2e7d521f;
-  --accent-2: #6366f1;
-  --accent-3: #0891b2;
-  --warn: #b45309;
-  --grad-accent: linear-gradient(135deg, var(--accent) 0%, var(--accent-3) 100%);
-  --folder: #b07f2e;
-  --focus-border: #7a8d7d;
-  --button-bg: #2c4634;
-  --button-text: #ffffff;
-  --error: #9d3731;
-  --error-bg: #fae9e5;
-  --error-subtle: #9d373114;
-  --shadow-sm: 0 1px 2px rgba(30, 35, 28, .08);
-  --shadow-md: 0 8px 24px rgba(30, 35, 28, .1);
-  --shadow-lg: 0 18px 48px rgba(30, 35, 28, .16);
-  --ring: 0 0 0 3px var(--accent-subtle);
+  --folder: #8f7447;
+  --success: #2f8a57;
+  --warn: #8f6a00;
+  --error: #b8433a;
+  --error-bg: #fbecea;
+  --shadow-sm: 0 1px 2px rgba(30, 30, 25, .06);
+  --shadow-md: 0 8px 24px rgba(30, 30, 25, .08);
+  --shadow-lg: 0 18px 48px rgba(30, 30, 25, .14);
+}
+
+/* ------------------------------------------------------------------
+   Safelights. [data-accent] re-derives the tints in that element's
+   context, so a swatch preview shows the real accent. Dark values are
+   the base; light values apply under data-theme=light.
+------------------------------------------------------------------- */
+[data-accent] {
+  --accent-subtle: color-mix(in srgb, var(--accent) 9%, transparent);
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --focus-border: color-mix(in srgb, var(--accent) 45%, var(--border-strong));
+}
+[data-accent=amber] { --accent: #f08a3c; --accent-strong: #ffab6e; }
+[data-accent=ruby] { --accent: #ff7a5c; --accent-strong: #ff9e86; }
+[data-accent=sodium] { --accent: #e9c64a; --accent-strong: #f5d978; }
+[data-accent=cyan] { --accent: #5cc8d6; --accent-strong: #8adbe5; }
+[data-accent=iris] { --accent: #8ea4ff; --accent-strong: #b3c1ff; }
+[data-accent=custom] {
+  --accent: var(--accent-custom, #f08a3c);
+  --accent-strong: color-mix(in srgb, var(--accent-custom, #f08a3c) 75%, #fff);
+}
+:root[data-theme=light][data-accent=amber], :root[data-theme=light] [data-accent=amber] { --accent: #b2530f; --accent-strong: #8f420a; }
+:root[data-theme=light][data-accent=ruby], :root[data-theme=light] [data-accent=ruby] { --accent: #c0391f; --accent-strong: #9e2c15; }
+:root[data-theme=light][data-accent=sodium], :root[data-theme=light] [data-accent=sodium] { --accent: #8a6d00; --accent-strong: #6e5600; }
+:root[data-theme=light][data-accent=cyan], :root[data-theme=light] [data-accent=cyan] { --accent: #0f7d8c; --accent-strong: #0b6672; }
+:root[data-theme=light][data-accent=iris], :root[data-theme=light] [data-accent=iris] { --accent: #3f5fd6; --accent-strong: #2f4bb8; }
+:root[data-theme=light][data-accent=custom], :root[data-theme=light] [data-accent=custom] {
+  --accent: color-mix(in srgb, var(--accent-custom, #b2530f) 72%, #000);
+  --accent-strong: color-mix(in srgb, var(--accent-custom, #b2530f) 58%, #000);
+}
+
+/* Density */
+[data-density=compact] { --row-h: 26px; --turn-gap: 28px; --row-pad-y: 8px; }
+[data-density=spacious] { --row-h: 36px; --turn-gap: 56px; --row-pad-y: 16px; }
+
+/* Contrast */
+:root[data-contrast=high] {
+  --secondary: color-mix(in srgb, var(--text) 88%, var(--background));
+  --muted: color-mix(in srgb, var(--text) 74%, var(--background));
+  --border: var(--border-strong);
+}
+
+/* Motion: reduced kills transitions and animations everywhere; system
+   follows the OS preference. 'full' never reduces. */
+:root[data-motion=reduced] *, :root[data-motion=reduced] *::before, :root[data-motion=reduced] *::after {
+  animation-duration: .001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: .001ms !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-motion=system] *, :root[data-motion=system] *::before, :root[data-motion=system] *::after,
+  :root:not([data-motion]) *, :root:not([data-motion]) *::before, :root:not([data-motion]) *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
 }

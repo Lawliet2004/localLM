@@ -1,9 +1,5 @@
 //! Hugging Face discovery and a disk-backed library. Only verified weights are published.
-use crate::{
-    download,
-    model_install::{RunGuard, Status},
-    AppState,
-};
+use crate::{download, model_install::Status, AppState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -47,6 +43,15 @@ pub struct InstalledModel {
     pub projector_filename: Option<String>,
     #[serde(default)]
     pub projector_path: Option<String>,
+    #[serde(default)]
+    pub external: bool,
+    /// Basename, bytes and sha256 of every weight shard and the projector,
+    /// written into model.json at publish time.
+    #[serde(default)]
+    pub expected: Vec<HubFile>,
+    /// Computed at scan time; the value stored on disk is never trusted.
+    #[serde(default)]
+    pub verified: bool,
 }
 
 /// An mmproj/vision-projector companion for a multimodal GGUF model.
@@ -289,26 +294,11 @@ pub async fn download_hugging_face_model(
     token: Option<String>,
     projector: Option<String>,
 ) -> Result<Status, String> {
-    let _operation = state
-        .installation_operation
-        .try_lock()
-        .map_err(|_| "Another model or runtime installation is running.")?;
     let installer = &state.model_installer;
-    let (sender, receiver) = tokio::sync::watch::channel(false);
-    {
-        let mut inner = installer
-            .inner
-            .lock()
-            .map_err(|_| "Installer unavailable.")?;
-        inner.0 = Status {
-            busy: true,
-            phase: "resolving".into(),
-            ..Default::default()
-        };
-        inner.1 = Some(sender);
-    }
-    let _guard = RunGuard(installer);
+    let key = format!("model:hf:{repo}@{revision}:{filename}");
+    let (_guard, receiver, _job_id) = installer.begin(&key, &filename)?;
     let result = async {
+        installer.update(|status| status.phase = "resolving".into());
         let catalog = tokio::select! {
             result = repository(repo, Some(&revision), token.as_deref()) => result?,
             _ = async { let mut cancel = receiver.clone(); let _ = cancel.changed().await; } => return Err("Download cancelled.".into()),
@@ -348,15 +338,23 @@ pub async fn download_hugging_face_model(
             already = already.saturating_add(have);
             n.checked_add(f.bytes.saturating_sub(have)).ok_or("Model size overflow.")
         })?;
+        let download_files: Vec<HubFile> = pending.iter().map(|f| (*f).clone()).collect();
         write_download_state(&directory, &DownloadState {
             repo: catalog.repo.clone(), revision: catalog.revision.clone(),
             filename: files[0].filename.clone(), bytes: total, sha256: files[0].sha256.clone(), received: already,
             projector: projector_file.map(|p| p.filename.clone()),
+            files: download_files,
+        })?;
+        installer.update(|status| {
+            status.path = Some(directory.join(files[0].filename.rsplit('/').next().unwrap()).to_string_lossy().into_owned());
+            status.total = total;
+            status.received = already;
+            status.saved = already;
+            status.asset_count = pending.len() as u32;
+            status.phase = if already > 0 { "resuming".into() } else { "downloading".into() };
         });
-        { let mut inner = installer.inner.lock().map_err(|_| "Installer unavailable.")?;
-          inner.0.path = Some(directory.join(files[0].filename.rsplit('/').next().unwrap()).to_string_lossy().into_owned());
-          inner.0.total = total; inner.0.received = already; inner.0.phase = if already > 0 { "resuming".into() } else { "downloading".into() }; }
-        if needed > 0 && download::available_space(&directory)? < download::required_space(needed)? { return Err("Not enough disk space for this model and verification overhead.".into()); }
+        let space = download::storage(&directory, needed, 0)?;
+        if space.available < space.required { return Err("Not enough disk space for this model and verification overhead.".into()); }
         let mut builder = reqwest::Client::builder().https_only(true).connect_timeout(Duration::from_secs(15)).timeout(Duration::from_secs(7200));
         if let Some(token) = token.as_deref().filter(|s| !s.is_empty()) {
             let mut headers = reqwest::header::HeaderMap::new();
@@ -366,26 +364,37 @@ pub async fn download_hugging_face_model(
         let client = builder.build().map_err(|_| "Could not initialize downloader.")?;
         let mut finished = 0;
         let mut paths = Vec::new();
-        for file in pending {
+        for (index, file) in pending.iter().enumerate() {
             let basename = file.filename.rsplit('/').next().unwrap();
             let path = directory.join(basename);
             if path.exists() && !std::fs::canonicalize(&path).map_err(|e| e.to_string())?.starts_with(&directory) { return Err("Model file resolves outside managed storage.".into()); }
             let url = format!("https://huggingface.co/{}/resolve/{}/{}", catalog.repo, catalog.revision, file.filename);
             let asset = download::Asset { url: &url, bytes: file.bytes, sha256: &file.sha256 };
             let have = std::fs::metadata(download::partial_path(&path)).map(|m| m.len()).unwrap_or(0);
-            { let mut inner = installer.inner.lock().map_err(|_| "Installer unavailable.")?;
-              inner.0.total = total;
-              inner.0.phase = if path.exists() { "verifying".into() } else if have > 0 { "resuming".into() } else { "downloading".into() }; }
-            let progress = |received| { if let Ok(mut inner) = installer.inner.lock() { inner.0.received = finished + received; } };
-            if path.exists() { download::verify_file(&path, &asset, receiver.clone(), progress).await?; }
-            else if let Err(error) = download::fetch(&client, &asset, &path, receiver.clone(), progress).await {
+            let exists = path.exists();
+            installer.update(|status| {
+                status.asset = Some(basename.to_owned());
+                status.asset_index = index as u32 + 1;
+                status.asset_total = file.bytes;
+                status.asset_received = if exists { 0 } else { have.min(file.bytes) };
+                status.phase = if exists { "verifying".into() } else if have > 0 { "resuming".into() } else { "downloading".into() };
+            });
+            if exists {
+                download::verify_file(&path, &asset, receiver.clone(), |n| {
+                    installer.update(|status| {
+                        status.asset_received = n;
+                        status.received = finished + n;
+                    });
+                }).await?;
+            } else if let Err(error) = download::fetch(&client, &asset, &path, receiver.clone(), |event| installer.progress(finished, event)).await {
                 let saved = std::fs::metadata(download::partial_path(&path)).map(|m| m.len()).unwrap_or(0);
                 write_download_state(&directory, &DownloadState {
                     repo: catalog.repo.clone(), revision: catalog.revision.clone(),
                     filename: files[0].filename.clone(), bytes: total, sha256: files[0].sha256.clone(),
                     received: finished + saved,
                     projector: projector_file.map(|p| p.filename.clone()),
-                });
+                    files: pending.iter().map(|f| (*f).clone()).collect(),
+                })?;
                 return Err(error);
             }
             finished += file.bytes;
@@ -401,10 +410,18 @@ pub async fn download_hugging_face_model(
         }
         let weight_first = weight_paths.first().cloned().unwrap_or_else(|| paths[0].clone());
         let weight_bytes = total.saturating_sub(projector_file.map(|p| if projector_in_weights { 0 } else { p.bytes }).unwrap_or(0));
+        let expected: Vec<HubFile> = pending
+            .iter()
+            .map(|f| HubFile {
+                filename: f.filename.rsplit('/').next().unwrap_or(&f.filename).to_owned(),
+                bytes: f.bytes,
+                sha256: f.sha256.clone(),
+            })
+            .collect();
         let model = InstalledModel { id: weight_first.clone(), path: weight_first, filename: files[0].filename.clone(), bytes: weight_bytes, repo: Some(catalog.repo.clone()), revision: Some(catalog.revision.clone()), files: weight_paths, complete: true, received: weight_bytes,
             projector_filename: projector_record.as_ref().map(|(name, _)| name.clone()),
-            projector_path: projector_record.as_ref().map(|(_, path)| path.clone()) };
-        let _ = std::fs::remove_file(directory.join("download.json"));
+            projector_path: projector_record.as_ref().map(|(_, path)| path.clone()), external: false,
+            expected, verified: true };
         crate::gguf::read_architecture(Path::new(&model.path))?.ok_or("Downloaded file is not a supported GGUF header.")?;
         if let Some(ref projector_path) = model.projector_path {
             // The projector is a vision encoder, not a language model; a GGUF
@@ -419,27 +436,10 @@ pub async fn download_hugging_face_model(
             }
         }
         if *receiver.borrow() { return Err("Download cancelled.".into()); }
-        // Publish metadata atomically; interrupted downloads remain visible but unusable.
-        use std::io::Write;
-        let mut manifest = tempfile::NamedTempFile::new_in(&directory).map_err(|e| e.to_string())?;
-        manifest.write_all(&serde_json::to_vec_pretty(&model).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        manifest.as_file().sync_all().map_err(|e| e.to_string())?;
-        manifest.persist(directory.join("model.json")).map_err(|e| e.to_string())?;
+        publish_manifest(&directory, &model)?;
         Ok::<_, String>(model.path)
     }.await;
-    let mut inner = installer
-        .inner
-        .lock()
-        .map_err(|_| "Installer unavailable.")?;
-    inner.0.busy = false;
-    match result {
-        Ok(path) => {
-            inner.0.phase = "ready".into();
-            inner.0.path = Some(path);
-        }
-        Err(e) => inner.0.fail(e),
-    }
-    Ok(inner.0.clone())
+    Ok(installer.finish(result))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -455,6 +455,10 @@ struct DownloadState {
     // state can recover the choice when its saved total uniquely matches one
     // projector plus the selected weights.
     projector: Option<String>,
+    /// Every weight shard plus the selected projector (repo filename, bytes,
+    /// sha256). Empty for state written by earlier builds.
+    #[serde(default)]
+    files: Vec<HubFile>,
 }
 fn projector_for_resume(
     files: &[HubFile],
@@ -482,10 +486,31 @@ fn projector_for_resume(
     }
     Some(projector.filename.clone())
 }
-fn write_download_state(directory: &Path, state: &DownloadState) {
-    if let Ok(body) = serde_json::to_vec_pretty(state) {
-        let _ = std::fs::write(directory.join("download.json"), body);
-    }
+/// Publish model.json atomically; interrupted downloads stay visible but
+/// unusable. The pending marker is only cleared once model.json is durable.
+fn publish_manifest(directory: &Path, model: &InstalledModel) -> Result<(), String> {
+    use std::io::Write;
+    let mut manifest = tempfile::NamedTempFile::new_in(directory).map_err(|e| e.to_string())?;
+    manifest
+        .write_all(&serde_json::to_vec_pretty(model).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    manifest.as_file().sync_all().map_err(|e| e.to_string())?;
+    manifest
+        .persist(directory.join("model.json"))
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(directory.join("download.json"));
+    Ok(())
+}
+
+fn write_download_state(directory: &Path, state: &DownloadState) -> Result<(), String> {
+    use std::io::Write;
+    let body = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(directory).map_err(|e| e.to_string())?;
+    temp.write_all(&body).map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    temp.persist(directory.join("download.json"))
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn known_source(filename: &str) -> Option<String> {
@@ -530,6 +555,10 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
     let source = std::fs::read(directory.join("model.json"))
         .ok()
         .and_then(|v| serde_json::from_slice::<InstalledModel>(&v).ok());
+    let managed = directory
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit()));
     let hub_files: Vec<_> = files
         .iter()
         .map(|(p, bytes)| HubFile {
@@ -538,6 +567,7 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
             sha256: String::new(),
         })
         .collect();
+    let mut local: Vec<InstalledModel> = Vec::new();
     for file in &hub_files {
         if file.filename.to_lowercase().contains("mmproj") {
             continue;
@@ -546,11 +576,7 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
             continue;
         }
         let group = selected_files(&hub_files, &file.filename);
-        let managed = directory
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit()));
-        let complete = group.is_ok() && (!managed || source.is_some());
+        let group_ok = group.is_ok();
         let group = group.unwrap_or_else(|_| {
             let base = file
                 .filename
@@ -569,12 +595,37 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
             .map(|f| root.join(&f.filename).to_string_lossy().into_owned())
             .collect();
         let path = paths[0].clone();
-        if result.iter().any(|m| m.path == path) {
+        if local.iter().any(|m| m.path == path) {
             continue;
         }
         let bytes = group.iter().map(|f| f.bytes).sum();
+        let manifest_row = source.as_ref().is_some_and(|s| s.path == path);
+        // A managed manifest is only as good as the bytes it declares: pinned
+        // expectations must match on size, and legacy manifests must still
+        // point at files that exist.
+        let (complete, verified) = if managed && manifest_row {
+            let manifest = source.as_ref().unwrap();
+            if !manifest.expected.is_empty() {
+                let intact = manifest.expected.iter().all(|expected| {
+                    std::fs::symlink_metadata(root.join(&expected.filename))
+                        .is_ok_and(|m| {
+                            m.is_file() && !m.file_type().is_symlink() && m.len() == expected.bytes
+                        })
+                });
+                (intact && group_ok, intact)
+            } else {
+                let intact = manifest.files.iter().all(|p| Path::new(p).is_file())
+                    && manifest
+                        .projector_path
+                        .as_ref()
+                        .is_none_or(|p| Path::new(p).is_file());
+                (intact && group_ok, false)
+            }
+        } else {
+            (group_ok && (!managed || source.is_some()), false)
+        };
         let (projector_filename, projector_path) = match &source {
-            Some(manifest) if manifest.path == path => (
+            Some(manifest) if manifest_row => (
                 manifest.projector_filename.clone(),
                 manifest.projector_path.clone(),
             ),
@@ -598,7 +649,7 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
                     .unwrap_or((None, None))
             }
         };
-        result.push(InstalledModel {
+        local.push(InstalledModel {
             id: path.clone(),
             path,
             filename: file.filename.clone(),
@@ -617,40 +668,88 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
             },
             projector_filename,
             projector_path,
+            external: false,
+            expected: if manifest_row {
+                source.as_ref().map(|s| s.expected.clone()).unwrap_or_default()
+            } else {
+                Vec::new()
+            },
+            verified,
         });
     }
+    // A pending download state is authoritative for this directory's matching
+    // row; suppression never reaches rows from other directories, so two repos
+    // with identical filenames both stay listed.
     if let Some(state) = pending_download(directory) {
-        let dest = root.join(state.filename.rsplit('/').next().unwrap_or(&state.filename));
+        let basename = state.filename.rsplit('/').next().unwrap_or(&state.filename);
+        let dest = root.join(basename);
         let part = download::partial_path(&dest);
-        let received = std::fs::metadata(&part)
-            .map(|m| m.len())
-            .unwrap_or(state.received);
-        if !result.iter().any(|m| {
-            m.filename == state.filename.rsplit('/').next().unwrap_or(&state.filename)
-                || Path::new(&m.path) == dest.as_path()
-        }) {
+        let received = if state.files.is_empty() {
+            std::fs::metadata(&part)
+                .map(|m| m.len())
+                .unwrap_or(state.received)
+        } else {
+            state
+                .files
+                .iter()
+                .map(|f| {
+                    let path = root.join(f.filename.rsplit('/').next().unwrap_or(&f.filename));
+                    match std::fs::metadata(&path).ok().filter(|m| m.is_file()) {
+                        Some(m) => m.len(),
+                        None => std::fs::metadata(download::partial_path(&path))
+                            .map(|m| m.len())
+                            .unwrap_or(0)
+                            .min(f.bytes),
+                    }
+                })
+                .sum()
+        };
+        let finals: Vec<String> = state
+            .files
+            .iter()
+            .filter_map(|f| {
+                let path = root.join(f.filename.rsplit('/').next().unwrap_or(&f.filename));
+                path.is_file()
+                    .then(|| path.to_string_lossy().into_owned())
+            })
+            .collect();
+        if let Some(row) = local.iter_mut().find(|m| m.filename == basename) {
+            row.repo = Some(state.repo);
+            row.revision = Some(state.revision);
+            row.projector_filename = state.projector.clone();
+            row.projector_path = None;
+            row.bytes = state.bytes;
+            row.complete = false;
+            row.received = received;
+            if !state.files.is_empty() {
+                row.files = finals;
+            }
+        } else {
             let path = if dest.exists() { dest } else { part.clone() };
             let path_string = path.to_string_lossy().into_owned();
-            result.push(InstalledModel {
+            local.push(InstalledModel {
                 id: path_string.clone(),
                 path: path_string.clone(),
-                filename: state
-                    .filename
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&state.filename)
-                    .to_owned(),
+                filename: basename.to_owned(),
                 bytes: state.bytes,
                 repo: Some(state.repo),
                 revision: Some(state.revision),
-                files: vec![path_string],
+                files: if finals.is_empty() {
+                    vec![path_string]
+                } else {
+                    finals
+                },
                 complete: false,
                 received,
                 projector_filename: state.projector.clone(),
                 projector_path: None,
+                external: false,
+                expected: Vec::new(),
+                verified: false,
             });
         }
     }
+    result.extend(local);
     Ok(())
 }
 fn pending_download(directory: &Path) -> Option<DownloadState> {
@@ -681,6 +780,11 @@ fn inventory(state: &AppState) -> Result<Vec<InstalledModel>, String> {
             }
         }
     }
+    if let Some(model) = k2_horizon_model() {
+        if !result.iter().any(|item| paths_match(&item.path, &model.path)) {
+            result.push(model);
+        }
+    }
     let selected = state.database()?.preferences()?.model_path;
     if let Ok(path) = std::fs::canonicalize(&selected) {
         let path_string = path.to_string_lossy().into_owned();
@@ -702,11 +806,44 @@ fn inventory(state: &AppState) -> Result<Vec<InstalledModel>, String> {
                 received: path.metadata().map_err(|e| e.to_string())?.len(),
                 projector_filename: None,
                 projector_path: None,
+                external: true,
+                expected: Vec::new(),
+                verified: false,
             });
         }
     }
     result.sort_by(|a, b| a.filename.cmp(&b.filename));
     Ok(result)
+}
+
+fn k2_horizon_model() -> Option<InstalledModel> {
+    k2_horizon_model_at(&PathBuf::from(std::env::var_os("APPDATA")?))
+}
+
+fn k2_horizon_model_at(app_data: &Path) -> Option<InstalledModel> {
+    let path = app_data.join("studio.k2horizon.app/models/k2-horizon-3.7b/K2-Horizon-4B-Q4_K_M.gguf");
+    let path = std::fs::canonicalize(path).ok()?;
+    let bytes = path.metadata().ok()?.len();
+    let path = path.to_string_lossy().into_owned();
+    Some(InstalledModel {
+        id: path.clone(), path: path.clone(), filename: "K2-Horizon-4B-Q4_K_M.gguf".into(),
+        bytes, repo: None, revision: None, files: vec![path], complete: true,
+        received: bytes, projector_filename: None, projector_path: None, external: true,
+        expected: Vec::new(), verified: false,
+    })
+}
+
+fn k2_horizon_runtime(model: &InstalledModel) -> Option<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?;
+    k2_horizon_runtime_at(model, root)
+}
+
+fn k2_horizon_runtime_at(model: &InstalledModel, root: &Path) -> Option<PathBuf> {
+    if !model.external || model.filename != "K2-Horizon-4B-Q4_K_M.gguf" {
+        return None;
+    }
+    let runtime = root.join("k2 horizon agent/local-k2/runtime/windows/cuda/llama-server.exe");
+    runtime.is_file().then_some(runtime)
 }
 #[tauri::command]
 pub fn list_installed_models(
@@ -724,14 +861,18 @@ pub async fn delete_installed_model(
         .operation
         .try_lock()
         .map_err(|_| "Stop generation or loading before deleting a model.")?;
-    let _installation = state
-        .installation_operation
+    let _model_download = state
+        .model_installer
+        .run
         .try_lock()
-        .map_err(|_| "Wait for the download to finish before deleting a model.")?;
+        .map_err(|_| "Pause the model download before deleting a model.")?;
     let model = inventory(&state)?
         .into_iter()
         .find(|m| m.id == id)
         .ok_or("Model is no longer in the library.")?;
+    if model.external {
+        return Err("This model belongs to another project. Remove it from that project instead.".into());
+    }
     let mut runtime = state.runtime.lock().await;
     if runtime
         .inspect()
@@ -746,6 +887,9 @@ pub async fn delete_installed_model(
     let selected = std::fs::canonicalize(&preferences.model_path)
         .ok()
         .is_some_and(|p| model.files.iter().any(|file| Path::new(file) == p));
+    let projector_deleted = std::fs::canonicalize(&preferences.projector_path)
+        .ok()
+        .is_some_and(|p| model.files.iter().any(|file| Path::new(file) == p));
     for path in &model.files {
         std::fs::remove_file(path).map_err(|e| format!("Could not delete model: {e}"))?;
     }
@@ -753,6 +897,11 @@ pub async fn delete_installed_model(
     let store = state.database()?;
     if selected {
         preferences.model_path.clear();
+        preferences.projector_path.clear();
+    } else if projector_deleted {
+        preferences.projector_path.clear();
+    }
+    if selected || projector_deleted {
         store.save_preferences(&preferences)?;
     }
     Ok(())
@@ -825,15 +974,6 @@ struct Profile {
 }
 fn profile_path(state: &AppState, path: &str) -> PathBuf {
     profile_path_for(&state.data_dir, path)
-}
-
-pub(crate) fn saved_profile_config(state: &AppState, path: &str) -> Result<Option<crate::runtime_config::RuntimeConfig>, String> {
-    match std::fs::read(profile_path(state, path)) {
-        Ok(bytes) => serde_json::from_slice::<Profile>(&bytes).map(|profile| Some(profile.config))
-            .map_err(|_| "Saved model profile is invalid.".into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
 }
 
 fn paths_match(left: &str, right: &str) -> bool {
@@ -931,7 +1071,7 @@ pub async fn use_installed_model(
         .iter()
         .find(|m| m.id == id && m.complete)
         .ok_or("Model is missing or has incomplete shards.")?;
-    {
+    let (next_preferences, next_config) = {
         let store = state.database()?;
         let mut preferences = store.preferences()?;
         let current_config = store.runtime_config()?;
@@ -954,23 +1094,78 @@ pub async fn use_installed_model(
             preferences.runtime_path = profile.runtime_path;
             profile.config
         } else {
-            initial_config(
+            preferences.runtime_path.clear();
+            let mut config = initial_config(
                 crate::gguf::model_metadata(Path::new(&model.path))
                     .ok()
                     .as_ref(),
-            )
+            );
+            if model.external && model.filename == "K2-Horizon-4B-Q4_K_M.gguf" {
+                config.context_length = 16_384;
+            }
+            config
         };
+        if model.external && model.filename == "K2-Horizon-4B-Q4_K_M.gguf" {
+            preferences.runtime_path = k2_horizon_runtime(model)
+                .ok_or("K2 Horizon's custom CUDA runtime is missing from the neighboring k2 horizon agent project.")?
+                .to_string_lossy().into_owned();
+        }
         preferences.model_path = model.path.clone();
-        store.save_preferences(&preferences)?;
-        store.save_runtime_config(&config)?;
-        write_profile(&state, &model.path, &preferences.runtime_path, &config)?;
-    }
-    crate::commands::load_selected_model(&state).await
+        // Keep the projector in lockstep with the weights: a stale mmproj from
+        // a previous model makes llama-server crash on an embedding-size
+        // mismatch, and a missing projector silently disables vision.
+        preferences.projector_path = model.projector_path.clone().unwrap_or_default();
+        (preferences, config)
+    };
+    crate::commands::switch_and_load(&state, next_preferences, next_config).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discovers_k2_horizon_without_taking_ownership_of_its_file() {
+        let app_data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = app_data.path().join("studio.k2horizon.app/models/k2-horizon-3.7b/K2-Horizon-4B-Q4_K_M.gguf");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"GGUF").unwrap();
+        let model = k2_horizon_model_at(app_data.path()).unwrap();
+        assert!(model.external);
+        assert_eq!(model.bytes, 4);
+        assert!(k2_horizon_runtime_at(&model, project.path()).is_none());
+        let runtime = project.path().join("k2 horizon agent/local-k2/runtime/windows/cuda/llama-server.exe");
+        std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+        std::fs::write(&runtime, b"runtime").unwrap();
+        assert_eq!(k2_horizon_runtime_at(&model, project.path()), Some(runtime));
+    }
+    #[test]
+    fn saving_preferences_updates_the_active_models_runtime_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = crate::web_search::tests::test_state(directory.path());
+        let model = directory.path().join("model.gguf");
+        std::fs::write(&model, b"GGUF").unwrap();
+        let first = directory.path().join("runtime-a.exe");
+        let second = directory.path().join("runtime-b.exe");
+        std::fs::write(&first, b"runtime").unwrap();
+        std::fs::write(&second, b"runtime").unwrap();
+        let preferences = crate::store::Preferences {
+            model_path: model.to_string_lossy().into_owned(),
+            runtime_path: first.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        crate::commands::persist_preferences(&state, preferences.clone()).unwrap();
+        crate::commands::persist_preferences(&state, crate::store::Preferences {
+            runtime_path: second.to_string_lossy().into_owned(),
+            ..preferences
+        }).unwrap();
+        let bytes = std::fs::read(profile_path(&state, &model.to_string_lossy())).unwrap();
+        let profile: Profile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(profile.runtime_path, second.to_string_lossy());
+        let store = state.database().unwrap();
+        assert_eq!(store.preferences().unwrap().runtime_path, second.to_string_lossy().into_owned());
+    }
+
     #[test]
     fn new_models_do_not_inherit_unsupported_quantized_cache_settings() {
         let config = initial_config(Some(&crate::gguf::ModelMetadata {
@@ -997,6 +1192,9 @@ mod tests {
             received: 1,
             projector_filename: None,
             projector_path: None,
+            external: false,
+            expected: Vec::new(),
+            verified: false,
         };
         assert!(already_using_model(r"C:\models\model.gguf", &model));
         assert!(already_using_model(r"c:\models\model.gguf", &model));
@@ -1085,8 +1283,10 @@ mod tests {
                 sha256: "b".repeat(64),
                 received: 4,
                 projector: Some("mmproj-model-f16.gguf".into()),
+                files: Vec::new(),
             },
-        );
+        )
+        .unwrap();
         let mut result = Vec::new();
         scan(dir.path(), 1, &mut result).unwrap();
         assert_eq!(result.len(), 1);
@@ -1160,6 +1360,9 @@ mod tests {
             received: 4,
             projector_filename: None,
             projector_path: None,
+            external: false,
+            expected: Vec::new(),
+            verified: false,
         };
         cleanup_model_storage(&model, data.path()).unwrap();
         assert!(!dir.exists());
@@ -1285,6 +1488,7 @@ mod tests {
             sha256: "a".repeat(64),
             received: 40,
             projector: None,
+            files: Vec::new(),
         };
         assert_eq!(
             projector_for_resume(&files, None, Some(&legacy), 100).as_deref(),
@@ -1314,6 +1518,7 @@ mod tests {
             sha256: "a".repeat(64),
             received: 4,
             projector: Some("mmproj-model-f16.gguf".into()),
+            files: Vec::new(),
         };
         let parsed: DownloadState =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
@@ -1324,5 +1529,218 @@ mod tests {
         );
         let legacy: DownloadState = serde_json::from_str(&legacy).unwrap();
         assert_eq!(legacy.projector, None);
+    }
+
+    fn hub_file(filename: &str, bytes: u64) -> HubFile {
+        HubFile {
+            filename: filename.into(),
+            bytes,
+            sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn an_interrupted_second_shard_reports_saved_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("a".repeat(64));
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model-00001-of-00002.gguf"), b"done!").unwrap();
+        std::fs::write(model_dir.join("model-00002-of-00002.gguf.part"), b"hal").unwrap();
+        write_download_state(
+            &model_dir,
+            &DownloadState {
+                repo: "owner/repo".into(),
+                revision: "r".repeat(40),
+                filename: "model-00001-of-00002.gguf".into(),
+                bytes: 15,
+                sha256: "c".repeat(64),
+                received: 8,
+                projector: Some("mmproj-model-f16.gguf".into()),
+                files: vec![
+                    hub_file("model-00001-of-00002.gguf", 5),
+                    hub_file("model-00002-of-00002.gguf", 10),
+                ],
+            },
+        )
+        .unwrap();
+        let mut result = Vec::new();
+        scan(dir.path(), 1, &mut result).unwrap();
+        assert_eq!(result.len(), 1);
+        let row = &result[0];
+        assert!(!row.complete);
+        assert_eq!(row.received, 8);
+        assert_eq!(row.bytes, 15);
+        assert_eq!(row.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(
+            row.projector_filename.as_deref(),
+            Some("mmproj-model-f16.gguf")
+        );
+    }
+
+    #[test]
+    fn a_pending_projector_keeps_the_download_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("b".repeat(64));
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"weights").unwrap();
+        std::fs::write(model_dir.join("mmproj-model-f16.gguf.part"), b"mm").unwrap();
+        write_download_state(
+            &model_dir,
+            &DownloadState {
+                repo: "owner/repo".into(),
+                revision: "r".repeat(40),
+                filename: "model.gguf".into(),
+                bytes: 12,
+                sha256: "c".repeat(64),
+                received: 9,
+                projector: Some("mmproj-model-f16.gguf".into()),
+                files: vec![hub_file("model.gguf", 7), hub_file("mmproj-model-f16.gguf", 5)],
+            },
+        )
+        .unwrap();
+        let mut result = Vec::new();
+        scan(dir.path(), 1, &mut result).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].complete);
+        assert_eq!(result[0].received, 9);
+        assert_eq!(
+            result[0].projector_filename.as_deref(),
+            Some("mmproj-model-f16.gguf")
+        );
+    }
+
+    #[test]
+    fn identical_filenames_in_different_repos_stay_separate_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, repo) in [("c".repeat(64), "owner/one"), ("d".repeat(64), "owner/two")] {
+            let model_dir = dir.path().join(name);
+            std::fs::create_dir(&model_dir).unwrap();
+            std::fs::write(model_dir.join("model.gguf"), b"same!").unwrap();
+            write_download_state(
+                &model_dir,
+                &DownloadState {
+                    repo: repo.into(),
+                    revision: "r".repeat(40),
+                    filename: "model.gguf".into(),
+                    bytes: 9,
+                    sha256: "c".repeat(64),
+                    received: 5,
+                    projector: None,
+                    files: vec![hub_file("model.gguf", 9)],
+                },
+            )
+            .unwrap();
+        }
+        let mut result = Vec::new();
+        scan(dir.path(), 1, &mut result).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|m| m.repo.as_deref() == Some("owner/one")));
+        assert!(result.iter().any(|m| m.repo.as_deref() == Some("owner/two")));
+        assert!(result.iter().all(|m| !m.complete));
+    }
+
+    fn manifest(directory: &Path, expected: Vec<HubFile>, projector: Option<String>) -> String {
+        let root = std::fs::canonicalize(directory).unwrap();
+        let weights = root.join("model.gguf").to_string_lossy().into_owned();
+        serde_json::to_string(&InstalledModel {
+            id: weights.clone(),
+            path: weights.clone(),
+            filename: "model.gguf".into(),
+            bytes: 7,
+            repo: Some("owner/repo".into()),
+            revision: Some("r".repeat(40)),
+            files: vec![weights],
+            complete: true,
+            received: 7,
+            projector_filename: projector.clone(),
+            projector_path: projector,
+            external: false,
+            expected,
+            verified: true,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn expected_sizes_decide_whether_a_managed_model_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("e".repeat(64));
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"weights").unwrap();
+        // Truncated file: the manifest's pinned size does not match.
+        let expected = vec![hub_file("model.gguf", 99)];
+        std::fs::write(model_dir.join("model.json"), manifest(&model_dir, expected, None))
+            .unwrap();
+        let mut result = Vec::new();
+        scan(&model_dir, 0, &mut result).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].complete);
+        assert!(!result[0].verified);
+        // The right size makes the same manifest complete and verified.
+        let expected = vec![hub_file("model.gguf", 7)];
+        std::fs::write(model_dir.join("model.json"), manifest(&model_dir, expected, None))
+            .unwrap();
+        let mut result = Vec::new();
+        scan(&model_dir, 0, &mut result).unwrap();
+        assert!(result[0].complete);
+        assert!(result[0].verified);
+    }
+
+    #[test]
+    fn a_missing_declared_projector_breaks_legacy_completeness() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("f".repeat(64));
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"weights").unwrap();
+        let missing = model_dir.join("mmproj-model-f16.gguf").to_string_lossy().into_owned();
+        std::fs::write(
+            model_dir.join("model.json"),
+            manifest(&model_dir, Vec::new(), Some(missing)),
+        )
+        .unwrap();
+        let mut result = Vec::new();
+        scan(&model_dir, 0, &mut result).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].complete);
+        assert!(!result[0].verified);
+        // A legacy manifest with every declared file present stays complete.
+        std::fs::write(
+            model_dir.join("model.json"),
+            manifest(&model_dir, Vec::new(), None),
+        )
+        .unwrap();
+        let mut result = Vec::new();
+        scan(&model_dir, 0, &mut result).unwrap();
+        assert!(result[0].complete);
+        assert!(!result[0].verified);
+    }
+
+    #[test]
+    fn a_failed_manifest_publish_keeps_the_download_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("model.json")).unwrap();
+        std::fs::write(dir.path().join("download.json"), b"{}").unwrap();
+        let model = InstalledModel {
+            id: "x".into(),
+            path: dir.path().join("model.gguf").to_string_lossy().into_owned(),
+            filename: "model.gguf".into(),
+            bytes: 7,
+            repo: None,
+            revision: None,
+            files: Vec::new(),
+            complete: true,
+            received: 7,
+            projector_filename: None,
+            projector_path: None,
+            external: false,
+            expected: Vec::new(),
+            verified: true,
+        };
+        assert!(publish_manifest(dir.path(), &model).is_err());
+        assert!(dir.path().join("download.json").exists());
+        std::fs::remove_dir(dir.path().join("model.json")).unwrap();
+        publish_manifest(dir.path(), &model).unwrap();
+        assert!(dir.path().join("model.json").is_file());
+        assert!(!dir.path().join("download.json").exists());
     }
 }

@@ -91,7 +91,7 @@ impl RuntimeConfig {
         self.validate()?;
         let mut args = vec![
             "--ctx-size".into(),
-            self.context_length.to_string(),
+            (self.context_length * self.inference_slots).to_string(),
         ];
         // -1 means automatic: llama.cpp --fit chooses how many layers fill
         // VRAM and leaves the rest in RAM. Passing --n-gpu-layers disables that.
@@ -146,7 +146,12 @@ impl RuntimeConfig {
         if usable == 0 {
             return 0;
         }
-        let kv = kv_cache_bytes(model, config).unwrap_or(0);
+        // An unknown KV layout (hybrid/recurrent architecture or missing
+        // dimensions) means the VRAM estimate cannot be trusted — stay on CPU,
+        // matching the frontend's conservative rule.
+        let Some(kv) = kv_cache_bytes(model, config) else {
+            return 0;
+        };
         let gpu_full = model
             .file_bytes
             .saturating_add(if config.offload_kv_cache { kv } else { 0 });
@@ -198,6 +203,20 @@ fn cache_elem_bytes(cache: CacheType, elements: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_allocation_is_per_slot_and_matches_kv_estimate() {
+        let model = crate::gguf::ModelMetadata {
+            architecture: Some("llama".into()), context_length: Some(8192), block_count: Some(32),
+            embedding_length: Some(4096), head_count: Some(32), head_count_kv: Some(8),
+            key_length: None, value_length: None, file_bytes: 0,
+        };
+        let one = RuntimeConfig { context_length: 4096, inference_slots: 1, ..Default::default() };
+        for slots in [1, 2] {
+            let config = RuntimeConfig { inference_slots: slots, ..one.clone() };
+            assert!(config.arguments().unwrap().windows(2).any(|pair| pair == ["--ctx-size", &(4096 * slots).to_string()]));
+            assert_eq!(kv_cache_bytes(&model, &config).unwrap(), kv_cache_bytes(&model, &one).unwrap() * u64::from(slots));
+        }
+    }
 
     #[test]
     fn default_configuration_is_valid_for_initial_load() {
@@ -242,6 +261,32 @@ mod tests {
         );
         let tight = RuntimeConfig::auto_gpu_layers(&model, &config, Some(5 * 1024 * 1024 * 1024));
         assert!(tight > 0 && tight < 33, "tight fit was {tight}");
+    }
+
+    #[test]
+    fn auto_gpu_layers_stays_on_cpu_when_the_cache_layout_is_unknown() {
+        let config = RuntimeConfig { context_length: 8192, ..Default::default() };
+        let ample = Some(24 * 1024 * 1024 * 1024);
+        let model = |architecture: Option<&str>, head_count_kv| crate::gguf::ModelMetadata {
+            architecture: architecture.map(str::to_string),
+            context_length: Some(8192), block_count: Some(32),
+            embedding_length: Some(4096), head_count: Some(32), head_count_kv,
+            file_bytes: 4 * 1024 * 1024 * 1024, ..Default::default()
+        };
+        // Unknown/hybrid architecture: the standard-attention formula does not apply.
+        assert_eq!(RuntimeConfig::auto_gpu_layers(&model(Some("mamba"), Some(8)), &config, ample), 0);
+        assert_eq!(RuntimeConfig::auto_gpu_layers(&model(None, Some(8)), &config, ample), 0);
+        // Known architecture but a dimension needed for the cache is missing.
+        assert_eq!(RuntimeConfig::auto_gpu_layers(&model(Some("llama"), None), &config, ample), 0);
+        // Barely any free VRAM: the 1 GiB headroom leaves nothing usable.
+        let model = model(Some("llama"), Some(8));
+        assert_eq!(RuntimeConfig::auto_gpu_layers(&model, &config, Some(600 * 1024 * 1024)), 0);
+        // More inference slots need proportionally more cache, so fewer layers fit.
+        let constrained = Some(5 * 1024 * 1024 * 1024);
+        let one = RuntimeConfig::auto_gpu_layers(&model, &config, constrained);
+        let four = RuntimeConfig::auto_gpu_layers(&model, &RuntimeConfig { inference_slots: 4, ..config.clone() }, constrained);
+        assert!(one > 0 && four < one, "one={one} four={four}");
+        assert_eq!(RuntimeConfig::auto_gpu_layers(&model, &config, ample), -1);
     }
 
     #[test]

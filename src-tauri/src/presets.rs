@@ -58,7 +58,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             mcp: true,
             system_time: true,
             skills: true,
-            harness: harness(&["ptc_run", "todo_write", "goal_set", "memory_teach", "memory_recall", "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch", "file_search", "ask_user"]),
+            harness: harness(&["ptc_run", "todo_write", "goal_set", "memory_teach", "memory_recall", "web_search", "get_weather", "web_read", "web_find", "file_search", "docs_search", "ask_user", "artifact_read"]),
         },
         MINIMAL => Preset {
             id: MINIMAL.into(),
@@ -81,12 +81,12 @@ pub fn get(id: &str) -> Result<Preset, String> {
             system_time: true,
             skills: true,
             harness: harness(&[
-                "todo_write", "todo_add", "todo_update", "goal_set", "goal_clear", "subagent", "send_message",
+                "todo_write", "goal_set", "goal_clear", "subagent", "send_message",
                 "interrupt_agent", "list_agents", "list_subagent_models", "workflow_run", "ralph_run",
-                "terminal_create", "terminal_send", "terminal_close", "web_search", "web_read", "web_open", "web_find", "web_fetch_url", "web_fetch",
+                "terminal_create", "terminal_send", "terminal_close", "web_search", "get_weather", "web_read", "web_find", "browser",
                 "file_search", "file_read", "file_write", "run_code", "memory_teach", "memory_recall",
-                "ask_user", "artifact_read", "docker_exec",
-                "preset_guide", "compact_conversation", "research_pause", "research_resume", "research_cancel", "research_progress",
+                "ask_user", "artifact_read", "propose_criteria", "verify_run",
+                "preset_guide", "compact_conversation",
             ]),
         },
         CHAT => Preset {
@@ -97,7 +97,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             mcp: false,
             system_time: false,
             skills: true,
-            harness: harness(&["todo_write", "memory_recall", "compact_conversation"]),
+            harness: harness(&["todo_write", "memory_recall", "compact_conversation", "artifact_read"]),
         },
         RESEARCH => Preset {
             id: RESEARCH.into(),
@@ -108,9 +108,9 @@ pub fn get(id: &str) -> Result<Preset, String> {
             system_time: true,
             skills: true,
             harness: harness(&[
-                "todo_write", "todo_add", "todo_update", "memory_recall", "compact_conversation",
+                "todo_write", "memory_recall", "compact_conversation",
                 "search", "visit", "update_context", "finish", "artifact_read",
-                "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch", "file_search",
+                "web_search", "get_weather", "web_read", "web_find", "browser", "file_search", "docs_search", "propose_criteria", "verify_run",
             ]),
         },
         CODING => Preset {
@@ -122,11 +122,11 @@ pub fn get(id: &str) -> Result<Preset, String> {
             system_time: true,
             skills: true,
             harness: harness(&[
-                "todo_write", "todo_add", "todo_update", "goal_set", "goal_clear",
+                "todo_write", "goal_set", "goal_clear",
                 "subagent", "send_message", "interrupt_agent", "list_agents",
                 "terminal_create", "terminal_send", "terminal_close",
-                "file_search", "memory_teach", "memory_recall",
-                "artifact_read", "ask_user", "compact_conversation", "research_pause", "research_resume", "research_cancel", "research_progress",
+                "file_search", "docs_search", "memory_teach", "memory_recall", "browser",
+                "artifact_read", "ask_user", "compact_conversation", "propose_criteria", "verify_run",
             ]),
         },
         _ => Preset {
@@ -139,10 +139,10 @@ pub fn get(id: &str) -> Result<Preset, String> {
             skills: true,
             // Lean for small local models: core workspace ops, shell, web,
             // memory, subagents, and granular todos. Advanced orchestration
-            // (workflow_run, ralph_run), docker, and guides live in
+            // (workflow_run, ralph_run), and guides live in
             // Creator or behind subagent delegation.
             harness: harness(&[
-                "web_search", "web_read", "web_find", "file_search", "file_read", "file_write", "run_code", "ask_user",
+                "web_search", "get_weather", "web_read", "web_find", "browser", "file_search", "docs_search", "propose_criteria", "verify_run", "file_read", "file_write", "run_code", "ask_user", "artifact_read",
             ]),
         },
     };
@@ -156,8 +156,8 @@ pub fn minimal_workspace_tools() -> [&'static str; 1] {
 }
 
 /// The everyday assistant catalog. Older aliases stay readable.
-pub fn assistant_catalog() -> [&'static str; 8] {
-    ["web_search", "web_read", "web_find", "file_search", "file_read", "file_write", "run_code", "ask_user"]
+pub fn assistant_catalog() -> [&'static str; 12] {
+    ["web_search", "get_weather", "web_read", "web_find", "browser", "file_search", "docs_search", "file_read", "file_write", "run_code", "ask_user", "artifact_read"]
 }
 
 pub fn canonical_tool(alias: &str) -> String {
@@ -225,7 +225,7 @@ pub fn authoring_guide() -> &'static str {
     "Compose a preset without forking source: pick sources (workspace, execution, daytona), \
      MCP on/off, system_time on/off, skills on/off, and a harness tool subset. Standard = lean core \
      (todos, subagents, shell, web, memory, ask_user, artifacts); \
-     Creator = Standard plus orchestration (workflow_run, ralph_run), docker, and guides. \
+     Creator = Standard plus orchestration (workflow_run, ralph_run), and guides. \
      Minimal = execution + edit_file + terminal_* only. New presets need a Rust change today; \
      file-based preset overlays are future work."
 }
@@ -254,7 +254,17 @@ mod tests {
     #[test]
     fn standard_is_lean_and_creator_is_full() {
         let standard = get(STANDARD).unwrap();
-        assert_eq!(standard.harness, assistant_catalog().map(str::to_string).to_vec());
+        // Standard is the assistant catalog plus the evidence tools; the
+        // catalog itself stays 11 entries for the SDK-facing list.
+        let mut expected: Vec<String> = assistant_catalog().map(str::to_string).to_vec();
+        expected.extend(["propose_criteria", "verify_run"].map(str::to_string));
+        let mut standard_sorted = standard.harness.clone();
+        standard_sorted.sort();
+        expected.sort();
+        assert_eq!(standard_sorted, expected);
+        assert!(standard.harness.contains(&"artifact_read".to_string()));
+        assert!(get(CHAT).unwrap().harness.contains(&"artifact_read".to_string()));
+        assert!(get(CODE).unwrap().harness.contains(&"artifact_read".to_string()));
         for advanced in ["workflow_run", "ralph_run", "subagent", "ptc_run",
             "docker_exec", "preset_guide", "list_subagent_models", "terminal_send"] {
             assert!(!standard.harness.contains(&advanced.to_string()), "{advanced} is not in the assistant catalog");
@@ -266,8 +276,35 @@ mod tests {
         for alias in &standard.harness {
             assert!(creator.harness.contains(alias), "creator should include standard {alias}");
         }
-        for advanced in ["workflow_run", "ralph_run", "docker_exec", "preset_guide"] {
+        for advanced in ["workflow_run", "ralph_run", "preset_guide"] {
             assert!(creator.harness.contains(&advanced.to_string()));
+        }
+    }
+    #[test]
+    fn coding_preset_uses_one_todo_writer_without_positional_updates() {
+        let coding = get(CODING).unwrap();
+        assert!(coding.harness.iter().any(|alias| alias == "todo_write"));
+        assert!(
+            !coding
+                .harness
+                .iter()
+                .any(|alias| alias == "todo_add" || alias == "todo_update")
+        );
+    }
+    #[test]
+    fn presets_offer_one_url_reader_and_no_research_control_echoes() {
+        for id in [CREATOR, RESEARCH, CODE] {
+            let preset = get(id).unwrap();
+            assert!(preset.harness.contains(&"web_read".to_string()));
+            for redundant in ["web_fetch", "web_fetch_url", "web_open", "research_pause", "research_resume", "research_cancel", "research_progress"] {
+                assert!(!preset.harness.contains(&redundant.to_string()), "{id} still offers {redundant}");
+            }
+        }
+        for id in [CREATOR, RESEARCH] {
+            let preset = get(id).unwrap();
+            assert!(preset.harness.contains(&"todo_write".to_string()));
+            assert!(!preset.harness.contains(&"todo_add".to_string()));
+            assert!(!preset.harness.contains(&"todo_update".to_string()));
         }
     }
 }

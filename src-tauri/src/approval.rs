@@ -1,6 +1,27 @@
 use std::{collections::HashMap, sync::Mutex};
 use tokio::sync::oneshot;
 
+/// How one approval wait ended. The channel carries only the user's binary
+/// answer; timeout and cancellation are distinguished at the wait site so a
+/// never-answered request is not recorded as a denial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Allowed,
+    Denied,
+    TimedOut,
+    Cancelled,
+}
+impl ApprovalOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Approvals(Mutex<HashMap<String, oneshot::Sender<bool>>>);
 impl Approvals {

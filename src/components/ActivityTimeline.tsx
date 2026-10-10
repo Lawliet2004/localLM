@@ -1,25 +1,32 @@
-import { Fragment, useEffect, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react';
 import { ChevronRight } from 'lucide-react';
 import { api, nativeAvailable } from '../lib/api';
-import type { Message, SessionEvent } from '../lib/types';
+import type { Message, RunRecord, SessionEvent } from '../lib/types';
 import { isPlanStateTool } from './PlanChecklist';
 import { TraceIcon, groupKindOf, toolKindOf, type TraceKind } from './TraceIcon';
+import { WorkSummary } from './WorkSummary';
 
 export function useSessionActivity(conversationId: string, generating: boolean) {
   const [events, setEvents] = useState<SessionEvent[]>([]);
+  const position = useRef({ conversationId, cursor: 0 });
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
-    let cursor = 0;
-    setEvents([]);
+    if (position.current.conversationId !== conversationId) {
+      position.current = { conversationId, cursor: 0 };
+      setEvents([]);
+    }
+    const currentPosition = position.current;
     if (!nativeAvailable || conversationId === 'new' || !api.getSessionEvents) return;
     async function load() {
       try {
-        const batch = await api.getSessionEvents(conversationId, cursor, 500);
+        const batch = await api.getSessionEvents(conversationId, currentPosition.cursor, 500);
         if (disposed) return;
         if (batch.length) {
-          cursor = Math.max(...batch.map(e => e.seq)) + 1;
-          setEvents(current => [...new Map([...current, ...batch].map(e => [e.seq, e])).values()].sort((a, b) => a.seq - b.seq));
+          // Store::session_events returns unique rows ordered by seq, starting
+          // at the cursor; only the new page needs to be appended.
+          currentPosition.cursor = batch[batch.length - 1].seq + 1;
+          setEvents(current => [...current, ...batch]);
         }
         if (batch.length === 500 || generating) timer = setTimeout(() => void load(), batch.length === 500 ? 0 : 750);
       } catch { if (!disposed && generating) timer = setTimeout(() => void load(), 2000); }
@@ -34,14 +41,11 @@ interface TimelineItem {
   id: string;
   kind: 'model_response' | 'compaction' | 'edit' | 'tool' | 'thought';
   icon?: TraceKind;
-  rawEvent?: SessionEvent;
   toolMessage?: Message;
   content?: string;
   artifact?: string;
   thoughtText?: string;
   duration?: string;
-  toolName?: string;
-  filename?: string;
   isFolder?: boolean;
   isSearch?: boolean;
   isTask?: boolean;
@@ -57,13 +61,28 @@ interface ActivityBlock {
   icon?: TraceKind;
 }
 
-export function ActivityTimeline({ events, messages, renderMessage, renderTool }: {
+function toolItem(id: string, toolName: string, args: Record<string, any>, result: Record<string, any>, toolMessage: Message): TimelineItem {
+  return {
+    id,
+    kind: /edit|create_file|write_to_file|replace/.test(toolName) || result?.diff ? 'edit' : 'tool',
+    icon: toolKindOf(toolName, args, result),
+    toolMessage,
+    isSearch: /search|grep|find|locate/.test(toolName),
+    isFolder: /list_dir|list_files|browse_dir/.test(toolName),
+    isTask: toolName === 'manage_task',
+    isCommand: Boolean(args.command || args.CommandLine || /exec|run_code|terminal|run_command/.test(toolName)),
+  };
+}
+
+export function ActivityTimeline({ events, messages, renderMessage, renderTool, compact = false, run }: {
   events: SessionEvent[]; messages: Message[];
-  renderMessage: (message: Message) => ReactNode; renderTool: (message: Message) => ReactNode;
+  /** `final` is true only for the answer shown outside the work disclosure. */
+  renderMessage: (message: Message, final?: boolean) => ReactNode; renderTool: (message: Message) => ReactNode;
+  compact?: boolean; run?: RunRecord | null;
 }) {
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
 
-  const assistant = messages.find(m => m.role === 'assistant');
+  const assistant = [...messages].reverse().find(m => m.role === 'assistant');
   const base: Message = assistant ?? { id: '', conversationId: '', role: 'assistant', content: '', reasoning: '', createdAt: 0, status: 'complete' };
   const completedText = events.filter(e => e.eventType === 'model_response').map(e => (e.payload as {content?: string}).content ?? '').join('');
   const completedReasoning = events.filter(e => e.eventType === 'reasoning').map(e => (e.payload as {text?: string}).text ?? '').join('');
@@ -80,7 +99,6 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         id: `thought-${assistant.id || 'initial'}`,
         kind: 'thought',
         thoughtText: assistant.reasoning,
-        duration: isStreaming ? undefined : '8s',
       });
     }
 
@@ -98,27 +116,7 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         } catch { /* ignore */ }
         if (isPlanStateTool(toolName)) continue;
 
-        const diff = res?.diff;
-        const path = (args.path ?? args.AbsolutePath ?? args.TargetFile ?? args.file) as string | undefined;
-        const filename = path ? path.split(/[\\/]/).pop() : undefined;
-        const isEdit = /edit|create_file|write_to_file|replace/.test(toolName) || Boolean(diff);
-        const isSearch = /search|grep|find|locate/.test(toolName);
-        const isFolder = /list_dir|list_files|browse_dir/.test(toolName);
-        const isTask = toolName === 'manage_task';
-        const isCommand = Boolean(args.command || args.CommandLine || /exec|run_code|terminal|run_command/.test(toolName));
-
-        timelineItems.push({
-          id: msg.id,
-          kind: isEdit ? 'edit' : 'tool',
-          icon: toolKindOf(toolName, args, res),
-          toolMessage: msg,
-          toolName,
-          filename,
-          isFolder,
-          isSearch,
-          isTask,
-          isCommand,
-        });
+        timelineItems.push(toolItem(msg.id, toolName, args, res, msg));
       }
     }
 
@@ -130,6 +128,14 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
       });
     }
   } else {
+    const callKey = (event: SessionEvent) => JSON.stringify([event.runId, event.toolCallId]);
+    const results = new Map<string, Record<string, any>>();
+    const endedRuns = new Set<string | null | undefined>();
+    const liveMessages = new Map(messages.map(message => [message.id, message]));
+    for (const event of events) {
+      if (event.eventType === 'tool_result' && !results.has(callKey(event))) results.set(callKey(event), event.payload as Record<string, any>);
+      if (event.eventType === 'turn_end') endedRuns.add(event.runId);
+    }
     for (let i = 0; i < events.length; i++) {
       const event = events[i];
       const payload = (event.payload ?? {}) as Record<string, any>;
@@ -138,7 +144,6 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         timelineItems.push({
           id: event.id,
           kind: 'model_response',
-          rawEvent: event,
           content: payload.content ?? '',
         });
         continue;
@@ -148,7 +153,6 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         timelineItems.push({
           id: event.id,
           kind: 'compaction',
-          rawEvent: event,
           artifact: payload.artifact,
         });
         continue;
@@ -164,21 +168,15 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
           durationStr = `${payload.seconds}s`;
         } else if (events[i + 1]?.createdAt && event.createdAt) {
           const delta = events[i + 1].createdAt - event.createdAt;
-          const sec = delta > 10000 ? Math.round(delta / 1000) : delta;
+          const sec = Math.round(delta / 1000);
           if (sec > 0 && sec < 3600) {
             durationStr = `${sec}s`;
           }
-        }
-        if (!durationStr) {
-          const words = (payload.text ?? '').trim().split(/\s+/).filter(Boolean).length;
-          const estimatedSec = Math.max(2, Math.min(30, Math.round(words / 15)));
-          durationStr = `${estimatedSec}s`;
         }
 
         timelineItems.push({
           id: event.id,
           kind: 'thought',
-          rawEvent: event,
           thoughtText: payload.text ?? '',
           duration: durationStr,
         });
@@ -188,9 +186,9 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
       if (event.eventType === 'tool_call') {
         const callName = String((payload as { name?: string }).name ?? '');
         if (isPlanStateTool(callName)) continue;
-        const result = events.find(e => e.eventType === 'tool_result' && e.runId === event.runId && e.toolCallId === event.toolCallId)?.payload as Record<string, any> | undefined;
-        const live = messages.find(m => m.id === `tool-${event.toolCallId}`);
-        const ended = events.some(e => e.eventType === 'turn_end' && e.runId === event.runId);
+        const result = results.get(callKey(event));
+        const live = liveMessages.get(`tool-${event.toolCallId}`);
+        const ended = endedRuns.has(event.runId);
         const toolMessage: Message = result ? {
           ...base, id: event.id, role: 'tool', status: 'complete',
           content: JSON.stringify({ request: { name: result.name ?? payload.name, arguments: payload.arguments, decision: result.decision }, result: result.result }),
@@ -199,29 +197,7 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         const toolName = (result?.name ?? payload.name ?? '') as string;
         const args = (payload.arguments ?? {}) as Record<string, any>;
         const res = (result?.result ?? {}) as Record<string, any>;
-        const diff = res?.diff;
-        const path = (args.path ?? args.AbsolutePath ?? args.TargetFile ?? args.file) as string | undefined;
-        const filename = path ? path.split(/[\\/]/).pop() : undefined;
-
-        const isEdit = /edit|create_file|write_to_file|replace/.test(toolName) || Boolean(diff);
-        const isSearch = /search|grep|find|locate/.test(toolName);
-        const isFolder = /list_dir|list_files|browse_dir/.test(toolName);
-        const isTask = toolName === 'manage_task';
-        const isCommand = Boolean(args.command || args.CommandLine || /exec|run_code|terminal|run_command/.test(toolName));
-
-        timelineItems.push({
-          id: event.id,
-          kind: isEdit ? 'edit' : 'tool',
-          icon: toolKindOf(toolName, args, res),
-          rawEvent: event,
-          toolMessage,
-          toolName,
-          filename,
-          isFolder,
-          isSearch,
-          isTask,
-          isCommand,
-        });
+        timelineItems.push(toolItem(event.id, toolName, args, res, toolMessage));
         continue;
       }
     }
@@ -290,9 +266,16 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
   }
   flushPendingGroup(isStreaming);
 
-  return (
+  const finalBlockIndex = compact && !isStreaming ? blocks.map(block => block.type).lastIndexOf('model_response') : -1;
+  const finalBlock = finalBlockIndex >= 0 ? blocks[finalBlockIndex] : null;
+  const displayBlocks = finalBlockIndex >= 0 ? blocks.filter((_, index) => index !== finalBlockIndex) : blocks;
+  const extraText = events.length > 0 && assistant?.content.startsWith(completedText) ? assistant.content.slice(completedText.length) : '';
+  const finalText = finalBlock?.item ? `${finalBlock.item.content ?? ''}${extraText}` : assistant?.content ?? '';
+  const durationMs = events.length > 1 ? events[events.length - 1].createdAt - events[0].createdAt : null;
+
+  const activity = (
     <div className="activity-feed">
-      {blocks.map((block, blockIndex) => {
+      {displayBlocks.map((block, blockIndex) => {
         if (block.type === 'model_response' && block.item) {
           return (
             <Fragment key={block.key}>
@@ -328,7 +311,7 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         }
 
         if (block.type === 'group' && block.items) {
-          const isLastGroup = blockIndex === blocks.length - 1;
+          const isLastGroup = blockIndex === displayBlocks.length - 1;
           const isLive = isStreaming && isLastGroup;
           const defaultExpanded = isStreaming || isLastGroup || block.items.length <= 1;
           const isExpanded = openGroups[block.key] ?? defaultExpanded;
@@ -343,7 +326,6 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
               >
                 <TraceIcon kind={block.icon ?? 'explore'} size={13} />
                 <span className="activity-group-title">{block.title}</span>
-                <span className="activity-group-count">{block.items.length}</span>
                 <ChevronRight size={13} className="activity-group-chevron" />
               </button>
               <div
@@ -356,7 +338,7 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
                       <details key={item.id} className="trace-thought-details">
                         <summary className="trace-thought-pill">
                           <TraceIcon kind="thought" size={12} />
-                          <span className="trace-thought-label">Thought for {item.duration ?? '8s'}</span>
+                          <span className="trace-thought-label">{item.duration ? `Thought for ${item.duration}` : 'Thought'}</span>
                           <ChevronRight size={13} className="thought-chevron" />
                         </summary>
                         <div className="trace-thought-content">{item.thoughtText}</div>
@@ -380,10 +362,20 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool }
         return null;
       })}
 
-      {((events.length > 0 && (liveText || liveReasoning || assistant?.status === 'streaming')) ||
+      {!compact && ((events.length > 0 && (liveText || liveReasoning || assistant?.status === 'streaming')) ||
         (events.length === 0 && isStreaming && (assistant?.content || assistant?.reasoning))) &&
         renderMessage({ ...base, id: `${base.id}-live`, content: events.length > 0 ? liveText : (assistant?.content ?? ''), reasoning: events.length > 0 ? liveReasoning : (assistant?.reasoning ?? '') })}
-      {assistant?.error && <p role="alert" className="error-banner">{assistant.error}</p>}
     </div>
   );
+  if (!compact) return <>{activity}{assistant?.error && <p role="alert" className="error-banner">{assistant.error}</p>}</>;
+
+  const steps = timelineItems.filter(item => item.kind !== 'model_response').length;
+  return <WorkSummary messages={messages} run={run} durationMs={durationMs} running={isStreaming} initiallyOpen={!assistant} steps={steps}
+    activity={displayBlocks.length > 0 || liveReasoning ? activity : undefined}>
+    {(finalText || (isStreaming && liveText) || assistant?.status === 'error' || assistant?.status === 'interrupted') && renderMessage({
+      ...base, id: finalBlock?.item?.id ?? `${base.id}-live`,
+      content: isStreaming ? liveText : finalText,
+      reasoning: '',
+    }, !isStreaming)}
+  </WorkSummary>;
 }

@@ -18,13 +18,10 @@ export interface WebSearchFetchConfig {
   normalPages: number;
   deepPages: number;
   timeoutSeconds: number;
-  deepTimeoutSeconds: number;
   maxBytes: number;
-  deepMaxBytes: number;
   globalConcurrency: number;
   perDomainConcurrency: number;
   userAgent: string;
-  userAgents: string[];
   /**
    * Retry failed page fetches through the Wayback Machine before falling back
    * to snippet-only evidence. Snapshot provenance is marked in document text
@@ -49,9 +46,6 @@ export interface WebSearchChunkingConfig {
 }
 
 export interface WebSearchRetrievalConfig {
-  bm25: boolean;
-  embeddings: boolean;
-  rrfK: number;
   candidateLimit: number;
   finalLimit: number;
   maxChunksPerDoc: number;
@@ -72,22 +66,32 @@ export interface WebSearchVerificationConfig {
 
 export interface WebSearchCacheConfig {
   enabled: boolean;
-  databasePath?: string;
-  searchTtlSeconds: {
-    news: number;
-    weather: number;
-    documentation: number;
-    default: number;
-  };
+  searchTtlSeconds: number;
+}
+
+/**
+ * One research run's spend limits for a mode (fast/normal/deep). This is the
+ * single source of truth — the query planner, staged research loop, dynamic
+ * follow-ups, page fetching, and the verification retry loop all read these
+ * instead of keeping their own hardcoded clamps.
+ */
+export interface ResearchBudget {
+  /** Queries planned up front for one research question. */
+  initialQueries: number;
+  /** Dynamically added follow-up or cross-check queries on top of the initial set. */
+  followUpQueries: number;
+  /** Total page fetches per run across every query and retry round. */
+  pageFetches: number;
+  /** Verification retry rounds after the initial pass (verification.enabled still gates them). */
+  retries: number;
+  /** Wall-clock cap for one run in milliseconds; callers may still pass a tighter deadlineMs. */
+  timeMs: number;
 }
 
 export interface WebSearchConfig {
   extractEvidenceWithModel: boolean;
-  localEmbedding?: { baseUrl: string; model: string };
-  localReranker?: { baseUrl: string; model: string };
   enabled: boolean;
   mode: ResearchMode;
-  profile: 'standard' | 'low_memory';
   searxngBaseUrl: string;
   searxngTimeoutMs: number;
   searxngEngines: string[];

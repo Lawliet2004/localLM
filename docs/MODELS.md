@@ -43,12 +43,19 @@ build. Safetensors/PyTorch weights require external conversion. Projectors,
 adapters, embedding-only models, and other companion files are not standalone
 chat models. The harness does not execute downloaded model code.
 
-All models run on the standard llama.cpp runtime; when no executable is
-selected the app falls back to the managed runtime, and a missing runtime
-produces an actionable error. **Model files** retains manual model and runtime
-paths, runtime installation, and the original pinned download controls.
+Models use the standard llama.cpp runtime when no executable is selected. On
+machines with the neighboring K2 Horizon project and its downloaded GGUF, the
+model appears in **My Models** and the chat model picker. Selecting it uses
+the custom CUDA llama-server from the
+neighboring `k2 horizon agent` project. Selecting another model without a saved
+runtime profile returns to the standard runtime. The K2 model remains owned by
+its original project, so LocalLM cannot delete it. **Model files** retains
+manual model and runtime paths, runtime installation, and the original pinned
+download controls.
 
 ## Runtime guidance
+
+Context length is capacity **per inference slot**. One slot emits `--ctx-size N --parallel 1`; two emit `--ctx-size 2*N --parallel 2`. KV estimates include both slots. Model-limit validation compares N to the trained maximum. After loading, authenticated `/props` (`default_generation_settings.n_ctx`) supplies measured capacity; a missing or invalid value falls back to N. Nested worker calls use slot 1 with a managed two-slot runtime, while chat uses slot 0. Calls within a worker queue serially; one-slot and external loopback providers leave the slot unspecified.
 
 The Runtime page reads architecture, context capacity, transformer blocks,
 attention dimensions, and weight size from the GGUF header. Split-model sizes
@@ -85,3 +92,38 @@ broader runtime compatibility; saved model-specific choices take precedence.
 
 Implementation follows the [Hugging Face Hub API](https://huggingface.co/docs/hub/api)
 and [GGUF metadata specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md).
+
+## Qualification and readiness
+
+A model that loads and answers one prompt is not qualified. **Run qualification**
+in Models sends a fixed, deterministic suite (temperature 0, small output caps,
+per-case timeouts) and records each case as passed, failed, unsupported, or
+untested — never as a load-and-hope check:
+
+- `basic_chat` — a fixed question; requires a non-empty streamed answer.
+- `structured_output` — a small JSON schema must be returned intact.
+- `tool_call` / `tool_args_parsing` — a function call with typed, nested
+  arguments must round-trip through the same parser the turn loop uses.
+- `malformed_recovery` — a corrupt tool result gets one retry.
+- `simple_coding` — a generated function is run locally when a Python runtime
+  is available; otherwise `untested` rather than a silent pass.
+- `grounded_research` — only tested when web search is configured.
+- `cancellation` — a long generation must stop within 5 seconds and leave the
+  model responsive.
+
+Overall `passed` requires every core case (chat, both tool-call cases,
+structured output) to pass; a failure in any of them yields `partial` or
+`failed`, and a cancelled run is `cancelled`. Results persist per
+**model identity** — model file, runtime version, provider, and generation
+config — hashed into `identity_hash`. Change the model or its config and the
+saved result is shown as stale until re-run.
+
+The single **readiness** indicator walks the setup chain in order — runtime,
+model selection, load state (including OOM hints for low-VRAM machines),
+provider reachability, then qualification — and names the one next action.
+Chat shows this card until the setup is actually ready.
+
+**Profiles** (Chat / Coding / Research / Advanced, in Settings → Tools) map to
+the existing tool presets and interaction modes. Recommendations come from the
+qualification record: a model that cannot call tools recommends only Chat and
+explains why under Coding and Research.

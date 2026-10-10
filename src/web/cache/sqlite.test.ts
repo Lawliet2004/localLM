@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { InMemoryStorageAdapter } from './sqlite';
 import { SearchCache } from './search_cache';
 import type { SearchResult } from '../types';
@@ -19,6 +19,17 @@ describe('Storage & Cache Expiration', () => {
 
     const val = await storage.get<string>('test_table', 'key2');
     expect(val).toBeNull();
+  });
+
+  it('expires entries exactly at the TTL boundary', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      const storage = new InMemoryStorageAdapter();
+      await storage.set('cache', 'item', 'value', 1);
+      clock.mockReturnValue(now + 1000);
+      expect(await storage.get('cache', 'item')).toBeNull();
+    } finally { clock.mockRestore(); }
   });
 
   it('caches search results by provider, query, and freshness', async () => {

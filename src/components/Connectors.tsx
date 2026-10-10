@@ -5,6 +5,7 @@ import catalog from '../lib/catalog.json';
 import type { ConnectorView } from '../lib/types';
 import { LocalConnectorForm } from './LocalConnectorForm';
 import type { LocalServerConfig } from '../lib/api';
+import { SettingsHeader } from './Settings';
 
 const presets: ConnectorView[] = catalog.connectors.map(item => ({
   id: item.name, description: item.description, url: item.url,
@@ -56,8 +57,8 @@ export function Connectors() {
   }
   const filtered = items.filter(item => `${item.id} ${item.description}`.toLowerCase().includes(query.toLowerCase()));
   return <div className="settings-page catalog-page">
-    <div className="page-heading"><p className="eyebrow">EXTEND YOUR WORKSPACE</p><h1>Connectors</h1><p>Connect your accounts and discover the tools they provide.</p></div>
-    <div className="catalog-toolbar"><label className="search-field"><Search size={16} /><input type="search" aria-label="Search connectors" placeholder="Search connectors…" value={query} onChange={e => setQuery(e.target.value)} /></label><span>{filtered.length} connectors</span></div>
+    <SettingsHeader title="Connectors" description="Connect your accounts and discover the tools they provide." />
+    <div className="catalog-toolbar"><label className="search-field"><Search size={15} /><input type="search" aria-label="Search connectors" placeholder="Search connectors…" value={query} onChange={e => setQuery(e.target.value)} /></label><span>{filtered.length} connectors</span></div>
     <p className="catalog-notice">Credentials are encrypted on this device. Connected services reconnect when you reopen the app; disconnect to keep a service off. Services that need renewed authorization may ask you to sign in again. Actions follow your conversation's permission mode. Connecting a remote service sends tool arguments to that service; it never runs code on this device.</p>
     <LocalConnectorForm key={editing?.id ?? 'new'} initial={editing} onCancel={editing ? () => setEditing(undefined) : undefined} onSaved={async () => { setEditing(undefined); setItems(await api.listConnectors()); }} />
     {error && <p role="alert" className="error-banner">{error}</p>}

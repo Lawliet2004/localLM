@@ -241,7 +241,11 @@ pub fn validate_base_url(raw: &str) -> Result<String, String> {
 pub fn is_loopback_base_url(raw: &str) -> bool {
     reqwest::Url::parse(raw.trim())
         .ok()
-        .and_then(|url| url.host_str().map(|host| matches!(host, "localhost" | "127.0.0.1" | "::1")))
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.username().is_empty() && url.password().is_none())
+        .and_then(|url| url.host_str().map(|host| {
+            let host = host.trim_matches(['[', ']']).trim_end_matches('.');
+            host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        }))
         .unwrap_or(false)
 }
 
@@ -454,6 +458,11 @@ pub fn merge_listed_models(existing: &[RemoteModel], ids: &[String]) -> Vec<Remo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn loopback_urls_require_http_without_credentials_and_accept_ipv6() {
+        for url in ["http://[::1]:8080", "http://LOCALHOST:8080", "http://localhost.:8080"] { assert!(super::is_loopback_base_url(url), "{url}"); }
+        for url in ["file://localhost/model", "http://localhost@evil.com", "http://user:pass@127.0.0.1", "http://127.0.0.1.evil.com", "http://[::ffff:127.0.0.1]"] { assert!(!super::is_loopback_base_url(url), "{url}"); }
+    }
     use super::*;
 
     #[test]

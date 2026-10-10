@@ -1,147 +1,48 @@
 //! Sandboxing, persistent terminal, FS policy, web tools, guards (Phase 5).
 //!
-//! Local execution is NOT an isolation boundary (see SPEC). Docker is the
-//! opt-in boundary; every Docker call fails loud when the daemon is missing.
-//! Approval answers WHETHER a tool runs; the sandbox provider answers WHERE.
+//! Local execution is not an isolation boundary. Container execution is
+//! unavailable; old provider selections never silently fall back to the host.
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
 pub const PROVIDER_KEY: &str = "sandbox.provider";
-pub const DOCKER_IMAGE_KEY: &str = "sandbox.docker_image";
 pub const TOOL_TIMEOUT_KEY: &str = "guards.tool_timeout_secs";
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum SandboxProvider {
-    Local,
-    Docker,
-}
-
-pub fn provider(store: &crate::store::Store) -> SandboxProvider {
-    let name: String = store.setting(PROVIDER_KEY).unwrap_or_default();
-    if name == "docker" {
-        SandboxProvider::Docker
-    } else {
-        SandboxProvider::Local
-    }
-}
-
-pub fn docker_image(store: &crate::store::Store) -> String {
-    let image: String = store.setting(DOCKER_IMAGE_KEY).unwrap_or_default();
-    if image.trim().is_empty() {
-        "mcr.microsoft.com/windows/servercore:ltsc2022".to_string()
-    } else {
-        image
-    }
-}
-
-fn validate_command(command: &str) -> Result<(), String> {
-    if command.trim().is_empty() || command.len() > 8192 {
-        return Err("Docker command must be 1-8192 characters.".into());
+pub fn ensure_local_execution(store: &crate::store::Store) -> Result<(), String> {
+    let saved: String = store.setting(PROVIDER_KEY)?;
+    if !saved.is_empty() && saved != "local" {
+        return Err("The saved execution provider is unavailable in this build. Choose local execution explicitly; this command was not run.".into());
     }
     Ok(())
 }
 
-/// Run a command inside a one-shot container: no network, capped CPU/memory,
-/// workspace mounted at C:\\work (Windows containers). The caller timeout is
-/// enforced: on expiry the container process is killed and an error returned.
-pub async fn docker_exec(
-    workspace: &str,
-    image: &str,
-    command: &str,
-    timeout_secs: u64,
-) -> Result<serde_json::Value, String> {
-    validate_command(command)?;
-    let timeout_secs = timeout_secs.clamp(1, 300);
-    let child = tokio::process::Command::new("docker")
-        .args([
-            "run", "--rm", "--network", "none", "--cpus", "2", "--memory", "2g",
-            "--volume", &format!("{workspace}:C:\\work"), "--workdir", "C:\\work", image,
-            "powershell", "-NoProfile", "-NonInteractive", "-Command", command,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|_| "Docker is not available. Install Docker Desktop or switch the sandbox provider back to local.")?;
-    let output = match tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return Err(format!("Docker execution failed: {error}")),
-        Err(_) => {
-            // wait_with_output takes ownership; kill via `docker kill` lookup
-            // is racy, so report the timeout and let --rm reap the container.
-            return Err(format!("Docker command timed out after {timeout_secs}s; the container was left to --rm reaping."));
-        }
-    };
-    if !output.status.success() {
-        return Ok(serde_json::json!({
-            "isError": true,
-            "exit": output.status.code(),
-            "stdout": String::from_utf8_lossy(&output.stdout).chars().take(8000).collect::<String>(),
-            "stderr": String::from_utf8_lossy(&output.stderr).chars().take(4000).collect::<String>(),
-        }));
-    }
-    Ok(serde_json::json!({
-        "exit": 0,
-        "stdout": String::from_utf8_lossy(&output.stdout).chars().take(16000).collect::<String>(),
-    }))
+fn validate_provider(name: &str) -> Result<(), String> {
+    if name != "local" { return Err("Only local execution is available. Docker is not implemented in this build.".into()); }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn sandbox_status(state: tauri::State<'_, crate::AppState>) -> Result<serde_json::Value, String> {
-    let active = {
-        let store = state.database()?;
-        provider(&store)
-    };
-    let docker = tokio::process::Command::new("docker")
-        .args(["info", "--format", "{{.ServerVersion}}"])
-        .output()
-        .await
-        .map_err(|_| "docker-not-found".to_string());
-    Ok(serde_json::json!({
-        "provider": format!("{active:?}").to_lowercase(),
-        "warning": "Local execution is NOT an isolation boundary. Use Docker for untrusted work.",
-        "docker": match docker {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            _ => "unavailable".to_string(),
-        },
-    }))
+    let store = state.database()?;
+    let available = ensure_local_execution(&store).is_ok();
+    Ok(serde_json::json!({"provider":"local","available":available,"warning":"Local execution runs with this user's filesystem and network permissions. It is unsandboxed."}))
 }
 
 #[tauri::command]
-pub async fn set_sandbox_provider(
-    state: tauri::State<'_, crate::AppState>,
-    provider_name: String,
-    image: Option<String>,
-) -> Result<(), String> {
-    let _operation = state
-        .operation
-        .try_lock()
-        .map_err(|_| "Wait for the active operation before changing the sandbox provider.")?;
-    if provider_name != "local" && provider_name != "docker" {
-        return Err("Sandbox provider must be 'local' or 'docker'.".into());
-    }
-    let store = state.database()?;
-    store.save_setting(PROVIDER_KEY, &provider_name)?;
-    if let Some(image) = image {
-        if image.len() > 300 {
-            return Err("Docker image reference is too long.".into());
-        }
-        store.save_setting(DOCKER_IMAGE_KEY, &image)?;
-    }
-    Ok(())
+pub async fn set_sandbox_provider(state: tauri::State<'_, crate::AppState>, provider_name: String, image: Option<String>) -> Result<(), String> {
+    let _operation = state.operation.try_lock().map_err(|_| "Wait for the active operation before changing execution settings.")?;
+    validate_provider(&provider_name)?;
+    let _ = image; // Historical clients may still send the unused image field.
+    state.database()?.save_setting(PROVIDER_KEY, &provider_name)
 }
 
 // ---- Persistent terminal sessions ----
 
 pub struct TerminalSession {
-    child: tokio::process::Child,
+    // KillOnDrop and the Windows job own the whole process tree; a session
+    // leaked past close or app exit cannot leave a live shell behind.
+    child: Box<dyn process_wrap::tokio::ChildWrapper>,
     stderr_buf: std::sync::Arc<std::sync::Mutex<String>>,
     stderr_seen: usize,
 }
@@ -154,21 +55,41 @@ impl TerminalRegistry {
     pub fn new() -> Self {
         Self { sessions: HashMap::new() }
     }
-    pub fn create(&mut self, shell: &str) -> Result<String, String> {
+    pub fn create(
+        &mut self,
+        shell: &str,
+        cwd: &str,
+        isolation: &crate::isolation::IsolationSettings,
+        db_path: Option<&std::path::Path>,
+    ) -> Result<String, String> {
         if self.sessions.len() >= 8 {
             return Err("At most 8 persistent terminal sessions.".into());
         }
-        let mut child = tokio::process::Command::new(shell)
-            .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+        // Agent shells open in the conversation's workspace (its isolated
+        // task root while a task workspace is active).
+        let cwd_path = if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
+            std::path::PathBuf::from(cwd)
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+        };
+        let spec = crate::isolation::SpawnSpec {
+            program: shell.into(),
+            args: ["-NoProfile", "-NonInteractive", "-Command", "-"]
+                .map(String::from)
+                .to_vec(),
+            cwd: cwd_path.clone(),
+            env: crate::isolation::SpawnSpec::standard_env(&[]),
+            stdin: true,
+            stderr: true,
+            writable: vec![cwd_path],
+            cpu_seconds: 0,
+        };
+        let mut child = crate::isolation::spawn(&spec, isolation, db_path)
             .map_err(|error| format!("Could not start terminal shell: {error}"))?;
         // Capture stderr in the background (capped) so errors stay visible to
         // the model instead of being discarded, without blocking the pipe.
         let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.stderr().take() {
             let captured = stderr_buf.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
@@ -203,7 +124,7 @@ impl TerminalRegistry {
         // finishes instead of sleeping for a fixed window every call.
         let sentinel = format!("__LOCALLM_DONE_{}__", uuid::Uuid::new_v4().simple());
         let session = self.sessions.get_mut(id).ok_or("Terminal session no longer exists.")?;
-        let stdin = session.child.stdin.as_mut().ok_or("Terminal input is closed.")?;
+        let stdin = session.child.stdin().as_mut().ok_or("Terminal input is closed.")?;
         {
             use tokio::io::AsyncWriteExt;
             stdin
@@ -212,7 +133,7 @@ impl TerminalRegistry {
                 .map_err(|error| format!("Terminal write failed: {error}"))?;
             stdin.flush().await.map_err(|error| format!("Terminal flush failed: {error}"))?;
         }
-        let stdout = session.child.stdout.as_mut().ok_or("Terminal output is closed.")?;
+        let stdout = session.child.stdout().as_mut().ok_or("Terminal output is closed.")?;
         let mut output = read_until_sentinel(stdout, &sentinel, Duration::from_secs(30), 65_536).await;
         // Merge newly arrived stderr so model-visible errors are not lost.
         let fresh_stderr = session.stderr_buf.lock().map(|locked| {
@@ -231,8 +152,18 @@ impl TerminalRegistry {
     }
     pub async fn close(&mut self, id: &str) -> Result<(), String> {
         let mut session = self.sessions.remove(id).ok_or("Terminal session no longer exists.")?;
-        session.child.kill().await.map_err(|error| format!("Could not stop terminal: {error}"))?;
+        session.child.start_kill().map_err(|error| format!("Could not stop terminal: {error}"))?;
+        let _ = tokio::time::timeout(Duration::from_secs(3), session.child.wait()).await;
         Ok(())
+    }
+    /// Terminate every session and wait briefly for reaping. Called on app
+    /// exit so interactive shells never outlive the app.
+    pub async fn kill_all(&mut self) {
+        let sessions = std::mem::take(&mut self.sessions);
+        for (_, mut session) in sessions {
+            let _ = session.child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), session.child.wait()).await;
+        }
     }
     pub fn ids(&self) -> Vec<String> {
         self.sessions.keys().cloned().collect()
@@ -300,38 +231,6 @@ async fn read_until_sentinel(
     text
 }
 
-/// Legacy fixed-window read; superseded by sentinel reads in `send`.
-#[allow(dead_code)]
-async fn read_available(
-    stdout: &mut tokio::process::ChildStdout,
-    window: Duration,
-    max_bytes: usize,
-) -> String {
-    use tokio::io::AsyncReadExt;
-    let mut collected = Vec::new();
-    let deadline = tokio::time::Instant::now() + window;
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() || collected.len() >= max_bytes {
-            break;
-        }
-        match tokio::time::timeout(remaining, stdout.read(&mut buf)).await {
-            Ok(Ok(0)) | Err(_) => break,
-            Ok(Ok(count)) => collected.extend_from_slice(&buf[..count]),
-            Ok(Err(_)) => break,
-        }
-        if collected.len() >= max_bytes {
-            break;
-        }
-    }
-    let mut text = String::from_utf8_lossy(&collected).into_owned();
-    if collected.len() >= max_bytes {
-        text.push_str("\n… (terminal output truncated at 64 KiB; refine the command)");
-    }
-    text
-}
-
 // ---- FS policy over workspace.rs ----
 
 const DENY_BASENAMES: [&str; 3] = [".env", "id_rsa", "id_ed25519"];
@@ -375,51 +274,104 @@ pub fn check_bytes(bytes: &[u8], limit: usize) -> Result<(), String> {
 
 pub const ALLOW_PRIVATE_FETCH_KEY: &str = "sandbox.allow_private_fetch";
 
+fn is_blocked_v4(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_link_local()
+        || o[0] == 0
+        || o[0] == 10
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 169 && o[1] == 254)
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 0)
+        || (o[0] == 198 && (18..=19).contains(&o[1]))
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+        || o[0] >= 240
+}
+
+/// RFC 6052 NAT64 prefixes whose embedded IPv4 destination is checked like a
+/// literal v4: the well-known `64:ff9b::/96` and the local-use `64:ff9b:1::/48`.
+fn nat64_embedded_v4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let b = v6.octets();
+    if b[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+        return Some(std::net::Ipv4Addr::new(b[12], b[13], b[14], b[15]));
+    }
+    // /48 embeds the v4 in bytes 6-7 and 9-10; byte 8 is reserved zero.
+    if b[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01] && b[8] == 0 {
+        return Some(std::net::Ipv4Addr::new(b[6], b[7], b[9], b[10]));
+    }
+    None
+}
+
 fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_link_local()
-                || o[0] == 10
-                || (o[0] == 172 && (16..=31).contains(&o[1]))
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 169 && o[1] == 254)
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
-                || (o[0] == 198 && (18..=19).contains(&o[1]))
-                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
-                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-        }
+        std::net::IpAddr::V4(v4) => is_blocked_v4(v4),
         std::net::IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return true;
+            }
+            // IPv4 carried inside IPv6 (mapped ::ffff:a.b.c.d, compatible
+            // ::a.b.c.d) is classified by the embedded address so a mapped
+            // loopback or private v4 cannot bypass the v4 checks.
+            if let Some(v4) = v6.to_ipv4() {
+                return is_blocked_v4(&v4);
+            }
+            let s = v6.segments();
+            (s[0] & 0xfe00) == 0xfc00                 // fc00::/7 unique local
+                || (s[0] & 0xffc0) == 0xfe80          // fe80::/10 link-local
+                || (s[0] & 0xffc0) == 0xfec0          // fec0::/10 site-local
+                || s[0] == 0x2002                     // 2002::/16 6to4
+                || (s[0] == 0x2001 && s[1] == 0)      // 2001::/32 Teredo
+                || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32 documentation
+                || nat64_embedded_v4(v6).is_some_and(|v4| is_blocked_v4(&v4))
         }
     }
 }
 
-async fn check_fetch_host(url: &reqwest::Url, allow_private: bool) -> Result<(), String> {
-    if allow_private {
-        return Ok(());
+/// Resolve the URL host once and validate every answer. Returns the socket
+/// addresses the request must be pinned to, or `None` when pinning is not
+/// needed (private fetching opted in, or a literal IP already checked).
+/// Pinning closes the re-resolution window between this check and connect.
+async fn fetch_pins(
+    url: &reqwest::Url,
+    allow_private: bool,
+) -> Result<Option<(String, Vec<std::net::SocketAddr>)>, String> {
+    // Credentials in URLs forward ambient authority to an arbitrary host.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("web_fetch does not accept credentials in URLs.".into());
     }
     let host = url.host_str().ok_or("web_fetch needs a host.")?.to_string();
-    let port = url.port_or_known_default().unwrap_or(443);
-    // Literal IPs are checked directly; hostnames go through DNS pre-flight.
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+    if allow_private {
+        return Ok(None);
+    }
+    // WHATWG URL parsing already normalized non-canonical IPv4 forms
+    // (0x7f.0.0.1, 2130706433, 0177.0.0.1) before host_str().
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(&host);
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
         if is_blocked_ip(&ip) {
             return Err("web_fetch blocked: loopback, link-local, and private addresses are not fetchable.".into());
         }
-        return Ok(());
+        return Ok(None);
     }
-    let addrs = tokio::net::lookup_host((host.as_str(), port))
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((unbracketed, port))
         .await
-        .map_err(|_| "web_fetch could not resolve the host.".to_string())?;
-    for addr in addrs {
+        .map_err(|_| "web_fetch could not resolve the host.".to_string())?
+        .collect();
+    if addrs.is_empty() {
+        return Err("web_fetch could not resolve the host.".into());
+    }
+    for addr in &addrs {
         if is_blocked_ip(&addr.ip()) {
             return Err("web_fetch blocked: host resolves to a loopback, link-local, or private address.".into());
         }
     }
-    Ok(())
+    Ok(Some((host, addrs)))
 }
 
 fn resolve_redirect(current: &reqwest::Url, location: &str) -> Result<reqwest::Url, String> {
@@ -504,8 +456,19 @@ pub fn allow_private_fetch(store: &crate::store::Store) -> bool {
     store.setting(ALLOW_PRIVATE_FETCH_KEY).unwrap_or(false)
 }
 
-async fn fetch_one(client: &reqwest::Client, url: &reqwest::Url, allow_private: bool) -> Result<reqwest::Response, String> {
-    check_fetch_host(url, allow_private).await?;
+async fn fetch_one(url: &reqwest::Url, allow_private: bool) -> Result<reqwest::Response, String> {
+    let pins = fetch_pins(url, allow_private).await?;
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20));
+    if let Some((host, addrs)) = pins {
+        // Connect only to the validated answer set — DNS is not consulted again.
+        builder = builder.resolve_to_addrs(&host, &addrs);
+    }
+    let client = builder
+        .build()
+        .map_err(|_| "Could not create the web client.".to_string())?;
     client
         .get(url.clone())
         .header("user-agent", "LocalLM/0.1")
@@ -518,6 +481,65 @@ pub async fn web_fetch(url: &str) -> Result<serde_json::Value, String> {
     web_fetch_with_flag(url, false).await
 }
 
+fn has_soft_error_heading(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    ["title", "h1"].iter().any(|tag| {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}");
+        let Some(start) = lower.find(&open) else {
+            return false;
+        };
+        let Some(open_end) = lower[start..].find('>') else {
+            return false;
+        };
+        let content_start = start + open_end + 1;
+        let Some(content_len) = lower[content_start..].find(&close) else {
+            return false;
+        };
+        let heading = html_to_text(&raw[content_start..content_start + content_len])
+            .trim()
+            .to_ascii_lowercase();
+        matches!(
+            heading.as_str(),
+            "404"
+                | "404 error"
+                | "404 not found"
+                | "404 page not found"
+                | "page not found"
+                | "the page was not found"
+                | "the requested page was not found"
+                | "sorry, page not found"
+                | "access denied"
+                | "403 forbidden"
+                | "just a moment"
+        )
+    })
+}
+
+fn shape_fetch_response(url: &str, status: u16, raw: String, spill: bool) -> serde_json::Value {
+    let body = html_to_text(&raw);
+    let error_page = status < 400 && has_soft_error_heading(&raw);
+    let failed = status >= 400 || error_page;
+    let mut result = serde_json::json!({
+        "url": url,
+        "status": status,
+        "bytes": raw.len(),
+        "body": if failed { body.chars().take(4000).collect::<String>() } else { body },
+    });
+    if failed {
+        result["isError"] = serde_json::json!(true);
+        result["message"] = serde_json::json!(if error_page {
+            "Page returned an error or challenge screen; no research content was retrieved.".to_string()
+        } else {
+            format!("HTTP {status}: page not retrieved. The body is diagnostic text, not research evidence.")
+        });
+    }
+    if spill {
+        result["truncated"] = serde_json::json!("Body exceeded 256 KiB; remainder spilled. Narrow the request.");
+    }
+    result
+}
+
 pub async fn web_fetch_with_flag(url: &str, allow_private: bool) -> Result<serde_json::Value, String> {
     let mut current = reqwest::Url::parse(url).map_err(|_| "web_fetch needs an absolute http(s) URL.".to_string())?;
     if !matches!(current.scheme(), "http" | "https") {
@@ -526,17 +548,12 @@ pub async fn web_fetch_with_flag(url: &str, allow_private: bool) -> Result<serde
     if url.len() > 2048 {
         return Err("URL is too long.".into());
     }
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|_| "Could not create the web client.".to_string())?;
-    // Manual redirect chain (max 3): every hop re-resolves so a public URL
-    // cannot bounce into loopback/private space mid-fetch.
+    // Manual redirect chain (max 3): every hop re-resolves and re-pins so a
+    // public URL cannot bounce into loopback/private space mid-fetch.
     let mut response = None;
     for _ in 0..4 {
-        let next = fetch_one(&client, &current, allow_private).await?;
+        reject_placeholder_url(&current)?;
+        let next = fetch_one(&current, allow_private).await?;
         let status = next.status();
         if [301, 302, 303, 307, 308].contains(&status.as_u16()) {
             let location = next.headers().get(reqwest::header::LOCATION)
@@ -562,16 +579,15 @@ pub async fn web_fetch_with_flag(url: &str, allow_private: bool) -> Result<serde
     let spill = bytes.len() > 262_144;
     let body = if spill { bytes[..262_144].to_vec() } else { bytes.to_vec() };
     let raw = String::from_utf8_lossy(&body).into_owned();
-    let mut text = serde_json::json!({
-        "url": url,
-        "status": status,
-        "bytes": body.len(),
-        "body": html_to_text(&raw),
-    });
-    if spill {
-        text["truncated"] = serde_json::json!("Body exceeded 256 KiB; remainder spilled. Narrow the request.");
+    Ok(shape_fetch_response(url, status, raw, spill))
+}
+
+pub fn reject_placeholder_url(url: &reqwest::Url) -> Result<(), String> {
+    let path = url.path().to_ascii_lowercase();
+    if path.contains("xxxxx") || path.contains("...") || path.contains("%3c") || path.contains("%3e") || path.contains('<') || path.contains('>') {
+        return Err("URL contains a placeholder path; provide a verified source URL before fetching.".into());
     }
-    Ok(text)
+    Ok(())
 }
 
 /// Fixed-string file search inside the workspace. Skips hidden dirs,
@@ -625,8 +641,38 @@ pub fn file_search(root: &std::path::Path, needle: &str) -> Result<Vec<String>, 
 
 // ---- Guards ----
 
+/// Serialize a JSON value with sorted object keys so the same logical
+/// arguments compare equal regardless of key order or whitespace.
+/// Repetition and blocked-call guards compare this canonical form.
+pub fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let inner = keys
+                .iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::Value::String((*key).clone()),
+                        canonical_json(&map[*key])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+        serde_json::Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(canonical_json).collect::<Vec<_>>().join(",")
+        ),
+        other => other.to_string(),
+    }
+}
+
 /// Loop hygiene: three identical consecutive tool calls in a row end the
-/// streak with an errored result instead of burning more rounds.
+/// streak with an errored result instead of burning more rounds. Callers
+/// pass [`canonical_json`] output so key order cannot evade the check.
 pub fn check_repetition(history: &[(String, String)], alias: &str, arguments: &str) -> Option<String> {
     if history.len() >= 2
         && history.iter().rev().take(2).all(|(name, args)| name == alias && args == arguments)
@@ -692,6 +738,116 @@ mod tests {
         assert!(web_fetch("http://127.0.0.1:4317/api/config").await.is_err());
         assert!(web_fetch("http://10.0.0.9/").await.is_err());
         assert!(web_fetch("ftp://example.com/x").await.is_err());
+    }
+    #[test]
+    fn ssrf_guard_blocks_embedded_and_translated_v4() {
+        // IPv4-mapped and IPv4-compatible IPv6 must not bypass the v4 checks.
+        for ip in ["::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254",
+            "::127.0.0.1", "::0.0.0.1",
+            // NAT64 well-known prefix carrying private v4 destinations.
+            "64:ff9b::7f00:1", "64:ff9b::a00:1", "64:ff9b::a9fe:a9fe",
+            // 6to4, Teredo, site-local, documentation.
+            "2002:a00:1::1", "2001::4136:e378:8000:63bf:3fff:fdd2", "fec0::1", "2001:db8::1"] {
+            assert!(is_blocked_ip(&ip.parse().unwrap()), "{ip} should be blocked");
+        }
+        for ip in ["::ffff:8.8.8.8", "64:ff9b::808:808", "2606:4700:4700::1111"] {
+            assert!(!is_blocked_ip(&ip.parse().unwrap()), "{ip} should be allowed");
+        }
+    }
+    #[test]
+    fn ssrf_guard_checks_nat64_local_use_embedded_v4() {
+        // 64:ff9b:1::/48 embeds v4 in bytes 6-7 and 9-10: this is 10.0.0.1.
+        let private: std::net::IpAddr = "64:ff9b:1:a00:0:100::".parse().unwrap();
+        assert!(is_blocked_ip(&private));
+        // Same prefix carrying public 8.8.8.8 is allowed.
+        let public: std::net::IpAddr = "64:ff9b:1:808:0:808::".parse().unwrap();
+        assert!(!is_blocked_ip(&public));
+    }
+    #[tokio::test]
+    async fn web_fetch_rejects_credentials_in_url() {
+        assert!(web_fetch("http://user:pass@example.com/").await.is_err());
+        assert!(web_fetch("http://user@example.com/").await.is_err());
+        // Even with private fetching enabled, credentials are never accepted.
+        assert!(web_fetch_with_flag("http://user:pass@127.0.0.1/", true).await.is_err());
+    }
+    #[test]
+    fn fetch_response_marks_http_failures_without_losing_status() {
+        let ok = shape_fetch_response("https://example.org/ok", 200, "<h1>Research result</h1>".into(), false);
+        assert_eq!(ok["status"], 200);
+        assert_ne!(ok["isError"], true);
+        assert!(ok["body"].as_str().unwrap().contains("Research result"));
+
+        for status in [403, 404, 500] {
+            let failed = shape_fetch_response("https://example.org/missing", status, "<h1>Page Not Found</h1>".into(), false);
+            assert_eq!(failed["status"], status);
+            assert_eq!(failed["isError"], true);
+            assert!(failed["message"].as_str().unwrap().contains("not retrieved"));
+            assert!(failed["body"].as_str().unwrap().contains("Page Not Found"));
+        }
+        let soft_404 = shape_fetch_response("https://example.org/missing", 200, "<html><title>Page Not Found</title><h1>Missing</h1></html>".into(), false);
+        assert_eq!(soft_404["status"], 200);
+        assert_eq!(soft_404["isError"], true);
+
+        let article = shape_fetch_response("https://example.org/http-status", 200,
+            "<html><title>HTTP 404 status code explained</title><body><p>Why missing pages return 404.</p></body></html>".into(), false);
+        assert_ne!(article["isError"], true);
+        assert!(article["body"]
+            .as_str()
+            .unwrap()
+            .contains("Why missing pages return 404"));
+    }
+    #[tokio::test]
+    async fn web_fetch_reports_live_http_status_from_a_local_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let n = stream.read(&mut request).await.unwrap();
+                let path = String::from_utf8_lossy(&request[..n]);
+                let (status, body) = if path.contains("/missing") { (404, "Page Not Found") }
+                    else if path.contains("/blocked") { (403, "Access denied") }
+                    else { (200, "Primary source content") };
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        for (path, status, error) in [("ok", 200, false), ("missing", 404, true), ("blocked", 403, true)] {
+            let result = web_fetch_with_flag(&format!("http://127.0.0.1:{port}/{path}"), true).await.unwrap();
+            assert_eq!(result["status"], status);
+            assert_eq!(result["isError"] == true, error);
+        }
+        server.await.unwrap();
+    }
+    #[test]
+    fn placeholder_urls_are_rejected_without_blocking_ordinary_paths() {
+        for path in ["/articles/s41586-024-XXXXX", "/papers/%3Cdoi%3E", "/docs/..."] {
+            let url = reqwest::Url::parse(&format!("https://example.org{path}")).unwrap();
+            assert!(super::reject_placeholder_url(&url).is_err());
+        }
+        for path in ["/articles/s41586-024-12345", "/docs/x-ray-results"] {
+            let url = reqwest::Url::parse(&format!("https://example.org{path}")).unwrap();
+            assert!(super::reject_placeholder_url(&url).is_ok());
+        }
+    }
+    #[test]
+    fn canonical_json_ignores_key_order_and_whitespace() {
+        let a: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":{"x":2,"y":3}}"#).unwrap();
+        let b: serde_json::Value = serde_json::from_str(r#"{ "b": { "y": 3, "x": 2 }, "a": 1 }"#).unwrap();
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+        let different: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":{"x":2,"y":4}}"#).unwrap();
+        assert_ne!(canonical_json(&a), canonical_json(&different));
+    }
+    #[test]
+    fn audit_docker_is_rejected_and_saved_preferences_do_not_fall_back() {
+        assert!(validate_provider("docker").is_err());
+        let store = crate::store::Store::open_memory().unwrap();
+        store.save_setting(PROVIDER_KEY, &"docker").unwrap();
+        assert!(ensure_local_execution(&store).is_err());
+        store.save_local_execution_config(&crate::execution::ExecutionConfig::default()).unwrap();
+        assert!(ensure_local_execution(&store).is_ok());
     }
     #[test]
     fn html_to_text_drops_markup_and_keeps_words() {

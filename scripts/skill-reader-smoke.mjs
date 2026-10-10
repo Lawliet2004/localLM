@@ -1,9 +1,8 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { writeFileSync } from 'node:fs';
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
 
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-let page;
-await expect.poll(() => { page = browser.contexts()[0].pages().find(item => item.url().includes('1420')); return Boolean(page); }).toBe(true);
+let { browser, page } = await connectSmoke();
 page.setDefaultTimeout(15000);
 async function invoke(command, args = {}) {
   return page.evaluate(async ({command, args}) => {
@@ -12,7 +11,7 @@ async function invoke(command, args = {}) {
   }, {command, args});
 }
 try {
-  await page.getByRole('button', {name:'Models & runtime', exact:true}).click();
+  await openSettingsSection(page, 'Models');
   if (await page.getByRole('button', {name:'Load model', exact:true}).count()) {
     await page.getByRole('button', {name:'Load model', exact:true}).click();
     await expect(page.getByRole('button', {name:'Unload', exact:true})).toBeVisible({timeout:120000});

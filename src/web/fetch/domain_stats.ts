@@ -56,7 +56,7 @@ export class DomainStatsStore {
       return { attempts: 0, ok: 0, fail: 0, windowStartMs: Date.now() };
     }
     if (Date.now() - stat.windowStartMs <= this.windowMs) return stat;
-    return { attempts: 0, ok: 0, fail: 0, windowStartMs: stat.windowStartMs };
+    return { attempts: 0, ok: 0, fail: 0, windowStartMs: Date.now() };
   }
 
   async record(domain: string, ok: boolean, error?: string): Promise<void> {

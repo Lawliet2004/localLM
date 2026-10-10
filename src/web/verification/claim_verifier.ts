@@ -49,9 +49,13 @@ export class ClaimVerifier {
         const combinedScore = Math.max(coverage, jaccard);
 
         const negative = (text: string) => /\b(not|never|no|cannot|doesn't|isn't|wasn't|unable)\b/i.test(text);
-        const numsMatch = (claimNums.length === 0 || claimNums.every((n) => evNums.includes(n))) && negative(claim) === negative(ev.claim);
+        const numsMatch = claimNums.every((n) => evNums.includes(n)) && negative(claim) === negative(ev.claim);
 
-        if (combinedScore > bestScore) {
+        // Version components can tie after tokenization (e.g. 24.1.0 vs
+        // 24.2.0). The exact excerpt must win over a merely similar passage.
+        const exactTie = combinedScore === bestScore && excerptContains(claim, ev.claim)
+          && (!matchingEvidence || !excerptContains(claim, matchingEvidence.claim));
+        if (combinedScore > bestScore || exactTie) {
           bestScore = combinedScore;
           matchingEvidence = ev;
           bestNumbersMatch = numsMatch;
@@ -71,7 +75,7 @@ export class ClaimVerifier {
         && !addsCurrentWording(claim, passage);
       const assessment = !matchingEvidence
         ? 'unresolved'
-        : matchingEvidence.status === 'conflicting'
+        : matchingEvidence.status === 'conflicting' && exact
           ? 'conflicting'
           : grounded
             ? 'exact_excerpt'
@@ -79,9 +83,9 @@ export class ClaimVerifier {
               ? 'lexical_match'
               : 'unresolved';
       if (matchingEvidence) {
-        if (matchingEvidence.status === 'conflicting' || assessment === 'conflicting') {
+        if (assessment === 'conflicting') {
           status = 'CONFLICTING';
-          sources = matchingEvidence.supportingSources;
+          sources = [...new Set([...matchingEvidence.supportingSources, ...(matchingEvidence.conflictingSources ?? [])])];
           conflictingCount++;
         } else if (grounded) {
           // Lexical overlap is not enough. Only an exact excerpt certifies the claim.
@@ -169,6 +173,12 @@ Output valid JSON: {"claims": [{"claim": "...", "status": "SUPPORTED|UNSUPPORTED
           let unsup = 0;
           let conf = 0;
           const vClaims: VerifiedClaim[] = parsed.claims.map((item: any) => {
+            // A model's assessment cannot promote an unsupported assertion to
+            // verified evidence; certify only excerpts from the cited sources.
+            if (item.status === 'SUPPORTED') {
+              const grounded = this.verifyClaimsDeterministic([item.claim], evidence.filter(e => e.supportingSources.some(id => item.sources.includes(id))));
+              if (!grounded.allSupported) { unsup++; return grounded.claims[0]; }
+            }
             const st: ClaimStatus = item.status || 'UNSUPPORTED';
             if (st === 'SUPPORTED') sup++;
             else if (st === 'CONFLICTING') conf++;

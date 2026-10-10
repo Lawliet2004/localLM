@@ -1,5 +1,6 @@
-import { chromium, expect } from '@playwright/test';
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
+import { expect } from '@playwright/test';
+import { connectSmoke } from './smoke-lib.mjs';
+let { browser, page } = await connectSmoke();
 try {
   const page = browser.contexts()[0].pages().find(page => page.url().includes('1420'));
   const result = await page.evaluate(async () => {

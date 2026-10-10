@@ -1,7 +1,33 @@
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { expect, it } from 'vitest';
 import { ActivityTimeline } from './ActivityTimeline';
 import type { Message, SessionEvent } from '../lib/types';
+
+it('keeps progress in a disclosure and the final answer visible in compact chat', async () => {
+  const events: SessionEvent[] = [
+    { id: '1', conversationId: 'chat', runId: 'run', seq: 1, eventType: 'model_response', payload: { content: 'Checking files.', final: false }, createdAt: 1000, ignorable: false },
+    { id: '2', conversationId: 'chat', runId: 'run', seq: 2, eventType: 'model_response', payload: { content: 'Updated the styles.', final: true }, createdAt: 4000, ignorable: false },
+  ];
+  const answer: Message = { id: 'a', conversationId: 'chat', role: 'assistant', status: 'complete', content: 'Checking files.Updated the styles.', reasoning: '', createdAt: 4000 };
+  render(<ActivityTimeline compact events={events} messages={[answer]} renderMessage={m => <p>{m.content}</p>} renderTool={() => null} />);
+  expect(screen.getByText('Updated the styles.')).toBeVisible();
+  expect(screen.getByText('Checking files.')).not.toBeVisible();
+  await userEvent.click(screen.getByText('3s', { selector: '.work-duration' }));
+  expect(screen.getByText('Checking files.')).toBeVisible();
+});
+
+it('flags only the visible answer as final so per-turn stats render once', () => {
+  const events: SessionEvent[] = [
+    { id: '1', conversationId: 'chat', runId: 'run', seq: 1, eventType: 'model_response', payload: { content: 'Checking files.' }, createdAt: 1000, ignorable: false },
+    { id: '2', conversationId: 'chat', runId: 'run', seq: 2, eventType: 'model_response', payload: { content: 'Updated the styles.' }, createdAt: 4000, ignorable: false },
+  ];
+  const answer: Message = { id: 'a', conversationId: 'chat', role: 'assistant', status: 'complete', content: 'Checking files.Updated the styles.', reasoning: '', createdAt: 4000, metrics: { genTokPerSec: 30 } };
+  const { container } = render(<ActivityTimeline compact events={events} messages={[answer]} renderMessage={(m, final) => <p data-final={String(Boolean(final))}>{m.content}</p>} renderTool={() => null} />);
+  expect(container.querySelectorAll('[data-final="true"]')).toHaveLength(1);
+  expect(screen.getByText('Updated the styles.')).toHaveAttribute('data-final', 'true');
+  expect(screen.getByText('Checking files.')).toHaveAttribute('data-final', 'false');
+});
 
 it('keeps todo harness updates out of the activity feed', () => {
   const event = (seq: number, eventType: string, payload: unknown, toolCallId?: string): SessionEvent => ({ id: String(seq), conversationId: 'chat', runId: 'run', seq, eventType, payload, toolCallId, createdAt: seq, ignorable: false });
@@ -66,7 +92,7 @@ it('groups exploration actions and formats clean trace items matching reference 
   // Group summary
   expect(screen.getByText('Explored 1 file, 1 search')).toBeInTheDocument();
   // Thought pill
-  expect(screen.getByText(/Thought for/)).toBeInTheDocument();
+  expect(screen.getByText(/^Thought(?: for .+)?$/)).toBeInTheDocument();
   // Tool outputs are rendered inside the trace
   expect(screen.getByTestId('tool-2')).toHaveTextContent('view_file: ToolControls.tsx');
   expect(screen.getByTestId('tool-4')).toHaveTextContent('grep_search: PermissionSelector');
@@ -149,4 +175,24 @@ it('synthesizes activity groups and edits from messages when events array is emp
   expect(screen.getByTestId('tool-t3')).toBeInTheDocument();
   // Assistant response
   expect(screen.getByText('Inspection finished.')).toBeInTheDocument();
+});
+
+it('matches reused tool IDs to their own run with linear event reads', () => {
+  let eventReads = 0;
+  const events: SessionEvent[] = Array.from({ length: 200 }, (_, i) => [
+    { id: `call-${i}`, conversationId: 'chat', runId: `run-${i}`, seq: i * 3, eventType: 'tool_call', payload: { name: 'view_file', arguments: {} }, createdAt: i, ignorable: false },
+    { id: `result-${i}`, conversationId: 'chat', runId: `run-${i}`, seq: i * 3 + 1, eventType: 'tool_result', payload: { name: 'view_file', result: { stdout: `Result ${i}` } }, createdAt: i, ignorable: false },
+    { id: `end-${i}`, conversationId: 'chat', runId: `run-${i}`, seq: i * 3 + 2, eventType: 'turn_end', payload: {}, createdAt: i, ignorable: false },
+  ].map(event => {
+    const eventType = event.eventType;
+    return Object.defineProperties(event, {
+      toolCallId: { value: 'shared-id' },
+      eventType: { get() { eventReads++; return eventType; } },
+    });
+  })).flat();
+  const { container } = render(<ActivityTimeline messages={[]} events={events} renderMessage={() => null}
+    renderTool={message => <p>{JSON.parse(message.content).result.stdout}</p>} />);
+  expect(container.textContent).toContain('Result 0');
+  expect(container.textContent).toContain('Result 199');
+  expect(eventReads).toBeLessThanOrEqual(events.length * 8);
 });

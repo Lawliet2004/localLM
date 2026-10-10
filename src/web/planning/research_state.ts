@@ -10,6 +10,7 @@
  */
 
 import type { EvidenceClaim, SourceRegistry } from '../types';
+import { comparisonSubjects } from './fallback_planner';
 
 export interface ResearchRequirement {
   id: string;
@@ -80,7 +81,7 @@ export function recordRound(
       state.evidenceHashes.push(hash);
       newEvidence++;
       state.findings.push({
-        requirementId: matchRequirement(state, claim.claim),
+        requirementId: matchRequirement(state, claim.claim) ?? 'unmatched',
         claim: claim.claim,
         supportingPassages: [claim.claim],
         sources: claim.supportingSources.filter((id) => sources[id]),
@@ -95,13 +96,16 @@ export function recordRound(
   return { newEvidence, repeated };
 }
 
-function matchRequirement(state: ResearchState, claim: string): string {
+function matchRequirement(state: ResearchState, claim: string): string | undefined {
   const lower = claim.toLowerCase();
+  const subjects = comparisonSubjects(state.question).map(subject => subject.toLowerCase());
   const hit = state.requirements.find((r) => {
-    const words = r.text.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
+    const requirement = r.text.toLowerCase();
+    if (subjects.some(subject => requirement.includes(subject) && !lower.includes(subject))) return false;
+    const words = requirement.split(/\s+/).filter((w) => w.length > 3);
     return words.some((w) => lower.includes(w));
   });
-  return hit ? hit.id : state.requirements[0]?.id || 'REQ-1';
+  return hit?.id;
 }
 
 export function markContradiction(state: ResearchState, a: string, b: string, sources: string[]): void {
@@ -114,8 +118,9 @@ export function rejectCandidate(state: ResearchState, candidate: string, reason:
   }
 }
 
-/** Targeted follow-up queries from missing evidence (gap-driven). */
-export function followUpQueries(state: ResearchState, maxQueries = 2): Array<{ query: string; purpose: string }> {
+/** Targeted follow-up queries from missing evidence (gap-driven).
+ *  `maxQueries` is required: callers pass the mode's `ResearchBudget.followUpQueries`. */
+export function followUpQueries(state: ResearchState, maxQueries: number): Array<{ query: string; purpose: string }> {
   const out: Array<{ query: string; purpose: string }> = [];
   for (const req of state.requirements) {
     if (req.status !== 'unresolved') continue;
@@ -139,8 +144,8 @@ export function classifyRequirements(
   evidence: EvidenceClaim[],
 ): ResearchRequirement[] {
   return state.requirements.map((req) => {
-    const supporting = evidence.filter((c) => matchRequirement({ ...state, requirements: [req] }, c.claim) === req.id);
-    if (supporting.length > 0) return { ...req, status: 'answered' as const };
+    const supporting = evidence.some((c) => matchRequirement({ ...state, requirements: [req] }, c.claim) === req.id);
+    if (supporting) return { ...req, status: 'answered' as const };
     if (state.roundsWithoutNewEvidence >= 2) {
       return { ...req, status: 'unresolved' as const, reason: 'No new evidence after repeated investigation' };
     }

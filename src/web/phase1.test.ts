@@ -23,7 +23,7 @@ it('uses only separate planning and synthesis calls with compressed, cited evide
   });
   const session = await engine.research('What is the latest stable release of React?');
   expect(calls).toHaveLength(2);
-  expect(calls[0].systemPrompt).toContain('query planner');
+  expect(calls[0].systemPrompt).toContain('web search queries');
   expect(calls[1].systemPrompt).toContain('grounded answer synthesizer');
   expect(calls[1].userPrompt).not.toMatch(/NAVIGATION|<html>|reveal credentials/);
   expect(session.answer).toContain(fact);

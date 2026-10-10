@@ -76,6 +76,7 @@ interface AnsiSpan {
 }
 
 function parseAnsiLine(line: string): AnsiSpan[] {
+  // oxlint-disable-next-line no-control-regex -- ANSI escape sequences are the point here.
   const regex = /\x1b\[([0-9;]*)m/g;
   const spans: AnsiSpan[] = [];
   let lastIndex = 0;
@@ -263,7 +264,7 @@ export function CommandRunCard({
     ? args.toolAction
     : undefined;
 
-  const isWeb = /web_search|web_open|web_find|web_fetch/.test(toolName);
+  const isWeb = /web_search|web_open|web_find|web_fetch|^browser$/.test(toolName);
   const isEdit = /edit|create_file|write_to_file|replace/.test(toolName) || Boolean(diff);
   const isSearch = isWeb || /search|grep|find|list_files|locate/.test(toolName);
   const isRead = /read_file|view_file|open_file|cat/.test(toolName) || (Boolean(path) && !isEdit && !isSearch);
@@ -274,7 +275,7 @@ export function CommandRunCard({
 
   let displayVerb = kind;
   if (isWeb) {
-    displayVerb = toolName === 'web_open' ? 'Opened' : toolName === 'web_fetch_url' || toolName === 'web_fetch' ? 'Fetched' : toolName === 'web_find' ? 'Found' : 'Searched the web';
+    displayVerb = toolName === 'browser' ? 'Browser' : toolName === 'web_open' ? 'Opened' : toolName === 'web_fetch_url' || toolName === 'web_fetch' ? 'Fetched' : toolName === 'web_find' ? 'Found' : 'Searched the web';
   } else if (isEdit) displayVerb = 'Edited';
   else if (isRead) displayVerb = 'Analyzed';
   else if (isSearch) displayVerb = 'Searched';
@@ -311,6 +312,8 @@ export function CommandRunCard({
 
   const displayTitle = isTask
     ? (taskTitle || 'Task')
+    : toolName === 'browser'
+    ? [args?.action, args?.url ?? (args?.index != null ? `[${String(args.index)}]` : ''), typeof args?.text === 'string' ? `"${args.text}"` : ''].filter(Boolean).join(' ')
     : isSearch
     ? (searchQuery || 'Search')
     : isCommand

@@ -1,7 +1,8 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-const page = browser.contexts()[0].pages().find(value => value.url().includes('1420'));
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
+let { browser, page } = await connectSmoke()
+
 if (!page) throw new Error('Native LocalLM webview is unavailable.');
 page.setDefaultTimeout(15000);
 const report = { testedAt: new Date().toISOString(), scenarios: [] };
@@ -14,7 +15,7 @@ try {
     await connector.getByRole('button', { name: 'Connect', exact: true }).click();
     await expect(connector.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible({ timeout: 70000 });
   }
-  await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
+  await openSettingsSection(page, 'Models');
   if (await page.getByRole('button', { name: 'Load model', exact: true }).count()) {
     await page.getByRole('button', { name: 'Load model', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Unload', exact: true })).toBeVisible({ timeout: 120000 });

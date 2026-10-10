@@ -43,4 +43,11 @@ Detailed explanation of sub-components and interfaces.`,
     const chunks = chunkDocument(doc);
     expect(chunks).toHaveLength(0);
   });
+
+  it('keeps zero-overlap paragraphs distinct instead of copying the entire previous chunk', () => {
+    const paragraphs = ['Alpha', 'Beta', 'Gamma'].map(name => `${name} ${'content '.repeat(12)}`.trim());
+    const doc: RetrievedDocument = { id: 'doc', url: 'https://example.com', domain: 'example.com', title: 'Doc',
+      retrievedAt: new Date().toISOString(), searchResultIds: [], text: paragraphs.join('\n\n') };
+    expect(chunkDocument(doc, { targetTokens: 30, overlapTokens: 0 }).map(chunk => chunk.text)).toEqual(paragraphs);
+  });
 });

@@ -3,9 +3,10 @@ import { BookOpen, Search } from 'lucide-react';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import catalog from '../lib/catalog.json';
 import type { SkillDependencyStatus, SkillUpdateStatus, SkillView } from '../lib/types';
+import { SettingsHeader } from './Settings';
 
 const presets: SkillView[] = catalog.skills.map(item => ({ id: item.name, description: item.description, repo: item.url.replace('https://github.com/', ''), revision: '', sourcePath: item.path, files: [], installed: false, active: false }));
-export function Skills() {
+export function Skills({ conversationId }: { conversationId?: string | null }) {
   const [items, setItems] = useState(presets);
   const [query, setQuery] = useState('');
   const [pending, setPending] = useState('');
@@ -16,16 +17,16 @@ export function Skills() {
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
-    api.listSkills().then(value => { if (!disposed) setItems(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
+    api.listSkills(conversationId).then(value => { if (!disposed) setItems(value); }).catch(e => { if (!disposed) setError(errorMessage(e)); });
     return () => { disposed = true; };
-  }, []);
+  }, [conversationId]);
   async function action(item: SkillView, kind: 'install' | 'remove' | 'activate') {
     setPending(item.id); setError('');
     try {
       if (kind === 'install') await api.installSkill(item.id);
       if (kind === 'remove') { await api.removeSkill(item.id); if (preview?.id === item.id) setPreview(null); if (dependencies?.id === item.id) setDependencies(null); if (updateStatus?.id === item.id) setUpdateStatus(null); }
-      if (kind === 'activate') await api.setSkillActive(item.id, !item.active);
-      setItems(await api.listSkills());
+      if (kind === 'activate') await api.setSkillActive(item.id, !item.active, conversationId);
+      setItems(await api.listSkills(conversationId));
       if (item.installed) setUpdateStatus({ id: item.id, status: await api.skillUpdateStatus(item.id) });
     } catch (e) { setError(errorMessage(e)); }
     finally { setPending(''); }
@@ -46,8 +47,8 @@ export function Skills() {
     finally { setPending(''); }
   }
   const filtered = items.filter(item => `${item.id} ${item.description}`.toLowerCase().includes(query.toLowerCase()));
-  return <div className="settings-page catalog-page"><div className="page-heading"><p className="eyebrow">EXTEND YOUR WORKSPACE</p><h1>Skills</h1><p>Reusable instructions and resources for specialized work.</p></div>
-    <div className="catalog-toolbar"><label className="search-field"><Search size={16} /><input type="search" aria-label="Search skills" placeholder="Search skills…" value={query} onChange={event => setQuery(event.target.value)} /></label><span>{filtered.length} available presets</span></div>
+  return <div className="settings-page catalog-page"><SettingsHeader title="Skills" description="Reusable instructions and resources for specialized work." />
+    <div className="catalog-toolbar"><label className="search-field"><Search size={15} /><input type="search" aria-label="Search skills" placeholder="Search skills…" value={query} onChange={event => setQuery(event.target.value)} /></label><span>{filtered.length} available presets</span></div>
     <p className="catalog-notice">Installed files are verified against pinned sources. Active skills guide your next messages and enable a tool to read their references and script source. Reading follows your conversation’s permissions; scripts need a separately enabled execution tool.</p>
     {error && <p className="error-banner" role="alert">{error}</p>}
     <div className="catalog-list">{filtered.map(item => <details className="catalog-item" key={item.id}><summary><span className="catalog-icon"><BookOpen size={18} /></span><span><strong>{item.id.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')}</strong><small>{item.description}</small></span><small>{item.active ? 'Active' : item.installed ? 'Installed' : 'Not installed'}</small></summary><div className="catalog-detail">

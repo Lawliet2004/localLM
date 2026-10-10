@@ -2,7 +2,22 @@ use aes_gcm::{
     aead::{Aead, AeadCore, OsRng, Payload},
     Aes256Gcm, KeyInit, Nonce,
 };
+use serde::{Deserialize, Serialize};
 use std::{io::Write, path::PathBuf, sync::Mutex};
+
+/// Metadata kept alongside each stored credential. A `created_at` of `0`
+/// means the secret predates records and its age is unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialMeta {
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub last_verified_at: Option<i64>,
+}
+#[derive(Serialize, Deserialize)]
+struct CredentialRecord {
+    secret: String,
+    meta: CredentialMeta,
+}
 
 pub struct Vault {
     directory: PathBuf,
@@ -47,12 +62,34 @@ impl Vault {
         Aes256Gcm::new_from_slice(&key)
             .map_err(|_| "The protected credential encryption key is invalid.".into())
     }
+    /// Loads the stored secret. Credential records unwrap transparently, so
+    /// callers always receive bare secret bytes.
+    /// The app database sits next to the vault directory.
+    pub fn db_path(&self) -> std::path::PathBuf {
+        self.directory
+            .parent()
+            .unwrap_or(&self.directory)
+            .join("locallm.sqlite")
+    }
     pub fn load(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
         validate_id(id)?;
         let _guard = self
             .lock
             .lock()
             .map_err(|_| "Credential vault lock unavailable.")?;
+        Ok(self.load_sealed(id)?.map(|bytes| unwrap_record(bytes).0))
+    }
+    /// Loads the stored secret with its record metadata. Secrets written
+    /// before records existed return `CredentialMeta::default()`.
+    pub fn load_record(&self, id: &str) -> Result<Option<(Vec<u8>, CredentialMeta)>, String> {
+        validate_id(id)?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "Credential vault lock unavailable.")?;
+        Ok(self.load_sealed(id)?.map(unwrap_record))
+    }
+    fn load_sealed(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
         let path = self.directory.join(format!("{id}.sealed"));
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
@@ -66,12 +103,49 @@ impl Vault {
         Ok(Some(unseal(&self.cipher()?, id, &bytes)?))
     }
     pub fn save(&self, id: &str, secret: &[u8]) -> Result<(), String> {
+        self.save_with_expiry(id, secret, None)
+    }
+    /// Stores `secret` as a fresh credential record: `created_at` is stamped
+    /// now and `expires_at` carries the caller's expiry, if any. Saving over
+    /// an existing id replaces the record entirely (rotation semantics).
+    pub fn save_with_expiry(
+        &self,
+        id: &str,
+        secret: &[u8],
+        expires_at: Option<i64>,
+    ) -> Result<(), String> {
+        validate_id(id)?;
+        let plaintext = wrap_record(
+            secret,
+            CredentialMeta {
+                created_at: crate::store::now() / 1000,
+                expires_at,
+                last_verified_at: None,
+            },
+        )?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "Credential vault lock unavailable.")?;
+        self.save_sealed(id, &plaintext)
+    }
+    /// Stamps `last_verified_at` on the stored record, upgrading a legacy bare
+    /// secret to a record in place. No-op when nothing is stored under `id`.
+    pub fn mark_verified(&self, id: &str) -> Result<(), String> {
         validate_id(id)?;
         let _guard = self
             .lock
             .lock()
             .map_err(|_| "Credential vault lock unavailable.")?;
-        let bytes = seal(&self.cipher()?, id, secret)?;
+        let Some(bytes) = self.load_sealed(id)? else {
+            return Ok(());
+        };
+        let (secret, mut meta) = unwrap_record(bytes);
+        meta.last_verified_at = Some(crate::store::now() / 1000);
+        self.save_sealed(id, &wrap_record(&secret, meta)?)
+    }
+    fn save_sealed(&self, id: &str, plaintext: &[u8]) -> Result<(), String> {
+        let bytes = seal(&self.cipher()?, id, plaintext)?;
         std::fs::create_dir_all(&self.directory).map_err(|error| error.to_string())?;
         let temporary = self.directory.join(format!("{}.tmp", uuid::Uuid::new_v4()));
         let result = (|| {
@@ -114,6 +188,21 @@ fn validate_id(id: &str) -> Result<(), String> {
         return Err("Invalid credential identifier.".into());
     }
     Ok(())
+}
+fn wrap_record(secret: &[u8], meta: CredentialMeta) -> Result<Vec<u8>, String> {
+    let secret = std::str::from_utf8(secret)
+        .map_err(|_| "Credential payloads must be UTF-8 text.".to_string())?;
+    serde_json::to_vec(&CredentialRecord {
+        secret: secret.to_string(),
+        meta,
+    })
+    .map_err(|error| format!("Could not encode credential record: {error}"))
+}
+fn unwrap_record(bytes: Vec<u8>) -> (Vec<u8>, CredentialMeta) {
+    match serde_json::from_slice::<CredentialRecord>(&bytes) {
+        Ok(record) => (record.secret.into_bytes(), record.meta),
+        Err(_) => (bytes, CredentialMeta::default()),
+    }
 }
 fn seal(cipher: &Aes256Gcm, id: &str, secret: &[u8]) -> Result<Vec<u8>, String> {
     if secret.len() > 131_072 {
@@ -178,5 +267,62 @@ mod tests {
             assert!(validate_id(name).is_err());
         }
         assert!(validate_id("oauth-linear").is_ok());
+    }
+    #[test]
+    fn record_metadata_round_trip_and_verified_stamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::new(temp.path().join("vault"));
+        vault.save("oauth-linear", b"raw-token").unwrap();
+        let (secret, meta) = vault.load_record("oauth-linear").unwrap().unwrap();
+        assert_eq!(secret, b"raw-token");
+        assert!(meta.created_at > 0);
+        assert_eq!(meta.expires_at, None);
+        assert_eq!(meta.last_verified_at, None);
+        assert_eq!(vault.load("oauth-linear").unwrap().unwrap(), b"raw-token");
+        vault.mark_verified("oauth-linear").unwrap();
+        let meta = vault.load_record("oauth-linear").unwrap().unwrap().1;
+        assert!(meta.last_verified_at.unwrap() > 0);
+        assert_eq!(vault.load("oauth-linear").unwrap().unwrap(), b"raw-token");
+        vault.mark_verified("missing-id").unwrap();
+        assert!(vault.load_record("missing-id").unwrap().is_none());
+    }
+    #[test]
+    fn rotation_replaces_record_and_refreshes_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::new(temp.path().join("vault"));
+        vault
+            .save_with_expiry("subscription-x", b"token-one", Some(111))
+            .unwrap();
+        vault.mark_verified("subscription-x").unwrap();
+        let (_, before) = vault.load_record("subscription-x").unwrap().unwrap();
+        vault
+            .save_with_expiry("subscription-x", b"token-two", Some(222))
+            .unwrap();
+        let (secret, after) = vault.load_record("subscription-x").unwrap().unwrap();
+        assert_eq!(secret, b"token-two");
+        assert_eq!(after.expires_at, Some(222));
+        assert_eq!(after.last_verified_at, None);
+        assert!(after.created_at >= before.created_at);
+    }
+    #[test]
+    fn legacy_bare_secret_reads_with_empty_meta() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("vault");
+        std::fs::create_dir_all(&directory).unwrap();
+        let vault = Vault::new(directory.clone());
+        let cipher = vault.cipher().unwrap();
+        std::fs::write(
+            directory.join("legacy-id.sealed"),
+            seal(&cipher, "legacy-id", b"plain-secret").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(vault.load("legacy-id").unwrap().unwrap(), b"plain-secret");
+        let (secret, meta) = vault.load_record("legacy-id").unwrap().unwrap();
+        assert_eq!(secret, b"plain-secret");
+        assert_eq!(meta, CredentialMeta::default());
+        vault.mark_verified("legacy-id").unwrap();
+        let (secret, meta) = vault.load_record("legacy-id").unwrap().unwrap();
+        assert_eq!(secret, b"plain-secret");
+        assert!(meta.last_verified_at.unwrap() > 0);
     }
 }

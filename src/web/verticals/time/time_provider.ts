@@ -35,13 +35,18 @@ const CITY_TIMEZONES: Record<string, string> = {
 
 export class TimeProvider implements VerticalProvider<string, TimeReport> {
   resolveTimezone(query: string): { location: string; timezone: string } {
+    const zone = query.match(/\b[A-Za-z_+-]+\/[A-Za-z_+-]+(?:\/[A-Za-z_+-]+)?\b/)?.[0];
+    if (zone) {
+      const timezone = new Intl.DateTimeFormat('en-US', { timeZone: zone }).resolvedOptions().timeZone;
+      return { location: zone, timezone };
+    }
     const q = query.toLowerCase();
     for (const [city, tz] of Object.entries(CITY_TIMEZONES)) {
-      if (q.includes(city)) {
+      if (new RegExp(`\\b${city}\\b`).test(q)) {
         return { location: city.toUpperCase(), timezone: tz };
       }
     }
-    return { location: 'UTC', timezone: 'UTC' };
+    throw new Error('Could not resolve a timezone for the requested location.');
   }
 
   async execute(query: string): Promise<TimeReport> {
@@ -73,7 +78,7 @@ export class TimeProvider implements VerticalProvider<string, TimeReport> {
       timeFormatted,
       dateFormatted,
       iso: now.toISOString(),
-      utcOffset: timezone,
+      utcOffset: new Intl.DateTimeFormat('en-US', { timeZone: timezone, timeZoneName: 'longOffset' }).formatToParts(now).find(part => part.type === 'timeZoneName')!.value.replace('GMT', '') || '+00:00',
     };
   }
 

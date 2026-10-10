@@ -146,14 +146,6 @@ pub fn parse_todo_write(arguments: &serde_json::Value) -> Result<Vec<Todo>, Stri
     Ok(todos)
 }
 
-#[allow(dead_code)]
-fn make_todo(text: &str) -> Result<Todo, String> {
-    if text.trim().is_empty() || text.len() > 500 {
-        return Err("Each todo needs 1-500 characters of text.".into());
-    }
-    Ok(Todo { text: text.to_string(), status: PENDING.to_string(), updated_at: crate::store::now() })
-}
-
 /// One-line open-work summary injected into the turn context (logged).
 /// `todo_tools` is the subset of todo mutators actually offered this turn —
 /// naming tools the model cannot see just teaches it to emit dead calls.
@@ -229,13 +221,6 @@ mod tests {
         assert!(summary_line(&todos, None, &[]).unwrap().contains("no todo tools"));
         assert!(summary_line(&[], None, &["todo_write"]).is_none());
     }
-    #[test]
-    fn todo_factory_rejects_blank_and_oversize_text() {
-        assert!(make_todo("write tests").is_ok());
-        assert!(make_todo("").is_err());
-        assert!(make_todo(&"x".repeat(501)).is_err());
-    }
-
     #[test]
     fn parse_plan_steps_takes_numbered_and_bulleted_lines() {
         let plan = "# Plan\n\n1. **Search** fusion yield papers\n2. Open the top source\n3. Calculate the yield\n- skip headings above\n\nThen we are done.";

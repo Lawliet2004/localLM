@@ -1,7 +1,8 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
 
 // Workspace edit acceptance: MiniCPM reads a file, applies one approved
 // edit_file with the fresh SHA-256, and the exact bytes land on disk.
@@ -9,9 +10,7 @@ const folder = resolve('.local', `edit-smoke-${randomUUID()}`);
 mkdirSync(folder, { recursive: true });
 const original = `Line one\nLine two has the_old_phrase embedded\nLine three\n`;
 writeFileSync(join(folder, 'note.txt'), original);
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-let page;
-await expect.poll(() => { page = browser.contexts()[0].pages().find(item => item.url().includes('1420')); return Boolean(page); }).toBe(true);
+let { browser, page } = await connectSmoke();
 page.setDefaultTimeout(15000);
 const invoke = (command, args = {}) => page.evaluate(async ({ command, args }) => {
   const { invoke } = await import('/node_modules/@tauri-apps/api/core.js');
@@ -24,7 +23,7 @@ try {
   await invoke('save_preferences', { preferences: { ...originalPreferences, temperature: 0, maxTokens: 2048 } });
   await invoke('set_workspace', { path: folder });
   await page.reload();
-  await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
+  await openSettingsSection(page, 'Models');
   if (await page.getByRole('button', { name: 'Load model', exact: true }).count()) {
     await expect(page.getByRole('button', { name: 'Load model', exact: true })).toBeEnabled({ timeout: 30000 });
     await page.getByRole('button', { name: 'Load model', exact: true }).click();

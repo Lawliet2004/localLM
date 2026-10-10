@@ -8,11 +8,16 @@ const edit: Message = { id: 'edit', conversationId: 'chat', role: 'tool', status
 const run: RunRecord = { id:'run', conversationId:'chat', status:'completed', createdAt:1000, updatedAt:232000 };
 
 it('shows recorded duration and an expandable edit card with actual diff counts', async () => {
-  render(<WorkSummary messages={[edit]} run={run}><p>Updated the styles.</p></WorkSummary>);
-  expect(screen.getByText('Worked for 3m 51s')).toBeVisible();
-  expect(screen.getByText('Edited styles.css')).toBeVisible();
-  expect(screen.getByText('+2')).toBeVisible();
-  expect(screen.getByText('−1')).toBeVisible();
+  render(<WorkSummary messages={[edit]} run={run} activity={<p>Edited a file.</p>}><p>Updated the styles.</p></WorkSummary>);
+  expect(screen.getByText('Worked for', { selector: '.work-summary-label' })).toBeVisible();
+  expect(screen.getByText('3m 51s', { selector: '.work-duration' })).toBeVisible();
+  expect(screen.getByText('Edited a file.')).not.toBeVisible();
+  expect(screen.getByText('Updated the styles.')).toBeVisible();
+  await userEvent.click(screen.getByText('Worked for', { selector: '.work-summary-label' }));
+  expect(screen.getByText('Edited a file.')).toBeVisible();
+  expect(screen.getByText('src/styles.css', { selector: '.file-change-heading strong' })).toBeVisible();
+  expect(screen.getByText('+2', { selector: '.file-change-card .diff-added' })).toBeVisible();
+  expect(screen.getByText('−1', { selector: '.file-change-card .diff-removed' })).toBeVisible();
   await userEvent.click(screen.getByText('Review'));
   expect(screen.getByText(/--- a\/src\/styles.css/)).toBeVisible();
 });
@@ -24,5 +29,6 @@ it('does not present failed edits as successful changes or invent a duration', (
 });
 it('does not call a cancelled run completed', () => {
   render(<WorkSummary messages={[]} run={{...run,status:'cancelled'}}><p>Stopped.</p></WorkSummary>);
-  expect(screen.getByText('Stopped for 3m 51s')).toBeVisible();
+  expect(screen.getByText('Stopped for', { selector: '.work-summary-label' })).toBeVisible();
+  expect(screen.getByText('3m 51s', { selector: '.work-duration' })).toBeVisible();
 });

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Cpu, Layers, MemoryStick, Sparkles } from 'lucide-react';
 import type { CacheType, HardwareStatus, ModelMetadata, RuntimeConfig, RuntimeStatus } from '../lib/types';
 import { api, nativeAvailable } from '../lib/api';
@@ -7,11 +7,14 @@ import { samePath } from '../lib/pathUtils';
 
 interface Props {
   initial: RuntimeConfig;
-  onSave: (config: RuntimeConfig) => void;
+  onSave: (config: RuntimeConfig) => Promise<void>;
   busy: boolean;
   modelPath?: string;
   runtime?: RuntimeStatus;
 }
+
+const sameConfig = (a: RuntimeConfig, b: RuntimeConfig) =>
+  (Object.keys(a) as (keyof RuntimeConfig)[]).every(key => a[key] === b[key]);
 
 function meterMax(used: number | null, available: number | null) {
   if (used == null) return 1;
@@ -22,10 +25,24 @@ function meterMax(used: number | null, available: number | null) {
 export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props) {
   const [config, setConfig] = useState(initial);
   const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [syncNote, setSyncNote] = useState(false);
   const [model, setModel] = useState<ModelMetadata | null>(null);
   const [hardware, setHardware] = useState<HardwareStatus | null>(null);
   const [metadataError, setMetadataError] = useState('');
-  useEffect(() => setConfig(initial), [initial]);
+  const lastSynced = useRef(initial);
+  // Adopt a new saved configuration only while the draft is clean (or right
+  // after this form's own save); unsaved edits are never overwritten.
+  useEffect(() => {
+    if (initial === lastSynced.current) return;
+    if (sameConfig(config, lastSynced.current)) {
+      setConfig(initial);
+      setSyncNote(false);
+    } else {
+      setSyncNote(true);
+    }
+    lastSynced.current = initial;
+  }, [initial, config]);
   useEffect(() => {
     if (!nativeAvailable || !modelPath) return;
     let disposed = false;
@@ -64,10 +81,14 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props
     if (config.contextLength > maxContext) {
       setError('Saved context exceeds this model’s limit. Choose a smaller value before saving.'); return;
     }
-    onSave(config);
+    setSaving(true); setError('');
+    void Promise.resolve(onSave(config))
+      .then(() => { lastSynced.current = config; setSyncNote(false); })
+      .catch(e => setError(`Not saved: ${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => setSaving(false));
   }}>
     <section className="runtime-overview" aria-label="Selected model limits">
-      <div className="section-heading"><div><p className="eyebrow">TUNE YOUR MODEL</p><h2>Runtime</h2><p className="runtime-model-name">{modelPath?.split(/[\\/]/).pop() || 'Select a model in the Models tab to see its limits'}</p></div><Cpu size={24} /></div>
+      <p className="runtime-model-name"><Cpu size={14} aria-hidden="true" />{modelPath?.split(/[\\/]/).pop() || 'Select a model in Models to see its limits'}</p>
       {!modelPath && <p className="section-description">Use a downloaded model first. Runtime limits come from that file’s GGUF header and the GPU/RAM available right now.</p>}
       {metadataError && <p className="selection-warning">Model limits unavailable: {metadataError}</p>}
       <div className="runtime-dashboard">
@@ -78,6 +99,7 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props
             <div><dt>Fits in current VRAM</dt><dd>{fittedLayers == null ? 'Unknown' : fittedLayers === 0 ? 'CPU recommended' : fittedLayers === modelLayers ? 'All layers' : `${fittedLayers} layers`}</dd></div>
             <div><dt>Requested</dt><dd>{gpuLayersLabel(config.gpuLayers)}</dd></div>
             {loadedHere && runtime?.gpuOffload && <div><dt>Currently loaded</dt><dd>{runtime.gpuOffload.layers} / {runtime.gpuOffload.totalLayers} offloaded</dd></div>}
+            {loadedHere && runtime?.launchConfig && runtime.launchConfig.gpuLayers !== (runtime.loadedConfig?.gpuLayers ?? -1) && <div><dt>Effective GPU layers</dt><dd>{gpuLayersLabel(runtime.launchConfig.gpuLayers)}</dd></div>}
           </dl>
           <p className="runtime-help">Automatic puts as many layers as will fit in free VRAM on the GPU and keeps the rest in system RAM. No GPU, or a model that cannot use this GPU, runs on CPU. A custom count overrides that.</p>
           <label>Compute device<select value={device} disabled={busy} onChange={e => {
@@ -104,6 +126,7 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props
             {model?.contextLength && model.contextLength > contextSafetyLimit && <div><dt>Harness safety cap</dt><dd>{contextSafetyLimit.toLocaleString()} tokens</dd></div>}
             <div><dt>Recommended</dt><dd>{recommended ? `${recommended.contextLength.toLocaleString()} tokens` : 'Unknown'}</dd></div>
             <div><dt>Current setting</dt><dd>{config.contextLength.toLocaleString()} tokens</dd></div>
+            {loadedHere && runtime?.loadedContext != null && runtime.loadedContext !== runtime.loadedConfig?.contextLength && <div><dt>Loaded context</dt><dd>{runtime.loadedContext.toLocaleString()} tokens</dd></div>}
           </dl>
           <p className="runtime-help">Training context from the GGUF header. Larger windows need more attention-cache memory. Loading refuses a context beyond the known model or harness limit.</p>
           <label>Context window<input type="number" min={128} max={maxContext} required disabled={busy} value={Number.isNaN(config.contextLength) ? '' : config.contextLength} onChange={e => update('contextLength', e.target.valueAsNumber)} />
@@ -171,7 +194,8 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props
         <div className="field-pair"><label>Batch size<input type="number" min={1} max={8192} required value={Number.isNaN(config.batchSize) ? '' : config.batchSize} onChange={e => update('batchSize', e.target.valueAsNumber)} /></label><label>Micro batch size<input type="number" min={1} max={8192} required value={Number.isNaN(config.microBatchSize) ? '' : config.microBatchSize} onChange={e => update('microBatchSize', e.target.valueAsNumber)} /></label></div>
       </fieldset>
     </details>
+    {syncNote && <p className="selection-warning">Saved settings changed; your unsaved edits are kept.</p>}
     {error && <p className="error" role="alert">{error}</p>}
-    <div className="form-footer"><small>{runtime?.phase === 'ready' ? 'Saving reloads the model so the new context is actually loaded.' : 'Load the model after saving to allocate the selected context window.'}</small><button className="primary" type="submit" disabled={busy}>Save configuration</button></div>
+    <div className="form-footer"><small>{runtime?.phase === 'ready' ? 'Saving reloads the model so the new context is actually loaded.' : 'Load the model after saving to allocate the selected context window.'}</small><button className="primary" type="submit" disabled={busy || saving}>{saving ? 'Saving…' : 'Save configuration'}</button></div>
   </form>;
 }

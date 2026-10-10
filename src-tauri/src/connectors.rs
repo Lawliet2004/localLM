@@ -7,7 +7,14 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    },
+    time::Duration,
+};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,12 +66,10 @@ pub struct ConnectorView {
     pub connection_error: Option<String>,
 }
 struct Connection {
-    service: ConnectorSession,
-    tools: Vec<ToolView>,
-    local_name: Option<String>,
+    shared: Arc<SharedConnection>,
 }
 enum ConnectorSession {
-    Remote(RunningService<RoleClient, ()>),
+    Remote(RunningService<RoleClient, HubHandler>),
     Local(crate::local_mcp_process::LocalSession),
 }
 impl ConnectorSession {
@@ -102,6 +107,373 @@ impl ConnectorSession {
             Self::Local(session) => session.service.peer().clone(),
         }
     }
+}
+
+/// A poisoned lock means a panicked holder left inconsistent state; recovering
+/// the guard keeps reads/writes available rather than cascading the panic.
+fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+fn mutex<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Delays between reconnect attempts; the first attempt runs immediately, so a
+/// dead session gets `RECONNECT_DELAYS.len() + 1` tries (5) before the
+/// connector stays unavailable.
+const RECONNECT_DELAYS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
+
+/// Live state for one connector, shared by the hub, minted `AgentTool`s, the
+/// rmcp notification handler, and any in-flight reconnect task. A reconnect
+/// installs the fresh session into these same slots, so tools minted before a
+/// drop pick up the new peer instead of pinning a dead one.
+struct SharedConnection {
+    id: String,
+    vault: Arc<crate::vault::Vault>,
+    local_name: Option<String>,
+    service: RwLock<Option<ConnectorSession>>,
+    tools: RwLock<Vec<ToolView>>,
+    reconnect: Mutex<ReconnectState>,
+    /// Set by `notifications/tools/list_changed`; the next catalog refresh
+    /// clears it once new tools are installed.
+    tools_dirty: AtomicBool,
+    refreshing: AtomicBool,
+    /// Set when the hub entry is removed or replaced so an in-flight reconnect
+    /// drops its freshly opened session instead of resurrecting the connector.
+    detached: AtomicBool,
+}
+
+#[derive(Default)]
+struct ReconnectState {
+    running: bool,
+    failed_attempts: u32,
+}
+
+impl SharedConnection {
+    fn new(id: &str, vault: Arc<crate::vault::Vault>, local_name: Option<String>) -> Self {
+        Self {
+            id: id.into(),
+            vault,
+            local_name,
+            service: RwLock::new(None),
+            tools: RwLock::new(Vec::new()),
+            reconnect: Mutex::new(ReconnectState::default()),
+            tools_dirty: AtomicBool::new(false),
+            refreshing: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
+        }
+    }
+    fn is_live(&self) -> bool {
+        read_lock(&self.service)
+            .as_ref()
+            .is_some_and(|service| !service.is_closed() && !service.peer().is_transport_closed())
+    }
+    /// Live-check every hub read path wants: a dead session schedules a bounded
+    /// reconnect, a live one picks up any pending catalog refresh.
+    fn live_or_reconnect(self: &Arc<Self>) -> bool {
+        if self.is_live() {
+            self.kick_tools_refresh();
+            return true;
+        }
+        self.kick_reconnect();
+        false
+    }
+    fn peer(&self) -> Option<rmcp::Peer<RoleClient>> {
+        read_lock(&self.service).as_ref().map(ConnectorSession::peer)
+    }
+    fn tools(&self) -> Vec<ToolView> {
+        read_lock(&self.tools).clone()
+    }
+    /// Install a freshly opened session and catalog; returns the session being
+    /// replaced so the caller can close it outside the locks.
+    fn install(&self, service: ConnectorSession, tools: Vec<ToolView>) -> Option<ConnectorSession> {
+        *write_lock(&self.tools) = tools;
+        // The installed catalog is fresh; any pending refresh request is moot.
+        self.tools_dirty.store(false, Ordering::Release);
+        write_lock(&self.service).replace(service)
+    }
+    fn take_service(&self) -> Option<ConnectorSession> {
+        write_lock(&self.service).take()
+    }
+    fn note_tools_changed(self: &Arc<Self>) {
+        self.tools_dirty.store(true, Ordering::Release);
+        self.kick_tools_refresh();
+    }
+    /// Spawn a catalog refresh unless one is already in flight or the flag is
+    /// unset. A failed refresh leaves `tools_dirty` set so the next hub read
+    /// retries; a notification landing mid-refresh re-dirties it for the
+    /// follow-up check at the end of the task.
+    fn kick_tools_refresh(self: &Arc<Self>) {
+        // A dead session can't answer list_tools; the reconnect path installs a
+        // fresh catalog instead, so don't churn doomed refresh tasks.
+        if self.detached.load(Ordering::Acquire)
+            || !self.tools_dirty.load(Ordering::Acquire)
+            || !self.is_live()
+        {
+            return;
+        }
+        if self.refreshing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.refreshing.store(false, Ordering::Release);
+            return;
+        };
+        let slot = Arc::clone(self);
+        handle.spawn(async move { slot.refresh_tools().await });
+    }
+    async fn refresh_tools(self: Arc<Self>) {
+        // Consume the flag before fetching: a notification arriving during the
+        // fetch re-dirties it and earns the follow-up refresh below.
+        self.tools_dirty.store(false, Ordering::Release);
+        let mut succeeded = false;
+        if let Some(peer) = self.peer().filter(|peer| !peer.is_transport_closed()) {
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                crate::tool_discovery::discover(|cursor| {
+                    let peer = peer.clone();
+                    async move {
+                        peer.list_tools(Some(
+                            rmcp::model::PaginatedRequestParams::default().with_cursor(cursor),
+                        ))
+                        .await
+                        .map_err(|error| error.to_string())
+                    }
+                }),
+            )
+            .await
+            {
+                Ok(Ok(tools)) => match tool_views(tools) {
+                    Ok(views) => {
+                        *write_lock(&self.tools) = views;
+                        succeeded = true;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[connectors] tool catalog refresh for '{}' failed: {error}",
+                            self.id
+                        );
+                    }
+                },
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "[connectors] tool catalog refresh for '{}' failed: {error}",
+                        self.id
+                    );
+                }
+                Err(_) => {
+                    eprintln!("[connectors] tool catalog refresh for '{}' timed out", self.id);
+                }
+            }
+        }
+        // A dead session's catalog is repopulated by the reconnect path; a
+        // failed refresh re-dirties so the next hub read retries.
+        if !succeeded && read_lock(&self.service).is_some() {
+            self.tools_dirty.store(true, Ordering::Release);
+        }
+        self.refreshing.store(false, Ordering::Release);
+        if succeeded && self.tools_dirty.load(Ordering::Acquire) {
+            self.kick_tools_refresh();
+        }
+    }
+    fn kick_reconnect(self: &Arc<Self>) {
+        if self.is_live() || self.detached.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = mutex(&self.reconnect);
+        if state.running || state.failed_attempts > RECONNECT_DELAYS.len() as u32 {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        state.running = true;
+        drop(state);
+        let slot = Arc::clone(self);
+        handle.spawn(async move { slot.reconnect_loop(&RECONNECT_DELAYS).await });
+    }
+    async fn reconnect_loop(self: Arc<Self>, delays: &[Duration]) {
+        for attempt in 0..=delays.len() {
+            if attempt > 0 {
+                tokio::time::sleep(delays[attempt - 1]).await;
+            }
+            if self.detached.load(Ordering::Acquire) {
+                break;
+            }
+            let local = crate::local_mcp_config::load(&self.vault)
+                .ok()
+                .and_then(|servers| servers.into_iter().find(|server| server.id == self.id));
+            let db_path = self.vault.db_path();
+            let opened = match open_session(&self.vault, &self.id, local, &self, &db_path).await {
+                Ok(opened) => opened,
+                Err(error) => {
+                    eprintln!(
+                        "[connectors] reconnect attempt {}/{} for '{}' failed: {error}",
+                        attempt + 1,
+                        delays.len() + 1,
+                        self.id
+                    );
+                    continue;
+                }
+            };
+            if self.detached.load(Ordering::Acquire) {
+                // Disconnected or replaced while the session was opening.
+                let _ = opened.service.cancel().await;
+                break;
+            }
+            let old = self.install(opened.service, opened.tools);
+            eprintln!("[connectors] reconnected '{}'", self.id);
+            {
+                let mut state = mutex(&self.reconnect);
+                state.failed_attempts = 0;
+                state.running = false;
+            }
+            if let Some(old) = old {
+                let _ = old.cancel().await;
+            }
+            return;
+        }
+        let mut state = mutex(&self.reconnect);
+        state.running = false;
+        if !self.detached.load(Ordering::Acquire) {
+            state.failed_attempts = delays.len() as u32 + 1;
+        }
+    }
+}
+
+/// Client handler wiring `notifications/tools/list_changed` to the owning
+/// connection. rmcp delivers server notifications only through `ClientHandler`
+/// (there is no peer-level notification stream), so a flag plus a refresh task
+/// is the minimal handoff. Local stdio sessions keep the `()` handler inside
+/// `local_mcp_process`, so their catalog refreshes only through reconnects.
+struct HubHandler {
+    connection: Arc<SharedConnection>,
+}
+impl rmcp::ClientHandler for HubHandler {
+    async fn on_tool_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        self.connection.note_tools_changed();
+    }
+}
+
+/// Session open + tool discovery shared by explicit connects and the reconnect
+/// task. The remote handler points at `slot` so notifications keep flagging the
+/// connection that ends up owning the session.
+struct Opened {
+    view: ConnectorView,
+    service: ConnectorSession,
+    tools: Vec<ToolView>,
+}
+
+/// True for transport-level failures (dropped connection, failed send) that
+/// justify a reconnect; `McpError`, timeouts, and cancellations leave the
+/// session usable and do not.
+fn is_transport_failure(error: &rmcp::ServiceError) -> bool {
+    matches!(
+        error,
+        rmcp::ServiceError::TransportClosed | rmcp::ServiceError::TransportSend(_)
+    )
+}
+
+/// Largest single text item forwarded to the model; longer items are truncated.
+const MAX_TOOL_TEXT_BYTES: usize = 65_536;
+/// Largest projected tool result envelope; larger results fail outright.
+const MAX_TOOL_RESULT_BYTES: usize = 262_144;
+
+fn bounded_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= MAX_TOOL_TEXT_BYTES {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = MAX_TOOL_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated: {} bytes total]", &text[..end], text.len()).into()
+}
+
+fn content_mime_type(block: &rmcp::model::ContentBlock) -> &str {
+    match block {
+        rmcp::model::ContentBlock::Image(image) => image.mime_type.as_str(),
+        rmcp::model::ContentBlock::Audio(audio) => audio.mime_type.as_str(),
+        rmcp::model::ContentBlock::Resource(resource) => match &resource.resource {
+            rmcp::model::ResourceContents::TextResourceContents { mime_type, .. }
+            | rmcp::model::ResourceContents::BlobResourceContents { mime_type, .. } => {
+                mime_type.as_deref().unwrap_or("application/octet-stream")
+            }
+            _ => "application/octet-stream",
+        },
+        rmcp::model::ContentBlock::ResourceLink(link) => {
+            link.mime_type.as_deref().unwrap_or("application/octet-stream")
+        }
+        _ => "application/octet-stream",
+    }
+}
+
+/// Project a tool result into the model-facing envelope: text stays text
+/// (bounded per item), image/audio/resource and unrecognized blocks become
+/// bounded placeholders so base64 blobs never reach the model context, and
+/// `structuredContent` passes through.
+fn project_tool_result(result: &rmcp::model::CallToolResult) -> Result<Value, String> {
+    let content: Vec<Value> = result
+        .content
+        .iter()
+        .map(|block| match block {
+            rmcp::model::ContentBlock::Text(text) => serde_json::json!({
+                "type": "text",
+                "text": bounded_text(&text.text),
+            }),
+            other => serde_json::json!({
+                "type": "unsupported",
+                "mimeType": content_mime_type(other),
+                "note": "binary content omitted",
+            }),
+        })
+        .collect();
+    let mut value = serde_json::json!({
+        "isError": result.is_error.unwrap_or(false),
+        "content": content,
+    });
+    if let Some(structured) = &result.structured_content {
+        value["structuredContent"] = structured.clone();
+    }
+    if value.to_string().len() > MAX_TOOL_RESULT_BYTES {
+        return Err("Tool result exceeds 256 KiB. Request a narrower result.".into());
+    }
+    Ok(value)
+}
+
+/// Map discovered tools to views with the same catalog cap `connect` enforces,
+/// so a `tools/list_changed` refresh cannot grow the cache without bound.
+fn tool_views(tools: Vec<rmcp::model::Tool>) -> Result<Vec<ToolView>, String> {
+    let views: Vec<_> = tools
+        .into_iter()
+        .map(|tool| ToolView {
+            name: tool.name.into_owned(),
+            description: tool
+                .description
+                .map(|text| text.into_owned())
+                .unwrap_or_default(),
+            input_schema: Value::Object((*tool.input_schema).clone()),
+        })
+        .collect();
+    if serde_json::to_vec(&views)
+        .map_err(|error| error.to_string())?
+        .len()
+        > 2_097_152
+    {
+        return Err("Connector tool catalog exceeds 2 MiB.".into());
+    }
+    Ok(views)
 }
 fn local_view(server: &crate::local_mcp_config::LocalServer) -> ConnectorView {
     ConnectorView {
@@ -172,7 +544,7 @@ impl Clone for AgentTool {
             ToolBackend::Skills(reader) => ToolBackend::Skills(reader.clone()),
             ToolBackend::Execution(execution) => ToolBackend::Execution(execution.clone()),
             ToolBackend::Workspace(workspace) => ToolBackend::Workspace(workspace.clone()),
-            // MCP peers hold a live session handle that cannot cross the
+            // MCP sessions hold a live transport that cannot cross the
             // workflow/spawn boundary; mark the clone detached.
             ToolBackend::Mcp { local_name, .. } => ToolBackend::DetachedMcp { local_name: local_name.clone() },
             ToolBackend::DetachedMcp { local_name } => ToolBackend::DetachedMcp { local_name: local_name.clone() },
@@ -227,7 +599,7 @@ enum ToolBackend {
     Skills(Arc<crate::skills::SkillReader>),
     Execution(Arc<crate::execution::LocalExecution>),
     Mcp {
-        peer: rmcp::Peer<RoleClient>,
+        slot: Arc<SharedConnection>,
         local_name: Option<String>,
     },
     /// Clone marker for MCP tools carried across workflow/spawn boundaries.
@@ -248,6 +620,9 @@ impl AgentTool {
     }
     pub fn is_mcp(&self) -> bool {
         matches!(&self.backend, ToolBackend::Mcp { .. } | ToolBackend::DetachedMcp { .. })
+    }
+    pub fn is_daytona(&self) -> bool {
+        matches!(self.backend, ToolBackend::Daytona(_))
     }
     pub fn is_harness(&self) -> bool {
         matches!(&self.backend, ToolBackend::Harness { .. })
@@ -339,7 +714,7 @@ impl AgentTool {
         arguments: Value,
         on_chunk: Option<crate::execution::ChunkCallback>,
     ) -> Result<Value, String> {
-        let peer = match &self.backend {
+        let slot = match &self.backend {
             ToolBackend::System => {
                 if self.tool.name == "system_time" {
                     return crate::system_tools::execute_system_time(&arguments);
@@ -363,7 +738,7 @@ impl AgentTool {
                     return execution.run_with_stream(arguments, on_chunk).await;
                 }
             }
-            ToolBackend::Mcp { peer, .. } => peer,
+            ToolBackend::Mcp { slot, .. } => slot,
             ToolBackend::DetachedMcp { .. } => {
                 return Err("This connector tool was inherited without its live session. Ask the parent for what you need instead.".into());
             }
@@ -375,20 +750,31 @@ impl AgentTool {
                     .map_err(|_| "Workspace operation failed unexpectedly.")?;
             }
         };
+        let peer = match slot.peer() {
+            Some(peer) if !peer.is_transport_closed() => peer,
+            _ => {
+                slot.kick_reconnect();
+                return Err(
+                    "This connector is not connected right now; a reconnect may be in progress."
+                        .into(),
+                );
+            }
+        };
         let arguments = arguments
             .as_object()
             .ok_or("Tool arguments must be an object.")?
             .clone();
-        let response = peer.call_tool_once(rmcp::model::CallToolRequestParams::new(self.tool.name.clone()).with_arguments(arguments)).await.map_err(|_| "Connector tool request failed. Its remote outcome may be unknown; do not automatically retry.".to_string())?;
-        match response {
-            rmcp::model::CallToolResponse::Complete(result) => {
-                let value =
-                    serde_json::to_value(result).map_err(|_| "Could not decode tool result.")?;
-                if value.to_string().len() > 262_144 {
-                    return Err("Tool result exceeds 256 KiB. Request a narrower result.".into());
-                }
-                Ok(value)
+        let response = peer.call_tool_once(rmcp::model::CallToolRequestParams::new(self.tool.name.clone()).with_arguments(arguments)).await.map_err(|error| {
+            // A dead transport makes this a connection failure, not a tool
+            // failure; schedule the bounded reconnect so the connector heals
+            // without waiting for a manual reconnect.
+            if is_transport_failure(&error) || peer.is_transport_closed() {
+                slot.kick_reconnect();
             }
+            "Connector tool request failed. Its remote outcome may be unknown; do not automatically retry.".to_string()
+        })?;
+        match response {
+            rmcp::model::CallToolResponse::Complete(result) => project_tool_result(&result),
             _ => Err(
                 "This tool requires additional server input, which is not supported yet.".into(),
             ),
@@ -452,6 +838,144 @@ fn validate_token(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn vault_token(vault: &crate::vault::Vault, id: &str) -> Result<Option<String>, String> {
+    vault
+        .load(&format!("token-{id}"))?
+        .map(|bytes| {
+            String::from_utf8(bytes).map_err(|_| "Invalid stored token encoding.".into())
+        })
+        .transpose()
+}
+
+/// Open a connector session and run tool discovery against it. Shared by
+/// explicit connects and the reconnect task; on success the caller installs
+/// `service`/`tools` into `slot`. The remote notification handler already
+/// points at `slot`, so a `tools/list_changed` that lands before install is not
+/// lost — it just refreshes the freshly installed catalog.
+async fn open_session(
+    vault: &Arc<crate::vault::Vault>,
+    id: &str,
+    local: Option<crate::local_mcp_config::LocalServer>,
+    slot: &Arc<SharedConnection>,
+    db_path: &std::path::Path,
+) -> Result<Opened, String> {
+    let mut item = match &local {
+        Some(server) => local_view(server),
+        None => preset(id)?,
+    };
+    let credential = preset_credential(id).ok();
+    let secret = if local.is_some() {
+        None
+    } else if credential == Some("header") {
+        vault_token(vault, id)?
+    } else {
+        // OAuth presets authenticate through the sign-in flow; a saved
+        // bearer token must never be attached to them. Public presets
+        // connect without credentials.
+        None
+    };
+    if item.auth_type == "apiKey" && secret.is_none() {
+        return Err("Add an API token before connecting.".into());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Could not initialize connector networking.")?;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(item.url.clone())
+        .max_concurrent_requests(2);
+    if let Some(secret) = &secret {
+        config = config.auth_header(secret);
+    }
+    let redact = |error: String| {
+        if local.is_some() {
+            return "Local connector discovery failed. Check its MCP tool catalog.".into();
+        }
+        secret
+            .as_ref()
+            .map(|secret| error.replace(secret, "[redacted]"))
+            .unwrap_or(error)
+    };
+    let service = if let Some(server) = &local {
+        // Enforced isolation runs the stdio server inside the same
+        // AppContainer policy as other spawns; its tools then still carry the
+        // in-process network gate (see effective_capabilities).
+        let isolation = crate::store::Store::open(db_path)
+            .map(|store| crate::isolation::settings(&store))
+            .unwrap_or_default();
+        ConnectorSession::Local(crate::local_mcp_process::connect(server, &isolation, Some(db_path)).await?)
+    } else {
+        let handler = HubHandler {
+            connection: slot.clone(),
+        };
+        let service = if item.auth_type == "oauth" {
+            let mut manager = crate::oauth::manager(id, &item.url, vault.clone()).await?;
+            if !manager
+                .initialize_from_store()
+                .await
+                .map_err(|_| "Saved authorization could not be restored. Sign in again.")?
+            {
+                return Err("Sign in to this connector first.".into());
+            }
+            let client = rmcp::transport::auth::AuthClient::new(client, manager);
+            let transport = StreamableHttpClientTransport::with_client(client, config);
+            tokio::time::timeout(Duration::from_secs(30), handler.serve(transport))
+                .await
+                .map_err(|_| "Connector handshake timed out.")?
+                .map_err(|_| {
+                    "Authorized connection failed. Check account access or sign in again."
+                        .to_string()
+                })?
+        } else {
+            let transport = StreamableHttpClientTransport::with_client(client, config);
+            tokio::time::timeout(Duration::from_secs(30), handler.serve(transport))
+                .await
+                .map_err(|_| "Connector handshake timed out.")?
+                .map_err(|error| redact(format!("Could not connect: {error}")))?
+        };
+        ConnectorSession::Remote(service)
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::tool_discovery::discover(|cursor| {
+            let peer = service.peer();
+            async move {
+                peer.list_tools(Some(
+                    rmcp::model::PaginatedRequestParams::default().with_cursor(cursor),
+                ))
+                .await
+                .map_err(|error| error.to_string())
+            }
+        }),
+    )
+    .await;
+    let tools = match result {
+        Ok(Ok(tools)) => tools,
+        result => {
+            let _ = service.cancel().await;
+            return Err(match result {
+                Err(_) => "Tool discovery timed out.".into(),
+                Ok(Err(error)) => redact(format!("Tool discovery failed: {error}")),
+                _ => unreachable!(),
+            });
+        }
+    };
+    let views = match tool_views(tools) {
+        Ok(views) => views,
+        Err(error) => {
+            let _ = service.cancel().await;
+            return Err(error);
+        }
+    };
+    item.has_credential = secret.is_some() || item.auth_type == "oauth";
+    Ok(Opened {
+        view: item,
+        service,
+        tools: views,
+    })
+}
+
 impl McpHub {
     /// Saved choices survive disconnects, but only live, explicitly selected tools
     /// belong in a request. Return omissions so both the UI and model can explain them.
@@ -496,12 +1020,11 @@ impl McpHub {
             let connection = self
                 .connections
                 .get(id)
-                .filter(|value| {
-                    !value.service.is_closed() && !value.service.peer().is_transport_closed()
-                })
+                .filter(|value| value.shared.live_or_reconnect())
                 .ok_or_else(|| format!("Connector {id} is not connected."))?;
+            let catalog = read_lock(&connection.shared.tools);
             let selected = select_views(
-                &connection.tools,
+                &catalog,
                 selections
                     .iter()
                     .filter(|selection| &selection.connector_id == id)
@@ -517,8 +1040,8 @@ impl McpHub {
                     tool: tool.clone(),
                     alias: tool_alias(id, &tool.name),
                     backend: ToolBackend::Mcp {
-                        peer: connection.service.peer(),
-                        local_name: connection.local_name.clone(),
+                        slot: connection.shared.clone(),
+                        local_name: connection.shared.local_name.clone(),
                     },
                 });
             }
@@ -541,12 +1064,7 @@ impl McpHub {
         }
     }
     fn token(&self, id: &str) -> Result<Option<String>, String> {
-        self.vault
-            .load(&format!("token-{id}"))?
-            .map(|bytes| {
-                String::from_utf8(bytes).map_err(|_| "Invalid stored token encoding.".into())
-            })
-            .transpose()
+        vault_token(&self.vault, id)
     }
     fn save_token(&self, id: &str, value: &str) -> Result<(), String> {
         if preset_credential(id)? != "header" {
@@ -572,9 +1090,9 @@ impl McpHub {
                 self.token(&item.id)?.is_some()
             };
             if let Some(connection) = self.connections.get(&item.id) {
-                item.connected = !connection.service.is_closed();
+                item.connected = connection.shared.live_or_reconnect();
                 if item.connected {
-                    item.tools = connection.tools.clone();
+                    item.tools = connection.shared.tools();
                 }
             }
         }
@@ -585,13 +1103,13 @@ impl McpHub {
     pub fn is_connected(&self, id: &str) -> bool {
         self.connections
             .get(id)
-            .is_some_and(|connection| !connection.service.is_closed())
+            .is_some_and(|connection| connection.shared.live_or_reconnect())
     }
     pub fn active_connector_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self
             .connections
             .iter()
-            .filter(|(_, conn)| !conn.service.is_closed() && !conn.service.peer().is_transport_closed())
+            .filter(|(_, conn)| conn.shared.live_or_reconnect())
             .map(|(id, _)| id.clone())
             .collect();
         ids.sort();
@@ -641,140 +1159,27 @@ impl McpHub {
         let local = crate::local_mcp_config::load(&self.vault)?
             .into_iter()
             .find(|server| server.id == id);
-        let mut item = match &local {
-            Some(server) => local_view(server),
-            None => preset(id)?,
-        };
         if local.is_some() && self.connections.contains_key(id) {
             return Err("Disconnect the local server before reconnecting.".into());
         }
-        let credential = preset_credential(id).ok();
-        let secret = if local.is_some() {
-            None
-        } else if credential == Some("header") {
-            self.token(id)?
-        } else {
-            // OAuth presets authenticate through the sign-in flow; a saved
-            // bearer token must never be attached to them. Public presets
-            // connect without credentials.
-            None
-        };
-        if item.auth_type == "apiKey" && secret.is_none() {
-            return Err("Add an API token before connecting.".into());
-        }
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| "Could not initialize connector networking.")?;
-        let mut config = StreamableHttpClientTransportConfig::with_uri(item.url.clone())
-            .max_concurrent_requests(2);
-        if let Some(secret) = &secret {
-            config = config.auth_header(secret);
-        }
-        let redact = |error: String| {
-            if local.is_some() {
-                return "Local connector discovery failed. Check its MCP tool catalog.".into();
-            }
-            secret
-                .as_ref()
-                .map(|secret| error.replace(secret, "[redacted]"))
-                .unwrap_or(error)
-        };
-        let service = if let Some(server) = &local {
-            ConnectorSession::Local(crate::local_mcp_process::connect(server).await?)
-        } else if item.auth_type == "oauth" {
-            let mut manager = crate::oauth::manager(id, &item.url, self.vault.clone()).await?;
-            if !manager
-                .initialize_from_store()
-                .await
-                .map_err(|_| "Saved authorization could not be restored. Sign in again.")?
-            {
-                return Err("Sign in to this connector first.".into());
-            }
-            let client = rmcp::transport::auth::AuthClient::new(client, manager);
-            let transport = StreamableHttpClientTransport::with_client(client, config);
-            ConnectorSession::Remote(
-                tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
-                    .await
-                    .map_err(|_| "Connector handshake timed out.")?
-                    .map_err(|_| {
-                        "Authorized connection failed. Check account access or sign in again."
-                            .to_string()
-                    })?,
-            )
-        } else {
-            let transport = StreamableHttpClientTransport::with_client(client, config);
-            ConnectorSession::Remote(
-                tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
-                    .await
-                    .map_err(|_| "Connector handshake timed out.")?
-                    .map_err(|error| redact(format!("Could not connect: {error}")))?,
-            )
-        };
-        let result = tokio::time::timeout(
-            Duration::from_secs(30),
-            crate::tool_discovery::discover(|cursor| {
-                let peer = service.peer();
-                async move {
-                    peer.list_tools(Some(
-                        rmcp::model::PaginatedRequestParams::default().with_cursor(cursor),
-                    ))
-                    .await
-                    .map_err(|error| error.to_string())
-                }
-            }),
-        )
-        .await;
-        let tools = match result {
-            Ok(Ok(tools)) => tools,
-            result => {
-                let _ = service.cancel().await;
-                return Err(match result {
-                    Err(_) => "Tool discovery timed out.".into(),
-                    Ok(Err(error)) => redact(format!("Tool discovery failed: {error}")),
-                    _ => unreachable!(),
-                });
-            }
-        };
-        if tools.len() > 512 {
-            let _ = service.cancel().await;
-            return Err("Connector returned more than 512 tools.".into());
-        }
-        let views: Vec<_> = tools
-            .into_iter()
-            .map(|tool| ToolView {
-                name: tool.name.into_owned(),
-                description: tool
-                    .description
-                    .map(|text| text.into_owned())
-                    .unwrap_or_default(),
-                input_schema: Value::Object((*tool.input_schema).clone()),
-            })
-            .collect();
-        if serde_json::to_vec(&views)
-            .map_err(|error| error.to_string())?
-            .len()
-            > 2_097_152
-        {
-            let _ = service.cancel().await;
-            return Err("Connector tool catalog exceeds 2 MiB.".into());
-        }
+        let shared = Arc::new(SharedConnection::new(
+            id,
+            self.vault.clone(),
+            local.as_ref().map(|server| server.name.clone()),
+        ));
+        let db_path = self.vault.db_path();
+        let opened = open_session(&self.vault, id, local, &shared, &db_path).await?;
+        let _ = shared.install(opened.service, opened.tools);
         if let Some(old) = self.connections.remove(id) {
-            let _ = old.service.cancel().await;
+            old.shared.detached.store(true, Ordering::Release);
+            if let Some(service) = old.shared.take_service() {
+                let _ = service.cancel().await;
+            }
         }
-        self.connections.insert(
-            id.into(),
-            Connection {
-                service,
-                tools: views.clone(),
-                local_name: local.as_ref().map(|server| server.name.clone()),
-            },
-        );
+        let mut item = opened.view;
         item.connected = true;
-        item.has_credential = secret.is_some() || item.auth_type == "oauth";
-        item.tools = views;
+        item.tools = shared.tools();
+        self.connections.insert(id.into(), Connection { shared });
         self.restore_errors.remove(id);
         Ok(item)
     }
@@ -787,10 +1192,15 @@ impl McpHub {
             preset(id)?;
         }
         if let Some(connection) = self.connections.remove(id) {
-            // A failed local shutdown keeps the saved configuration but
-            // releases the session lock so the user can retry, inspect, or
-            // remove the server. Cleanup never deletes saved configuration.
-            connection.service.cancel().await?;
+            // Detach first so an in-flight reconnect drops its freshly opened
+            // session instead of resurrecting this connector. A failed local
+            // shutdown keeps the saved configuration but releases the session
+            // lock so the user can retry, inspect, or remove the server.
+            // Cleanup never deletes saved configuration.
+            connection.shared.detached.store(true, Ordering::Release);
+            if let Some(service) = connection.shared.take_service() {
+                service.cancel().await?;
+            }
         }
         if forget && !local {
             self.vault.clear(&format!("token-{id}"))?;
@@ -1325,5 +1735,190 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         let redacted = error.replace("fixture-token-abcdef", "[redacted]");
         assert!(!redacted.contains("fixture-token-abcdef"));
         assert!(redacted.contains("[redacted]"));
+    }
+    #[test]
+    fn reconnect_backoff_is_bounded_exponential() {
+        // Five attempts total: an immediate try plus these four delays.
+        assert_eq!(
+            super::RECONNECT_DELAYS,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8)
+            ]
+        );
+    }
+    #[test]
+    fn reconnect_requires_a_runtime_and_never_fires_on_live_or_detached() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::vault::Vault::new(temp.path().join("vault")));
+        let shared = Arc::new(super::SharedConnection::new("fixture", vault, None));
+        // No tokio runtime in this test: the kick must degrade to a no-op.
+        shared.kick_reconnect();
+        assert!(!super::mutex(&shared.reconnect).running);
+    }
+    #[tokio::test]
+    async fn reconnect_loop_bounds_attempts_and_detach_stops_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::vault::Vault::new(temp.path().join("vault")));
+        let shared = Arc::new(super::SharedConnection::new(
+            "not-a-real-connector",
+            vault,
+            None,
+        ));
+        // A connector that can never open records a bounded failure count.
+        shared.clone().reconnect_loop(&[]).await;
+        {
+            let state = super::mutex(&shared.reconnect);
+            assert!(!state.running);
+            assert_eq!(state.failed_attempts, 1);
+        }
+        // A detached connection exits immediately without recording more.
+        shared.detached.store(true, Ordering::Release);
+        super::mutex(&shared.reconnect).running = true;
+        shared.clone().reconnect_loop(&[]).await;
+        let state = super::mutex(&shared.reconnect);
+        assert!(!state.running);
+        assert_eq!(state.failed_attempts, 1);
+    }
+    #[test]
+    fn tool_list_changed_flag_waits_for_a_live_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::vault::Vault::new(temp.path().join("vault")));
+        let shared = Arc::new(super::SharedConnection::new("fixture", vault, None));
+        shared.note_tools_changed();
+        // With no live session no refresh task spawns; the flag stays set for
+        // the reconnect path, which installs a fresh catalog on success.
+        assert!(shared.tools_dirty.load(Ordering::Acquire));
+        assert!(!shared.refreshing.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn dead_local_connector_reconnects_with_stable_tool_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fixture.cjs");
+        // The fixture answers one tools/call, then exits — killing the
+        // transport so the hub observes a dead session.
+        std::fs::write(&script, r#"
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+ const r = JSON.parse(line); if (r.id === undefined) return;
+ const result = r.method === 'initialize'
+ ? {protocolVersion:r.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}}
+ : r.method === 'tools/call'
+ ? {content:[{type:'text',text:'ok'}],isError:false}
+ : {tools:[{name:'read_file',description:'fixture',inputSchema:{type:'object'}}]};
+ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\n');
+ if (r.method === 'tools/call') setTimeout(() => process.exit(0), 150);
+});
+"#).unwrap();
+        let mut hub = super::McpHub::new(Arc::new(crate::vault::Vault::new(
+            temp.path().join("vault"),
+        )));
+        let server = crate::local_mcp_config::LocalServer {
+            id: format!("local-{}", uuid::Uuid::new_v4()),
+            name: "Fixture".into(),
+            executable: crate::execution::ExecutionConfig::default().node_path,
+            arguments: vec![script.to_string_lossy().into_owned()],
+            working_directory: temp.path().to_string_lossy().into_owned(),
+            environment: Default::default(),
+        };
+        hub.save_local(server.clone()).unwrap();
+        hub.connect(&server.id).await.unwrap();
+        let selections = [super::ToolSelection {
+            connector_id: server.id.clone(),
+            tool_name: "read_file".into(),
+        }];
+        let tools = hub.selected_tools(&[], &selections).unwrap();
+        let alias = tools[0].alias.clone();
+        tools[0].call(serde_json::json!({})).await.unwrap();
+        // The process exit closes the transport; the next hub read observes a
+        // dead session and reports the connector unavailable.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while hub.is_connected(&server.id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture transport never closed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (_, omitted) = hub
+            .tools_for_turn(std::slice::from_ref(&server.id), &[])
+            .unwrap();
+        assert_eq!(omitted, std::slice::from_ref(&server.id));
+        // That same read scheduled the bounded reconnect; the connector comes
+        // back without a manual reconnect.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !hub.is_connected(&server.id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reconnect never restored the session"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Reconnect re-ran discovery; the same tool name keeps the same alias.
+        let tools = hub.selected_tools(&[], &selections).unwrap();
+        assert_eq!(tools[0].alias, alias);
+        tools[0].call(serde_json::json!({})).await.unwrap();
+        hub.disconnect(&server.id, false).await.unwrap();
+        hub.remove_local(&server.id).unwrap();
+    }
+    #[test]
+    fn tool_result_projection_keeps_text_and_omits_binary_bodies() {
+        use rmcp::model::{CallToolResult, ContentBlock, Resource, ResourceContents};
+        let result = CallToolResult::success(vec![
+            ContentBlock::text("hello"),
+            ContentBlock::image("aGVsbG8=", "image/png"),
+            ContentBlock::audio("aGVsbG8=", "audio/wav"),
+            ContentBlock::resource(
+                ResourceContents::blob("AAAA", "file:///bin").with_mime_type("application/pdf"),
+            ),
+            ContentBlock::resource_link(
+                Resource::new("file:///doc", "doc").with_mime_type("text/markdown"),
+            ),
+        ]);
+        let value = super::project_tool_result(&result).unwrap();
+        assert_eq!(value["isError"], serde_json::json!(false));
+        assert_eq!(
+            value["content"][0],
+            serde_json::json!({"type": "text", "text": "hello"})
+        );
+        for index in 1..5 {
+            let item = &value["content"][index];
+            assert_eq!(item["type"], "unsupported", "item {index}");
+            assert_eq!(item["note"], "binary content omitted", "item {index}");
+            assert!(item.get("data").is_none(), "base64 leaked at {index}");
+            assert!(item.get("blob").is_none(), "base64 leaked at {index}");
+        }
+        assert_eq!(value["content"][1]["mimeType"], "image/png");
+        assert_eq!(value["content"][2]["mimeType"], "audio/wav");
+        assert_eq!(value["content"][3]["mimeType"], "application/pdf");
+        assert_eq!(value["content"][4]["mimeType"], "text/markdown");
+    }
+    #[test]
+    fn tool_result_projection_surfaces_errors_and_bounds_items() {
+        use rmcp::model::{CallToolResult, ContentBlock};
+        let error = CallToolResult::error(vec![ContentBlock::text("boom")]);
+        let value = super::project_tool_result(&error).unwrap();
+        assert_eq!(value["isError"], serde_json::json!(true));
+        assert_eq!(value["content"][0]["text"], "boom");
+        // A single text item beyond ~64 KiB is truncated with a marker.
+        let big = CallToolResult::success(vec![ContentBlock::text("x".repeat(70_000))]);
+        let value = super::project_tool_result(&big).unwrap();
+        let text = value["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("truncated"));
+        assert!(text.len() < 70_000);
+        assert!(text.len() > 65_536);
+        // The 256 KiB total cap still rejects oversized envelopes.
+        let huge = CallToolResult::success(
+            (0..8)
+                .map(|_| ContentBlock::text("y".repeat(60_000)))
+                .collect(),
+        );
+        assert!(super::project_tool_result(&huge).is_err());
+        // structuredContent passes through untouched.
+        let mut structured = CallToolResult::success(vec![]);
+        structured.structured_content = Some(serde_json::json!({"rows": 2}));
+        let value = super::project_tool_result(&structured).unwrap();
+        assert_eq!(value["structuredContent"], serde_json::json!({"rows": 2}));
     }
 }

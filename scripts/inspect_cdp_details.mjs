@@ -1,7 +1,6 @@
-import { chromium } from '@playwright/test';
+import { connectSmoke } from './smoke-lib.mjs';
 
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-const page = browser.contexts()[0].pages().find(p => p.url().includes('1420'));
+let { browser, page } = await connectSmoke();
 if (!page) {
   console.log('No 1420 page found');
   await browser.close();

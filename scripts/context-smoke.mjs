@@ -1,9 +1,9 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-const browser=await chromium.connectOverCDP('http://127.0.0.1:9223');
-let page;await expect.poll(()=>{page=browser.contexts()[0].pages().find(page=>page.url().includes('1420'));return Boolean(page);}).toBe(true);
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
+let { browser, page } = await connectSmoke()
 page.setDefaultTimeout(15000);
 async function invoke(command,args={}){return page.evaluate(async({command,args})=>{const {invoke}=await import('/node_modules/@tauri-apps/api/core.js');return invoke(command,args);},{command,args});}
 const original=(await invoke('bootstrap')).preferences;
@@ -12,7 +12,7 @@ const folder=resolve('.local','context-smoke-'+randomUUID());mkdirSync(folder,{r
 const oversized='word '.repeat(18000);writeFileSync(join(folder,'long.txt'),oversized);
 try{
   await invoke('save_preferences',{preferences:{...original,maxTokens:2048,temperature:0}});
-  await page.getByRole('button',{name:'Models & runtime',exact:true}).click();
+  await openSettingsSection(page, 'Models');
   if(await page.getByRole('button',{name:'Load model',exact:true}).count()){
     await page.getByRole('button',{name:'Load model',exact:true}).click();
     await expect(page.getByRole('button',{name:'Unload',exact:true})).toBeVisible({timeout:120000});

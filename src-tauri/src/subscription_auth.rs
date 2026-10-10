@@ -57,7 +57,7 @@ pub struct CliDetectionResult {
     pub grok_path: Option<String>,
 }
 
-fn vault_id_for_provider(provider: &str) -> Result<&'static str, String> {
+pub fn vault_id_for_provider(provider: &str) -> Result<&'static str, String> {
     match provider {
         PROVIDER_CHATGPT | "chatgpt-subscription" => Ok(VAULT_CHATGPT_SUB),
         PROVIDER_GROK | "grok-subscription" => Ok(VAULT_GROK_SUB),
@@ -81,7 +81,38 @@ pub fn save_session(vault: &Vault, session: &SubscriptionSession) -> Result<(), 
     let id = vault_id_for_provider(&session.provider)?;
     let bytes = serde_json::to_vec(session)
         .map_err(|e| format!("Failed to serialize subscription session: {e}"))?;
-    vault.save(id, &bytes)
+    vault.save_with_expiry(id, &bytes, session.expires_at)?;
+    verify_committed_session(vault, id, session)
+}
+
+/// Post-auth commit check: re-read the record this flow just wrote and confirm
+/// it decodes with this authorization's access token, so a failed or partial
+/// write cannot be masked by a credential that was stored earlier.
+fn verify_committed_session(
+    vault: &Vault,
+    id: &str,
+    session: &SubscriptionSession,
+) -> Result<(), String> {
+    let result = (|| -> Result<(), String> {
+        let Some((bytes, _)) = vault.load_record(id)? else {
+            return Err("Subscription credential was not persisted.".into());
+        };
+        let stored: SubscriptionSession = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Stored subscription credential failed to decode: {e}"))?;
+        if stored.access_token.trim().is_empty() {
+            return Err("Stored subscription credential is missing its access token.".into());
+        }
+        if stored.access_token != session.access_token {
+            return Err(
+                "Stored subscription credential does not match this authorization.".into(),
+            );
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = vault.clear(id);
+    }
+    result
 }
 
 pub fn clear_session(vault: &Vault, provider: &str) -> Result<(), String> {
@@ -354,74 +385,52 @@ pub async fn refresh_subscription_token(
     let client = crate::providers::client()?;
     let now_sec = crate::store::now() / 1000;
 
-    match provider {
+    let (endpoint, client_id) = match provider {
         PROVIDER_CHATGPT | "chatgpt-subscription" => {
-            let body = format!(
-                "grant_type=refresh_token&client_id={}&refresh_token={}",
-                OPENAI_CODEX_CLIENT_ID,
-                urlencoding::encode(&refresh_token)
-            );
-            let response = client
-                .post("https://auth.openai.com/oauth/token")
-                .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to reach OpenAI refresh endpoint: {e}"))?;
-
-            if response.status().is_success() {
-                let json: serde_json::Value = response
-                    .json()
-                    .await
-                    .map_err(|e| format!("Invalid refresh response: {e}"))?;
-
-                if let Some(new_access) = json.get("access_token").and_then(|v| v.as_str()) {
-                    session.access_token = new_access.to_string();
-                }
-                if let Some(new_refresh) = json.get("refresh_token").and_then(|v| v.as_str()) {
-                    session.refresh_token = Some(new_refresh.to_string());
-                }
-                if let Some(expires_in) = json.get("expires_in").and_then(|v| v.as_i64()) {
-                    session.expires_at = Some(now_sec + expires_in);
-                }
-                session.updated_at = crate::store::now();
-                let _ = save_session(vault, &session);
-            }
+            ("https://auth.openai.com/oauth/token", OPENAI_CODEX_CLIENT_ID)
         }
         PROVIDER_GROK | "grok-subscription" => {
-            let body = format!(
-                "grant_type=refresh_token&client_id={}&refresh_token={}",
-                GROK_BUILD_CLIENT_ID,
-                urlencoding::encode(&refresh_token)
-            );
-            let response = client
-                .post("https://auth.x.ai/oauth/token")
-                .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to reach Grok refresh endpoint: {e}"))?;
+            ("https://auth.x.ai/oauth/token", GROK_BUILD_CLIENT_ID)
+        }
+        _ => return Ok(session),
+    };
 
-            if response.status().is_success() {
-                let json: serde_json::Value = response
-                    .json()
-                    .await
-                    .map_err(|e| format!("Invalid refresh response: {e}"))?;
+    let body = format!(
+        "grant_type=refresh_token&client_id={}&refresh_token={}",
+        client_id,
+        urlencoding::encode(&refresh_token)
+    );
+    let response = client
+        .post(endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach {provider} refresh endpoint: {e}"))?;
 
-                if let Some(new_access) = json.get("access_token").and_then(|v| v.as_str()) {
-                    session.access_token = new_access.to_string();
-                }
-                if let Some(new_refresh) = json.get("refresh_token").and_then(|v| v.as_str()) {
-                    session.refresh_token = Some(new_refresh.to_string());
-                }
-                if let Some(expires_in) = json.get("expires_in").and_then(|v| v.as_i64()) {
-                    session.expires_at = Some(now_sec + expires_in);
-                }
-                session.updated_at = crate::store::now();
-                let _ = save_session(vault, &session);
+    if response.status().is_success() {
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Invalid refresh response: {e}"))?;
+
+        if let Some(new_access) = json.get("access_token").and_then(|v| v.as_str()) {
+            session.access_token = new_access.to_string();
+        }
+        if let Some(new_refresh) = json.get("refresh_token").and_then(|v| v.as_str()) {
+            session.refresh_token = Some(new_refresh.to_string());
+        }
+        if let Some(expires_in) = json.get("expires_in").and_then(|v| v.as_i64()) {
+            session.expires_at = Some(now_sec + expires_in);
+        }
+        session.updated_at = crate::store::now();
+        let _ = save_session(vault, &session);
+        // A successful refresh is a live verification of the credential.
+        if let Ok(id) = vault_id_for_provider(provider) {
+            if let Err(error) = vault.mark_verified(id) {
+                eprintln!("Could not record subscription credential verification: {error}");
             }
         }
-        _ => {}
     }
 
     Ok(session)
@@ -787,5 +796,76 @@ mod tests {
         assert_eq!(extract_query_param(target, "code"), Some("abc-123".into()));
         assert_eq!(extract_query_param(target, "state"), Some("state-456".into()));
         assert_eq!(extract_query_param(target, "unknown"), None);
+    }
+
+    fn session_fixture(access_token: &str) -> SubscriptionSession {
+        SubscriptionSession {
+            provider: PROVIDER_CHATGPT.into(),
+            access_token: access_token.into(),
+            refresh_token: Some("refresh-token".into()),
+            expires_at: Some(4_000_000_000),
+            account_id: None,
+            plan_type: None,
+            source: "oauth".into(),
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn save_session_writes_record_meta_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::new(temp.path().join("vault"));
+        save_session(&vault, &session_fixture("oauth-token")).unwrap();
+        let (_, meta) = vault.load_record(VAULT_CHATGPT_SUB).unwrap().unwrap();
+        assert_eq!(meta.expires_at, Some(4_000_000_000));
+        assert!(meta.created_at > 0);
+        let loaded = load_session(&vault, PROVIDER_CHATGPT).unwrap().unwrap();
+        assert_eq!(loaded.access_token, "oauth-token");
+        assert_eq!(loaded.refresh_token.as_deref(), Some("refresh-token"));
+    }
+
+    #[test]
+    fn commit_check_rejects_missing_or_mismatched_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::new(temp.path().join("vault"));
+        save_session(&vault, &session_fixture("good-token")).unwrap();
+        // A write whose token is empty fails the check and clears the record.
+        assert!(save_session(&vault, &session_fixture("   ")).is_err());
+        assert!(load_session(&vault, PROVIDER_CHATGPT).unwrap().is_none());
+        // Undecodable stored content is caught too.
+        vault
+            .save_with_expiry(VAULT_CHATGPT_SUB, b"not-a-session", None)
+            .unwrap();
+        assert!(
+            verify_committed_session(&vault, VAULT_CHATGPT_SUB, &session_fixture("good-token"))
+                .is_err()
+        );
+        // A stored credential from an earlier authorization cannot stand in.
+        vault
+            .save_with_expiry(
+                VAULT_CHATGPT_SUB,
+                &serde_json::to_vec(&session_fixture("old-token")).unwrap(),
+                None,
+            )
+            .unwrap();
+        assert!(
+            verify_committed_session(&vault, VAULT_CHATGPT_SUB, &session_fixture("new-token"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reauth_rotates_record_and_refreshes_meta() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::new(temp.path().join("vault"));
+        save_session(&vault, &session_fixture("token-one")).unwrap();
+        vault.mark_verified(VAULT_CHATGPT_SUB).unwrap();
+        let (_, before) = vault.load_record(VAULT_CHATGPT_SUB).unwrap().unwrap();
+        save_session(&vault, &session_fixture("token-two")).unwrap();
+        let (bytes, after) = vault.load_record(VAULT_CHATGPT_SUB).unwrap().unwrap();
+        let stored: SubscriptionSession = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(stored.access_token, "token-two");
+        assert!(after.created_at >= before.created_at);
+        assert_eq!(after.last_verified_at, None);
     }
 }

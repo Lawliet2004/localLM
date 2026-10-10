@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint", "unicorn", "typescript", "react"],
+  "rules": {
+    "typescript/no-floating-promises": "error",
+    "react/set-state-in-effect": "off",
+    "react/refs": "off",
+    "react/immutability": "off",
+    "react/purity": "off",
+    "react-hooks/exhaustive-deps": "off"
+  }
+}

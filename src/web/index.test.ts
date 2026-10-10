@@ -1,9 +1,120 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
-import { installWebFixtures } from './test-fixtures';
-import { WebSearchEngine } from './index';
-import { MockSearchProvider } from './search/provider';
+import { installWebFixtures, MockSearchProvider } from './test-fixtures';
+import { FetchFailure, WebSearchEngine } from './index';
+import { createConfig } from './config/defaults';
 import { formatDiagnosticReport } from './observability/metrics';
 import type { SearchResult } from './types';
+import { InMemoryStorageAdapter } from './cache/sqlite';
+import { DocumentStore } from './documents/document_store';
+
+it('Google health is explicitly untested and spends no query', async () => {
+  const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+  const health = await new WebSearchEngine({ config: { searchProvider: 'google', googleApiKey: 'secret', googleCxId: 'cx' } }).getHealthStatus();
+  expect(health.search).toBe('configured_not_tested');
+  expect(health.google).toBe('configured_not_tested');
+  expect(fetchMock).not.toHaveBeenCalled(); vi.unstubAllGlobals();
+});
+
+it('Google quota refuses an oversized batch without changing the counter', async () => {
+  const storage = new InMemoryStorageAdapter();
+  const key = `google_search_count_${new Date().toISOString().split('T')[0]}`;
+  const engine = new WebSearchEngine({ storage });
+  await storage.set('quota', key, 89);
+  const claim = (engine as unknown as { claimGoogleQuota(n: number): Promise<boolean> }).claimGoogleQuota.bind(engine);
+  expect(await claim(4)).toBe(false); expect(await storage.get('quota', key)).toBe(89);
+  await storage.set('quota', key, 86); expect(await claim(4)).toBe(true); expect(await storage.get('quota', key)).toBe(90);
+});
+
+it('primary Google research counts every request including retries', async () => {
+  const storage = new InMemoryStorageAdapter();
+  const fetchMock = vi.fn(async () => new Response('', { status: 503 })); vi.stubGlobal('fetch', fetchMock);
+  await new WebSearchEngine({ storage, config: { searchProvider: 'google', googleApiKey: 'secret', googleCxId: 'cx',
+    searchFallback: { enabled: false, googleDailyLimit: 90 }, searchRetries: 1, searchRetryDelayMs: 1, enablePagination: false,
+    cache: { ...createConfig().cache, enabled: false } } }).research('adapter charging specifications');
+  expect(await storage.get('quota', `google_search_count_${new Date().toISOString().split('T')[0]}`)).toBe(fetchMock.mock.calls.length);
+  vi.unstubAllGlobals();
+});
+
+it('staged fallback reports the provider that supplied evidence', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (input: string) => new Response(JSON.stringify(input.includes('googleapis')
+    ? { items: [{ title: 'Adapter', link: 'https://spec.example/adapter', snippet: 'Adapter supports charging at 60 watts.' }] } : { results: [] }))));
+  const engine = new WebSearchEngine({ storage: new InMemoryStorageAdapter(), config: { googleApiKey: 'secret', googleCxId: 'cx',
+    searchFallback: { enabled: true, googleDailyLimit: 90 }, searchRetries: 0 },
+    llmProvider: { generate: async request => ({ text: request.systemPrompt.includes('search queries') ? 'adapter charging' : 'S1.1' }) } });
+  const session = await engine.researchStaged('adapter charging');
+  expect(session.trace?.providerUsed).toBe('google'); expect(session.trace?.fallbackUsed).toBe(true);
+  const batch = await engine.searchQueries(['adapter charging']);
+  expect(batch).toMatchObject({ provider: 'google', fallbackUsed: true }); vi.unstubAllGlobals();
+});
+
+it('agent searches reuse cache within freshness and configured provider boundaries', async () => {
+  const search = vi.fn(async () => [{ id: 'r1', queryId: 'adapter', title: 'Adapter charging',
+    url: 'https://spec.example/adapter', domain: 'spec.example', rank: 1, snippet: 'Adapter charging supports 60 watts.' }]);
+  const engine = new WebSearchEngine({ searchProvider: { search }, config: { resultsPerQuery: 3 } });
+  await engine.searchQueries([' adapter charging '], 'realtime');
+  await engine.searchQueries(['adapter charging'], 'realtime');
+  expect(search).toHaveBeenCalledTimes(1);
+  expect(search.mock.calls[0]).toEqual([{ query: 'adapter charging', freshness: 'realtime', maxResults: 3, page: undefined }]);
+  await engine.searchQueries(['adapter charging'], 'any');
+  expect(search).toHaveBeenCalledTimes(2);
+  engine.config.searxngEngines = ['different engine'];
+  await engine.searchQueries(['adapter charging'], 'any');
+  expect(search).toHaveBeenCalledTimes(3);
+});
+
+it('does not cache a partial query batch or ignore a disabled cache', async () => {
+  const search = vi.fn(async ({ query }: { query: string }) => {
+    if (query === 'offline') throw new Error('unreachable');
+    return [{ id: 'r1', queryId: query, title: query, url: 'https://spec.example/adapter', domain: 'spec.example', rank: 1 }];
+  });
+  const engine = new WebSearchEngine({ searchProvider: { search }, config: { searchRetries: 0 } });
+  await engine.searchQueries(['adapter', 'offline']);
+  await engine.searchQueries(['adapter', 'offline']);
+  expect(search).toHaveBeenCalledTimes(4);
+  engine.config.cache.enabled = false;
+  await engine.searchQueries(['adapter']);
+  await engine.searchQueries(['adapter']);
+  expect(search).toHaveBeenCalledTimes(6);
+});
+
+it('direct page reads reuse redirects but refresh older documents for realtime requests', async () => {
+  const now = Date.now();
+  vi.useFakeTimers();
+  vi.setSystemTime(now);
+  const fetch = vi.fn(async (url: string) => ({ url, finalUrl: 'https://spec.example/current/adapter', success: true,
+    status: 200, mimeType: 'text/html', durationMs: 1,
+    body: `<html><title>Adapter</title><article><p>${'Adapter charging supports 60 watts. '.repeat(8)}</p></article></html>` }));
+  try {
+    const engine = new WebSearchEngine({ fetcher: { fetch } });
+    const first = await engine.fetchUrl('https://spec.example/adapter');
+    expect((await engine.fetchUrl('https://spec.example/adapter')).url).toBe(first.url);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(now + 6 * 60 * 1000);
+    await engine.fetchUrl('https://spec.example/adapter', 'realtime');
+    expect(fetch).toHaveBeenCalledTimes(2);
+  } finally { vi.useRealTimers(); }
+});
+
+it('keeps full staged research pages available for open and find after compressing evidence', async () => {
+  const sourceUrl = 'https://spec.example/adapter';
+  const engine = new WebSearchEngine({
+    searchProvider: { search: async () => [{ id: 'r1', queryId: 'q1', rank: 1, title: 'Adapter',
+      url: sourceUrl, domain: 'spec.example', snippet: 'The adapter supports charging at 60 watts.' }] },
+    fetcher: { fetch: async url => ({ url, finalUrl: url, success: true, status: 200, mimeType: 'text/html', durationMs: 1,
+      body: `<html><title>Adapter</title><article><h1>Charging</h1><p>The adapter supports charging at 60 watts.</p><p>${'Background information. '.repeat(50)}</p><h2>Warranty</h2><p>The warranty reference is W123.</p></article></html>` }) },
+    llmProvider: { generate: async request => ({ text: request.systemPrompt.includes('search queries') ? 'adapter charging'
+      : request.systemPrompt.includes('fact extractor') ? 'S1.1' : 'The adapter supports charging at 60 watts. [S1]' }) },
+  });
+  const session = await engine.researchStaged('adapter charging', { fetchPages: true });
+  expect(session.evidence.some(item => item.claim.includes('60 watts'))).toBe(true);
+  expect(session.evidence.some(item => item.claim.includes('W123'))).toBe(false);
+  const document = session.documents[0];
+  expect(document.metadata?.extractionMethod).toBe('main_content');
+  const store = new DocumentStore();
+  store.save({ ...document, fullText: document.text, extractionMethod: 'main_content' });
+  expect(store.find(document.id, 'W123')[0].text).toContain('The warranty reference is W123.');
+  expect(store.open(document.id, { section: 'Warranty' })[0].text).toContain('W123');
+});
 
 describe('WebSearchEngine End-to-End Integration Suite', () => {
   const originalFetch = globalThis.fetch;
@@ -12,6 +123,24 @@ describe('WebSearchEngine End-to-End Integration Suite', () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     globalThis.fetch = originalFetch;
+  });
+
+  it('preserves bounded status diagnostics when a direct URL read fails', async () => {
+    const body = 'Page Not Found. '.repeat(500);
+    const engine = new WebSearchEngine({
+      config: { fetch: { ...createConfig().fetch, waybackFallback: false } },
+      fetcher: {
+        fetch: async (url) => ({
+          url, finalUrl: url, success: false, status: 403, body,
+          error: 'Page unavailable: HTTP 403', durationMs: 1,
+        }),
+      },
+    });
+    const error = await engine.fetchUrl('https://source.example/blocked').catch((value) => value);
+    expect(error).toBeInstanceOf(FetchFailure);
+    expect(error.status).toBe(403);
+    expect(error.diagnosticBody).toContain('Page Not Found');
+    expect(error.diagnosticBody.length).toBeLessThanOrEqual(4000);
   });
 
   // Test A: Weather Structured Retrieval
@@ -25,6 +154,37 @@ describe('WebSearchEngine End-to-End Integration Suite', () => {
     expect(session.answer).toContain('Ranaghat');
     expect(session.tokenUsage.estimatedEvidenceTokens).toBeLessThan(300); // Super compact!
   }, 15000);
+
+  // Test A2: A structured vertical that fails before searching falls back to web search
+  it('Test A2: Weather vertical failure falls back to web search instead of canned error', async () => {
+    const searchProvider = new MockSearchProvider({
+      'weather': [
+        {
+          id: 'w1',
+          queryId: 'q',
+          title: 'Coastal Storm Update',
+          url: 'https://example.com/storm',
+          snippet: 'Weather today: a storm system moves along the coast with heavy rain expected.',
+          domain: 'example.com',
+          rank: 1,
+        },
+      ],
+    });
+
+    const engine = new WebSearchEngine({ searchProvider });
+    // 'weather today' routes to WEATHER but carries no location, so the provider throws.
+    const session = await engine.research('weather today');
+
+    expect(session.results.length).toBeGreaterThan(0);
+    expect(session.answer).not.toContain("couldn't retrieve current weather data");
+  });
+
+  // Test A3: The canned vertical error is a last resort when search is also empty
+  it('Test A3: Canned vertical error survives only when web search yields nothing', async () => {
+    const engine = new WebSearchEngine({ searchProvider: new MockSearchProvider({}) });
+    const session = await engine.research('weather today');
+    expect(session.answer).toContain("couldn't retrieve current weather data");
+  });
 
   // Test B: Current Software Information with Primary Documentation & Citation
   it('Test B: Current software query favors primary documentation and cites it', async () => {
@@ -263,7 +423,8 @@ describe('WebSearchEngine End-to-End Integration Suite', () => {
   // Test I: Local Operation (Zero Paid APIs)
   it('Test I: Operates completely offline/locally without paid APIs', async () => {
     const health = await new WebSearchEngine().getHealthStatus();
-    expect(health.embeddingModel).toBe('disabled');
+    expect(health.llm).toBe('deterministic_fallback_ready');
+    expect(health.google).toBe('not_configured');
     expect(health.reranker).toBe('disabled');
   });
 

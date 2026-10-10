@@ -8,15 +8,10 @@ it('renders log text literally and refreshes after an error', async () => {
   read.mockRejectedValueOnce('Read failed').mockResolvedValueOnce({ content: '<script>example</script>', truncated: true });
   render(<RuntimeDiagnostics />);
   expect(await screen.findByRole('alert')).toHaveTextContent('Read failed');
-  expect(screen.queryByText(/offered again on the next message/i)).not.toBeInTheDocument();
   await userEvent.click(screen.getByRole('button', { name: 'Refresh log' }));
   expect(await screen.findByLabelText('Runtime log output')).toHaveTextContent('<script>example</script>');
   expect(screen.getByRole('status')).toHaveTextContent('final 64 KiB');
   expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-  expect(screen.queryByText(/offered again on the next message/i)).not.toBeInTheDocument();
-  await userEvent.click(screen.getByRole('button', { name: 'Retest tool calling' }));
-  expect(screen.getByText(/Tool calling will be offered again on the next message/i)).toBeInTheDocument();
-  expect(screen.getByText(/malformed call is repaired once without disabling later turns/i)).toBeInTheDocument();
-  expect(screen.getByRole('status')).toHaveTextContent('final 64 KiB');
+  expect(screen.queryByRole('button', { name: 'Retest tool calling' })).not.toBeInTheDocument();
   expect(read).toHaveBeenCalledTimes(2);
 });

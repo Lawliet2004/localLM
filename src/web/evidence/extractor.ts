@@ -6,12 +6,6 @@
 import type { EvidenceChunk, ExtractedFact, LLMProvider } from '../types';
 import { sanitizeWebEvidence } from '../security/injection_guard';
 
-export interface FactExtractionResult {
-  sourceId: string;
-  chunkId: string;
-  facts: ExtractedFact[];
-}
-
 export class EvidenceExtractor {
   constructor(private llmProvider?: LLMProvider) {}
 

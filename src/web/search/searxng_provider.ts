@@ -70,6 +70,11 @@ export function parseSearxngBaseUrls(baseUrl: string): string[] {
   return urls.length > 0 ? urls : ['http://127.0.0.1:8080'];
 }
 
+function isFixtureResponse(data: any): boolean {
+  return Array.isArray(data?.results) && data.results.some((result: any) =>
+    String(result?.engine ?? '').toLowerCase() === 'fixture');
+}
+
 /** Instant answers and infoboxes become evidence documents for small local models. */
 export function documentsFromSearchMeta(meta: SearchMeta, retrievedAt: string = new Date().toISOString()): RetrievedDocument[] {
   const docs: RetrievedDocument[] = [];
@@ -127,6 +132,18 @@ function hostnameOf(url: string): string {
   }
 }
 
+function engineFailures(data: any): Record<string, string> {
+  const failures: Record<string, string> = {};
+  for (const item of Array.isArray(data?.unresponsive_engines) ? data.unresponsive_engines : []) {
+    if (Array.isArray(item)) failures[String(item[0])] = String(item[1] ?? 'engine failed');
+    else failures[String(item)] = 'engine failed';
+  }
+  for (const [name, info] of Object.entries(data?.engines ?? {}) as Array<[string, any]>) {
+    if (info && (info.error || info.timed_out)) failures[name] = String(info.error || 'timeout');
+  }
+  return failures;
+}
+
 export class SearXNGProvider implements SearchProvider {
   private retryAfter = 0;
   public lastDiagnostics: SearXNGDiagnostics | null = null;
@@ -137,6 +154,7 @@ export class SearXNGProvider implements SearchProvider {
     private timeoutMs: number = 8000,
     private engines: string[] = ['google cse', 'yep', 'duckduckgo', 'google news', 'reuters', 'wikipedia', 'wikinews', 'stackoverflow', 'github', 'arxiv', 'openstreetmap'],
     private disabledEngines: string[] = [...KEYFREE_CREDENTIAL_ENGINES],
+    private storage?: import('../cache/sqlite').StorageAdapter,
   ) {}
 
   /** Verify which configured engines answer instead of assuming they work. */
@@ -145,7 +163,9 @@ export class SearXNGProvider implements SearchProvider {
     const failing: Record<string, string> = {};
     await Promise.all(this.engines.map(async (engine) => {
       try {
-        const url = new URL('/search', parseSearxngBaseUrls(this.baseUrl)[0]);
+        const base = parseSearxngBaseUrls(this.baseUrl)[0];
+        if ((await this.storage?.get<number>('cooldown', base) ?? 0) > Date.now()) throw new Error('SearXNG Retry-After cooldown active');
+        const url = new URL('search', base.endsWith('/') ? base : base + '/');
         url.searchParams.set('q', 'health check');
         url.searchParams.set('format', 'json');
         url.searchParams.set('engines', engine);
@@ -158,7 +178,12 @@ export class SearXNGProvider implements SearchProvider {
             redirect: 'error',
           });
           if (!res.ok) failing[engine] = `HTTP ${res.status}`;
-          else working.push(engine);
+          else {
+            const data = await res.json();
+            if (isFixtureResponse(data)) failing[engine] = 'Fixture results, not live search';
+            else if (engineFailures(data)[engine]) failing[engine] = engineFailures(data)[engine];
+            else working.push(engine);
+          }
         } finally {
           clearTimeout(timer);
         }
@@ -179,11 +204,15 @@ export class SearXNGProvider implements SearchProvider {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
       try {
-        const hits = await this.searchAgainst(bases[i], request, remaining);
+        if ((await this.storage?.get<number>('cooldown', bases[i]) ?? 0) > Date.now()) throw new Error('SearXNG Retry-After cooldown active');
+        const hits = await this.searchAgainst(bases[i], request, Math.floor(remaining / (bases.length - i)));
         return hits;
       } catch (err: any) {
         lastError = err;
-        if (typeof err?.cooldownUntil === 'number') cooldownUntil = Math.max(cooldownUntil, err.cooldownUntil);
+        if (typeof err?.cooldownUntil === 'number') {
+          cooldownUntil = Math.max(cooldownUntil, err.cooldownUntil);
+          await this.storage?.set('cooldown', bases[i], err.cooldownUntil, Math.max(1, (err.cooldownUntil - Date.now()) / 1000));
+        }
         if (bases.length === 1) {
           if (cooldownUntil) this.retryAfter = cooldownUntil;
           throw err;
@@ -196,7 +225,7 @@ export class SearXNGProvider implements SearchProvider {
 
   private async searchAgainst(baseUrl: string, request: SearchRequest, timeoutMs: number): Promise<SearchResult[]> {
     const page = Math.max(1, Math.min(5, Math.floor(request.page ?? 1) || 1));
-    const url = new URL('/search', baseUrl);
+    const url = new URL('search', baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
     url.searchParams.set('q', request.query);
     url.searchParams.set('format', 'json');
     url.searchParams.set('pageno', String(page));
@@ -211,6 +240,7 @@ export class SearXNGProvider implements SearchProvider {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(50, timeoutMs));
+    let httpStatus: number | undefined;
 
     try {
       const res = await fetch(url.toString(), {
@@ -218,6 +248,7 @@ export class SearXNGProvider implements SearchProvider {
         signal: controller.signal,
         redirect: 'error',
       });
+      httpStatus = res.status;
 
       if (!res.ok) {
         this.lastDiagnostics = { httpStatus: res.status, page, error: `HTTP ${res.status}` };
@@ -232,17 +263,24 @@ export class SearXNGProvider implements SearchProvider {
 
       const data = await res.json();
       clearTimeout(timer);
+      if (isFixtureResponse(data)) {
+        this.lastDiagnostics = { httpStatus: res.status, page, error: 'Fixture results, not live web search' };
+        throw new Error('SearXNG endpoint returned fixture results, not live web search');
+      }
       const engines = data?.engines && typeof data.engines === 'object' ? data.engines : undefined;
       const unresponsive = Array.isArray(data?.unresponsive_engines)
         ? data.unresponsive_engines.map((e: unknown) => String(e)) : [];
-      const engineFailures: Record<string, string> = {};
+      const failures = engineFailures(data);
       if (engines) {
         for (const [name, info] of Object.entries(engines as Record<string, any>)) {
           const failed = info && typeof info === 'object' && ('error' in info || (typeof (info as any).timed_out !== 'undefined' && (info as any).timed_out));
-          if (failed) engineFailures[name] = String((info as any).error || 'engine failed');
+          if (failed) failures[name] = String((info as any).error || 'engine failed');
         }
       }
-      this.lastDiagnostics = { httpStatus: res.status, engines: engineFailures, unresponsiveEngines: unresponsive, page };
+      this.lastDiagnostics = { httpStatus: res.status, engines: failures, unresponsiveEngines: unresponsive, page };
+      if (!data?.results?.length && this.engines.length && this.engines.every(engine => failures[engine])) {
+        throw new Error(`All requested engines failed: ${this.engines.map(engine => `${engine}: ${failures[engine]}`).join('; ')}`);
+      }
       const meta = normalizeSearxMeta(data);
       this.lastMeta = this.lastMeta ? mergeSearchMeta(this.lastMeta, meta) : meta;
       if (!data || !Array.isArray(data.results)) {
@@ -261,12 +299,15 @@ export class SearXNGProvider implements SearchProvider {
       return results;
     } catch (err: any) {
       clearTimeout(timer);
-      if (err.name === 'AbortError') {
-        this.lastDiagnostics = { page, error: 'timeout' };
-        throw new Error(`SearXNG request timed out after ${this.timeoutMs}ms`);
-      }
-      if (!this.lastDiagnostics) this.lastDiagnostics = { page, error: String(err?.message || err) };
-      throw err;
+      const cause = err?.cause;
+      const codes = [cause?.code, ...(Array.isArray(cause?.errors) ? cause.errors.map((error: any) => error?.code) : [])]
+        .filter((code): code is string => typeof code === 'string');
+      const detail = err?.name === 'AbortError' ? `SearXNG request timed out after ${timeoutMs}ms`
+        : `${String(err?.message || err)}${codes.length ? ` (${[...new Set(codes)].join(', ')})` : ''}`;
+      const message = `SearXNG at ${url.origin}: ${detail}`;
+      this.lastDiagnostics = { httpStatus, page, error: message };
+      // Keep Retry-After on the error while preserving the cause for diagnostics.
+      throw Object.assign(new Error(message), { cause: err, cooldownUntil: err?.cooldownUntil });
     }
   }
 }

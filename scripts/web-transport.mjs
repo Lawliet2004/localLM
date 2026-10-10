@@ -85,51 +85,49 @@ export async function pinnedGet(url, options) {
 export class PinnedPageFetcher {
   constructor(globalConcurrency = 8, perDomainConcurrency = 2, get = pinnedGet) {
     this.get = get; this.limiter = new BoundedConcurrencyLimiter(globalConcurrency, perDomainConcurrency);
-    this.robots = new Map(); this.queues = new Map(); this.cooldowns = new Map();
+    this.robots = new Map(); this.queues = new Map(); this.cooldowns = new Map(); this.nextRequestAt = new Map();
   }
   async limited(url, options) {
     const domain = url.hostname;
     const previous = this.queues.get(domain) || Promise.resolve();
     const task = previous.catch(() => {}).then(async () => {
       if ((this.cooldowns.get(domain) || 0) > Date.now()) throw new Error('Host Retry-After cooldown active');
-      let lastError;
-      for (let attempt = 0; attempt < 3; attempt++) {
+      const maxRetries = Math.max(0, Math.min(2, Math.floor(options.maxRetries ?? 2) || 0));
+      for (let attempt = 0; ; attempt++) {
         try {
-          // One request per host per second, including robots requests.
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          // Space request starts, including robots, without delaying a cold host.
+          const delay = (this.nextRequestAt.get(domain) || 0) - Date.now();
+          if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
           const release = await this.limiter.acquire(domain);
+          this.nextRequestAt.set(domain, Date.now() + 1000);
           let response;
           try { response = await this.get(url, options); } finally { release(); }
           if ([429, 503].includes(response.status)) {
             const value = response.headers['retry-after'];
             const deadline = /^\d+$/.test(value || '') ? Date.now() + Number(value) * 1000 : Date.parse(value);
             this.cooldowns.set(domain, Math.max(Date.now() + 30000, Number.isFinite(deadline) ? deadline : 0));
-            lastError = new Error(`HTTP ${response.status}`);
-            if (attempt < 2) { await new Promise(r => setTimeout(r, 3000)); continue; }
-            throw lastError;
           }
           return response;
         } catch (err) {
-          lastError = err;
-          if (err.message === 'Host Retry-After cooldown active') throw err;
-          if (attempt < 2) { await new Promise(r => setTimeout(r, 3000)); continue; }
-          throw err;
+          if (attempt >= maxRetries) throw err;
+          await new Promise(resolve => setTimeout(resolve, 3000));
         }
       }
-      throw lastError;
     });
     this.queues.set(domain, task);
-    return task;
+    try { return await task; }
+    finally { if (this.queues.get(domain) === task) this.queues.delete(domain); }
   }
   async allowed(url, options) {
     if (!this.robots.has(url.origin)) {
       const task = (async () => {
         const res = await this.limited(new URL('/robots.txt', url), {...options, maxBytes: 512000});
         if (res.status === 404 || res.status === 410) return [];
-        if (res.status !== 200) return []; // Softened: allow if robots.txt unavailable
+        if (res.status !== 200) { this.robots.delete(url.origin); return []; } // Recheck transient failures next time.
         return new RobotsChecker().parseRobotsTxt(res.body.toString('utf8'));
       })();
       this.robots.set(url.origin, task);
+      task.catch(() => { if (this.robots.get(url.origin) === task) this.robots.delete(url.origin); });
     }
     return new RobotsChecker().isPathAllowed(url.pathname + url.search, await this.robots.get(url.origin), 'LocalLM-Research');
   }
@@ -148,12 +146,25 @@ export class PinnedPageFetcher {
           url = new URL(res.headers.location, url);
           continue;
         }
-        if (res.status !== 200) throw new Error(`Page unavailable: HTTP ${res.status}`);
         const mime = String(res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+        const bodyBuffer = Buffer.isBuffer(res.body) ? res.body : Buffer.from(res.body || '');
+        const body = bodyBuffer.subarray(0, options.maxBytes).toString('utf8');
+        if (res.status !== 200) {
+          return {
+            url: raw,
+            finalUrl: url.href,
+            success: false,
+            status: res.status,
+            body,
+            mimeType: mime,
+            error: `Page unavailable: HTTP ${res.status}`,
+            durationMs: Date.now() - started,
+          };
+        }
         if (!['text/html','text/plain','text/markdown','application/xhtml+xml','application/json','application/pdf'].includes(mime)) throw new Error(`Unsupported MIME ${mime}`);
         // PDFs travel as latin1 text so the worker's extractor sees raw bytes.
-        const body = mime === 'application/pdf' ? res.body.toString('latin1') : res.body.toString('utf8');
-        return {url: raw, finalUrl: url.href, success: true, status: res.status, body, mimeType: mime, durationMs: Date.now() - started};
+        const decoded = mime === 'application/pdf' ? bodyBuffer.subarray(0, options.maxBytes).toString('latin1') : body;
+        return {url: raw, finalUrl: url.href, success: true, status: res.status, body: decoded, mimeType: mime, durationMs: Date.now() - started};
       }
       throw new Error('Redirect limit exceeded');
     } catch (error) {

@@ -1,20 +1,30 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Download, HardDrive, Heart, Search, Trash2, Play, RefreshCw, ExternalLink } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowLeft, Download, HardDrive, Heart, Search, Trash2, Play, RefreshCw, ExternalLink } from 'lucide-react';
 import { api, errorMessage, nativeAvailable, type ModelInstallStatus } from '../lib/api';
 import type { HardwareStatus, HubRepo, HubSearchHit, InstalledModel } from '../lib/types';
 import { modelLabel } from '../lib/localModels';
 import { compactCount, downloadSize, fitKind, fitLabel, parseHubQuery, preferredFile, preferredProjector, projectorFiles, quantLabel, repoParts, weightFiles } from '../lib/modelStudio';
 import { gib } from '../lib/runtimeGuidance';
 import { samePath } from '../lib/pathUtils';
+import { refreshDownloadJobs, useDownloadJobs } from '../lib/downloadJobs';
+import { JobProgress } from './JobProgress';
+import { moveWithinGroup } from '../lib/roving';
 
 function downloadedBytes(model: InstalledModel) {
   return model.received ?? (model.complete ? model.bytes : 0);
 }
 function modelStatus(model: InstalledModel, selectedPath: string, loadedPath: string | null) {
-  if (!model.complete) return downloadedBytes(model) > 0 ? 'Interrupted' : 'Incomplete';
+  if (!model.complete) return 'Incomplete';
   if (samePath(loadedPath, model.path)) return 'Running';
   if (samePath(selectedPath, model.path)) return 'Selected';
   return null;
+}
+function modelJob(jobs: ModelInstallStatus[], model: InstalledModel) {
+  return jobs.find(job => {
+    if (job.key === `model:catalog:${model.filename}`) return true;
+    if (!model.repo || !model.revision || !job.key.startsWith(`model:hf:${model.repo}@${model.revision}:`)) return false;
+    return job.key.endsWith(`:${model.filename}`) || job.key.endsWith(`/${model.filename}`);
+  });
 }
 
 interface Props {
@@ -32,33 +42,25 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
   const [projector, setProjector] = useState('');
   const [working, setWorking] = useState(false);
   const [downloading, setDownloading] = useState(false);
-  const [status, setStatus] = useState<ModelInstallStatus | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [remove, setRemove] = useState<string | null>(null);
   const [searched, setSearched] = useState(false);
   const [browseMode, setBrowseMode] = useState<'popular' | 'search'>('popular');
   const [hardware, setHardware] = useState<HardwareStatus | null>(null);
+  const { jobs } = useDownloadJobs();
+  const modelBusy = jobs.some(job => job.busy && job.key.startsWith('model:'));
+  const wasBusy = useRef(false);
+  useEffect(() => {
+    if (wasBusy.current && !modelBusy) void onRefresh();
+    wasBusy.current = modelBusy;
+  }, [modelBusy, onRefresh]);
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    let wasBusy = false;
-    async function poll() {
-      try {
-        const value = await api.modelInstallStatus();
-        if (!disposed) {
-          setStatus(value);
-          if (wasBusy && !value.busy) await onRefresh();
-          wasBusy = value.busy;
-        }
-      } catch (e) { if (!disposed) setError(errorMessage(e)); }
-      finally { if (!disposed) timer = setTimeout(() => void poll(), 1000); }
-    }
-    void poll();
     void api.hardwareStatus().then(value => { if (!disposed) setHardware(value); }).catch(() => {});
-    return () => { disposed = true; clearTimeout(timer); };
-  }, [onRefresh]);
+    return () => { disposed = true; };
+  }, []);
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
@@ -68,12 +70,12 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
     return () => { disposed = true; };
   }, []);
   const locked = busy || working;
-  const downloadLocked = locked || downloading || Boolean(status?.busy);
+  const downloadLocked = locked || downloading || modelBusy;
   async function download(repo: string, revision: string, file: string, projectorFile?: string) {
     setDownloading(true); setError(''); setNotice('');
     try {
       const result = await api.downloadHuggingFaceModel(repo, revision, file, token || undefined, projectorFile || null);
-      setStatus(result); await onRefresh();
+      refreshDownloadJobs(); await onRefresh();
       if (result.error) throw new Error(result.error);
       setNotice(projectorFile ? 'Model and vision projector verified. Choose Use model in your library.' : 'Download verified. Choose Use model in your library.');
     } catch (e) { setError(errorMessage(e)); }
@@ -124,14 +126,15 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
     return haystack.includes(libraryQuery.trim().toLowerCase());
   });
   return <div className="studio">
-    <div className="studio-switch" role="tablist" aria-label="Model library">
-      <button type="button" role="tab" aria-selected={view === 'discover'} onClick={() => setView('discover')}><Search size={14} />Discover</button>
-      <button type="button" role="tab" aria-label={`My Models, ${models.length}`} aria-selected={view === 'library'} onClick={() => setView('library')}><HardDrive size={14} />My Models<span className="studio-count">{models.length}</span></button>
+    <div className="studio-switch" role="tablist" aria-label="Model library"
+      onKeyDown={event => moveWithinGroup(event, ['discover', 'library'] as const, view, setView)}>
+      <button type="button" role="tab" aria-selected={view === 'discover'} tabIndex={view === 'discover' ? 0 : -1} onClick={() => setView('discover')}><Search size={14} />Discover</button>
+      <button type="button" role="tab" aria-label={`My Models, ${models.length}`} aria-selected={view === 'library'} tabIndex={view === 'library' ? 0 : -1} onClick={() => setView('library')}><HardDrive size={14} />My Models<span className="studio-count">{models.length}</span></button>
     </div>
     {view === 'discover' ? <div className="studio-discover">
-      <section className="studio-pane" aria-labelledby="discover-heading">
+      {!catalog && <section className="studio-pane" aria-labelledby="discover-heading">
         <div className="studio-pane-head">
-          <div><p className="eyebrow">HUGGING FACE</p><h2 id="discover-heading">Discover</h2></div>
+          <h2 id="discover-heading">Discover on Hugging Face</h2>
         </div>
         <p className="section-description">Search GGUF models, paste an owner/name, or drop a Hugging Face URL. Choose a quantization that fits this machine, then download.</p>
         <form className="studio-search" onSubmit={e => { e.preventDefault(); void run(() => searchHub(query)); }}>
@@ -146,19 +149,18 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
           <p className="hub-results-heading">{browseMode === 'popular' ? 'Popular GGUF models' : 'Search results'}</p>
           {results.map(hit => {
             const parts = repoParts(hit.id);
-            return <button type="button" className={`studio-hit${catalog?.repo === hit.id ? ' selected' : ''}`} key={hit.id} disabled={locked} onClick={() => void run(() => openRepo(hit.id))}>
+            return <button type="button" className="studio-hit" key={hit.id} disabled={locked} onClick={() => void run(() => openRepo(hit.id))}>
               <span className="studio-avatar" aria-hidden>{parts.publisher.slice(0, 1).toUpperCase()}</span>
               <span className="studio-hit-copy"><strong>{parts.name}</strong><small>{hit.id}</small></span>
               <span className="studio-hit-meta">{hit.downloads != null && <span>{compactCount(hit.downloads)} downloads</span>}{hit.likes != null && <span><Heart size={11} /> {compactCount(hit.likes)}</span>}</span>
             </button>;
           })}
         </div>}
-      </section>
-      <section className="studio-pane studio-detail" aria-labelledby="quant-heading">
-        {!catalog && <div className="studio-detail-empty"><Download size={28} /><h3 id="quant-heading">Select a model</h3><p>Pick a repository on the left to see every GGUF quantization, its size, and whether it is likely to fit this GPU or system RAM.</p></div>}
-        {catalog && <>
+      </section>}
+      {catalog && <section className="studio-pane studio-detail" aria-labelledby="quant-heading">
+          <button type="button" className="studio-back" disabled={locked} onClick={() => { setCatalog(null); setFilename(''); setProjector(''); }}><ArrowLeft size={14} />All models</button>
           <div className="studio-pane-head">
-            <div><p className="eyebrow">{repoParts(catalog.repo).publisher}</p><h2 id="quant-heading">{repoParts(catalog.repo).name}</h2></div>
+            <div><small className="studio-publisher">{repoParts(catalog.repo).publisher}</small><h2 id="quant-heading">{repoParts(catalog.repo).name}</h2></div>
             <a className="secondary" href={`https://huggingface.co/${catalog.repo}`} target="_blank" rel="noreferrer"><ExternalLink size={14} />Hugging Face</a>
           </div>
           <p className="section-description">{catalog.repo} · SHA-256 verified · Split models download every shard together. Q4_K_M is the usual starting point when it is available.</p>
@@ -184,12 +186,10 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
             </label>
           </div>}
           {selected && <div className="quant-cta"><div><strong>{selected.quant}</strong><p>{gib(selected.bytes)}{projector ? ` + ${gib(projectorBytes)} projector` : ''} · {fitLabel(selected.kind)}. Projectors and adapters are companion files, not standalone chat models.</p></div><button type="button" className="primary" disabled={downloadLocked || !filename} onClick={() => void download(catalog.repo, catalog.revision, filename, projector || undefined)}><Download size={14} />Download model{projector ? ' + projector' : ''}</button></div>}
-        </>}
-
-      </section>
+      </section>}
     </div> : <section className="studio-pane studio-library" aria-labelledby="library-heading">
       <div className="studio-pane-head">
-        <div><p className="eyebrow">ON THIS MACHINE</p><h2 id="library-heading">My Models <span className="selection-badge">{models.length}</span></h2></div>
+        <h2 id="library-heading">On this computer <span className="selection-badge">{models.length}</span></h2>
         <button type="button" className="secondary" disabled={locked || loading} onClick={() => void run(onRefresh)}><RefreshCw size={14} />Refresh</button>
       </div>
       <p className="section-description">Load any downloaded GGUF, including the original catalog models. Each file remembers its runtime settings. Deleting a model keeps your conversations.</p>
@@ -197,18 +197,24 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
       {loading && <p>Reading your model library…</p>}
       {!loading && !models.length && <div className="library-empty"><HardDrive size={24} /><h3>No models downloaded yet</h3><p>Open Discover, pick a GGUF quantization that fits, then download it.</p><button type="button" className="primary" onClick={() => setView('discover')}>Discover models</button></div>}
       <div className="library-list">{visibleModels.map(model => {
-        const activeDownload = status?.busy && samePath(status.path, model.path.replace(/\.part$/, ''));
-        const received = activeDownload ? status.received : downloadedBytes(model);
-        const statusLabel = activeDownload ? (status.phase === 'verifying' ? 'Verifying' : 'Downloading') : modelStatus(model, selectedPath, loadedPath);
+        const job = modelJob(jobs, model);
+        const activeDownload = Boolean(job?.busy);
+        const received = activeDownload && job ? job.received : downloadedBytes(model);
+        const statusLabel = modelStatus(model, selectedPath, loadedPath);
         const quant = quantLabel(model.filename);
         return <article className={`library-model${statusLabel === 'Running' ? ' running' : ''}`} key={model.id}>
           <span className="studio-avatar" aria-hidden>{(model.repo?.split('/')[0] ?? 'G').slice(0, 1).toUpperCase()}</span>
           <div className="library-model-info">
             <strong>{modelLabel(model.filename)}</strong>
-            <span>{model.repo ? `Hugging Face · ${model.repo}` : 'Local GGUF file'}</span>
+            <span>{model.repo ? `Hugging Face · ${model.repo}` : model.external ? model.filename === 'K2-Horizon-4B-Q4_K_M.gguf' ? 'K2 Horizon project · custom llama.cpp runtime' : 'Existing local file' : 'Local GGUF file'}</span>
             <small>{quant} · {model.complete ? gib(model.bytes) : `${gib(received)} of ${gib(model.bytes)} saved`} · {model.files.length > 1 ? `${model.files.length} files` : '1 file'}{model.projectorFilename ? ` · Vision: ${model.projectorFilename}` : ''}</small>
-            {statusLabel && <span className={`library-chip${statusLabel === 'Incomplete' || statusLabel === 'Interrupted' ? ' warning' : ''}`}>{statusLabel}</span>}
-            {!model.complete && <progress aria-label={`${modelLabel(model.filename)} download progress`} value={received} max={model.bytes || 1} />}
+            {statusLabel && <span className={`library-chip${statusLabel === 'Incomplete' ? ' warning' : ''}`}>{statusLabel}</span>}
+            {model.complete && model.verified && <span className="library-chip">Verified</span>}
+            {model.complete && !model.verified && model.external && <span className="library-chip">Imported · not verified</span>}
+            {job?.busy
+              ? <JobProgress job={job} actions={<button type="button" className="secondary" onClick={() => void api.cancelModelInstall(job.jobId).catch(e => setError(errorMessage(e))).finally(refreshDownloadJobs)}>Pause</button>} />
+              : !model.complete && <progress aria-label={`${modelLabel(model.filename)} download progress`} value={received} max={model.bytes || 1} />}
+            {job && !job.busy && job.phase === 'failed' && job.error && <span role="alert">{job.error}</span>}
             <details><summary>File location & source</summary>{model.files.map(path => <p key={path}>{path}</p>)}{model.repo && <a href={`https://huggingface.co/${model.repo}`} target="_blank" rel="noreferrer">View on Hugging Face ↗</a>}{model.revision && <small>Revision {model.revision}</small>}</details>
           </div>
           <div className="library-actions">
@@ -218,7 +224,7 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
               else if (model.repo) void run(() => openRepo(model.repo!));
               else { setNotice('Enter the Hugging Face repository in Discover to finish this download.'); setView('discover'); }
             }}><Download size={14} />{activeDownload ? 'Downloading…' : downloadedBytes(model) > 0 ? 'Resume download' : 'Retry download'}</button>}
-            <button type="button" className="secondary" aria-label={`Delete ${modelLabel(model.filename)}`} disabled={downloadLocked} onClick={() => setRemove(model.id)}><Trash2 size={14} />Delete</button>
+            {!model.external && <button type="button" className="secondary" aria-label={`Delete ${modelLabel(model.filename)}`} disabled={downloadLocked} onClick={() => setRemove(model.id)}><Trash2 size={14} />Delete</button>}
           </div>
           {remove === model.id && <div className="library-delete" role="group" aria-label="Confirm model deletion"><p>Delete {modelLabel(model.filename)} ({gib(model.bytes)}) from disk? Every listed copy will be removed. A running copy will be unloaded. Conversations are kept.</p><button type="button" className="secondary" disabled={locked} onClick={() => setRemove(null)}>Keep model</button><button type="button" className="primary" disabled={downloadLocked} onClick={() => void run(async () => { await api.deleteInstalledModel(model.id); setRemove(null); await onDeleted(); await onRefresh(); setNotice('Model deleted.'); })}>Delete from disk</button></div>}
         </article>;

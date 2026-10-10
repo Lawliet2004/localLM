@@ -28,6 +28,6 @@ export function normalizeRawSearchResult(
     engine: raw.engine ? String(raw.engine) : undefined,
     rank: (page - 1) * 10 + rank,
     score: typeof raw.score === 'number' ? raw.score : undefined,
-    metadata: { ...(raw.metadata || {}), ...(page > 1 ? { searxngPage: page } : {}) },
+    metadata: { ...raw.metadata, ...(page > 1 ? { searxngPage: page } : {}) },
   };
 }

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { ApprovalDialog, PermissionSelector, ToolsSettings } from './ToolControls';
@@ -7,13 +7,20 @@ import type { ToolSelection } from '../lib/types';
 const fixtures = vi.hoisted(() => {
   const example = { id: 'example', connected: true, hasCredential: true, description: '', url: '', authType: 'apiKey', tools: Array.from({ length: 40 }, (_, index) => ({ name: `tool_${index}`, description: `Action ${index}`, inputSchema: {} })) };
   const offline = { id: 'offline', connected: false, hasCredential: true, description: '', url: '', authType: 'apiKey', tools: [{ name: 'their_tool', description: '', inputSchema: {} }] };
-  return { skills: [] as { id: string; active: boolean }[], connectors: [example] as (typeof example | typeof offline)[] };
+  return {
+    skills: [] as { id: string; active: boolean }[],
+    connectors: [example] as (typeof example | typeof offline)[],
+    effective: null as { name: string; source: string; available: boolean; enabled: boolean; permittedInMode: boolean; requiresApproval: boolean; blockedReason?: string }[] | null,
+  };
 });
 vi.mock('../lib/api', () => ({ nativeAvailable: true, errorMessage: String, api: {
-  hasDaytonaKey: async () => false,
+    profiles: async () => [],
+    hasDaytonaKey: async () => false,
   listConnectors: async () => fixtures.connectors,
   connectConnector: async (id: string) => ({ ...fixtures.connectors.find(item => item.id === id)!, connected: true }),
   listSkills: async () => fixtures.skills, getWorkspace: async () => ({ path: 'C:/workspace' }),
+  effectiveCapabilities: async () => fixtures.effective,
+  isolationGet: async () => ({ mode: 'unsandboxed', network: false, lan: false, lpac: false, toolchainDirs: [], processLimit: 32, memoryMb: 2048 }),
 } }));
 function Picker() {
   const [selected, setSelected] = useState<string[]>([]);
@@ -105,12 +112,13 @@ describe('tool controls', () => {
     await userEvent.click(trigger);
     const popover = screen.getByRole('dialog', { name: 'Select permission mode' });
     expect(popover).toBeInTheDocument();
-    expect(screen.getByText('Safe')).toBeInTheDocument();
-    expect(screen.getByText('Reads only')).toBeInTheDocument();
-    expect(screen.getByText('Unrestricted')).toBeInTheDocument();
+    const options = within(popover).getAllByRole('button');
+    expect(options).toHaveLength(3);
+    expect(within(popover).getByRole('button', { name: /Ask for approval/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(popover).getByRole('button', { name: /Auto-approve reads/ })).toBeInTheDocument();
+    expect(within(popover).getByRole('button', { name: /Full access/ })).toBeInTheDocument();
 
-    const fullAccessOption = screen.getByRole('button', { name: /Full access/ });
-    await userEvent.click(fullAccessOption);
+    await userEvent.click(within(popover).getByRole('button', { name: /Full access/ }));
     expect(onAccessModeChange).toHaveBeenCalledWith('fullAccess');
     expect(screen.queryByRole('dialog', { name: 'Select permission mode' })).not.toBeInTheDocument();
 
@@ -122,6 +130,41 @@ describe('tool controls', () => {
     expect(screen.getByRole('dialog', { name: 'Select permission mode' })).toBeInTheDocument();
     await userEvent.keyboard('{Escape}');
     expect(screen.queryByRole('dialog', { name: 'Select permission mode' })).not.toBeInTheDocument();
+
+    // Outside pointerdown also closes the popover.
+    await userEvent.click(fullTrigger);
+    expect(screen.getByRole('dialog', { name: 'Select permission mode' })).toBeInTheDocument();
+    await userEvent.click(document.body);
+    expect(screen.queryByRole('dialog', { name: 'Select permission mode' })).not.toBeInTheDocument();
+  });
+  it('summarizes backend-derived effective tools and lists each tool with its reason', async () => {
+    fixtures.effective = [
+      { name: 'read_file', source: 'workspace', available: true, enabled: true, permittedInMode: true, requiresApproval: false },
+      { name: 'list_files', source: 'workspace', available: true, enabled: true, permittedInMode: true, requiresApproval: false },
+      { name: 'edit_file', source: 'workspace', available: true, enabled: true, permittedInMode: false, requiresApproval: true, blockedReason: 'Plan mode only permits read-only tools.' },
+      { name: 'web_search', source: 'harness', available: true, enabled: true, permittedInMode: true, requiresApproval: true },
+      { name: 'browser', source: 'harness', available: false, enabled: false, permittedInMode: false, requiresApproval: true, blockedReason: "Not part of the 'standard' tool preset." },
+    ];
+    try {
+      render(<ToolsSettings selected={[]} onChange={vi.fn()} busy={false} interactionMode="plan" />);
+      expect(await screen.findByText('Tools · 3 available · 1 need approval · 1 unavailable')).toBeInTheDocument();
+      await userEvent.click(screen.getByText('Tool details'));
+      expect(screen.getByText('edit_file')).toBeInTheDocument();
+      expect(screen.getByText('Plan mode only permits read-only tools.')).toBeInTheDocument();
+      expect(screen.getByText("Not part of the 'standard' tool preset.")).toBeInTheDocument();
+      expect(screen.getByText('web_search')).toBeInTheDocument();
+      expect(screen.getAllByText('Needs approval each run')).toHaveLength(1);
+    } finally { fixtures.effective = null; }
+  });
+  it('never says Off while the backend reports a callable tool', async () => {
+    fixtures.effective = [
+      { name: 'read_file', source: 'workspace', available: true, enabled: true, permittedInMode: true, requiresApproval: true },
+    ];
+    try {
+      render(<ToolsSettings selected={[]} onChange={vi.fn()} busy={false} />);
+      expect(await screen.findByText('Tools · 1 available · 1 need approval')).toBeInTheDocument();
+      expect(screen.queryByText(/Tools · Off/)).not.toBeInTheDocument();
+    } finally { fixtures.effective = null; }
   });
   it('renders tool profile preset selector and calls onPresetChange', async () => {
     const onPresetChange = vi.fn();

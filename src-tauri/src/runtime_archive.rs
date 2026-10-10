@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct RuntimeAsset {
     pub name: String,
     pub url: String,
@@ -15,7 +15,7 @@ pub struct RuntimeAsset {
     pub bytes: u64,
     pub files: Vec<RuntimeFile>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct RuntimeFile {
     pub name: String,
     pub bytes: u64,

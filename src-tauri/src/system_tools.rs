@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Local, Offset, TimeZone, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -13,9 +13,12 @@ pub struct SystemTimeReport {
     pub source: &'static str,
 }
 
-/// Resolve an IANA timezone or offset string to a fixed offset in seconds.
-/// Supports common canonical IANA timezones and numeric UTC offsets.
+/// Resolve an IANA timezone's current offset, a fixed alias, or numeric UTC offset.
 pub fn parse_iana_offset(tz_name: &str) -> Option<chrono::FixedOffset> {
+    parse_iana_offset_at(tz_name, Utc::now())
+}
+
+fn parse_iana_offset_at(tz_name: &str, now: DateTime<Utc>) -> Option<chrono::FixedOffset> {
     let normalized = tz_name.trim();
     if normalized.is_empty() {
         return None;
@@ -30,6 +33,7 @@ pub fn parse_iana_offset(tz_name: &str) -> Option<chrono::FixedOffset> {
     if normalized.starts_with('+') || normalized.starts_with('-') {
         let sign = if normalized.starts_with('-') { -1 } else { 1 };
         let rest = &normalized[1..];
+        if !rest.is_ascii() { return None; }
         let (hours, mins) = if let Some((h, m)) = rest.split_once(':') {
             (h.parse::<i32>().ok()?, m.parse::<i32>().ok()?)
         } else if rest.len() == 4 {
@@ -46,36 +50,31 @@ pub fn parse_iana_offset(tz_name: &str) -> Option<chrono::FixedOffset> {
         return chrono::FixedOffset::east_opt(total_secs);
     }
 
-    // Common standard IANA timezone mappings
-    match normalized.to_ascii_lowercase().as_str() {
-        "asia/kolkata" | "asia/calcutta" | "ist" => chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60),
-        "asia/shanghai" | "asia/hong_kong" | "asia/singapore" | "cst" => chrono::FixedOffset::east_opt(8 * 3600),
-        "asia/tokyo" | "jst" => chrono::FixedOffset::east_opt(9 * 3600),
-        "asia/dubai" => chrono::FixedOffset::east_opt(4 * 3600),
-        "asia/bangkok" | "asia/jakarta" => chrono::FixedOffset::east_opt(7 * 3600),
-        "europe/london" | "europe/belfast" | "wwe" => chrono::FixedOffset::east_opt(0),
-        "europe/paris" | "europe/berlin" | "europe/rome" | "europe/madrid" | "europe/amsterdam" | "cet" => chrono::FixedOffset::east_opt(3600),
-        "europe/helsinki" | "europe/athens" | "eet" => chrono::FixedOffset::east_opt(2 * 3600),
-        "america/new_york" | "est" | "us/eastern" => chrono::FixedOffset::west_opt(5 * 3600),
-        "america/chicago" | "us/central" => chrono::FixedOffset::west_opt(6 * 3600),
-        "america/denver" | "mst" | "us/mountain" => chrono::FixedOffset::west_opt(7 * 3600),
-        "america/los_angeles" | "pst" | "us/pacific" => chrono::FixedOffset::west_opt(8 * 3600),
-        "america/sao_paulo" => chrono::FixedOffset::west_opt(3 * 3600),
-        "australia/sydney" | "australia/melbourne" | "aest" => chrono::FixedOffset::east_opt(10 * 3600),
-        "pacific/auckland" | "nzst" => chrono::FixedOffset::east_opt(12 * 3600),
-        _ => None,
-    }
+    // Legacy abbreviations explicitly denote fixed offsets; IANA regions follow DST.
+    let seconds = match normalized.to_ascii_lowercase().as_str() {
+        "ist" => 19_800, "cst" => 28_800, "jst" => 32_400, "wwe" => 0,
+        "cet" => 3_600, "eet" => 7_200, "est" => -18_000, "mst" => -25_200,
+        "pst" => -28_800, "aest" => 36_000, "nzst" => 43_200,
+        _ => {
+            let timezone = chrono_tz::TZ_VARIANTS.iter().find(|tz| tz.name().eq_ignore_ascii_case(normalized))?;
+            return Some(now.with_timezone(timezone).offset().fix());
+        }
+    };
+    chrono::FixedOffset::east_opt(seconds)
 }
 
 /// Query the deterministic system clock with optional IANA timezone translation.
 pub fn get_system_time(timezone_arg: Option<&str>) -> Result<SystemTimeReport, String> {
-    let now_utc: DateTime<Utc> = Utc::now();
+    get_system_time_at(timezone_arg, Utc::now())
+}
+
+fn get_system_time_at(timezone_arg: Option<&str>, now_utc: DateTime<Utc>) -> Result<SystemTimeReport, String> {
     let epoch_ms = now_utc.timestamp_millis();
 
     if let Some(tz_str) = timezone_arg {
         let tz_trimmed = tz_str.trim();
         if !tz_trimmed.is_empty() {
-            if let Some(offset) = parse_iana_offset(tz_trimmed) {
+            if let Some(offset) = parse_iana_offset_at(tz_trimmed, now_utc) {
                 let converted = offset.from_utc_datetime(&now_utc.naive_utc());
                 let offset_secs = offset.local_minus_utc();
                 let sign = if offset_secs >= 0 { '+' } else { '-' };
@@ -100,7 +99,7 @@ pub fn get_system_time(timezone_arg: Option<&str>) -> Result<SystemTimeReport, S
     }
 
     // Default to host system local time
-    let now_local: DateTime<Local> = Local::now();
+    let now_local: DateTime<Local> = now_utc.with_timezone(&Local);
     let offset = *now_local.offset();
     let offset_secs = offset.local_minus_utc();
     let sign = if offset_secs >= 0 { '+' } else { '-' };
@@ -159,6 +158,41 @@ mod tests {
 
         let neg = parse_iana_offset("-05:00").unwrap();
         assert_eq!(neg.local_minus_utc(), -18000);
+    }
+
+    #[test]
+    fn system_time_rejects_non_ascii_numeric_offsets_without_panicking() {
+        for timezone in ["+😀", "-éé", "+1界"] {
+            assert!(parse_iana_offset(timezone).is_none());
+            assert!(execute_system_time(&json!({"timezone": timezone})).is_err());
+        }
+    }
+
+    #[test]
+    fn iana_regions_follow_winter_and_summer_rules_at_the_reported_instant() {
+        let winter = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let summer = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+        for (zone, january, july) in [
+            ("America/New_York", "-05:00", "-04:00"),
+            ("europe/london", "+00:00", "+01:00"),
+            ("Australia/Sydney", "+11:00", "+10:00"),
+            ("Asia/Kathmandu", "+05:45", "+05:45"),
+        ] {
+            for (instant, expected) in [(winter, january), (summer, july)] {
+                let report = get_system_time_at(Some(zone), instant).unwrap();
+                assert_eq!(report.utc_offset, expected, "{zone} at {instant}");
+                assert!(report.iso.ends_with(expected));
+                assert_eq!(report.epoch_ms, instant.timestamp_millis());
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_aliases_and_numeric_offsets_do_not_follow_daylight_saving() {
+        let summer = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+        for (zone, expected) in [("EST", "-05:00"), ("CET", "+01:00"), ("+0530", "+05:30"), ("-4", "-04:00")] {
+            assert_eq!(get_system_time_at(Some(zone), summer).unwrap().utc_offset, expected);
+        }
     }
 
     #[test]

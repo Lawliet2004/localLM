@@ -1,5 +1,4 @@
 pub mod agent_run;
-mod experimental;
 mod arex;
 pub mod continuation;
 pub mod local_only;
@@ -29,6 +28,7 @@ mod history;
 pub mod gguf;
 mod inference;
 mod install_recovery;
+pub mod isolation;
 pub mod local_mcp_config;
 pub mod local_mcp_process;
 mod model_catalog;
@@ -39,7 +39,12 @@ mod permissions;
 pub mod memory;
 pub mod plans;
 mod prompt;
+mod qualification;
+mod repo_map;
+mod resources;
+pub mod documents;
 pub mod presets;
+pub mod recipes;
 mod providers;
 mod runtime;
 pub mod runtime_archive;
@@ -54,6 +59,7 @@ pub mod skills;
 mod sse;
 mod store;
 mod inspector_browser;
+mod browser_agent;
 mod terminal_ui;
 mod tool_envelope;
 mod research_tasks;
@@ -63,17 +69,19 @@ mod tool_discovery;
 pub mod subscription_auth;
 pub mod subagents;
 pub mod system_tools;
+mod task_queue;
+mod task_workspace;
 mod vault;
+mod verification;
+mod weather;
 mod workspace;
 
 use std::sync::Mutex;
 use tauri::Manager;
 
 pub struct AppState {
-    installation_operation: tokio::sync::Mutex<()>,
     runtime_installer: model_install::Installer,
     model_installer: model_install::Installer,
-    bonsai_installer: experimental::bonsai::Installer,
     daytona_vault: std::sync::Arc<vault::Vault>,
     daytona_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
     daytona_journal: std::sync::Arc<Mutex<daytona_journal::Journal>>,
@@ -82,7 +90,14 @@ pub struct AppState {
     pub ask_user: approval::ChoiceApprovals,
     store: Mutex<store::Store>,
     runtime: tokio::sync::Mutex<runtime::Runtime>,
-    operation: tokio::sync::Mutex<()>,
+    /// Last published runtime status; readable while a load holds `runtime`.
+    pub runtime_snapshot: std::sync::Arc<std::sync::Mutex<runtime::RuntimeStatus>>,
+    /// The inference lease: capacity 1. `Arc` so queued tasks can wait on an
+    /// owned guard while direct callers keep `try_lock` semantics.
+    operation: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Named resource slots (browser, workspace-write:<root>, background);
+    /// `inference` records its holder here for wait-reason display.
+    pub resources: std::sync::Arc<resources::LeaseRegistry>,
     cancel: tokio::sync::watch::Sender<bool>,
     pub run_control: std::sync::Mutex<agent_run::RunControl>,
     connectors: tokio::sync::Mutex<connectors::McpHub>,
@@ -94,6 +109,12 @@ pub struct AppState {
     pub pty_sessions: terminal_ui::PtyRegistry,
     /// Per-run web_search cache: (conversation_id, run_id, normalized question, mode) -> compact result.
     pub web_search_cache: Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    /// Windows only: keeps the configured WSL distro (and its SearXNG unit)
+    /// alive for the app's lifetime; released on exit.
+    pub searxng_wsl: Mutex<Option<(String, Box<dyn process_wrap::tokio::ChildWrapper>)>>,
+    /// The in-flight qualification run's cancel channel — separate from
+    /// `cancel` so a leftover `true` from a cancelled turn cannot wedge it.
+    pub qualifying: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     pub db_path: std::path::PathBuf,
     pub data_dir: std::path::PathBuf,
 }
@@ -149,12 +170,12 @@ pub fn run() {
             std::fs::create_dir_all(&data)?;
             let store =
                 store::Store::open(&data.join("locallm.sqlite")).map_err(std::io::Error::other)?;
+            let runtime = runtime::Runtime::new(data.join("runtime.log"));
+            let runtime_snapshot = runtime.published();
             let vault = std::sync::Arc::new(vault::Vault::new(data.join("credentials")));
             app.manage(AppState {
-                installation_operation: tokio::sync::Mutex::new(()),
                 runtime_installer: model_install::Installer::default(),
                 model_installer: model_install::Installer::default(),
-                bonsai_installer: experimental::bonsai::Installer::default(),
                 daytona_vault: vault.clone(),
                 daytona_operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 daytona_journal: std::sync::Arc::new(Mutex::new(
@@ -165,8 +186,10 @@ pub fn run() {
                 approvals: approval::Approvals::default(),
                 ask_user: approval::ChoiceApprovals::default(),
                 store: Mutex::new(store),
-                runtime: tokio::sync::Mutex::new(runtime::Runtime::new(data.join("runtime.log"))),
-                operation: tokio::sync::Mutex::new(()),
+                runtime: tokio::sync::Mutex::new(runtime),
+                runtime_snapshot,
+                operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                resources: std::sync::Arc::new(resources::LeaseRegistry::default()),
                 cancel: tokio::sync::watch::channel(false).0,
                 run_control: std::sync::Mutex::new(agent_run::RunControl::default()),
                 connectors: tokio::sync::Mutex::new(connectors::McpHub::new(vault)),
@@ -176,24 +199,92 @@ pub fn run() {
                 terminals: tokio::sync::Mutex::new(sandbox::TerminalRegistry::new()),
                 pty_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
                 web_search_cache: Mutex::new(std::collections::HashMap::new()),
+                searxng_wsl: Mutex::new(None),
+                qualifying: Mutex::new(None),
                 db_path: data.join("locallm.sqlite"),
                 data_dir: data.clone(),
             });
             if let Ok(store) = app.state::<AppState>().database() {
+                if let Err(error) = store.recover_interrupted_runs() {
+                    eprintln!("Startup run recovery could not complete: {error}");
+                }
                 let _ = research_tasks::recover_interrupted(&store);
+                if let Err(error) = task_queue::recover_tasks(&store) {
+                    eprintln!("Startup task recovery could not complete: {error}");
+                }
+                if let Err(error) = store.repair_open_turn_tails() {
+                    eprintln!("Startup session log repair could not complete: {error}");
+                }
             }
             let handle = app.handle().clone();
+            task_queue::spawn_scheduler(&handle);
+            let _ = inspector_browser::APP.set(handle.clone());
             let connector_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = connectors::restore_connections(&connector_handle.state::<AppState>()).await {
                     eprintln!("Could not restore saved connector selections: {error}");
                 }
             });
-            for (folder, runtime) in [("models", false), ("runtimes", true)] {
-                if let Err(error) = install_recovery::clean(&data.join(folder), runtime) {
-                    let state = app.state::<AppState>();
-                    let installer = if runtime { &state.runtime_installer } else { &state.model_installer };
-                    if let Ok(mut inner) = installer.inner.lock() { inner.0.error = Some(format!("Interrupted installation cleanup needs attention: {error}")); };
+            {
+                let state = app.state::<AppState>();
+                if let Err(error) = install_recovery::clean(&data.join("models")) {
+                    state.model_installer.update(|status| {
+                        status.error =
+                            Some(format!("Interrupted installation needs attention: {error}"));
+                    });
+                }
+                // Recognizable runtime staging migrates into the stable archive
+                // cache so interrupted installs resume instead of restarting.
+                if let Ok(assets) = runtime_archive::catalog() {
+                    let root = data.join("runtimes");
+                    match install_recovery::recover_runtime(&root, &assets) {
+                        Ok(recovered) => {
+                            let complete = runtime_inventory::find_complete(&root, runtime_install::STANDARD_PREFIX, &assets)
+                                .ok()
+                                .flatten()
+                                .is_some();
+                            if recovered.saved > 0 && !complete {
+                                state.runtime_installer.update(|status| {
+                                    status.phase = "interrupted".into();
+                                    status.key = "runtime:standard".into();
+                                    status.label = "llama.cpp CUDA runtime".into();
+                                    status.saved = recovered.saved;
+                                    status.received = recovered.saved;
+                                    status.total = recovered.total;
+                                    status.notice = Some(format!(
+                                        "Download paused at {} of {} bytes. Resume to continue — saved archives will be reused.",
+                                        recovered.saved, recovered.total
+                                    ));
+                                });
+                            }
+                        }
+                        Err(error) => state.runtime_installer.update(|status| {
+                            status.phase = "interrupted".into();
+                            status.key = "runtime:standard".into();
+                            status.label = "llama.cpp CUDA runtime".into();
+                            status.error =
+                                Some(format!("Interrupted installation needs attention: {error}"));
+                        }),
+                    }
+                }
+                // A leftover model .part marks its slot as resumable too.
+                let bytes = model_catalog::MODEL.bytes;
+                let partial = download::partial_path(&data.join("models").join(model_catalog::MODEL_FILENAME));
+                let saved = std::fs::metadata(&partial).ok()
+                    .filter(|metadata| metadata.is_file())
+                    .map(|metadata| metadata.len().min(bytes)).unwrap_or(0);
+                if saved > 0 {
+                    state.model_installer.update(|status| {
+                        status.phase = "interrupted".into();
+                        status.key = format!("model:catalog:{}", model_catalog::MODEL_FILENAME);
+                        status.label = model_catalog::MODEL_FILENAME.into();
+                        status.saved = saved;
+                        status.received = saved;
+                        status.total = bytes;
+                        status.notice = Some(format!(
+                            "Download paused at {saved} of {bytes} bytes. Resume to continue — saved archives will be reused."
+                        ));
+                    });
                 }
             }
             tauri::async_runtime::spawn(async move {
@@ -201,16 +292,10 @@ pub fn run() {
                     eprintln!("Startup cloud cleanup could not access its journal; pending ownership is retained.");
                 }
             });
+            web_search::start_searxng_wsl(&app.state::<AppState>());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            experimental::bonsai::bonsai_enabled,
-            experimental::bonsai::set_bonsai_enabled,
-            experimental::bonsai::bonsai_info,
-            experimental::bonsai::install_bonsai,
-            experimental::bonsai::bonsai_install_status,
-            experimental::bonsai::cancel_bonsai_install,
-            experimental::bonsai::activate_bonsai,
             daytona_settings::has_daytona_key,
             daytona_settings::save_daytona_key,
             daytona_settings::forget_daytona_key,
@@ -222,6 +307,18 @@ pub fn run() {
             execution::save_execution_config,
             execution::detect_interpreters,
             execution::test_interpreter,
+            isolation::isolation_status,
+            isolation::isolation_get,
+            isolation::isolation_save,
+            recipes::recipes_list,
+            recipes::recipe_save,
+            recipes::recipe_delete,
+            recipes::recipe_run_now,
+            documents::documents_list_collections,
+            documents::documents_add_collection,
+            documents::documents_remove_collection,
+            documents::documents_reindex,
+            documents::documents_search,
             workspace::get_workspace,
             workspace::set_workspace,
             skills::list_skills,
@@ -285,6 +382,15 @@ pub fn run() {
             memory::teach_fact_cmd,
             memory::forget_fact,
             memory::ingest_repo,
+            memory::memory_facts,
+            memory::memory_create,
+            memory::memory_update,
+            memory::memory_delete,
+            memory::memory_set_pinned,
+            memory::memory_set_excluded,
+            memory::memory_auto_retain,
+            memory::memory_set_auto_retain,
+            memory::context_preview,
             workspace_ui::workspace_index,
             workspace_ui::save_project,
             workspace_ui::remove_project,
@@ -292,6 +398,20 @@ pub fn run() {
             workspace_ui::workspace_inspect,
             workspace_ui::workspace_search,
             workspace_ui::workspace_git,
+            task_workspace::task_workspace_create,
+            task_workspace::task_workspace_status,
+            task_workspace::task_review,
+            task_workspace::task_file_diff,
+            task_workspace::task_checkpoints,
+            task_workspace::task_restore_checkpoint,
+            task_workspace::task_apply,
+            task_workspace::task_undo_apply,
+            task_workspace::task_discard,
+            verification::verification_summary,
+            verification::criteria_upsert,
+            verification::criteria_delete,
+            verification::verification_run_user,
+            verification::verification_record_output,
             terminal_ui::terminal_open,
             terminal_ui::terminal_attach,
             terminal_ui::terminal_input,
@@ -300,11 +420,14 @@ pub fn run() {
             inspector_browser::browser_show,
             inspector_browser::browser_hide,
             inspector_browser::browser_close,
+            inspector_browser::browser_close_all,
             inspector_browser::browser_navigate,
             inspector_browser::browser_reload,
             inspector_browser::browser_go_back,
             inspector_browser::browser_go_forward,
             inspector_browser::browser_url,
+            browser_agent::get_browser_config,
+            browser_agent::save_browser_config,
             sandbox::sandbox_status,
             sandbox::set_sandbox_provider,
             web_search::web_search_health,
@@ -332,8 +455,28 @@ pub fn run() {
             model_install::model_install_status,
             model_install::install_model,
             model_install::cancel_model_install,
+            model_install::download_jobs,
+            task_queue::tasks_list,
+            task_queue::task_enqueue,
+            task_queue::task_steer,
+            task_queue::task_pause,
+            task_queue::task_resume,
+            task_queue::task_cancel,
+            task_queue::task_retry,
+            task_queue::task_branch,
+            task_queue::task_resolve_uncertain,
+            task_queue::task_transitions,
+            qualification::qualification_run,
+            qualification::qualification_cancel,
+            qualification::qualification_results,
+            qualification::readiness,
+            qualification::profiles,
             chat::send_message,
             chat::context_preflight,
+            chat::effective_capabilities,
+            compaction::compaction_status,
+            compaction::set_compaction_auto,
+            compaction::compact_conversation_cmd,
             chat::cancel_generation,
             chat::pause_generation,
             chat::resume_generation,
@@ -356,6 +499,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
                 state.cancel.send_replace(true);
+                web_search::stop_searxng_wsl(&state);
                 if let Ok(mut sessions) = state.pty_sessions.lock() {
                     for (_, session) in sessions.drain() {
                         session.kill();
@@ -363,6 +507,7 @@ pub fn run() {
                 }
                 tauri::async_runtime::block_on(async {
                     let _ = state.runtime.lock().await.stop().await;
+                    state.terminals.lock().await.kill_all().await;
                 });
             }
         });

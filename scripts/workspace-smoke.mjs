@@ -1,19 +1,19 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
 const folder = resolve('.local', `workspace-smoke-${randomUUID()}`);
 mkdirSync(folder, { recursive: true });
 const marker = `LOCAL-${randomUUID()}`;
 writeFileSync(join(folder, 'fixture.txt'), `The verification code is ${marker}.\n`);
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-const page = browser.contexts()[0].pages().find(value => value.url().includes('1420'));
+let { browser, page } = await connectSmoke();
 if (!page) throw new Error('Native LocalLM webview is unavailable.');
 page.setDefaultTimeout(15000);
 try {
   await page.evaluate(async path => { const { invoke } = await import('/node_modules/@tauri-apps/api/core.js'); await invoke('set_workspace', { path }); }, folder);
   await page.reload();
-  await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
+  await openSettingsSection(page, 'Models');
   if (await page.getByRole('button', { name: 'Load model', exact: true }).count()) {
     await page.getByRole('button', { name: 'Load model', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Unload', exact: true })).toBeVisible({ timeout: 120000 });

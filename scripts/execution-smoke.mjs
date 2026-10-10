@@ -1,11 +1,12 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
 const folder=resolve('.local',`execution-smoke-${randomUUID()}`);
 mkdirSync(folder,{recursive:true}); writeFileSync(join(folder,'numbers.txt'),'17 25 12');
-const browser=await chromium.connectOverCDP('http://127.0.0.1:9223');
-const page=browser.contexts()[0].pages().find(value=>value.url().includes('1420'));
+let { browser, page } = await connectSmoke()
+
 if(!page) throw new Error('Native LocalLM webview is unavailable.');
 page.setDefaultTimeout(15000);
 let previousWorkspace;
@@ -17,7 +18,7 @@ try {
   await expect(page.getByRole('textbox',{name:'Python executable',exact:true})).not.toHaveValue('');
   await page.getByRole('button',{name:'Save interpreters',exact:true}).click();
   await expect(page.getByText('Interpreter settings saved.',{exact:true})).toBeVisible();
-  await page.getByRole('button',{name:'Models & runtime',exact:true}).click();
+  await openSettingsSection(page, 'Models');
   if(await page.getByRole('button',{name:'Load model',exact:true}).count()) { await page.getByRole('button',{name:'Load model',exact:true}).click(); await expect(page.getByRole('button',{name:'Unload',exact:true})).toBeVisible({timeout:120000}); }
   const scenarios=[];
   for(const mode of ['allow','deny','cancel']) {

@@ -1,7 +1,8 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { connectSmoke } from './smoke-lib.mjs';
 const directory = mkdtempSync(join(tmpdir(), 'locallm-mcp-smoke-'));
 const name = `Local fixture ${Date.now()}`;
 const script = join(directory, 'server.cjs');
@@ -13,16 +14,14 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
   : {tools:[{name:'fixture_echo',description:'Return fixture text',inputSchema:{type:'object'}}]};
   process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n');
 });`);
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-let page;
+let { browser, page } = await connectSmoke();
 let id;
 const invoke = (command, args = {}) => page.evaluate(async ({command,args}) => {
   const {invoke} = await import('/node_modules/@tauri-apps/api/core.js');
   return invoke(command,args);
 }, {command,args});
 try {
-  await expect.poll(() => { page = browser.contexts()[0].pages().find(value => value.url().includes('1420')); return Boolean(page); }).toBe(true);
-  await page.getByRole('button', {name:'Connectors',exact:true}).click();
+    await page.getByRole('button', {name:'Connectors',exact:true}).click();
   await page.getByText('Add a local MCP server', {exact:true}).click();
   await page.getByLabel('Name', {exact:true}).fill(name);
   await page.getByLabel('Executable path', {exact:true}).fill(process.execPath);

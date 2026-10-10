@@ -26,6 +26,7 @@ export interface Conversation {
 }
 export interface Message {
   error?: string | null;
+  metrics?: TurnMetrics | null;
   id: string; conversationId: string; role: 'user' | 'assistant' | 'tool';
   content: string; reasoning: string; status: 'complete' | 'streaming' | 'interrupted' | 'error'; createdAt: number;
 }
@@ -33,6 +34,11 @@ export interface InstalledModel {
   id: string; filename: string; path: string; bytes: number; repo: string | null;
   revision: string | null; files: string[]; complete: boolean; received?: number;
   projectorFilename?: string | null; projectorPath?: string | null;
+  external?: boolean;
+  /** Pinned expectations for every managed shard and projector. */
+  expected?: HubFile[];
+  /** Computed during scanning: expected files are present with matching sizes. */
+  verified?: boolean;
 }
 export interface HubFile { filename: string; bytes: number; sha256: string }
 export interface HubRepo { repo: string; revision: string; files: HubFile[] }
@@ -46,7 +52,7 @@ export interface Preferences {
   runtimePath: string; modelPath: string; projectorPath?: string; temperature: number; topP: number; maxTokens: number;
   systemPrompt: string;
 }
-export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null; gpuOffload?: { layers: number; totalLayers: number } | null }
+export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null; launchConfig?: RuntimeConfig | null; loadedContext?: number | null; gpuOffload?: { layers: number; totalLayers: number } | null }
 export type ToolSupport = 'unknown' | 'supported' | 'unsupported';
 export interface RemoteModel { supportsImages?: boolean; id: string; contextLength: number | null; maxOutputTokens: number | null; toolSupport: ToolSupport }
 export interface ProviderConnection {
@@ -58,10 +64,20 @@ export interface Bootstrap {
   conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus;
   rememberedTools: RememberedTools; providers: ProviderConnection[]; preferredModel: ModelSelection;
 }
-export interface RememberedTools { sources: string[]; tools: ToolSelection[]; accessMode?: AccessMode }
+export interface RememberedTools { sources: string[]; tools: ToolSelection[]; accessMode?: AccessMode; interactionMode?: InteractionMode }
+/** Ask/Plan/Act — what the model may do this turn; separate from accessMode, which gates approvals. */
+export type InteractionMode = 'ask' | 'plan' | 'act';
+/** One backend-computed row of the effective-tools listing. `available` means
+ *  the next turn would offer it; `permittedInMode` means the interaction mode
+ *  lets it run; `requiresApproval` means the permission mode would still ask. */
+export interface EffectiveTool {
+  name: string; source: string;
+  available: boolean; enabled: boolean; permittedInMode: boolean; requiresApproval: boolean;
+  blockedReason?: string;
+}
 export interface ToolApproval { id: string; kind?: 'tool' | 'ask_user'; connector: string; localServerName?: string | null; name: string; arguments: Record<string, unknown> }
 export interface AskUserApproval extends ToolApproval { kind: 'ask_user'; }
-export interface ContextUsage { inputTokens: number; responseReserve: number; contextLength: number; estimated?: boolean }
+export interface ContextUsage { inputTokens: number; outputTokens?: number | null; cachedInputTokens?: number | null; responseReserve: number; contextLength: number; estimated?: boolean }
 export interface PreflightBreakdown { total: number; instructions: number; tools: number; history: number; scratchpad?: number; draft: number; responseReserve: number; contextLength: number; exact: boolean; fits: boolean; notice?: string; overflow?: string }
 export interface Preset {
   id: string;
@@ -90,6 +106,39 @@ export interface CompactionStatus {
   keepLast: number;
   checkpoint: Checkpoint | null;
 }
+// Isolated task workspaces — a git worktree or bounded snapshot copy of the
+// project that one conversation works in until its changes are reviewed,
+// applied back, or discarded. Review/recovery only, not a security sandbox.
+export interface TaskExclusion { path: string; reason: string }
+export interface TaskWorkspace {
+  id: string; conversationId: string; sourceRoot: string;
+  kind: 'git-worktree' | 'snapshot';
+  isolatedRoot: string; branch: string | null; baselineCommit: string;
+  status: 'active' | 'applied' | 'discarded';
+  exclusions: TaskExclusion[]; createdAt: number; updatedAt: number;
+}
+export interface TaskCheckpoint { commit: string | null; label: string; createdAt: number; uncommitted: boolean }
+export interface TaskFileChange {
+  path: string; oldPath: string | null;
+  status: 'added' | 'modified' | 'deleted' | 'renamed';
+  binary: boolean; size: number;
+  baselineHash: string | null; taskHash: string | null; destinationHash: string | null;
+  destinationChanged: boolean; conflict: boolean;
+}
+export interface AppliedFile {
+  path: string; action: 'created' | 'written' | 'deleted';
+  wroteSha256: string | null; backup: string | null; taskVersion: string | null;
+}
+export interface TaskApply { id: string; taskId: string; createdAt: number; backupDir: string; files: AppliedFile[]; undoneAt: number | null }
+export interface TaskReview {
+  taskId: string; sourceRoot: string; isolatedRoot: string;
+  kind: 'git-worktree' | 'snapshot'; branch: string | null; baselineCommit: string;
+  exclusions: TaskExclusion[]; files: TaskFileChange[]; checkpoints: TaskCheckpoint[]; applies: TaskApply[];
+}
+export interface TaskFileDiff { text: string | null; truncated: boolean; binary: boolean; reason: string | null }
+export interface TaskApplyResult { applied: string[]; keptDestination: string[]; skippedConflicts: string[]; backupDir: string; applyId: string }
+export interface TaskUndoResult { restored: string[]; conflicts: string[] }
+export type TaskConflictResolution = 'take-task' | 'keep-destination';
 export interface Project { id: string; name: string; path: string }
 export interface TaskMeta { projectId: string | null; archived: boolean; pinned: boolean }
 export interface WorkspaceIndex { projects: Project[]; tasks: Record<string, TaskMeta> }
@@ -157,6 +206,7 @@ export interface TodoItem {
   updatedAt: number;
 }
 
+export interface TurnMetrics { ttftSecs?: number | null; promptTokPerSec?: number | null; genTokPerSec?: number | null }
 export interface ChatEvent {
   notice?: string;
   messageId: string;
@@ -172,6 +222,9 @@ export interface ChatEvent {
   elapsedSecs?: number;
   roundIndex?: number;
   toolStream?: ToolStreamEvent;
+  metrics?: TurnMetrics;
+  /** Terminal event of a Plan-mode turn — offer "Implement plan". */
+  planReady?: boolean;
 }
 export interface ToolView { name: string; description: string; inputSchema: Record<string, unknown> }
 export interface ToolSelection { connectorId: string; toolName: string }
@@ -192,14 +245,37 @@ export interface SkillUpdateStatus {
   updateAvailable: boolean; intact: boolean; problem: string | null;
 }
 export interface ExecutionConfig { pythonPath: string; nodePath: string; powershellPath: string }
-export interface WebSearchConfig { provider: 'searxng' | 'google'; searxngBaseUrl: string; googleApiKey: string; googleCxId: string; searchFallbackEnabled: boolean }
+export type IsolationMode = 'unsandboxed' | 'enforced';
+export interface IsolationSettings {
+  mode: IsolationMode;
+  /** Sandboxed processes get network access. Off means no network at all, including loopback. */
+  network: boolean;
+  /** LAN reach — requires network and an explicit opt-in. */
+  lan: boolean;
+  /** Opt into LPAC — stricter, but some interpreters cannot read their registry keys. */
+  lpac: boolean;
+  /** Extra directories (interpreters, toolchains) the container can read and execute. */
+  toolchainDirs: string[];
+  processLimit: number;
+  memoryMb: number;
+}
+export interface IsolationStatus {
+  available: boolean;
+  kind: string | null;
+  reason: string;
+  policy: IsolationSettings;
+  grants: string[];
+}
+export type BrowserMode = 'off' | 'auto' | 'preferred';
+export interface BrowserConfig { mode: BrowserMode; maxActions: number }
+export interface WebSearchConfig { provider: 'searxng' | 'google'; searxngBaseUrl: string; hasGoogleApiKey: boolean; googleCxId: string; searchFallbackEnabled: boolean }
 export interface HardwareStatus {
   logicalCpus: number; memoryTotalBytes: number | null; memoryAvailableBytes: number | null;
   gpuStatus: string; sampledAt: number;
   gpus: { name: string; uuid: string; memoryUsedMib: number | null; memoryTotalMib: number | null; utilizationPercent: number | null; driverVersion: string }[];
 }
 export type AccessMode = 'ask' | 'autoApprove' | 'fullAccess';
-export interface ConversationTools { sources: string[]; tools: ToolSelection[]; accessMode: AccessMode }
+export interface ConversationTools { sources: string[]; tools: ToolSelection[]; accessMode: AccessMode; interactionMode?: InteractionMode }
 export type CapabilityKind = 'Model' | 'Tool' | 'Skill' | 'Session' | 'Sandbox' | 'Storage' | 'Loop' | 'Ui';
 export interface Capability { id: string; kind: CapabilityKind | string; version: number; enabled: boolean; description: string; config?: Record<string, unknown> }
 export interface SessionEvent {
@@ -218,11 +294,109 @@ export interface ForkSessionResult {
   newConversation: Conversation;
   copiedEventsCount: number;
 }
-export interface Hit {
-  conversationId: string;
-  conversationTitle: string;
-  messageId: string;
-  role: string;
-  excerpt: string;
+
+export type CriterionOrigin = 'user' | 'agent';
+export type VerificationKind = 'command' | 'browser' | 'research' | 'calculation' | 'data' | 'manual';
+export type VerificationEnvironment = 'native-local' | 'task-worktree' | 'snapshot' | 'mocked';
+export type VerificationResult = 'passed' | 'failed' | 'unavailable' | 'inconclusive';
+export type CompletionState = 'work-completed' | 'checks-passed' | 'checks-failed' | 'partially-verified' | 'needs-review';
+
+export interface TaskCriterion {
+  id: string; conversationId: string; text: string; origin: CriterionOrigin; createdAt: number; updatedAt: number;
+}
+export interface VerificationRecord {
+  id: string; conversationId: string; criterionId?: string | null;
+  kind: VerificationKind; method: string; command?: string | null;
+  environment: VerificationEnvironment | string;
+  startedAt: number; endedAt: number; exitCode?: number | null;
+  /** Tail excerpt only — never the full log. Use verificationRecordOutput. */
+  outputExcerpt: string; outputArtifact?: string | null; outputTruncated: boolean;
+  artifacts: unknown; result: VerificationResult; limitations: string;
+  fingerprint?: string | null; createdAt: number;
+  /** Computed at read time: the workspace changed since this record ran. */
+  stale: boolean;
+}
+export interface VerificationSummary {
+  criteria: TaskCriterion[];
+  records: VerificationRecord[];
+  state: { state: CompletionState; summary: string };
+}
+export interface VerificationOutput { text: string; truncated: boolean; note?: string }
+
+export type MemoryScope = string; // 'user' | `project:${string}` | `conversation:${string}`
+export interface MemoryFact {
+  id: string; scope: MemoryScope; fact: string; origin: 'user' | 'agent' | 'survey' | string;
+  reason?: string | null; sourceConversationId?: string | null;
+  sourcePath?: string | null; sourceHash?: string | null; sourceBranch?: string | null;
+  pinned: boolean; excluded: boolean; stale: boolean; createdAt: number; updatedAt: number;
+}
+export interface DocCollection {
+  id: string; name: string; root: string; fileCount: number; chunkCount: number;
+  indexedAt: number | null; error: string | null; createdAt: number;
+}
+export interface DocHit {
+  collectionId: string; collection: string; path: string;
+  lineStart: number; lineEnd: number; snippet: string;
+}
+export interface Recipe {
+  id: string;
+  name: string;
+  prompt: string;
+  intervalMinutes: number | null;
+  enabled: boolean;
+  nextRunAt: number | null;
+  lastRunAt: number | null;
   createdAt: number;
+}
+export interface Task {
+  id: string;
+  conversationId: string;
+  content: string;
+  interactionMode: string;
+  status: string;
+  position: number | null;
+  runId: string | null;
+  waitReason: string | null;
+  error: string | null;
+  nextAction: string | null;
+  parentTaskId: string | null;
+  createdAt: number;
+  startedAt: number | null;
+  endedAt: number | null;
+}
+
+export interface TaskTransition {
+  taskId: string;
+  fromStatus: string;
+  toStatus: string;
+  reason: string | null;
+  at: number;
+}
+
+export interface ContextPreviewItem {
+  kind: string; label: string; tokens: number; reason: string; source?: string | null; id?: string | null;
+}
+export interface ContextPreview { items: ContextPreviewItem[]; totalTokens: number; budgetTokens: number }
+export interface UsedMemory { id: string; fact: string }
+
+export interface CaseResult {
+  name: string; status: 'passed' | 'failed' | 'unsupported' | 'untested';
+  latencyMs: number; tokensPerSecond?: number | null; error?: string | null; detail?: string | null;
+}
+export interface Qualification {
+  id: string; identityHash: string; stale: boolean; modelId: string; modelPath?: string | null;
+  providerId?: string | null; runtimeVersion?: string | null; config: unknown;
+  startedAt: number; endedAt?: number | null; cases: CaseResult[];
+  status: 'passed' | 'partial' | 'failed' | 'cancelled';
+}
+export type QualificationEvent =
+  | { kind: 'case'; name: string; status: string; result?: CaseResult | null }
+  | { kind: 'complete'; record: Qualification };
+export interface Readiness {
+  step: string; message: string;
+  nextAction?: { label: string; target: string } | null;
+}
+export interface Profile {
+  id: string; label: string; preset: string; interactionMode: InteractionMode;
+  recommended: boolean; note?: string | null;
 }

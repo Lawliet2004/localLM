@@ -83,7 +83,18 @@ pub fn bound_tool_result(
 
         // Find primary content field or provide truncated overview
         let mut handled = false;
-        if let Some(results) = obj.get("structuredContent").and_then(|sc| sc.get("results")).and_then(Value::as_array) {
+        if tool_name == "web_search" {
+            if let Some(evidence) = obj.get("evidence").or_else(|| obj.get("answer")).and_then(Value::as_str) {
+                // Research already produced bounded, cited evidence. Keep it
+                // ahead of duplicate answers and full document payloads.
+                bounded_obj.insert("evidence".into(), json!(evidence.chars().take(max_chars).collect::<String>()));
+                if let Some(session) = obj.get("sessionId") {
+                    bounded_obj.insert("sessionId".into(), session.clone());
+                }
+                handled = true;
+            }
+        }
+        if let Some(results) = obj.get("structuredContent").filter(|_| !handled).and_then(|sc| sc.get("results")).and_then(Value::as_array) {
             let mut snippets = Vec::new();
             for r in results.iter().take(5) {
                 let title = r.get("title").and_then(Value::as_str).unwrap_or("");
@@ -276,7 +287,7 @@ pub fn bound_tool_result(
             cur_len = serde_json::to_string(&bounded_obj).map_or(0, |s| s.len());
         }
         if cur_len > max_chars {
-            for key in ["content_excerpt", "text_excerpt", "body_excerpt", "preview", "goal", "instruction"] {
+            for key in ["content_excerpt", "text_excerpt", "body_excerpt", "preview", "goal", "instruction", "evidence"] {
                 if let Some(Value::String(s)) = bounded_obj.get(key) {
                     let excess = cur_len.saturating_sub(max_chars);
                     let new_take = s.len().saturating_sub(excess + 32);
@@ -376,6 +387,19 @@ mod tests {
         assert!(bounded["search_results"].is_array());
         let search_results = bounded["search_results"].as_array().unwrap();
         assert!(!search_results.is_empty() && search_results.len() <= 5);
+        assert!(bounded.to_string().len() <= 2048);
+    }
+
+    #[test]
+    fn research_tables_keep_all_rows_when_evidence_fits_the_context_budget() {
+        let evidence = format!("| Benchmark | Alpha | Beta | Source |\n{}",
+            (1..=10).map(|i| format!("| Benchmark {i} | 81% | 79% | [Source](https://example.com/scores) |\n")).collect::<String>());
+        let payload = json!({"sessionId":"session-1", "answer":evidence, "evidence":evidence,
+            "documents":[{"text":"Irrelevant full-page text. ".repeat(1000)}]});
+        let (bounded, artifact) = bound_tool_result(payload, "web_search", "c-1", None, 2048);
+        assert!(artifact.is_some());
+        assert_eq!(bounded["evidence"], evidence);
+        assert_eq!(bounded["sessionId"], "session-1");
         assert!(bounded.to_string().len() <= 2048);
     }
 

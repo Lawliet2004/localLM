@@ -1,57 +1,62 @@
-import { useEffect, useRef, useState } from 'react';
-import { api, errorMessage, nativeAvailable, type ModelInstallStatus } from '../lib/api';
-import { gib } from '../lib/runtimeGuidance';
+import { useState } from 'react';
+import { api, errorMessage, type ModelInstallStatus } from '../lib/api';
+import { dismissJob, isJobDismissed, refreshDownloadJobs, useDownloadJobs } from '../lib/downloadJobs';
+import { JobProgress } from './JobProgress';
 
 // Lives outside the settings pages so navigating back to chat keeps progress visible.
-export function DownloadActivity() {
-  const [status, setStatus] = useState<ModelInstallStatus | null>(null);
-  const [rate, setRate] = useState(0);
-  const [waiting, setWaiting] = useState(false);
-  const [error, setError] = useState('');
-  const [cancelling, setCancelling] = useState(false);
-  const [dismissed, setDismissed] = useState(false);
-  const sample = useRef({ received: 0, time: 0, changed: 0, path: '' });
-  useEffect(() => {
-    if (!nativeAvailable) return;
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    async function poll() {
-      try {
-        const next = await api.modelInstallStatus();
-        if (disposed) return;
-        const now = Date.now();
-        const previous = sample.current;
-        const same = previous.time > 0 && previous.path === next.path && next.received >= previous.received;
-        const delta = same ? next.received - previous.received : 0;
-        const changed = !same || delta > 0 ? now : previous.changed;
-        setRate(same ? delta / Math.max((now - previous.time) / 1000, 0.001) : 0);
-        setWaiting(next.busy && now - changed >= 10000);
-        sample.current = { received: next.received, time: now, changed, path: next.path ?? '' };
-        setStatus(next); setError('');
-        if (next.busy) setDismissed(false);
-      } catch (e) { if (!disposed) setError(errorMessage(e)); }
-      finally { if (!disposed) timer = setTimeout(() => void poll(), 1000); }
-    }
-    void poll();
-    return () => { disposed = true; clearTimeout(timer); };
-  }, []);
-  if (!status || dismissed || (!status.busy && !status.error && status.phase !== 'ready')) return null;
-  const percent = status.total > 0 ? Math.min(100, status.received / status.total * 100) : null;
-  const label = !status.busy ? status.phase === 'ready' ? 'Model download complete' : status.phase === 'cancelled' ? 'Download paused' : 'Download interrupted'
-    : status.phase === 'verifying' ? 'Verifying model' : status.phase === 'resolving' || status.phase === 'preparing' ? 'Preparing model download' : 'Downloading model';
-  return <section className="download-activity" aria-label="Model download">
-    <div className="download-activity-copy"><strong role="status">{label}{percent !== null && status.busy ? ` · ${percent.toFixed(1)}%` : ''}</strong>
-      {status.path && <small title={status.path}>{status.path.split(/[\\/]/).pop()}</small>}
-      <span>{gib(status.received)} / {status.total ? gib(status.total) : 'checking size'}
-        {status.busy && rate > 0 && status.phase !== 'verifying' ? ` · ${(rate / 1048576).toFixed(1)} MiB/s · ~${Math.max(1, Math.ceil((status.total - status.received) / rate / 60))} min left` : ''}
-        {status.busy ? waiting ? ' · Waiting for progress…' : ' · You can keep chatting with a loaded model.' : ''}</span>
-      {status.busy && <progress aria-label="Model download progress" max={status.total || 1} value={status.total ? status.received : undefined} />}
-      {(error || status.error) && <span role="alert">{error || status.error} Saved partial files can be resumed in My Models.</span>}
-    </div>
-    {status.busy ? <button type="button" className="secondary" disabled={cancelling} onClick={async () => {
-      setCancelling(true);
-      try { await api.cancelModelInstall(); } catch (e) { setError(errorMessage(e)); }
-      finally { setCancelling(false); }
-    }}>{cancelling ? 'Pausing…' : 'Pause download'}</button> : <button type="button" className="secondary" onClick={() => setDismissed(true)}>Dismiss</button>}
+
+const TERMINAL = new Set(['failed', 'cancelled', 'interrupted', 'ready']);
+
+function visible(job: ModelInstallStatus) {
+  if (job.busy) return true;
+  if (!TERMINAL.has(job.phase) || isJobDismissed(job)) return false;
+  // A recovered ready row belongs to an earlier session; only in-session jobs show.
+  return job.phase !== 'ready' || job.jobId !== 0;
+}
+
+function resumable(job: ModelInstallStatus) {
+  return ['failed', 'cancelled', 'interrupted'].includes(job.phase);
+}
+
+async function resume(job: ModelInstallStatus) {
+  if (job.key === 'runtime:standard') await api.installRuntime();
+  else if (job.key.startsWith('model:catalog:')) await api.installModel(job.key.slice('model:catalog:'.length));
+}
+
+async function pause(job: ModelInstallStatus) {
+  if (job.key === 'runtime:standard') await api.cancelRuntimeInstall(job.jobId);
+  else await api.cancelModelInstall(job.jobId);
+}
+
+function JobRow({ job, rate, waiting }: { job: ModelInstallStatus; rate: number; waiting: boolean }) {
+  const [acting, setActing] = useState(false);
+  const [rowError, setRowError] = useState('');
+  async function run(action: () => Promise<void>) {
+    setActing(true); setRowError('');
+    try { await action(); } catch (e) { setRowError(errorMessage(e)); }
+    finally { setActing(false); refreshDownloadJobs(); }
+  }
+  return <section className="download-activity" aria-label={job.label || 'Download'}>
+    <JobProgress job={job} rate={rate} waiting={waiting} actions={<>
+      {job.busy && <button type="button" className="secondary" disabled={acting}
+        onClick={() => void run(() => pause(job))}>{acting ? 'Pausing…' : 'Pause'}</button>}
+      {!job.busy && resumable(job) && (job.key.startsWith('model:hf:')
+        ? <span>Resume in My Models — the download may need your Hugging Face token.</span>
+        : <button type="button" className="secondary" disabled={acting}
+            onClick={() => void run(() => resume(job))}>Resume</button>)}
+      {!job.busy && <button type="button" className="secondary" onClick={() => dismissJob(job)}>Dismiss</button>}
+      {rowError && <span role="alert">{rowError}</span>}
+    </>}>
+      {job.busy && <small>You can keep chatting with a loaded model.</small>}
+    </JobProgress>
   </section>;
+}
+
+export function DownloadActivity() {
+  const { jobs, stale, rate, waiting } = useDownloadJobs();
+  const rows = jobs.filter(visible);
+  return <>
+    {stale && rows.length > 0 && <p className="download-activity-note" role="status">Status may be out of date.</p>}
+    {rows.map(job => <JobRow key={`${job.key}:${job.jobId}`} job={job} rate={rate(job.jobId)} waiting={waiting(job.jobId)} />)}
+  </>;
 }

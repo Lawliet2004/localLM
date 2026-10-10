@@ -1,53 +1,5 @@
 # Runtime provenance
 
-## Opt-in Bonsai-27B runtime
-
-The experimental acceptance helper downloads PrismML's Windows x64 CUDA 12.4
-release `prism-b10754-2459f68`, commit
-`2459f68b5c0eb26261fd5a81682004b93cd645ba`. Both release archives have been
-downloaded, SHA-256 verified through the production downloader, and extracted
-through the bounded runtime extractor into `.local/experimental/bonsai-27b`.
-Its server and benchmark executables identify CUDA0 as the RTX 2050, compute
-capability 8.6. Actual managed CUDA inference, ten coherent chat prompts,
-reasoning and a read-only native tool round-trip passed. The feature is wired
-behind Experimental models, off by default. The measured 4k/Q8/65-layer preset
-passed five repeated 2000-input/500-output chats; combined switching, streaming
-and failure recovery passed. The 30-minute soak passed 53 exact 2000-input/
-500-output requests, averaging 19.209 generation tokens/s without a crash;
-device VRAM returned to idle after shutdown.
-The fork uses the same CUDA 12.4 driver requirement
-as the standard runtime.
-
-Release provenance, archive hashes and licenses are pinned in
-`catalog/bonsai-runtime-assets.json` and `catalog/bonsai-27b.json`. The upstream
-source is [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp), with
-the [MIT license at the pinned commit](https://github.com/PrismML-Eng/llama.cpp/blob/2459f68b5c0eb26261fd5a81682004b93cd645ba/LICENSE).
-The [release](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10754-2459f68)
-provides these verified Windows x64 assets:
-
-| Asset | SHA-256 |
-| --- | --- |
-| `llama-prism-b10754-2459f68-bin-win-cuda-12.4-x64.zip` | `200842b4c689fe092a8a1684ef1e185d8d025a0bfae6908737607a0f29560b96` |
-| `cudart-llama-bin-win-cuda-12.4-x64.zip` | `8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6` |
-
-The upstream
-release workflow uses Ninja Multi-Config, `GGML_NATIVE=OFF`, `GGML_CUDA=ON`,
-`GGML_BACKEND_DL=ON`, `GGML_CPU_ALL_VARIANTS=ON`, `LLAMA_BUILD_BORINGSSL=ON`,
-and `CMAKE_CUDA_FLAGS=-diag-suppress=221`, plus examples/tools/server/RPC enabled
-and tests disabled through `CMAKE_ARGS`. These are the [pinned release workflow's](https://github.com/PrismML-Eng/llama.cpp/blob/2459f68b5c0eb26261fd5a81682004b93cd645ba/.github/workflows/release-prism.yml#L242)
-flags, not a claimed local source build. The verified prebuilt worked on cc 8.6,
-so end users need no compiler or CUDA Toolkit source build.
-
-[Bonsai acceptance](BONSAI_EXPERIMENTAL.md) records the model revision, archive
-names, exact hashes, licenses, benchmark table, checks and acceptance limits.
-The standard b10855 runtime and MiniCPM catalog remain unchanged. New settings
-keys use existing JSON settings storage with missing values defaulting to off;
-there is no database migration. Bonsai's model-specific PrismML launch uses the
-existing authenticated loopback manager and `runtime.log`, with its prompt-cache
-RAM bounded at 512 MiB instead of the fork's 8192 MiB default. Failed launch logs
-are saved separately before restoring the previous model. The standard model's
-arguments are unchanged.
-
 ## Standard MiniCPM runtime
 
 Development runtime: ggml-org/llama.cpp release b10855, Windows x64 CUDA 12.4. Archives and SHA-256 digests are pinned in scripts/prepare-runtime.ps1 using GitHub release asset metadata.

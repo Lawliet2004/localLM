@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BrowserPanel, resolveAddress } from './BrowserPanel';
 
@@ -99,5 +99,47 @@ describe('BrowserPanel', () => {
     await typeAndSubmit('javascript:alert(1)');
     expect(onError).toHaveBeenCalledWith('Only HTTP and HTTPS addresses can be opened.');
     expect(mocks.browserNavigate).not.toHaveBeenCalled();
+  });
+
+  it('waits for the native browser surface before navigating and repositions it after the panel moves', async () => {
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ left: 300, top: 80, width: 400, height: 500 } as DOMRect);
+    let finishShow!: () => void;
+    mocks.browserShow.mockImplementationOnce(() => new Promise<void>(resolve => { finishShow = resolve; }));
+    try {
+      const { container } = render(<div className="workspace"><div className="workspace-panel"><BrowserPanel tabId="t1" onError={() => {}} /></div></div>);
+      await typeAndSubmit('example.com');
+      expect(mocks.browserNavigate).not.toHaveBeenCalled();
+      await act(async () => finishShow());
+      await waitFor(() => expect(mocks.browserNavigate).toHaveBeenCalledWith('t1', 'https://example.com'));
+      fireEvent.animationEnd(container.querySelector('.workspace-panel')!);
+      await waitFor(() => expect(mocks.browserShow).toHaveBeenCalledTimes(2));
+    } finally {
+      rect.mockRestore();
+    }
+  });
+
+  it('hides a browser that finishes showing after its panel unmounts', async () => {
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ left: 300, top: 80, width: 400, height: 500 } as DOMRect);
+    let finishShow!: () => void;
+    const calls: string[] = [];
+    mocks.browserShow.mockImplementationOnce(() => {
+      calls.push('show');
+      return new Promise<void>(resolve => { finishShow = resolve; });
+    });
+    mocks.browserHide.mockImplementationOnce(() => {
+      calls.push('hide');
+      return Promise.resolve();
+    });
+    try {
+      const panel = render(<BrowserPanel tabId="late-show" onError={() => {}} />);
+      await waitFor(() => expect(mocks.browserShow).toHaveBeenCalledTimes(1));
+      panel.unmount();
+      expect(mocks.browserHide).not.toHaveBeenCalled();
+      await act(async () => finishShow());
+      await waitFor(() => expect(mocks.browserHide).toHaveBeenCalledWith('late-show'));
+      expect(calls).toEqual(['show', 'hide']);
+    } finally {
+      rect.mockRestore();
+    }
   });
 });

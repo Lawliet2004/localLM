@@ -1,6 +1,8 @@
 # Daytona execution implementation contract
 
-Current status: Daytona is selectable in chat after saving a key, with code approval in Ask and Auto-approve reads modes. The runtime attempts ownership-checked cleanup after execution/cancellation and once at startup for saved pending operations. Native denial tests passed in both prompting modes with no cloud resources created. Live account execution, credential rotation with pending cleanup and native restart recovery acceptance remain unverified. Implementation sections below record the stages that preceded this wiring.
+Current scope: new Daytona execution is unavailable. Settings retains credentials and cleanup actions only for historical cloud resources. The implementation details below describe the legacy execution path, which remains blocked by the local-only policy.
+
+Historical status before the local-only restriction: Daytona was selectable in chat after saving a key, with code approval in Ask and Auto-approve reads modes. The runtime attempts ownership-checked cleanup after execution/cancellation and once at startup for saved pending operations. Native denial tests passed in both prompting modes with no cloud resources created. Live account execution, credential rotation with pending cleanup and native restart recovery acceptance remain unverified. Implementation sections below record the stages that preceded this wiring.
 
 Startup recovery holds the cloud operation lock, skips other credential scopes without network requests, and retains per-operation failures while continuing to other records. Missing credentials are recorded as actionable cleanup errors. Recovery never reruns code or creates resources. A mixed-scope fixture verifies failed cleanup survives, unrelated credentials are skipped and confirmed absence clears the matching record.
 

@@ -160,3 +160,45 @@ it('skips live fetches for chronic domains', async () => {
   expect(outcome.method).toBe('failed');
   expect(calls.some((u) => u === 'https://walled.example/page')).toBe(false);
 });
+
+it('rejects a successful HTTP status that contains a soft 404 page', async () => {
+  const body = `<html><head><title>Page Not Found</title></head><body><h1>Sorry, page not found</h1><p>${'This page is unavailable. '.repeat(12)}</p></body></html>`;
+  const outcome = await fetchPageCascade('https://source.example/missing', {
+    fetch: async (url: string) => ({
+      url, finalUrl: url, success: true, status: 200, mimeType: 'text/html', body, durationMs: 1,
+    }),
+  }, { waybackFallback: false });
+  expect(outcome.method).toBe('failed');
+  expect(outcome.document).toBeNull();
+  expect(outcome.error).toMatch(/error_page:title/i);
+  expect(outcome.raw?.status).toBe(200);
+  expect(outcome.raw?.body).toBe(body);
+});
+
+it('keeps an article about HTTP 404 status codes as source content', async () => {
+  const body = `<html><head><title>HTTP 404 status code explained</title></head><body><article><p>${'A 404 status means the requested resource was not found. '.repeat(8)}</p></article></body></html>`;
+  const outcome = await fetchPageCascade('https://source.example/http-status-guide', {
+    fetch: async (url: string) => ({
+      url, finalUrl: url, success: true, status: 200, mimeType: 'text/html', body, durationMs: 1,
+    }),
+  }, { waybackFallback: false });
+  expect(outcome.method).toBe('live');
+  expect(outcome.document?.text).toContain('A 404 status means');
+});
+
+it('retains HTTP 403 and 404 diagnostic bodies on failed reads', async () => {
+  for (const status of [403, 404]) {
+    const body = `<html><title>${status} Error</title><body>${'Diagnostic page text. '.repeat(12)}</body></html>`;
+    const outcome = await fetchPageCascade(`https://source.example/${status}`, {
+      fetch: async (url: string) => ({
+        url, finalUrl: url, success: false, status, mimeType: 'text/html', body,
+        error: `Page unavailable: HTTP ${status}`, durationMs: 1,
+      }),
+    }, { waybackFallback: false });
+    expect(outcome.method).toBe('failed');
+    expect(outcome.document).toBeNull();
+    expect(outcome.error).toContain(String(status));
+    expect(outcome.raw?.status).toBe(status);
+    expect(outcome.raw?.body).toBe(body);
+  }
+});

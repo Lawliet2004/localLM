@@ -1,0 +1,87 @@
+diff --git a/src-tauri/src/chat.rs b/src-tauri/src/chat.rs
+index 194796d..4f6dbc0 100644
+--- a/src-tauri/src/chat.rs
++++ b/src-tauri/src/chat.rs
+@@ -244,6 +244,16 @@ fn replace_in_content(message: &mut Value, from: &str, to: &str) {
+     }
+ }
+ 
++fn offered_harness_aliases(
++    aliases: &[String],
++    docker_available: bool,
++) -> impl Iterator<Item = &str> {
++    aliases
++        .iter()
++        .map(String::as_str)
++        .filter(move |alias| *alias != "docker_exec" || docker_available)
++}
++
+ fn plan_focus_message(todos: &[crate::plans::Todo]) -> String {
+     match crate::plans::current_task_line(todos) {
+         Some(focus) => format!("{PLAN_IMPLEMENT_INSTRUCTION}\n\n{focus}"),
+@@ -914,13 +924,10 @@ async fn assemble_turn(
+         }
+         instructions
+     };
+-    for alias in &preset.harness {
+-        // Do not offer docker_exec on machines without a reachable daemon —
+-        // small models take offered tools at face value and waste calls on it.
+-        if alias == "docker_exec" && !crate::sandbox::docker_available() {
+-            continue;
+-        }
+-        if !tools.iter().any(|tool| &tool.alias == alias) {
++    let docker_available = !preset.harness.iter().any(|alias| alias == "docker_exec")
++        || crate::sandbox::docker_available();
++    for alias in offered_harness_aliases(&preset.harness, docker_available) {
++        if !tools.iter().any(|tool| tool.alias.as_str() == alias) {
+             tools.push(crate::connectors::AgentTool::harness(alias)?);
+         }
+     }
+@@ -3921,6 +3928,16 @@ mod finish_tests {
+         assert_eq!(ans, "Here is the answer");
+     }
+ 
++    #[test]
++    fn creator_offers_docker_only_when_the_daemon_is_available() {
++        let harness = crate::presets::get(crate::presets::CREATOR).unwrap().harness;
++        assert!(
++            super::offered_harness_aliases(&harness, true).any(|alias| alias == "docker_exec")
++        );
++        assert!(
++            !super::offered_harness_aliases(&harness, false).any(|alias| alias == "docker_exec")
++        );
++    }
+     #[test]
+     fn think_filter_parses_split_chunks() {
+         let mut filter = super::ThinkFilter::new();
+diff --git a/src-tauri/src/presets.rs b/src-tauri/src/presets.rs
+index 0b6922e..7dd13c8 100644
+--- a/src-tauri/src/presets.rs
++++ b/src-tauri/src/presets.rs
+@@ -122,7 +122,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
+             system_time: true,
+             skills: true,
+             harness: harness(&[
+-                "todo_write", "todo_add", "todo_update", "goal_set", "goal_clear",
++                "todo_write", "goal_set", "goal_clear",
+                 "subagent", "send_message", "interrupt_agent", "list_agents",
+                 "terminal_create", "terminal_send", "terminal_close",
+                 "file_search", "memory_teach", "memory_recall",
+@@ -271,6 +271,17 @@ mod tests {
+         }
+     }
+     #[test]
++    fn coding_preset_uses_one_todo_writer_without_positional_updates() {
++        let coding = get(CODING).unwrap();
++        assert!(coding.harness.iter().any(|alias| alias == "todo_write"));
++        assert!(
++            !coding
++                .harness
++                .iter()
++                .any(|alias| alias == "todo_add" || alias == "todo_update")
++        );
++    }
++    #[test]
+     fn presets_offer_one_url_reader_and_no_research_control_echoes() {
+         for id in [CREATOR, RESEARCH, CODE] {
+             let preset = get(id).unwrap();

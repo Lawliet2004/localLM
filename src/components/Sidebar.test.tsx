@@ -23,6 +23,7 @@ vi.mock('../lib/api', () => ({
     removeProject: mocks.removeProject,
     saveProject: mocks.saveProject,
     searchSessions: async () => [],
+    tasksList: async () => [],
   },
 }));
 
@@ -42,6 +43,18 @@ describe('Sidebar project folders and actions', () => {
     { id: 'chat-1', title: 'Alpha task chat', updatedAt: 1000, providerId: null, modelId: null, providerSelectionRequired: false },
     { id: 'chat-2', title: 'General unfiled chat', updatedAt: 2000, providerId: null, modelId: null, providerSelectionRequired: false },
   ];
+
+  it('expands project folders with the keyboard and has no inactive notifications control', async () => {
+    render(<Sidebar page="chat" onPage={vi.fn()} conversations={sampleConversations} activeId={null}
+      onSelect={vi.fn()} onNew={vi.fn()} busy={false} search="" onSearch={vi.fn()}
+      theme="dark" onTheme={vi.fn()} onCollapse={vi.fn()} workspace={sampleWorkspace} />);
+    const folder = screen.getByRole('button', { name: 'Alpha Project' });
+    expect(folder).toHaveAttribute('aria-expanded', 'true');
+    folder.focus();
+    await userEvent.keyboard('{Enter}');
+    expect(folder).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: 'Notifications' })).not.toBeInTheDocument();
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -216,7 +229,7 @@ describe('Sidebar project folders and actions', () => {
     expect(onWorkspace).not.toHaveBeenCalled();
   });
 
-  it('offers delete and options controls on every folder', () => {
+  it('keeps destructive folder actions in the options menu', () => {
     render(
       <Sidebar
         page="chat"
@@ -237,7 +250,7 @@ describe('Sidebar project folders and actions', () => {
     );
 
     for (const name of ['Alpha Project', 'Beta Project']) {
-      expect(screen.getByRole('button', { name: `Delete folder ${name}` })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: `Delete folder ${name}` })).not.toBeInTheDocument();
       expect(screen.getByRole('button', { name: `Options for ${name}` })).toBeInTheDocument();
     }
     expect(screen.queryByRole('button', { name: 'Delete folder localLM' })).not.toBeInTheDocument();
@@ -344,39 +357,9 @@ describe('Sidebar project folders and actions', () => {
     await userEvent.click(screen.getByRole('button', { name: 'New conversation' }));
 
     expect(mocks.open).toHaveBeenCalled();
-    await waitFor(() => expect(mocks.saveProject).toHaveBeenCalledWith({ id: 'gamma', name: 'gamma', path: 'C:/projects/gamma' }));
-    await waitFor(() => expect(onNew).toHaveBeenCalledWith('gamma'));
-  });
-
-  it('allows deleting custom project folders directly via the trash icon button', async () => {
-    const onWorkspace = vi.fn();
-    render(
-      <Sidebar
-        page="chat"
-        onPage={vi.fn()}
-        conversations={sampleConversations}
-        activeId={null}
-        onSelect={vi.fn()}
-        onNew={vi.fn()}
-        busy={false}
-        search=""
-        onSearch={vi.fn()}
-        theme="dark"
-        onTheme={vi.fn()}
-        onCollapse={vi.fn()}
-        workspace={sampleWorkspace}
-        onWorkspace={onWorkspace}
-      />
-    );
-
-    const directTrashBtn = screen.getByRole('button', { name: 'Delete folder Alpha Project' });
-    await userEvent.click(directTrashBtn);
-
-    expect(mocks.confirm).toHaveBeenCalledWith(
-      expect.stringContaining('Remove "Alpha Project" from the project section?'),
-      expect.objectContaining({ title: 'Remove project folder?', kind: 'warning' })
-    );
-    await waitFor(() => expect(mocks.removeProject).toHaveBeenCalledWith('alpha-proj'));
+    await waitFor(() => expect(mocks.saveProject).toHaveBeenCalledWith({ id: expect.any(String), name: 'gamma', path: 'C:/projects/gamma' }));
+    await waitFor(() => expect(onNew).toHaveBeenCalledWith(expect.any(String)));
+    expect(mocks.saveProject).toHaveBeenCalledWith(expect.objectContaining({ name: 'gamma', id: onNew.mock.calls[0][0] }));
   });
 
   it('toggling folder collapse does not call onProject or change the active project', async () => {
@@ -409,7 +392,30 @@ describe('Sidebar project folders and actions', () => {
     expect(onProject).not.toHaveBeenCalled();
   });
 
-  it('renders localLM brand button and navigates through feature toolsets', async () => {
+  it('adds folders with the same name without reusing an existing project ID', async () => {
+    mocks.open.mockResolvedValue('C:/another/Alpha Project');
+    mocks.saveProject.mockImplementation(async (project: unknown) => ({ projects: [...sampleWorkspace.projects, project], tasks: sampleWorkspace.tasks }));
+    render(<Sidebar page="chat" onPage={vi.fn()} conversations={sampleConversations} activeId={null}
+      onSelect={vi.fn()} onNew={vi.fn()} busy={false} search="" onSearch={vi.fn()}
+      theme="dark" onTheme={vi.fn()} onCollapse={vi.fn()} workspace={sampleWorkspace} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Add project' }));
+    await waitFor(() => expect(mocks.saveProject).toHaveBeenCalled());
+    expect(sampleWorkspace.projects.map(project => project.id)).not.toContain(mocks.saveProject.mock.calls[0][0].id);
+  });
+
+  it('keeps a new chat closed when adding its project failed', async () => {
+    mocks.open.mockResolvedValue('C:/missing/project');
+    mocks.saveProject.mockRejectedValueOnce(new Error('Folder unavailable'));
+    const onNew = vi.fn();
+    render(<Sidebar page="chat" onPage={vi.fn()} conversations={[]} activeId={null}
+      onSelect={vi.fn()} onNew={onNew} busy={false} search="" onSearch={vi.fn()}
+      theme="dark" onTheme={vi.fn()} onCollapse={vi.fn()} workspace={{ projects: [], tasks: {} }} />);
+    await userEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Folder unavailable');
+    expect(onNew).not.toHaveBeenCalled();
+  });
+
+  it('keeps settings behind one entry point', async () => {
     const onPage = vi.fn();
 
     render(
@@ -430,44 +436,24 @@ describe('Sidebar project folders and actions', () => {
       />
     );
 
-    // Workspace brand button
-    const brandBtn = screen.getByRole('button', { name: 'Workspace menu' });
-    expect(brandBtn).toHaveTextContent('localLM');
+    expect(screen.getByText('localLM')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Workspace menu' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: 'Quick links' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(onPage).toHaveBeenCalledWith('general');
+  });
 
-    // Open brand menu
-    await userEvent.click(brandBtn);
-    expect(await screen.findByRole('menuitem', { name: 'LocalLM Workspace' })).toBeInTheDocument();
-    expect(screen.getByRole('menuitem', { name: 'Connectors' })).toBeInTheDocument();
-    expect(screen.getByRole('menuitem', { name: 'Skills' })).toBeInTheDocument();
-    expect(screen.getByRole('menuitem', { name: 'Tools & Permissions' })).toBeInTheDocument();
-
-    // Verify toolsets navigation buttons
-    const connectorsBtn = screen.getByRole('button', { name: 'Connectors' });
-    const skillsBtn = screen.getByRole('button', { name: 'Skills' });
-    const toolsBtn = screen.getByRole('button', { name: 'Tools' });
-    const modelsBtn = screen.getByRole('button', { name: 'Models & runtime' });
-    const executionBtn = screen.getByRole('button', { name: 'Execution' });
-
-    expect(connectorsBtn).toBeInTheDocument();
-    expect(skillsBtn).toBeInTheDocument();
-    expect(toolsBtn).toBeInTheDocument();
-    expect(modelsBtn).toBeInTheDocument();
-    expect(executionBtn).toBeInTheDocument();
-
-    await userEvent.click(connectorsBtn);
-    expect(onPage).toHaveBeenCalledWith('connectors');
-
-    await userEvent.click(skillsBtn);
-    expect(onPage).toHaveBeenCalledWith('skills');
-
-    await userEvent.click(toolsBtn);
-    expect(onPage).toHaveBeenCalledWith('tools');
-
-    await userEvent.click(modelsBtn);
-    expect(onPage).toHaveBeenCalledWith('models');
-
-    await userEvent.click(executionBtn);
-    expect(onPage).toHaveBeenCalledWith('execution');
+  it('hides archived chats from the list but still finds them by search', () => {
+    const props = {
+      page: 'chat' as const, onPage: vi.fn(), activeId: null, onSelect: vi.fn(), onNew: vi.fn(), busy: false,
+      onSearch: vi.fn(), theme: 'dark', onTheme: vi.fn(), onCollapse: vi.fn(),
+      conversations: [{ id: 'old', title: 'Archived plan', updatedAt: 1, providerId: null, modelId: null, providerSelectionRequired: false }],
+      workspace: { projects: [], tasks: { old: { projectId: null, archived: true, pinned: false } } },
+    };
+    const { rerender } = render(<Sidebar {...props} search="" />);
+    expect(screen.queryByRole('button', { name: 'Archived plan' })).not.toBeInTheDocument();
+    rerender(<Sidebar {...props} search="plan" />);
+    expect(screen.getByRole('button', { name: 'Archived plan' })).toBeInTheDocument();
   });
 });
 

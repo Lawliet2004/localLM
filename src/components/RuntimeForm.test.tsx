@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { RuntimeForm } from './RuntimeForm';
@@ -98,5 +98,60 @@ describe('runtime settings', () => {
     expect(await screen.findByText('CPU recommended')).toBeVisible();
     expect(screen.getByText('Unknown')).toBeVisible();
     expect(screen.getByText(/cache layout incomplete/)).toBeVisible();
+  });
+
+  it('sends only one save while the first is still pending', async () => {
+    let resolve: () => void = () => {};
+    const onSave = vi.fn(() => new Promise<void>(done => { resolve = done; }));
+    render(<RuntimeForm initial={defaultRuntimeConfig} onSave={onSave} busy={false} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }));
+    const saving = await screen.findByRole('button', { name: 'Saving…' });
+    expect(saving).toBeDisabled();
+    await userEvent.click(saving);
+    expect(onSave).toHaveBeenCalledTimes(1);
+    resolve();
+  });
+
+  it('keeps unsaved edits and notes when the saved config changes', async () => {
+    const initial = { ...defaultRuntimeConfig, contextLength: 8192 };
+    const { rerender } = render(<RuntimeForm initial={initial} onSave={vi.fn()} busy={false} />);
+    fireEvent.change(screen.getByLabelText('Context window'), { target: { value: '4096' } });
+    rerender(<RuntimeForm initial={{ ...initial, contextLength: 16384 }} onSave={vi.fn()} busy={false} />);
+    expect(screen.getByLabelText('Context window')).toHaveValue(4096);
+    expect(await screen.findByText('Saved settings changed; your unsaved edits are kept.')).toBeVisible();
+  });
+
+  it('adopts a new saved config while the draft is clean', () => {
+    const { rerender } = render(<RuntimeForm initial={{ ...defaultRuntimeConfig, contextLength: 8192 }} onSave={vi.fn()} busy={false} />);
+    rerender(<RuntimeForm initial={{ ...defaultRuntimeConfig, contextLength: 16384 }} onSave={vi.fn()} busy={false} />);
+    expect(screen.getByLabelText('Context window')).toHaveValue(16384);
+    expect(screen.queryByText(/unsaved edits are kept/)).not.toBeInTheDocument();
+  });
+
+  it('adopts the saved config after this form saves it without a keep-edits note', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(<RuntimeForm initial={{ ...defaultRuntimeConfig, contextLength: 8192 }} onSave={onSave} busy={false} />);
+    fireEvent.change(screen.getByLabelText('Context window'), { target: { value: '4096' } });
+    await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }));
+    await screen.findByRole('button', { name: 'Save configuration' });
+    rerender(<RuntimeForm initial={{ ...defaultRuntimeConfig, contextLength: 4096 }} onSave={onSave} busy={false} />);
+    expect(screen.queryByText(/unsaved edits are kept/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Context window')).toHaveValue(4096);
+  });
+
+  it('shows effective loaded values when they differ from the request', () => {
+    render(<RuntimeForm initial={defaultRuntimeConfig} onSave={vi.fn()} busy={false} modelPath="model.gguf"
+      runtime={{ phase: 'ready', message: 'Model ready', modelPath: 'model.gguf',
+        loadedConfig: defaultRuntimeConfig, launchConfig: { ...defaultRuntimeConfig, gpuLayers: 18 },
+        loadedContext: defaultRuntimeConfig.contextLength, gpuOffload: { layers: 18, totalLayers: 25 } }} />);
+    expect(screen.getByText('18 / 25 offloaded')).toBeVisible();
+    expect(screen.getByText('Effective GPU layers')).toBeVisible();
+  });
+
+  it('shows an error when the save is rejected', async () => {
+    const onSave = vi.fn().mockRejectedValue(new Error('disk full'));
+    render(<RuntimeForm initial={defaultRuntimeConfig} onSave={onSave} busy={false} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Not saved: disk full');
   });
 });

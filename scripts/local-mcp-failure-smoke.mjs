@@ -1,8 +1,9 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
 
 // Local MCP failure-mode acceptance: cancellation during approval, tool
 // failure, unexpected server exit, and disconnect each produce accurate
@@ -31,9 +32,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
   }
 });`);
 
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-let page;
-await expect.poll(() => { page = browser.contexts()[0].pages().find(value => value.url().includes('1420')); return Boolean(page); }).toBe(true);
+let { browser, page } = await connectSmoke();
 page.setDefaultTimeout(15000);
 const invoke = (command, args = {}) => page.evaluate(async ({ command, args }) => {
   const { invoke } = await import('/node_modules/@tauri-apps/api/core.js');
@@ -45,7 +44,7 @@ const chats = [];
 let originalPreferences;
 try {
   originalPreferences = (await invoke('bootstrap')).preferences;
-  await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
+  await openSettingsSection(page, 'Models');
   if (await page.getByRole('button', { name: 'Load model', exact: true }).count()) {
     await expect(page.getByRole('button', { name: 'Load model', exact: true })).toBeEnabled({ timeout: 30000 });
     await page.getByRole('button', { name: 'Load model', exact: true }).click();

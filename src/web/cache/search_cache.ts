@@ -55,9 +55,7 @@ export class SearchCache {
     freshness: FreshnessWindow = 'any',
     ttlSeconds: number = 86400
   ): Promise<void> {
-    if (meta.answers.length || meta.infoboxes.length || meta.corrections.length || meta.suggestions.length) {
-      await this.storage.set('search_cache', `${this.makeKey(provider, query, freshness)}::meta`, meta, ttlSeconds);
-    }
+    await this.storage.set('search_cache', `${this.makeKey(provider, query, freshness)}::meta`, meta, ttlSeconds);
   }
 }
 

@@ -8,7 +8,7 @@
 
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -26,7 +26,7 @@ pub struct PtySession {
     // Separate handle for termination: the exit watcher holds `child` across
     // wait(), so locking `child` to kill a live shell would deadlock.
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    buffer: Mutex<Vec<u8>>,
+    buffer: Mutex<VecDeque<u8>>,
     sink: Mutex<Option<tauri::ipc::Channel<Value>>>,
     exit_code: Mutex<Option<u32>>,
 }
@@ -51,6 +51,37 @@ fn emit(session: &PtySession, event: Value) {
 
 fn lock<'a, T>(mutex: &'a Mutex<T>) -> Result<std::sync::MutexGuard<'a, T>, String> {
     mutex.lock().map_err(|_| "Terminal state lock is unavailable.".into())
+}
+
+fn decode_output(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
+    pending.extend_from_slice(bytes);
+    // A UTF-8 code point has at most four bytes. Retain only an incomplete
+    // trailing code point; invalid bytes still produce replacement characters.
+    let end = (pending.len().saturating_sub(3)..pending.len()).find(|&start| {
+        std::str::from_utf8(&pending[start..]).err()
+            .is_some_and(|error| error.valid_up_to() == 0 && error.error_len().is_none())
+    }).unwrap_or(pending.len());
+    let text = String::from_utf8_lossy(&pending[..end]).into_owned();
+    pending.drain(..end);
+    text
+}
+
+fn append_scrollback(buffer: &mut VecDeque<u8>, text: &str) {
+    buffer.extend(text.as_bytes());
+    let excess = buffer.len().saturating_sub(REPLAY_CAP);
+    buffer.drain(..excess);
+    while buffer.front().is_some_and(|byte| byte & 0xc0 == 0x80) {
+        buffer.pop_front();
+    }
+}
+
+fn publish_output(session: &PtySession, text: &str) {
+    if text.is_empty() { return; }
+    let mut buffer = session.buffer.lock().unwrap_or_else(|error| error.into_inner());
+    append_scrollback(&mut buffer, text);
+    // Match attach's buffer -> sink lock order. An attach between recording
+    // and sending otherwise replays this chunk and then receives it twice.
+    emit(session, json!({"type":"output","data":text}));
 }
 
 fn spawn_session(cwd: &str, cols: u16, rows: u16) -> Result<Arc<PtySession>, String> {
@@ -99,7 +130,7 @@ fn spawn_session(cwd: &str, cols: u16, rows: u16) -> Result<Arc<PtySession>, Str
         writer: Mutex::new(writer),
         child: Mutex::new(child),
         killer: Mutex::new(killer),
-        buffer: Mutex::new(Vec::new()),
+        buffer: Mutex::new(VecDeque::new()),
         sink: Mutex::new(None),
         exit_code: Mutex::new(None),
     });
@@ -108,24 +139,16 @@ fn spawn_session(cwd: &str, cols: u16, rows: u16) -> Result<Arc<PtySession>, Str
     let output_session = session.clone();
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
+        let mut pending = Vec::new();
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
-                    if let Ok(mut buffer) = output_session.buffer.lock() {
-                        buffer.extend_from_slice(&chunk[..count]);
-                        if buffer.len() > REPLAY_CAP {
-                            let excess = buffer.len() - REPLAY_CAP;
-                            buffer.drain(..excess);
-                        }
-                    }
-                    emit(
-                        &output_session,
-                        json!({"type":"output","data":String::from_utf8_lossy(&chunk[..count])}),
-                    );
+                    publish_output(&output_session, &decode_output(&mut pending, &chunk[..count]));
                 }
             }
         }
+        publish_output(&output_session, &String::from_utf8_lossy(&pending));
     });
 
     // Exit watcher: records the code and notifies the attached UI so it can
@@ -177,10 +200,10 @@ pub fn terminal_attach(
     {
         // Hold the buffer while installing the sink: the reader locks the same
         // buffer before emitting, so replayed bytes stay ahead of live output.
-        let buffer = lock(&session.buffer)?;
+        let mut buffer = lock(&session.buffer)?;
         let mut sink = lock(&session.sink)?;
         if !buffer.is_empty() {
-            let _ = channel.send(json!({"type":"output","data":String::from_utf8_lossy(&buffer).into_owned()}));
+            let _ = channel.send(json!({"type":"output","data":String::from_utf8_lossy(buffer.make_contiguous()).into_owned()}));
         }
         *sink = Some(channel);
     }
@@ -232,6 +255,31 @@ pub fn terminal_close(state: tauri::State<'_, crate::AppState>, id: String) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_output_preserves_unicode_across_every_read_boundary() {
+        let text = "hello 世界 🙂 café\r\n";
+        for split in 0..=text.len() {
+            let mut pending = Vec::new();
+            let output = decode_output(&mut pending, &text.as_bytes()[..split])
+                + &decode_output(&mut pending, &text.as_bytes()[split..]);
+            assert_eq!(output, text, "split at byte {split}");
+            assert!(pending.is_empty());
+        }
+        let mut pending = Vec::new();
+        assert_eq!(decode_output(&mut pending, b"a\xffb"), "a\u{fffd}b");
+    }
+
+    #[test]
+    fn terminal_scrollback_caps_bytes_on_a_unicode_boundary() {
+        let mut buffer = VecDeque::new();
+        append_scrollback(&mut buffer, &"界".repeat(REPLAY_CAP / 3 + 2));
+        assert!(buffer.len() <= REPLAY_CAP);
+        assert!(buffer.len() > REPLAY_CAP - 3);
+        assert!(std::str::from_utf8(buffer.make_contiguous()).unwrap().chars().all(|character| character == '界'));
+        append_scrollback(&mut buffer, "last output");
+        assert!(std::str::from_utf8(buffer.make_contiguous()).unwrap().ends_with("last output"));
+    }
 
     // Killing a live shell must not block: the exit watcher holds `child`
     // across wait(), so kill() has to go through the cloned killer.

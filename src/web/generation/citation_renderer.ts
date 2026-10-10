@@ -74,7 +74,7 @@ export function renderSourcesSection(citedIds: string[], sources: SourceRegistry
     const s = sources[id];
     if (s) {
       const dateStr = s.publishedAt ? ` — ${s.publishedAt}` : '';
-      lines.push(`- **[${id}]** [${escapeHtml(s.title).replace(/[\[\]\\]/g,'\\$&')}](${s.url.replace(/\(/g,'%28').replace(/\)/g,'%29')})${dateStr} (${s.domain})`);
+      lines.push(`- **[${id}]** [${escapeHtml(s.title).replace(/[[\]\\]/g,'\\$&')}](${s.url.replace(/\(/g,'%28').replace(/\)/g,'%29')})${dateStr} (${s.domain})`);
     }
   });
 

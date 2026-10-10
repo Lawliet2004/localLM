@@ -20,6 +20,7 @@ const scratch = process.env.LOCALLM_LIVE_SCRATCH || '';
 
 type Row = { pass: number; task: string; sameAsOtherPass: boolean | null; detail: string };
 const rows: Row[] = [];
+const recordedRequests: string[] = [];
 const external: string[] = [];
 let server: ChildProcess | null = null;
 let serverLog = '';
@@ -54,7 +55,7 @@ async function ready(): Promise<void> {
   while (Date.now() < deadline) {
     if (server?.exitCode !== null) throw new Error(`llama-server exited ${server?.exitCode}: ${serverLog.slice(-1500)}`);
     try {
-      const res = await originalFetch(`${base}/health`);
+      const res = await fetch(`${base}/health`);
       if (res.ok) return;
     } catch { /* still starting */ }
     await new Promise((r) => setTimeout(r, 500));
@@ -68,7 +69,7 @@ async function complete(messages: unknown[], extra: Record<string, unknown> = {}
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await originalFetch(url, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -128,7 +129,7 @@ function shippedLedger(pass: number, message: unknown): {
 
 async function abortThenPong(): Promise<{ aborted: boolean; later: string; firstChunkBytes: number }> {
   const controller = new AbortController();
-  const res = await originalFetch(`${base}/v1/chat/completions`, {
+  const res = await fetch(`${base}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -159,15 +160,18 @@ async function abortThenPong(): Promise<{ aborted: boolean; later: string; first
 
 beforeAll(async () => {
   if (!live) return;
+  // Observe this JS process's fetch calls only. Native children and other
+  // transports are outside this recorder; it cannot prove network isolation.
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    if (!/127\.0\.0\.1|localhost/i.test(url)) external.push(url);
+    const url = input instanceof Request ? input.url : String(input);
+    recordedRequests.push(url);
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(new URL(url).hostname)) external.push(url);
     return originalFetch(input, init);
   };
   server = spawn(serverBin, [
     '-m', model, '--jinja', '-c', '2048', '-ngl', '99',
     '--host', '127.0.0.1', '--port', String(port), '--no-webui',
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   server.stdout?.on('data', (chunk) => { serverLog += chunk; });
   server.stderr?.on('data', (chunk) => { serverLog += chunk; });
   await ready();
@@ -178,17 +182,19 @@ afterAll(async () => {
   globalThis.fetch = originalFetch;
   if (!live || !scratch) return;
   const lines = [
-    'step7 remaining families on managed llama-server + MiniCPM5-2B.Q6_K',
+    'direct managed-model fixtures and seeded Rust contracts on MiniCPM5-2B.Q6_K',
     `runtime=${serverBin}`,
     `model=${model}`,
     ...rows.map((row) => `pass=${row.pass} task=${row.task} same=${row.sameAsOtherPass} ${row.detail}`),
-    `unexpected_external_requests=${external.length}`,
+    `recorded_js_fetch_requests=${recordedRequests.length}`,
+    `unexpected_js_external_requests=${external.length}`,
+    'recorder_scope=JS fetch only; native child traffic unobserved; not network-isolation evidence',
     external.length ? `external=${external.join(' ')}` : 'external=none',
   ];
   writeFileSync(join(scratch, 'real-model-suite.log'), lines.join('\n') + '\n');
 });
 
-it.skipIf(!live)('runs the remaining fixture families twice on MiniCPM', async () => {
+it.skipIf(!live)('runs direct MiniCPM fixtures and seeded Rust contracts twice', async () => {
   const pdfBytes = compressedTariffPdf();
   const extracted = extractPdfText(pdfBytes);
   expect(extracted.status).toBe('text_extracted');
@@ -204,21 +210,21 @@ it.skipIf(!live)('runs the remaining fixture families twice on MiniCPM', async (
       role: 'user',
       content: 'In two sentences, explain what a unit test is. Do not use tools.',
     }]);
-    record['ordinary-explanation'] = `ms=${explanation.ms} model=${JSON.stringify(explanation.text)}`;
+    record['ordinary-completion'] = `ms=${explanation.ms} model=${JSON.stringify(explanation.text)}`;
 
     const pdfAnswer = await complete([{
       role: 'user',
       content: `Use only this extracted PDF text.\nPage 1: ${extracted.pages[0]}\nPage 2: ${extracted.pages[1]}\nWhat tariff number is stated, and on which page?`,
     }]);
     const pdfHit = /19\.99/.test(pdfAnswer.text) && /page\s*2|second page|\b2\b/i.test(pdfAnswer.text);
-    record['compressed-pdf'] = `ms=${pdfAnswer.ms} extract_page2=${extracted.pages[1]} model=${JSON.stringify(pdfAnswer.text)} hit=${pdfHit}`;
+    record['supplied-pdf-evidence'] = `ms=${pdfAnswer.ms} extract_page2=${extracted.pages[1]} model=${JSON.stringify(pdfAnswer.text)} hit=${pdfHit}`;
 
     const comparison = await complete([{
       role: 'user',
       content: 'Source A says Alpha costs 10. Source B says Beta costs 12. Compare Alpha and Beta using both sources. Mention both names.',
     }]);
     const compared = /alpha/i.test(comparison.text) && /beta/i.test(comparison.text);
-    record['multi-source-comparison'] = `ms=${comparison.ms} both=${compared} model=${JSON.stringify(comparison.text)}`;
+    record['supplied-source-comparison'] = `ms=${comparison.ms} both=${compared} model=${JSON.stringify(comparison.text)}`;
 
     const calc = await complete([{
       role: 'user',
@@ -226,7 +232,7 @@ it.skipIf(!live)('runs the remaining fixture families twice on MiniCPM', async (
     }], { tools: [runCodeTool], tool_choice: { type: 'function', function: { name: 'run_code' } } });
     const ledger = shippedLedger(pass, calc.message);
     const savedOnce = String(ledger.file).includes('21.59') && ledger.calculated === '21.59' && String(ledger.file).split('21.59').length - 1 === 1;
-    record['search-calculate-save'] = `model=${JSON.stringify(calc.message)} calculated=${ledger.calculated} model_code=${JSON.stringify(ledger.modelCode)} model_invoked=${ledger.modelInvoked} saved=${JSON.stringify(ledger.file)} once=${savedOnce} replayed=${ledger.replayed} inflight=${ledger.inflight}`;
+    record['generated-calc-tool-handoff'] = `model=${JSON.stringify(calc.message)} calculated=${ledger.calculated} model_code=${JSON.stringify(ledger.modelCode)} model_message_parsed=${ledger.modelInvoked} saved=${JSON.stringify(ledger.file)} once=${savedOnce} replayed=${ledger.replayed} inflight=${ledger.inflight}`;
 
     const donePath = join(scratch, `ws-${pass}`, 'done.txt');
     const fileBefore = readFileSync(donePath, 'utf8').trim();
@@ -236,10 +242,10 @@ it.skipIf(!live)('runs the remaining fixture families twice on MiniCPM', async (
     }]);
     const fileAfter = readFileSync(donePath, 'utf8').trim();
     const repeated = fileBefore !== fileAfter;
-    record['pause-restart-resume'] = `file_before=${fileBefore} file_after=${fileAfter} repeated=${repeated} resume=${JSON.stringify(resume.text)} checkpoint=${JSON.stringify(ledger.checkpoint)} inflight=${ledger.inflight} replayed=${ledger.replayed}`;
+    record['seeded-checkpoint-recovery'] = `file_before=${fileBefore} file_after=${fileAfter} repeated=${repeated} resume=${JSON.stringify(resume.text)} checkpoint=${JSON.stringify(ledger.checkpoint)} inflight=${ledger.inflight} replayed=${ledger.replayed}`;
 
     const cancelled = await abortThenPong();
-    record.cancellation = `first_chunk=${cancelled.firstChunkBytes} aborted=${cancelled.aborted} later=${JSON.stringify(cancelled.later)}`;
+    record['http-stream-abort'] = `first_chunk=${cancelled.firstChunkBytes} aborted=${cancelled.aborted} later=${JSON.stringify(cancelled.later)}`;
 
     const externalBefore = external.length;
     const weather = await complete([{
@@ -250,13 +256,13 @@ it.skipIf(!live)('runs the remaining fixture families twice on MiniCPM', async (
       tool_choice: { type: 'function', function: { name: 'web_search' } },
     });
     const toolName = weather.toolCalls[0]?.name ?? 'none';
-    record['offline-chat'] = `external_delta=${external.length - externalBefore} tool=${toolName} call=${JSON.stringify(weather.message)}`;
+    record['generated-weather-tool-call'] = `js_external_delta=${external.length - externalBefore} tool=${toolName} call=${JSON.stringify(weather.message)}`;
 
     const remoteBefore = external.length;
     const local = await complete([{ role: 'user', content: 'What is 1+1? Reply with only the digit.' }]);
     const openaiRequests = external.slice(remoteBefore).filter((url) => /openai\.com/i.test(url)).length;
-    record['old-remote-conversation'] = `text=${JSON.stringify(local.text)} final_url=${local.finalUrl} openai_requests=${openaiRequests}`;
-    record.compaction = `constraints=${ledger.constraints}`;
+    record['local-loopback-completion'] = `text=${JSON.stringify(local.text)} final_url=${local.finalUrl} js_openai_requests=${openaiRequests}`;
+    record['seeded-constraints-persistence'] = `constraints=${ledger.constraints}`;
 
     passes.push(record);
   }
@@ -267,31 +273,33 @@ it.skipIf(!live)('runs the remaining fixture families twice on MiniCPM', async (
     rows.push({ pass: 1, task, sameAsOtherPass: same, detail: passes[0][task] });
     rows.push({ pass: 2, task, sameAsOtherPass: same, detail: passes[1][task] });
   }
-  expect(external.filter((url) => /openai\.com/i.test(url))).toEqual([]);
+  expect(recordedRequests).toContain(`${base}/health`);
+  expect(recordedRequests.filter(url => url === `${base}/v1/chat/completions`).length).toBeGreaterThanOrEqual(18);
+  expect(external).toEqual([]);
   for (const pass of passes) {
-    expect(pass['compressed-pdf']).toContain('hit=true');
-    expect(pass['multi-source-comparison']).toContain('both=true');
-    expect(pass['ordinary-explanation'].length).toBeGreaterThan(40);
-    expect(pass['search-calculate-save']).toContain('calculated=21.59');
-    expect(pass['search-calculate-save']).toContain('model_invoked=1');
-    expect(pass['search-calculate-save']).toContain('once=true');
-    expect(pass['search-calculate-save']).toContain('replayed=0');
-    expect(pass['search-calculate-save']).toContain('inflight=unknown');
-    expect(pass['search-calculate-save']).toContain('run_code');
-    expect(pass['pause-restart-resume']).toContain('file_before=DONE');
-    expect(pass['pause-restart-resume']).toContain('file_after=DONE');
-    expect(pass['pause-restart-resume']).toContain('RESUMED');
-    expect(pass['pause-restart-resume']).toContain('Paused checkpoint');
-    expect(pass['pause-restart-resume']).toContain('inflight=unknown');
-    expect(pass['pause-restart-resume']).toContain('repeated=false');
-    expect(pass.cancellation).toContain('aborted=true');
-    expect(pass.cancellation).toMatch(/first_chunk=[1-9]/);
-    expect(pass.cancellation).toContain('PONG');
-    expect(pass['offline-chat']).toContain('tool=web_search');
-    expect(pass['offline-chat']).toContain('external_delta=0');
-    expect(pass['old-remote-conversation']).toContain('127.0.0.1:8107');
-    expect(pass['old-remote-conversation']).toContain('openai_requests=0');
-    expect(pass['old-remote-conversation']).toContain('"2"');
-    expect(pass.compaction).not.toContain('constraints=0');
+    expect(pass['supplied-pdf-evidence']).toContain('hit=true');
+    expect(pass['supplied-source-comparison']).toContain('both=true');
+    expect(pass['ordinary-completion'].length).toBeGreaterThan(40);
+    expect(pass['generated-calc-tool-handoff']).toContain('calculated=21.59');
+    expect(pass['generated-calc-tool-handoff']).toContain('model_message_parsed=1');
+    expect(pass['generated-calc-tool-handoff']).toContain('once=true');
+    expect(pass['generated-calc-tool-handoff']).toContain('replayed=0');
+    expect(pass['generated-calc-tool-handoff']).toContain('inflight=unknown');
+    expect(pass['generated-calc-tool-handoff']).toContain('run_code');
+    expect(pass['seeded-checkpoint-recovery']).toContain('file_before=DONE');
+    expect(pass['seeded-checkpoint-recovery']).toContain('file_after=DONE');
+    expect(pass['seeded-checkpoint-recovery']).toContain('RESUMED');
+    expect(pass['seeded-checkpoint-recovery']).toContain('Paused checkpoint');
+    expect(pass['seeded-checkpoint-recovery']).toContain('inflight=unknown');
+    expect(pass['seeded-checkpoint-recovery']).toContain('repeated=false');
+    expect(pass['http-stream-abort']).toContain('aborted=true');
+    expect(pass['http-stream-abort']).toMatch(/first_chunk=[1-9]/);
+    expect(pass['http-stream-abort']).toContain('PONG');
+    expect(pass['generated-weather-tool-call']).toContain('tool=web_search');
+    expect(pass['generated-weather-tool-call']).toContain('js_external_delta=0');
+    expect(pass['local-loopback-completion']).toContain('127.0.0.1:8107');
+    expect(pass['local-loopback-completion']).toContain('js_openai_requests=0');
+    expect(pass['local-loopback-completion']).toContain('"2"');
+    expect(pass['seeded-constraints-persistence']).not.toContain('constraints=0');
   }
 }, 420000);

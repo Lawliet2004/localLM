@@ -1,27 +1,26 @@
-import { useEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, Download, PanelLeftOpen, Pencil, Trash2, X, ArrowLeft, ArrowRight, Folder, MoreHorizontal, Cpu, Plug, BookOpen, Wrench, Terminal, Settings } from 'lucide-react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { Check, Download, PanelLeftOpen, Pencil, Trash2, X, ArrowLeft, ArrowRight, Folder, MoreHorizontal } from 'lucide-react';
 
 import { confirm, save } from '@tauri-apps/plugin-dialog';
+import { listen } from '@tauri-apps/api/event';
 
 import { api, errorMessage, nativeAvailable } from './lib/api';
 
-import { defaultRuntimeConfig, type Bootstrap, type Message, type ToolApproval, type ToolSelection, type AccessMode, type ContextUsage, type ModelSelection, type RememberedTools } from './lib/types';
+import { defaultRuntimeConfig, type Bootstrap, type Message, type ToolApproval, type ToolSelection, type AccessMode, type InteractionMode, type ContextUsage, type ModelSelection, type RememberedTools } from './lib/types';
 
 import { Sidebar, type Page } from './components/Sidebar';
 
 import type { Attachment } from './lib/attachments';
 
 import { Chat } from './components/Chat';
+import { localInferenceProvider } from './lib/providerCapabilities';
+import { useRuntimeStatusPoll } from './lib/runtimeStatusPoll';
 
-import { Models } from './components/Models';
 
 import { DownloadActivity } from './components/DownloadActivity';
 
-import { Skills } from './components/Skills';
 
-import { Execution } from './components/Execution';
 
-import { Connectors } from './components/Connectors';
 
 import { ApprovalDialog, ToolsSettings, PermissionSelector } from './components/ToolControls';
 
@@ -29,8 +28,10 @@ import { Trajectory } from './components/Trajectory';
 
 import { WindowControls } from './components/WindowControls';
 import { WorkspacePanel } from './components/WorkspacePanel';
+import { AppearanceSettings, BrowserSettings, DataSettings, GeneralSettings, SettingsShell, ShortcutSettings } from './components/Settings';
+import { applyAppearance, loadAppearance, saveAppearance } from './lib/appearance';
 
-import type { WorkspaceIndex } from './lib/types';
+import type { Task, TaskWorkspace, WorkspaceIndex } from './lib/types';
 
 import { allProjects, conversationProjectId, findProject } from './lib/projects';
 
@@ -40,7 +41,15 @@ import './workspace.css';
 
 import './models.css';
 
+import './settings.css';
+
 import { loadDraft, saveDraft, moveNewDraft } from './lib/drafts';
+
+const Models = lazy(() => import('./components/Models').then(module => ({ default: module.Models })));
+const Skills = lazy(() => import('./components/Skills').then(module => ({ default: module.Skills })));
+const Execution = lazy(() => import('./components/Execution').then(module => ({ default: module.Execution })));
+const Documents = lazy(() => import('./components/Documents').then(module => ({ default: module.Documents })));
+const Connectors = lazy(() => import('./components/Connectors').then(module => ({ default: module.Connectors })));
 
 
 
@@ -92,7 +101,15 @@ export default function App() {
 
       const project = findProject(workspaceIndex, target);
 
-      if (nativeAvailable && api.setWorkspace) await api.setWorkspace(project?.path ?? '');
+      // Same lock as above: a live run keeps the workspace pinned to its own
+      // task, but project selection should not be blocked by it.
+      if (nativeAvailable && api.setWorkspace) {
+
+        try { await api.setWorkspace(project?.path ?? ''); }
+
+        catch (e) { setError(errorMessage(e)); }
+
+      }
 
       if (activeId) setWorkspaceIndex(await api.saveTaskMeta(activeId, { ...(workspaceIndex.tasks[activeId] ?? { archived: false, pinned: false }), projectId: target }));
 
@@ -130,11 +147,16 @@ export default function App() {
 
   const [accessMode, setAccessMode] = useState<AccessMode>('ask');
 
-  // Composer "Plan mode" toggle: on send, a tool-free planning pass runs,
-  // then the ordinary tool loop implements the plan (multi-hop; no early
-  // research stop). Per-session, defaults off.
+  // Ask/Plan/Act: persisted per conversation like the permission choice; the
+  // last pick is remembered as the default for new chats. Old conversations
+  // without a stored mode default to Act.
 
-  const [planMode, setPlanMode] = useState(false);
+  const [interactionMode, setInteractionMode] = useState<InteractionMode>('act');
+
+  // A completed Plan-mode turn sets this; the composer then offers
+  // "Implement plan", which sends a follow-up turn in Act mode.
+
+  const [planReady, setPlanReady] = useState(false);
 
   const [selectedTools, setSelectedTools] = useState<ToolSelection[]>([]);
 
@@ -171,11 +193,52 @@ export default function App() {
   }, [messages, loading, hitId]);
 
   const [generating, setGenerating] = useState(false);
-  const [runPaused, setRunPaused] = useState(false);
+
+  // A task the scheduler started in the open chat runs without a Channel —
+  // track it so the composer still offers Queue/Steer and the Stop button
+  // reaches its cancel signal.
+  const [runningTask, setRunningTask] = useState<Task | null>(null);
+  useEffect(() => {
+    if (!activeId || !nativeAvailable) { setRunningTask(null); return; }
+    let alive = true;
+    const check = async () => {
+      try {
+        const busy = await api.tasksList(['running', 'waiting_approval', 'waiting_resource', 'paused']);
+        if (alive) setRunningTask(busy.find(task => task.conversationId === activeId) ?? null);
+      } catch { /* inbox is a signal, not a hard dependency */ }
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 2000);
+    let unlisten: (() => void) | undefined;
+    void listen('task-event', event => {
+      const payload = event.payload as { conversationId?: string };
+      if (payload?.conversationId === activeId) void check();
+    }).then(u => { unlisten = u; }).catch(() => {});
+    void listen('tasks-changed', () => void check()).then(u => { const prev = unlisten; unlisten = () => { prev?.(); u(); }; }).catch(() => {});
+    return () => { alive = false; window.clearInterval(timer); unlisten?.(); };
+  }, [activeId]);
 
   const [liveActivity, setLiveActivity] = useState<{ state?: string; activity?: string } | null>(null);
 
   const [chatError, setChatError] = useState('');
+  // The conversation's isolated task workspace (git worktree or snapshot
+  // copy). While one is active the backend resolves every tool/terminal/
+  // execution path to it; Review tab applies or discards the result.
+  const [taskWorkspace, setTaskWorkspace] = useState<TaskWorkspace | null>(null);
+  useEffect(() => {
+    if (!activeId || !nativeAvailable) { setTaskWorkspace(null); return; }
+    let cancelled = false;
+    api.taskWorkspaceStatus(activeId).then(task => { if (!cancelled) setTaskWorkspace(task); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [activeId]);
+  const isolateTask = useCallback(async () => {
+    if (!activeId || !nativeAvailable) return;
+    try {
+      setTaskWorkspace(await api.taskWorkspaceCreate(activeId));
+    } catch (error) {
+      setChatError(errorMessage(error));
+    }
+  }, [activeId]);
 
   const [chatNotice, setChatNotice] = useState('');
 
@@ -194,16 +257,82 @@ export default function App() {
   const [error, setError] = useState('');
 
   const [search, setSearch] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
 
   const [collapsed, setCollapsed] = useState(false);
+
+  // Below ~960px the sidebar leaves the grid and becomes a dismissible
+  // overlay so the composer and primary actions stay reachable on the
+  // minimum 760×560 window. It starts closed; the menubar toggle opens it.
+  const [narrow, setNarrow] = useState(() => window.matchMedia?.('(max-width: 960px)').matches ?? false);
+  const [sidebarOverlay, setSidebarOverlay] = useState(false);
+  const sidebarToggle = useRef<HTMLButtonElement>(null);
+  const sidebarOverlayEl = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const query = window.matchMedia?.('(max-width: 960px)');
+    if (!query) return;
+    const change = (event: MediaQueryListEvent) => setNarrow(event.matches);
+    query.addEventListener('change', change);
+    return () => query.removeEventListener('change', change);
+  }, []);
+
+  // Crossing the breakpoint either way closes the overlay; the wide layout
+  // then shows the sidebar per its own collapsed state again.
+  useEffect(() => { setSidebarOverlay(false); }, [narrow]);
+
+  const closeSidebarOverlay = useCallback(() => {
+    setSidebarOverlay(false);
+    sidebarToggle.current?.focus();
+  }, []);
+
+  // Opening moves focus into the panel; Escape closes it and returns focus
+  // to the menubar toggle.
+  useEffect(() => {
+    if (!narrow || !sidebarOverlay) return;
+    const el = sidebarOverlayEl.current;
+    el?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !document.querySelector('dialog[open]')) {
+        event.preventDefault();
+        closeSidebarOverlay();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [narrow, sidebarOverlay, closeSidebarOverlay]);
+
+  function openSearch() {
+    // At narrow widths the search field lives in the overlay sidebar.
+    if (narrow) setSidebarOverlay(true); else setCollapsed(false);
+    setSearchOpen(true);
+    setTimeout(() => document.querySelector<HTMLInputElement>('input[aria-label="Search conversations"]')?.focus(), 0);
+  }
 
   const [renaming, setRenaming] = useState(false);
 
   const [title, setTitle] = useState('');
 
-  const [theme, setTheme] = useState(() => localStorage.getItem('locallm-theme') || 'dark');
+  const [appearance, setAppearance] = useState(loadAppearance);
+  const [systemDark, setSystemDark] = useState(() => window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? true);
+  useEffect(() => {
+    const query = window.matchMedia?.('(prefers-color-scheme: dark)');
+    if (!query) return;
+    const change = (event: MediaQueryListEvent) => setSystemDark(event.matches);
+    query.addEventListener('change', change);
+    return () => query.removeEventListener('change', change);
+  }, []);
+  const resolvedTheme = appearance.theme === 'system' ? (systemDark ? 'dark' : 'light') : appearance.theme;
 
   const selection = useRef(0);
+  const settingsSave = useRef(0);
+
+  // Detect a llama-server that exits while it should be loading or running.
+  useRuntimeStatusPoll(data.runtime.phase, useCallback(runtime => setData(current => {
+    const existing = current.runtime;
+    if (existing.phase === runtime.phase && existing.message === runtime.message && existing.modelPath === runtime.modelPath) return current;
+    return { ...current, runtime };
+  }), [setData]));
 
   const active = data.conversations.find(item => item.id === activeId);
 
@@ -217,9 +346,9 @@ export default function App() {
 
   // Verified loopback engines (llama.cpp servers, FreeToken) run without an API key.
 
-  const providerLoopback = Boolean(selectedProvider && (selectedProvider.baseUrl.includes('localhost') || selectedProvider.baseUrl.includes('127.0.0.1') || selectedProvider.baseUrl.includes('::1')));
+  const providerLoopback = Boolean(selectedProvider && localInferenceProvider(selectedProvider));
 
-  const remoteReady = Boolean(selectedProvider?.verified && (selectedProvider.hasApiKey || providerLoopback) && selectedRemoteModel?.contextLength);
+  const remoteReady = Boolean(providerLoopback && selectedProvider?.verified && selectedRemoteModel?.contextLength);
 
   const chatReady = modelSelection.providerId ? remoteReady && !active?.providerSelectionRequired : nativeAvailable && data.runtime.phase === 'ready';
 
@@ -230,6 +359,10 @@ export default function App() {
     setError('');
 
     setPage(nextPage);
+
+    // Settings take over the whole window; a narrow-window overlay must not
+    // pop back open when the user returns to chat.
+    if (nextPage !== 'chat') setSidebarOverlay(false);
 
   }
 
@@ -260,7 +393,9 @@ export default function App() {
 
     setAccessMode(rememberedTools.current.accessMode ?? 'ask');
 
-    setPlanMode(false);
+    setInteractionMode(rememberedTools.current.interactionMode ?? 'act');
+
+    setPlanReady(false);
 
     setPreset('standard');
 
@@ -295,7 +430,7 @@ export default function App() {
 
       if (conversationId) {
 
-        await api.saveConversationTools(conversationId, { sources, tools, accessMode: mode });
+        await api.saveConversationTools(conversationId, { sources, tools, accessMode: mode, interactionMode });
 
         savedConversation = true;
 
@@ -303,9 +438,11 @@ export default function App() {
 
       if (nativeAvailable) {
 
-        await api.saveRememberedTools({ sources, tools, accessMode: mode });
+        const remembered = { sources, tools, accessMode: mode, interactionMode: rememberedTools.current.interactionMode };
 
-        rememberedTools.current = { sources, tools, accessMode: mode };
+        await api.saveRememberedTools(remembered);
+
+        rememberedTools.current = remembered;
 
       }
 
@@ -328,6 +465,57 @@ export default function App() {
       setSelectedConnectors(sources); setSelectedTools(tools); setAccessMode(mode);
 
     }
+
+    if (failure) setError(failure);
+
+    toolSave.current = false; setSavingTools(false);
+
+  }
+
+  // Ask/Plan/Act: saved on the conversation like the permission mode and
+  // remembered as the default for new chats, without touching either tools
+  // selection. Permitted tools and prompt injections follow on the next turn.
+  async function changeInteractionMode(next: InteractionMode) {
+
+    if (busy || toolSave.current || next === interactionMode) return;
+
+    toolSave.current = true; setSavingTools(true); setError('');
+
+    let savedConversation = false;
+
+    let failure = '';
+
+    try {
+
+      if (activeId) {
+
+        await api.saveConversationTools(activeId, { sources: selectedConnectors, tools: selectedTools, accessMode, interactionMode: next });
+
+        savedConversation = true;
+
+      }
+
+      if (nativeAvailable) {
+
+        const remembered = { ...rememberedTools.current, interactionMode: next };
+
+        await api.saveRememberedTools(remembered);
+
+        rememberedTools.current = remembered;
+
+      }
+
+    } catch (e) {
+
+      failure = savedConversation
+
+        ? `The mode is saved for this conversation, but remembering it for new chats failed: ${errorMessage(e)}`
+
+        : `Your mode choice was not saved: ${errorMessage(e)}`;
+
+    }
+
+    if (savedConversation || !failure) setInteractionMode(next);
 
     if (failure) setError(failure);
 
@@ -411,7 +599,7 @@ export default function App() {
 
   }, []);
 
-  useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('locallm-theme', theme); }, [theme]);
+  useEffect(() => { applyAppearance(appearance, resolvedTheme); saveAppearance(appearance); }, [appearance, resolvedTheme]);
 
   useEffect(() => {
 
@@ -435,6 +623,7 @@ export default function App() {
 
         setSelectedTools(rememberedTools.current.tools);
         setAccessMode(rememberedTools.current.accessMode ?? 'ask');
+        setInteractionMode(rememberedTools.current.interactionMode ?? 'act');
 
       }
 
@@ -450,7 +639,7 @@ export default function App() {
 
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
 
-        event.preventDefault(); setCollapsed(false); setTimeout(() => document.querySelector<HTMLInputElement>('[aria-label="Search conversations"]')?.focus(), 0);
+        event.preventDefault(); openSearch();
 
       }
 
@@ -478,14 +667,17 @@ export default function App() {
 
     setPage('chat'); setActiveId(id); setLoading(true); setError(''); setChatError(''); setLiveActivity(null); setRenaming(false);
 
-    setMessages([]); setSelectedConnectors([]); setSelectedTools([]); setAccessMode('ask'); setPlanMode(false); setPreset('standard');
+    setMessages([]); setSelectedConnectors([]); setSelectedTools([]); setAccessMode('ask'); setInteractionMode('act'); setPlanReady(false); setPreset('standard');
 
     try {
 
       const nextProject = conversationProjectId(workspaceIndex, id);
 
+      // A running model operation holds the backend workspace lock and
+      // rejects the switch; browsing a conversation must still work.
       if (nativeAvailable && api.setWorkspace) {
-        await api.setWorkspace(findProject(workspaceIndex, nextProject)?.path ?? '');
+        try { await api.setWorkspace(findProject(workspaceIndex, nextProject)?.path ?? ''); }
+        catch (e) { setError(errorMessage(e)); }
       }
 
       setProjectId(nextProject);
@@ -512,6 +704,10 @@ export default function App() {
 
         setAccessMode(tools.accessMode || 'ask');
 
+        // Old conversations have no stored mode — Act keeps their behavior.
+
+        setInteractionMode(tools.interactionMode ?? 'act');
+
         if (conversationPreset?.id) setPreset(conversationPreset.id);
 
       }
@@ -524,11 +720,18 @@ export default function App() {
 
   }
 
-  async function send(content: string) {
+  async function send(content: string, modeOverride?: InteractionMode) {
 
     if (busy || toolSave.current) throw new Error('Wait for the active operation before sending a message.');
 
     setChatNotice('');
+
+    // "Implement plan" overrides only this turn's mode; the selector keeps
+    // the user's choice so the next message follows it.
+
+    const sendMode = modeOverride ?? interactionMode;
+
+    setPlanReady(false);
 
     let id = activeId;
 
@@ -537,8 +740,9 @@ export default function App() {
       : (projectId && findProject(workspaceIndex, projectId) ? projectId : allProjects(workspaceIndex)[0]?.id) ?? null;
 
     if (!id && !folderId) {
-      setChatError('Add a project folder first, then send.');
-      return;
+      const issue = 'Add a project folder first, then send.';
+      setChatError(issue);
+      throw new Error(issue);
     }
 
     setGenerating(true); setChatError(''); setLiveActivity({ state: 'Preparing', activity: 'Preparing request…' });
@@ -573,7 +777,9 @@ export default function App() {
 
       }
 
-      await api.saveConversationTools(id, { sources: selectedConnectors, tools: selectedTools, accessMode });
+      // Persist the selector's choice, not a per-turn override — a Plan-mode
+      // conversation stays Plan even while "Implement plan" runs an Act turn.
+      await api.saveConversationTools(id, { sources: selectedConnectors, tools: selectedTools, accessMode, interactionMode });
 
       const conversationId = id;
 
@@ -585,7 +791,15 @@ export default function App() {
 
         if (event.context) setContextUsage({ conversationId, usage: event.context });
 
+        const metrics = event.metrics;
+
+        if (metrics) setMessages(current => current.map(message =>
+          message.id === event.messageId ? { ...message, metrics } : message
+        ));
+
         if ('approval' in event) setApproval(event.approval || null);
+
+        if (event.planReady) setPlanReady(true);
 
         if (event.state || event.activity) {
 
@@ -741,6 +955,8 @@ export default function App() {
 
         }
 
+        if (!event.messageId || (!event.content && !event.reasoning)) return;
+
         setMessages(current => {
 
           const existing = current.find(message => message.id === event.messageId);
@@ -751,7 +967,7 @@ export default function App() {
 
         });
 
-      }, selectedConnectors, selectedTools, planMode);
+      }, selectedConnectors, selectedTools, false, sendMode);
 
     } catch (e) {
 
@@ -771,25 +987,13 @@ export default function App() {
 
         setChatError(`${errorMessage(e)} Could not verify whether your message was saved. Reopen the conversation before sending it again.`);
 
-        return;
+        throw e;
 
       }
 
       setMessages(saved);
 
-      // Always rethrow so Chat.tsx can restore the draft. The error is already
-
-      // displayed via setChatError above; rethrowing ensures the draft and
-
-      // attachment state are properly restored by the caller's catch block.
-
       if (!saved.some(message => message.role === 'user' && !previousIds.has(message.id) && message.content === content.trim())) throw e;
-
-      // Even when the user message was saved, rethrow so the caller knows
-
-      // inference failed and can offer retry.
-
-      throw e;
 
     }
 
@@ -859,7 +1063,25 @@ export default function App() {
 
     }
 
-    catch (e) { setError(errorMessage(e)); setData(current => ({ ...current, runtime: { phase: 'error', message: errorMessage(e), modelPath: null } })); }
+    catch (e) {
+
+      setError(errorMessage(e));
+
+      // Refresh real status instead of manufacturing a null runtime — the
+      // backend restores the previous model when a load fails, so the old
+      // process may still be running.
+
+      let refreshed = false;
+
+      try { setData(normalizeBootstrap(await api.bootstrap())); refreshed = true; } catch { /* keep current data */ }
+
+      // runtimeStatus runs last: it is the freshest view of the process.
+
+      try { const runtime = await api.runtimeStatus(); setData(current => ({ ...current, runtime })); refreshed = true; } catch { /* keep current data */ }
+
+      if (!refreshed) setError(`${errorMessage(e)} · Could not refresh model status`);
+
+    }
 
     finally { setModelBusy(false); }
 
@@ -926,19 +1148,33 @@ export default function App() {
 
   }
 
+  async function restoreConversation(id: string) {
+    try { setWorkspaceIndex(await api.saveTaskMeta(id, { ...(workspaceIndex.tasks[id] ?? { projectId: null, pinned: false }), archived: false })); }
+    catch (e) { setError(errorMessage(e)); }
+  }
+
   const activeProject = allProjects(workspaceIndex).find(p => p.id === projectId);
   const activeProjectName = activeProject?.name ?? '';
 
-  return <div className={`app ${collapsed ? 'sidebar-collapsed' : ''}`}>
+  const banners = <>
+    {!nativeAvailable && <div className="preview-banner">Browser preview · Open the desktop application to load models and save conversations.</div>}
+    {exportedPath && <div className="preview-banner" role="status">Saved conversation to {exportedPath}<button className="icon-button" aria-label="Dismiss export confirmation" onClick={() => setExportedPath('')}><X size={16} /></button></div>}
+    {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
+  </>;
+
+  return <div className={`app ${collapsed || narrow || page !== 'chat' ? 'sidebar-collapsed' : ''}`}>
 
     <div className="app-menubar" aria-label="Application toolbar">
 
       <div className="menubar-nav-group">
         <button
+          ref={sidebarToggle}
           className="icon-button menubar-nav-btn menubar-sidebar-toggle"
           aria-label="Toggle sidebar"
+          aria-expanded={narrow ? sidebarOverlay : !collapsed}
+          aria-controls="app-sidebar"
           title="Toggle sidebar"
-          onClick={() => setCollapsed(!collapsed)}
+          onClick={() => narrow ? setSidebarOverlay(open => !open) : setCollapsed(!collapsed)}
         >
           <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
             <rect x="2" y="2" width="12" height="12" rx="2" />
@@ -973,9 +1209,9 @@ export default function App() {
 
       <details className="app-menu" name="application-menu"><summary>File</summary><div><button disabled={busy} onClick={event => { newConversation(); event.currentTarget.closest('details')?.removeAttribute('open'); }}>New task <kbd>Ctrl+N</kbd></button><button disabled={!active || busy} onClick={() => void exportChat()}>Save a copy…</button></div></details>
 
-      <details className="app-menu" name="application-menu"><summary>Edit</summary><div><button disabled={!active || busy} onClick={event => { if (active) { setTitle(active.title); setRenaming(true); } event.currentTarget.closest('details')?.removeAttribute('open'); }}>Rename task</button><button onClick={event => { setCollapsed(false); setTimeout(() => document.querySelector<HTMLInputElement>('[aria-label="Search conversations"]')?.focus(), 0); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Search tasks <kbd>Ctrl+K</kbd></button></div></details>
+      <details className="app-menu" name="application-menu"><summary>Edit</summary><div><button disabled={!active || busy} onClick={event => { if (active) { setTitle(active.title); setRenaming(true); } event.currentTarget.closest('details')?.removeAttribute('open'); }}>Rename task</button><button onClick={event => { event.currentTarget.closest('details')?.removeAttribute('open'); openSearch(); }}>Search tasks <kbd>Ctrl+K</kbd></button></div></details>
 
-      <details className="app-menu" name="application-menu"><summary>View</summary><div><button onClick={() => setCollapsed(!collapsed)}>Toggle sidebar</button><button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>Switch to {theme === 'dark' ? 'light' : 'dark'} theme</button><button onClick={event => { navigate('models'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Models &amp; runtime</button><button onClick={event => { navigate('connectors'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Connectors</button><button onClick={event => { navigate('skills'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Skills</button><button onClick={event => { navigate('tools'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Tools &amp; permissions</button><button onClick={event => { navigate('execution'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Execution</button></div></details>
+      <details className="app-menu" name="application-menu"><summary>View</summary><div><button onClick={() => setCollapsed(!collapsed)}>Toggle sidebar</button><button onClick={() => setAppearance(current => ({ ...current, theme: resolvedTheme === 'dark' ? 'light' : 'dark' }))}>Switch to {resolvedTheme === 'dark' ? 'light' : 'dark'} theme</button><button onClick={event => { navigate('general'); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Open settings</button></div></details>
 
       <details className="app-menu" name="application-menu"><summary>Help</summary><div className="shortcut-help"><strong>Workspace shortcuts</strong><span>Review <kbd>Ctrl+Shift+G</kbd></span><span>Terminal <kbd>Ctrl+`</kbd></span><span>Browser <kbd>Ctrl+T</kbd></span><span>Files <kbd>Ctrl+P</kbd></span></div></details>
 
@@ -984,176 +1220,143 @@ export default function App() {
       <WindowControls onError={setError} />
     </div>
 
-    {!collapsed && <Sidebar workspace={workspaceIndex} onWorkspace={setWorkspaceIndex} projectId={projectId} onProject={id => void selectProject(id)} onDeleteConversations={ids => void removeConversations(ids)} onHit={(id, messageId) => { setHitId(messageId); void selectConversation(id); }} page={page} onPage={navigate} conversations={data.conversations} activeId={activeId} onSelect={id => void selectConversation(id)} onNew={targetProjectId => void newConversation(targetProjectId)} busy={busy} search={search} onSearch={setSearch} theme={theme} onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')} onCollapse={() => setCollapsed(true)} />}
+    {page === 'chat' && (narrow
+      ? sidebarOverlay && <>
+          {/* Scrim click closes the overlay and returns focus to the toggle. */}
+          <div className="sidebar-scrim" aria-hidden="true" onClick={closeSidebarOverlay} />
+          <div
+            id="app-sidebar"
+            ref={sidebarOverlayEl}
+            className="sidebar-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Conversations"
+            tabIndex={-1}
+          >
+            <Sidebar workspace={workspaceIndex} onWorkspace={setWorkspaceIndex} projectId={projectId} onProject={id => void selectProject(id)} onDeleteConversations={ids => void removeConversations(ids)} onHit={(id, messageId) => { setHitId(messageId); void selectConversation(id); }} page={page} onPage={target => { setSidebarOverlay(false); navigate(target); }} conversations={data.conversations} activeId={activeId} onSelect={id => { setSidebarOverlay(false); void selectConversation(id); }} onNew={targetProjectId => { setSidebarOverlay(false); void newConversation(targetProjectId); }} busy={busy} search={search} onSearch={setSearch} searchOpen={searchOpen} onSearchOpenChange={setSearchOpen} theme={resolvedTheme} onTheme={() => setAppearance(current => ({ ...current, theme: resolvedTheme === 'dark' ? 'light' : 'dark' }))} onCollapse={closeSidebarOverlay} />
+          </div>
+        </>
+      : !collapsed && <Sidebar id="app-sidebar" workspace={workspaceIndex} onWorkspace={setWorkspaceIndex} projectId={projectId} onProject={id => void selectProject(id)} onDeleteConversations={ids => void removeConversations(ids)} onHit={(id, messageId) => { setHitId(messageId); void selectConversation(id); }} page={page} onPage={navigate} conversations={data.conversations} activeId={activeId} onSelect={id => void selectConversation(id)} onNew={targetProjectId => void newConversation(targetProjectId)} busy={busy} search={search} onSearch={setSearch} searchOpen={searchOpen} onSearchOpenChange={setSearchOpen} theme={resolvedTheme} onTheme={() => setAppearance(current => ({ ...current, theme: resolvedTheme === 'dark' ? 'light' : 'dark' }))} onCollapse={() => setCollapsed(true)} />)}
 
     {approval && <ApprovalDialog key={approval.id} request={approval} onResolve={allow => api.resolveToolApproval(approval.id, allow)} onResolveAskUser={(choice) => api.resolveAskUser(approval.id, choice)} />}
 
-    <main className="workspace"><header className={`workspace-header ${page === 'chat' && !messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead">{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{page === 'chat' ? <><button className="icon-button" aria-label="Back" disabled={busy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={busy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</> : <><Settings className="task-folder-icon" size={18} /><span className="workspace-title">{page === 'models' ? 'Models & runtime' : page === 'connectors' ? 'Connectors' : page === 'execution' ? 'Execution' : page === 'tools' ? 'Tools' : 'Skills'}</span></>}</div><div className="header-actions">{page === 'chat' && allProjects(workspaceIndex).length > 0 && <select aria-label="Task project" value={projectId ?? allProjects(workspaceIndex)[0]?.id} disabled={busy} onChange={e => void selectProject(e.target.value)}>{allProjects(workspaceIndex).map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}{page === 'chat' && <WorkspacePanel busy={busy} revision={`${projectId}:${activeId}`} />}<button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header><DownloadActivity />
-
-      {page !== 'chat' && (
-        <nav className="settings-nav-bar" aria-label="Settings navigation">
-          <div className="settings-nav-tabs">
-            <button
-              className={`settings-nav-tab ${page === 'models' ? 'active' : ''}`}
-              aria-label="Settings: Models & runtime"
-              onClick={() => navigate('models')}
-              title="Models & runtime (Local GGUF, llama.cpp)"
-            >
-              <Cpu size={14} />
-              <span>Models &amp; runtime</span>
-            </button>
-            <button
-              className={`settings-nav-tab ${page === 'connectors' ? 'active' : ''}`}
-              aria-label="Settings: Connectors"
-              onClick={() => navigate('connectors')}
-              title="Connectors (MCP servers, external tools)"
-            >
-              <Plug size={14} />
-              <span>Connectors</span>
-            </button>
-            <button
-              className={`settings-nav-tab ${page === 'skills' ? 'active' : ''}`}
-              aria-label="Settings: Skills"
-              onClick={() => navigate('skills')}
-              title="Skills (Reusable workflow instructions & scripts)"
-            >
-              <BookOpen size={14} />
-              <span>Skills</span>
-            </button>
-            <button
-              className={`settings-nav-tab ${page === 'tools' ? 'active' : ''}`}
-              aria-label="Settings: Tools"
-              onClick={() => navigate('tools')}
-              title="Tools & permissions"
-            >
-              <Wrench size={14} />
-              <span>Tools</span>
-            </button>
-            <button
-              className={`settings-nav-tab ${page === 'execution' ? 'active' : ''}`}
-              aria-label="Settings: Execution"
-              onClick={() => navigate('execution')}
-              title="Execution (Interpreters, Web Search)"
-            >
-              <Terminal size={14} />
-              <span>Execution</span>
-            </button>
-          </div>
-          <button
-            className="settings-nav-back"
-            aria-label="Close settings"
-            onClick={() => navigate('chat')}
-            title="Close settings and return to conversation"
-          >
-            <X size={14} />
-            <span>Close</span>
-          </button>
-        </nav>
-      )}
-
-      {!nativeAvailable && <div className="preview-banner">Browser preview · Open the desktop application to load models and save conversations.</div>}
-
-      {exportedPath && <div className="preview-banner" role="status">Saved conversation to {exportedPath}<button className="icon-button" aria-label="Dismiss export confirmation" onClick={() => setExportedPath('')}><X size={16} /></button></div>}
-
-      {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
-
-      {page === 'chat' ? <><Chat
-
+    {page === 'chat' ? <main className="workspace">
+      <header className={`workspace-header ${!messages.length && !renaming ? 'workspace-header-minimal' : ''}`}>
+        <div className="workspace-lead">
+          {collapsed && !narrow && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={17} /></button>}
+          {renaming
+            ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form>
+            : <span className="workspace-title">{active?.title || 'New conversation'}</span>}
+          {activeProjectName && !renaming && <span className="workspace-project"><Folder size={13} aria-hidden="true" />{activeProjectName}</span>}
+        </div>
+        <div className="header-actions">
+          {allProjects(workspaceIndex).length > 0 && <select aria-label="Task project" value={projectId ?? allProjects(workspaceIndex)[0]?.id} disabled={busy} onChange={e => void selectProject(e.target.value)}>{allProjects(workspaceIndex).map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}
+          {active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={17} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}
+          <WorkspacePanel busy={busy} revision={`${projectId}:${activeId}`} conversation={activeId} taskTick={messages.length} onTaskStatus={setTaskWorkspace} />
+        </div>
+      </header>
+      <DownloadActivity />
+      {banners}
+      <Chat
         projectName={activeProjectName}
-
         attachmentDrafts={attachmentDrafts}
-
         onAttachmentDraftsChange={setAttachmentDrafts}
-
         conversationKey={activeId ?? 'new'}
-
         composerTools={<PermissionSelector accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} nativeAvailable={nativeAvailable} />}
-
         contextUsage={contextUsage?.conversationId === activeId ? contextUsage.usage : undefined}
-
         modelLabel={modelLabel}
-
+        modelKey={JSON.stringify([modelSelection, data.runtime.modelPath, data.runtime.loadedConfig, selectedRemoteModel, data.preferences])}
         selectionIssue={active?.providerSelectionRequired || (Boolean(modelSelection.providerId) && !remoteReady)}
-
         draft={draft}
-
         onDraftChange={changeDraft}
-
         messages={messages}
-
-        generating={generating}
-
+        generating={generating || (runningTask != null && runningTask.status !== 'paused')}
         ready={chatReady}
-
         loading={loading}
-
         disabled={savingTools || exporting}
-
         preset={preset}
-
         connectorIds={selectedConnectors}
-
         connectorTools={selectedTools}
-
         onSend={send}
-
-        onCancel={() => { setRunPaused(false); void api.cancelGeneration().catch(e => setChatError(errorMessage(e))); }}
-        onPause={() => { setRunPaused(true); void api.pauseGeneration().catch(e => setChatError(errorMessage(e))); }}
-        paused={runPaused}
-        onResume={() => {
-          if (!activeId) return;
-          void api.resumeGeneration(activeId).then(checkpoint => {
-            setRunPaused(false);
-            const pending = (checkpoint.pending ?? []).join(', ');
-            return send(`Continue from the paused checkpoint. Do not repeat completed work. Pending: ${pending}.`);
-          }).catch(e => setChatError(errorMessage(e)));
-        }}
-
-        onConfigure={() => navigate('models')}
-
-        planMode={planMode}
-
-        onPlanModeChange={setPlanMode}
-
-        onConfigureLocalModel={filename => { setRequestedModel(filename); navigate('models'); }}
-
-        liveActivity={liveActivity}
-
-        providers={data.providers}
-
-        onSelectModel={saveModelSelection}
-
-        chatError={chatError}
-
-        chatNotice={chatNotice}
-
-        onDismissError={() => setChatError('')}
-
-      /><Trajectory
-
-        conversationId={activeId}
-
-        onFork={async newId => {
-
-          try {
-
-            const refreshed = normalizeBootstrap(await api.bootstrap());
-
-            setData(refreshed);
-
-            await selectConversation(newId);
-
-          } catch (e) {
-
-            setError(errorMessage(e));
-
+        onQueue={activeId ? async (content) => {
+          await api.taskEnqueue(activeId, content, interactionMode);
+          setMessages(current => [...current, { id: `queued-${Date.now()}`, conversationId: activeId, role: 'user', content, reasoning: '', status: 'complete', createdAt: Date.now() }]);
+        } : undefined}
+        onSteer={runningTask ? async (content) => api.taskSteer(runningTask.id, content) : undefined}
+        onCancel={() => {
+          if (!generating && runningTask) {
+            void api.taskCancel(runningTask.id).catch(e => setChatError(errorMessage(e)));
+          } else {
+            void api.cancelGeneration().catch(e => setChatError(errorMessage(e)));
           }
-
         }}
-
-      /></> : page === 'tools' ? <ToolsSettings accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} preset={preset} onPresetChange={changePreset} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} scopeLabel={active?.title} onBack={() => navigate('chat')} busy={busy} loading={loading} saving={savingTools} onNavigate={target => navigate(target)} /> : page === 'models' ? <Models onRefresh={async () => { setData(normalizeBootstrap(await api.bootstrap())); }} requestedModel={requestedModel} onRequestedModelHandled={() => setRequestedModel(undefined)} config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveSelection={saveModelSelection} onSaveConfig={async config => { try { await api.saveConfig(config); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'execution' ? <Execution /> : page === 'connectors' ? <Connectors /> : <Skills />}
-
-    </main>
+        onConfigure={() => navigate('models')}
+        interactionMode={interactionMode}
+        onInteractionModeChange={mode => void changeInteractionMode(mode)}
+        taskWorkspace={taskWorkspace}
+        onIsolateTask={activeId && !taskWorkspace ? () => void isolateTask() : undefined}
+        planReady={planReady}
+        onImplementPlan={() => {
+          const prompt = 'Implement the plan in your previous message. Work through the checklist one task at a time, updating the todo tools as steps complete. If a step cannot be completed, say so honestly instead of skipping it.';
+          void send(prompt, 'act').catch(e => setChatError(errorMessage(e)));
+        }}
+        onConfigureLocalModel={filename => { setRequestedModel(filename); navigate('models'); }}
+        liveActivity={liveActivity}
+        providers={data.providers}
+        onSelectModel={saveModelSelection}
+        chatError={chatError}
+        chatNotice={chatNotice}
+        onDismissError={() => setChatError('')}
+      />
+      <Trajectory
+        conversationId={activeId}
+        onFork={async newId => {
+          try {
+            const refreshed = normalizeBootstrap(await api.bootstrap());
+            setData(refreshed);
+            await selectConversation(newId);
+          } catch (e) {
+            setError(errorMessage(e));
+          }
+        }}
+      />
+    </main> : <main className="workspace settings-mode">
+      <DownloadActivity />
+      {banners}
+      <SettingsShell section={page} onSection={navigate} onClose={() => navigate('chat')}>
+        <Suspense fallback={<p role="status" className="loading-state">Opening settings…</p>}>
+        {page === 'general' ? <GeneralSettings accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} nativeAvailable={nativeAvailable} />
+          : page === 'appearance' ? <AppearanceSettings appearance={appearance} onChange={setAppearance} />
+          : page === 'shortcuts' ? <ShortcutSettings />
+          : page === 'data' ? <DataSettings workspace={workspaceIndex} conversations={data.conversations} activeTitle={active?.title} canExport={Boolean(active && messages.length)} onExport={() => void exportChat()} onRestore={id => void restoreConversation(id)} busy={busy} />
+          : page === 'tools' ? <ToolsSettings accessMode={accessMode} interactionMode={interactionMode} onInteractionModeChange={mode => void changeInteractionMode(mode)} preset={preset} onPresetChange={changePreset} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} scopeLabel={active?.title} conversationId={activeId} busy={busy} loading={loading} saving={savingTools} onNavigate={target => navigate(target)} />
+          : page === 'connectors' ? <Connectors />
+          : page === 'skills' ? <Skills conversationId={activeId} />
+          : page === 'execution' || page === 'web-search' ? <Execution section={page} />
+          : page === 'browser' ? <BrowserSettings />
+          : page === 'documents' ? <Documents />
+          : <Models section={page} onSection={navigate} onRefresh={async () => { setData(normalizeBootstrap(await api.bootstrap())); }} requestedModel={requestedModel} onRequestedModelHandled={() => setRequestedModel(undefined)} config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveSelection={saveModelSelection} onSaveConfig={async config => {
+            const request = ++settingsSave.current;
+            try { await api.saveConfig(config); } catch (e) { setError(errorMessage(e)); throw e; }
+            try {
+              const next = normalizeBootstrap(await api.bootstrap());
+              if (request === settingsSave.current) setData(next);
+            } catch (refreshError) {
+              return `Saved, but settings could not be refreshed: ${errorMessage(refreshError)}`;
+            }
+          }} onSavePreferences={async preferences => {
+            const request = ++settingsSave.current;
+            try { await api.savePreferences(preferences); } catch (e) { setError(errorMessage(e)); throw e; }
+            try {
+              const next = normalizeBootstrap(await api.bootstrap());
+              if (request === settingsSave.current) setData(next);
+            } catch (refreshError) {
+              return `Saved, but settings could not be refreshed: ${errorMessage(refreshError)}`;
+            }
+          }} />}
+        </Suspense>
+      </SettingsShell>
+    </main>}
 
   </div>;
 

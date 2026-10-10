@@ -1,0 +1,577 @@
+--- a/src-tauri/src/chat.rs
++++ b/src-tauri/src/chat.rs
+@@ -95,6 +95,7 @@
+     "Give the user a visible final answer now, using the conversation and tool results already collected. State any unresolved work or missing evidence honestly. Do not call tools, repeat progress updates, or expose private reasoning.";
+ const EMPTY_FINAL_ANSWER_ERROR: &str =
+     "The model finished without a visible answer after tool work completed. Please retry the request.";
++const RESEARCH_STALLED_RETRY: &str = "The previous response was not a final answer. Give the best answer supported by results already collected, cite sources where available, state unresolved questions, and do not call tools.";
+ const RESEARCH_STALLED: &str = "Research stopped because repeated web calls made no progress or reached the research budget. Give the best answer supported by the results already collected, cite each source with its URL (https://…) where available, and clearly state any unresolved questions. Do not claim the research or unfinished plan steps are complete. Do not call tools.";
+ const RESEARCH_STALLED_FALLBACK: &str = "Research stopped after repeated unproductive web calls or reaching its research budget. The model could not produce a supported final answer. The collected tool results remain available; unresolved claims have not been verified.";
+ 
+@@ -345,6 +346,16 @@
+     match fallback {
+         Some(answer) => FinalizationAction::Fallback(format!("Research result:\n\n{answer}")),
+         None => FinalizationAction::Error,
++    }
++}
++
++fn finalization_retry_instruction(stalled: bool, stall_announced: bool) -> &'static str {
++    if !stalled {
++        FINAL_ANSWER_INSTRUCTION
++    } else if stall_announced {
++        RESEARCH_STALLED_RETRY
++    } else {
++        RESEARCH_STALLED
+     }
+ }
+ 
+@@ -1687,6 +1698,7 @@
+     let mut research_attempted = false;
+     let mut research_source_urls = std::collections::HashSet::<String>::new();
+     let mut research_fallback: Option<String> = None;
++    let mut stalled_announced = false;
+     let mut finalization_retried = false;
+     // Calls whose `tool_call` session event exists without a `tool_result`
+     // yet: (step id, call, dispatched). The epilogue closes any left behind
+@@ -2356,7 +2368,10 @@
+                         if !round_answer.trim().is_empty() && !is_text_tool_call(&round_answer) {
+                             messages.push(json!({"role":"assistant","content":round_answer}));
+                         }
+-                        messages.push(json!({"role":"user","content":if research_progress.stopped() { RESEARCH_STALLED } else { FINAL_ANSWER_INSTRUCTION }}));
++                        let stalled = research_progress.stopped();
++                        let instruction = finalization_retry_instruction(stalled, stalled_announced);
++                        if stalled { stalled_announced = true; }
++                        messages.push(json!({"role":"user","content":instruction}));
+                         if let Ok(store) = state.database() {
+                             emit_session_event(
+                                 &store,
+@@ -3069,6 +3084,7 @@
+             if !tool_use_denied && research_progress.stopped() && research_fallback.is_none() {
+                 let unresolved = "Unresolved: the research budget is exhausted before every source was read.";
+                 research_fallback = Some(format!("{RESEARCH_STALLED_FALLBACK}\n\n{unresolved}"));
++                stalled_announced = true;
+                 messages.push(json!({"role":"user","content":format!("{RESEARCH_STALLED}\n\n{unresolved}")}));
+                 let mut event = ChatEvent::progress(&run.id, &step_id, &assistant.id, "Research stopped · preparing answer…", None);
+                 event.notice = Some("Research is no longer making progress or has reached its budget. Preparing an answer from the collected results.".into());
+@@ -3437,6 +3453,13 @@
+ mod finish_tests {
+     use serde_json::json;
+     #[test]
++    fn stalled_finalization_retry_does_not_repeat_the_stall_announcement() {
++        assert_eq!(super::finalization_retry_instruction(true, false), super::RESEARCH_STALLED);
++        assert_eq!(super::finalization_retry_instruction(true, true), super::RESEARCH_STALLED_RETRY);
++        assert_eq!(super::finalization_retry_instruction(false, true), super::FINAL_ANSWER_INSTRUCTION);
++    }
++
++    #[test]
+     fn direct_weather_route_handles_a_current_request_without_catching_analysis() {
+         assert!(super::is_direct_weather_request("What is the weather of Kokata?"));
+         assert!(super::is_direct_weather_request("What is today's weather report for Kolkata?\n- Max temperature"));
+
+--- a/src-tauri/src/sandbox.rs
++++ b/src-tauri/src/sandbox.rs
+@@ -622,11 +622,44 @@ pub async fn web_fetch(url: &str) -> Result<serde_json::Value, String> {
+     web_fetch_with_flag(url, false).await
+ }
+ 
++fn has_soft_error_heading(raw: &str) -> bool {
++    let lower = raw.to_ascii_lowercase();
++    ["title", "h1"].iter().any(|tag| {
++        let open = format!("<{tag}");
++        let close = format!("</{tag}");
++        let Some(start) = lower.find(&open) else {
++            return false;
++        };
++        let Some(open_end) = lower[start..].find('>') else {
++            return false;
++        };
++        let content_start = start + open_end + 1;
++        let Some(content_len) = lower[content_start..].find(&close) else {
++            return false;
++        };
++        let heading = html_to_text(&raw[content_start..content_start + content_len])
++            .trim()
++            .to_ascii_lowercase();
++        matches!(
++            heading.as_str(),
++            "404"
++                | "404 error"
++                | "404 not found"
++                | "404 page not found"
++                | "page not found"
++                | "the page was not found"
++                | "the requested page was not found"
++                | "sorry, page not found"
++                | "access denied"
++                | "403 forbidden"
++                | "just a moment"
++        )
++    })
++}
++
+ fn shape_fetch_response(url: &str, status: u16, raw: String, spill: bool) -> serde_json::Value {
+     let body = html_to_text(&raw);
+-    let lower = raw.to_ascii_lowercase();
+-    let error_page = status < 400 && ["<title>page not found", "<title>404", "<title>access denied", "<title>just a moment", "<h1>page not found", "<h1>404"]
+-        .iter().any(|marker| lower.contains(marker));
++    let error_page = status < 400 && has_soft_error_heading(&raw);
+     let failed = status >= 400 || error_page;
+     let mut result = serde_json::json!({
+         "url": url,
+@@ -895,6 +928,14 @@ mod tests {
+         let soft_404 = shape_fetch_response("https://example.org/missing", 200, "<html><title>Page Not Found</title><h1>Missing</h1></html>".into(), false);
+         assert_eq!(soft_404["status"], 200);
+         assert_eq!(soft_404["isError"], true);
++
++        let article = shape_fetch_response("https://example.org/http-status", 200,
++            "<html><title>HTTP 404 status code explained</title><body><p>Why missing pages return 404.</p></body></html>".into(), false);
++        assert_ne!(article["isError"], true);
++        assert!(article["body"]
++            .as_str()
++            .unwrap()
++            .contains("Why missing pages return 404"));
+     }
+     #[tokio::test]
+     async fn web_fetch_reports_live_http_status_from_a_local_server() {
+
+--- a/scripts/web-transport.mjs
++++ b/scripts/web-transport.mjs
+@@ -106,7 +106,7 @@
+             this.cooldowns.set(domain, Math.max(Date.now() + 30000, Number.isFinite(deadline) ? deadline : 0));
+             lastError = new Error(`HTTP ${response.status}`);
+             if (attempt < 2) { await new Promise(r => setTimeout(r, 3000)); continue; }
+-            throw lastError;
++            return response;
+           }
+           return response;
+         } catch (err) {
+@@ -148,12 +148,25 @@
+           url = new URL(res.headers.location, url);
+           continue;
+         }
+-        if (res.status !== 200) throw new Error(`Page unavailable: HTTP ${res.status}`);
+         const mime = String(res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
++        const bodyBuffer = Buffer.isBuffer(res.body) ? res.body : Buffer.from(res.body || '');
++        const body = bodyBuffer.subarray(0, options.maxBytes).toString('utf8');
++        if (res.status !== 200) {
++          return {
++            url: raw,
++            finalUrl: url.href,
++            success: false,
++            status: res.status,
++            body,
++            mimeType: mime,
++            error: `Page unavailable: HTTP ${res.status}`,
++            durationMs: Date.now() - started,
++          };
++        }
+         if (!['text/html','text/plain','text/markdown','application/xhtml+xml','application/json','application/pdf'].includes(mime)) throw new Error(`Unsupported MIME ${mime}`);
+         // PDFs travel as latin1 text so the worker's extractor sees raw bytes.
+-        const body = mime === 'application/pdf' ? res.body.toString('latin1') : res.body.toString('utf8');
+-        return {url: raw, finalUrl: url.href, success: true, status: res.status, body, mimeType: mime, durationMs: Date.now() - started};
++        const decoded = mime === 'application/pdf' ? bodyBuffer.subarray(0, options.maxBytes).toString('latin1') : body;
++        return {url: raw, finalUrl: url.href, success: true, status: res.status, body: decoded, mimeType: mime, durationMs: Date.now() - started};
+       }
+       throw new Error('Redirect limit exceeded');
+     } catch (error) {
+
+--- a/scripts/web-worker.mjs
++++ b/scripts/web-worker.mjs
+@@ -6,6 +6,7 @@
+ import { DocumentStore } from '../src/web/documents/document_store.ts';
+ import { extractAtomicClaims } from '../src/web/verification/claim_extractor.ts';
+ import { ClaimVerifier } from '../src/web/verification/claim_verifier.ts';
++import { shapeFailedFetch } from '../src/web/fetch/failure.ts';
+ import { WeatherProvider } from '../src/web/verticals/weather/weather_provider.ts';
+ 
+ /** Bounded page shape returned to the model for visit/fetch-url calls. */
+@@ -98,7 +99,11 @@
+   } else if (request.action === 'search') {
+     result = await engine.searchQueries(request.query);
+   } else if (request.action === 'fetch-url') {
+-    result = shapeDocument(await engine.fetchUrl(request.url));
++    try {
++      result = shapeDocument(await engine.fetchUrl(request.url));
++    } catch (error) {
++      result = shapeFailedFetch(String(request.url), error);
++    }
+   } else if (request.action === 'fetch-urls') {
+     // One worker process serves the whole visit batch; per-page failures are
+     // isolated so a single bad URL never discards the rest.
+@@ -108,7 +113,7 @@
+         try {
+           return shapeDocument(await engine.fetchUrl(String(url)));
+         } catch (error) {
+-          return { url: String(url), isError: true, message: String(error?.message || error) };
++          return shapeFailedFetch(String(url), error);
+         }
+       })),
+     };
+
+--- a/scripts/web-transport.test.mjs
++++ b/scripts/web-transport.test.mjs
+@@ -32,3 +32,34 @@
+   assert.equal(result.success, false);
+   assert.deepEqual(calls, ['/robots.txt']);
+ });
++
++test('HTTP error reads retain their status and a bounded diagnostic body', async () => {
++  const get = async (url) => {
++    if (url.pathname === '/robots.txt') return { status: 404, headers: {}, body: Buffer.from('') };
++    const status = url.pathname === '/missing' ? 404 : 403;
++    return {
++      status,
++      headers: { 'content-type': 'text/html' },
++      body: Buffer.from(`<html><title>${status} Error</title><p>${'diagnostic '.repeat(20)}</p></html>`),
++    };
++  };
++  const fetcher = new PinnedPageFetcher(2, 1, get);
++  for (const [path, status] of [['/missing', 404], ['/blocked', 403]]) {
++    const result = await fetcher.fetch(`https://1.1.1.1${path}`, { maxBytes: 4096 });
++    assert.equal(result.success, false);
++    assert.equal(result.status, status);
++    assert.match(result.error, new RegExp(String(status)));
++    assert.match(result.body, /diagnostic/);
++    assert.ok(Buffer.byteLength(result.body) <= 4096);
++  }
++});
++
++test('HTTP 200 reads remain successful and retain their content', async () => {
++  const get = async (url) => url.pathname === '/robots.txt'
++    ? { status: 404, headers: {}, body: Buffer.from('') }
++    : { status: 200, headers: { 'content-type': 'text/html' }, body: Buffer.from('<html><title>Article</title><p>Fetched article text.</p></html>') };
++  const result = await new PinnedPageFetcher(2, 1, get).fetch('https://1.1.1.1/article');
++  assert.equal(result.success, true);
++  assert.equal(result.status, 200);
++  assert.match(result.body, /Fetched article text/);
++});
+
+--- a/scripts/bundled-worker.test.mjs
++++ b/scripts/bundled-worker.test.mjs
+@@ -53,3 +53,30 @@
+     rmSync(directory, { recursive: true, force: true });
+   }
+ });
++
++test('bundled worker returns URL fetch failures as structured tool errors', async () => {
++  const directory = mkdtempSync(join(tmpdir(), 'locallm-worker-fetch-test-'));
++  try {
++    const child = spawn(process.execPath, [resolve('src-tauri/resources/web/worker.mjs')], {
++      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
++    });
++    child.stdin.end(JSON.stringify({
++      action: 'fetch-url',
++      url: 'http://127.0.0.1/private',
++      databasePath: join(directory, 'research.sqlite'),
++      config: { cache: { enabled: false }, fetch: { waybackFallback: false, jsRenderFallback: false } },
++    }));
++    let stdout = '';
++    let stderr = '';
++    for await (const chunk of child.stdout) stdout += chunk;
++    for await (const chunk of child.stderr) stderr += chunk;
++    const exit = await new Promise((resolveClose) => child.on('close', resolveClose));
++    assert.equal(exit, 0, stderr);
++    const result = JSON.parse(stdout);
++    assert.equal(result.isError, true);
++    assert.equal(result.failureKind, 'fetch_failed');
++    assert.match(result.message, /Non-public address blocked/);
++  } finally {
++    rmSync(directory, { recursive: true, force: true });
++  }
++});
+
+--- a/src/web/fetch/challenge.ts
++++ b/src/web/fetch/challenge.ts
+@@ -18,6 +18,8 @@
+ export const CHALLENGE_MISS_REASON = 'challenge_detected';
+ 
+ const BODY_SCAN_LIMIT = 64 * 1024;
++const ERROR_PAGE_SCAN_LIMIT = 8 * 1024;
++const ERROR_PAGE_HEADING = /^(?:sorry[,!\s]+)?(?:(?:the\s+)?page\s+not\s+found|(?:the\s+)?requested\s+(?:page|url|resource)\s+(?:was\s+)?not\s+found|404(?:\s+(?:error|not found))?|not found|access denied|403 forbidden)(?:\s*[-|:]\s*[\w .-]{1,60})?$/i;
+ 
+ const BODY_MARKERS: readonly { marker: string; re: RegExp }[] = [
+   { marker: 'title:just-a-moment', re: /<title[^>]*>\s*just a moment/i },
+@@ -25,6 +27,20 @@
+   { marker: 'challenge-platform', re: /challenge-platform/i },
+   { marker: '_cf_chl_opt', re: /_cf_chl_opt/i },
+ ];
++
++/** Detect obvious HTTP error templates served with a misleading 200 status. */
++export function detectErrorPage(body?: string | null): string | null {
++  if (!body) return null;
++  const head = body.slice(0, ERROR_PAGE_SCAN_LIMIT);
++  const headings = [...head.matchAll(/<(title|h1)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi)];
++  for (const match of headings) {
++    const text = match[2].replace(/<[^>]*>/g, ' ').replace(/&nbsp;|&#160;/gi, ' ').replace(/\s+/g, ' ').trim();
++    if (ERROR_PAGE_HEADING.test(text)) {
++      return `error_page:${match[1].toLowerCase()}`;
++    }
++  }
++  return null;
++}
+ 
+ export function detectChallenge(
+   status: number,
+
+--- a/src/web/fetch/cascade.ts
++++ b/src/web/fetch/cascade.ts
+@@ -11,7 +11,7 @@
+ import type { FetchOptions, FetchResult } from './http_fetcher';
+ import { toGitHubRawCandidates, isUsableRawResponse } from './github_fast_path';
+ import { fetchViaWayback } from './wayback';
+-import { detectChallenge, CHALLENGE_MISS_REASON } from './challenge';
++import { detectChallenge, detectErrorPage, CHALLENGE_MISS_REASON } from './challenge';
+ import type { DomainStatsStore } from './domain_stats';
+ 
+ export type FetchMethod = 'github_raw' | 'live' | 'js_render' | 'wayback' | 'failed';
+@@ -102,6 +102,7 @@
+   const titleHint = options.titleHint || url;
+ 
+   let skippedLive = false;
++  let failedFetch: FetchResult | undefined;
+   if (options.domainStats && domain) {
+     const status = await options.domainStats.status(domain);
+     if (status.chronic) skippedLive = true;
+@@ -121,7 +122,7 @@
+   const tryRender = async (): Promise<CascadeOutcome | null> => {
+     if (!options.jsRender) return null;
+     const rendered = await options.jsRender(url).catch(() => null);
+-    if (!rendered?.html || detectChallenge(200, rendered.html)) return null;
++    if (!rendered?.html || detectChallenge(200, rendered.html) || detectErrorPage(rendered.html)) return null;
+     const document = fromHtml(rendered.html, titleHint, rendered.finalUrl || url, 'js_render');
+     if (!document.text.trim()) return null;
+     return { document, method: 'js_render' };
+@@ -152,8 +153,19 @@
+         return { document: null, raw: live, method: 'live' };
+       }
+       const challenge = detectChallenge(live.status ?? 200, live.body);
+-      if (challenge) {
++      const errorPage = detectErrorPage(live.body);
++      if (errorPage) {
++        failureDetail = `${errorPage}: no research content was retrieved`;
++        failedFetch = live;
++        await record(false, failureDetail);
++        const rendered = await tryRender();
++        if (rendered) {
++          await record(true);
++          return rendered;
++        }
++      } else if (challenge) {
+         failureDetail = `${CHALLENGE_MISS_REASON}:${challenge.marker}`;
++        failedFetch = live;
+         await record(false, failureDetail);
+         const rendered = await tryRender();
+         if (rendered) {
+@@ -174,6 +186,7 @@
+       }
+     } else {
+       failureDetail = live.error || 'empty or thin response';
++      failedFetch = live;
+       await record(false, live.error);
+       // A browser render can outlive plain HTTP failures (TLS fingerprints,
+       // transient errors) but must never bypass a robots.txt refusal.
+@@ -219,6 +232,7 @@
+ 
+   return {
+     document: null,
++    raw: failedFetch,
+     method: 'failed',
+     skippedLive,
+     error: skippedLive ? 'chronic domain skipped live fetch' : (failureDetail || 'fetch failed'),
+
+--- a/src/web/fetch/cascade.test.ts
++++ b/src/web/fetch/cascade.test.ts
+@@ -160,3 +160,45 @@
+   expect(outcome.method).toBe('failed');
+   expect(calls.some((u) => u === 'https://walled.example/page')).toBe(false);
+ });
++
++it('rejects a successful HTTP status that contains a soft 404 page', async () => {
++  const body = `<html><head><title>Page Not Found</title></head><body><h1>Sorry, page not found</h1><p>${'This page is unavailable. '.repeat(12)}</p></body></html>`;
++  const outcome = await fetchPageCascade('https://source.example/missing', {
++    fetch: async (url: string) => ({
++      url, finalUrl: url, success: true, status: 200, mimeType: 'text/html', body, durationMs: 1,
++    }),
++  }, { waybackFallback: false });
++  expect(outcome.method).toBe('failed');
++  expect(outcome.document).toBeNull();
++  expect(outcome.error).toMatch(/error_page:title/i);
++  expect(outcome.raw?.status).toBe(200);
++  expect(outcome.raw?.body).toBe(body);
++});
++
++it('keeps an article about HTTP 404 status codes as source content', async () => {
++  const body = `<html><head><title>HTTP 404 status code explained</title></head><body><article><p>${'A 404 status means the requested resource was not found. '.repeat(8)}</p></article></body></html>`;
++  const outcome = await fetchPageCascade('https://source.example/http-status-guide', {
++    fetch: async (url: string) => ({
++      url, finalUrl: url, success: true, status: 200, mimeType: 'text/html', body, durationMs: 1,
++    }),
++  }, { waybackFallback: false });
++  expect(outcome.method).toBe('live');
++  expect(outcome.document?.text).toContain('A 404 status means');
++});
++
++it('retains HTTP 403 and 404 diagnostic bodies on failed reads', async () => {
++  for (const status of [403, 404]) {
++    const body = `<html><title>${status} Error</title><body>${'Diagnostic page text. '.repeat(12)}</body></html>`;
++    const outcome = await fetchPageCascade(`https://source.example/${status}`, {
++      fetch: async (url: string) => ({
++        url, finalUrl: url, success: false, status, mimeType: 'text/html', body,
++        error: `Page unavailable: HTTP ${status}`, durationMs: 1,
++      }),
++    }, { waybackFallback: false });
++    expect(outcome.method).toBe('failed');
++    expect(outcome.document).toBeNull();
++    expect(outcome.error).toContain(String(status));
++    expect(outcome.raw?.status).toBe(status);
++    expect(outcome.raw?.body).toBe(body);
++  }
++});
+
+--- /dev/null
++++ b/src/web/fetch/failure.ts
+@@ -0,0 +1,26 @@
++const DIAGNOSTIC_BODY_LIMIT = 4000;
++
++export class FetchFailure extends Error {
++  readonly status?: number;
++  readonly diagnosticBody?: string;
++
++  constructor(message: string, status?: number, diagnosticBody?: string) {
++    super(message);
++    this.name = 'FetchFailure';
++    if (Number.isInteger(status)) this.status = status;
++    if (diagnosticBody) this.diagnosticBody = diagnosticBody.slice(0, DIAGNOSTIC_BODY_LIMIT);
++  }
++}
++
++export function shapeFailedFetch(url: string, error: unknown) {
++  const failure = error instanceof FetchFailure ? error : undefined;
++  const diagnosticBody = failure?.diagnosticBody?.slice(0, DIAGNOSTIC_BODY_LIMIT);
++  return {
++    url,
++    isError: true,
++    failureKind: 'fetch_failed',
++    ...(failure?.status !== undefined ? { status: failure.status } : {}),
++    ...(diagnosticBody ? { diagnosticBody } : {}),
++    message: `${error instanceof Error ? error.message : String(error)}${diagnosticBody ? ' Diagnostic body is not research evidence.' : ''}`,
++  };
++}
+
+--- /dev/null
++++ b/src/web/fetch/failure.test.ts
+@@ -0,0 +1,16 @@
++import { describe, expect, it } from 'vitest';
++import { FetchFailure, shapeFailedFetch } from './failure';
++
++describe('failed URL reads', () => {
++  it('returns status and bounded body as diagnostic-only error data', () => {
++    const result = shapeFailedFetch(
++      'https://source.example/blocked',
++      new FetchFailure('Fetch failed: HTTP 403', 403, 'diagnostic '.repeat(1000)),
++    );
++    expect(result.isError).toBe(true);
++    expect(result.failureKind).toBe('fetch_failed');
++    expect(result.status).toBe(403);
++    expect((result.diagnosticBody ?? '').length).toBeLessThanOrEqual(4000);
++    expect(result.message).toContain('not research evidence');
++  });
++});
+
+--- a/src/web/index.ts
++++ b/src/web/index.ts
+@@ -35,6 +35,7 @@
+ import { selectPagesToFetch } from './fetch/fetch_policy';
+ import { HttpFetcher } from './fetch/http_fetcher';
+ import { fetchPageCascade } from './fetch/cascade';
++import { FetchFailure } from './fetch/failure';
+ import { DomainStatsStore, orderByDomainHealth } from './fetch/domain_stats';
+ import { fallbackSnippetExtraction } from './extraction/extraction_fallback';
+ import { chunkDocument } from './chunking/semantic_chunker';
+@@ -66,6 +67,7 @@
+ export * from './config/schema';
+ export * from './config/defaults';
+ export { formatDiagnosticReport } from './observability/metrics';
++export { FetchFailure } from './fetch/failure';
+ 
+ export interface EngineDependencies {
+   searchProvider?: SearchProvider;
+@@ -268,7 +270,11 @@
+         },
+       };
+     }
+-    throw new Error(`Fetch failed: ${outcome.error || res?.error || 'unknown error'}`);
++    throw new FetchFailure(
++      `Fetch failed: ${outcome.error || res?.error || 'unknown error'}`,
++      outcome.raw?.status,
++      outcome.raw?.body,
++    );
+   }
+ 
+   private async retrieveCandidate(
+
+--- a/src/web/index.test.ts
++++ b/src/web/index.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+ import { installWebFixtures, MockSearchProvider } from './test-fixtures';
+-import { WebSearchEngine } from './index';
++import { FetchFailure, WebSearchEngine } from './index';
++import { createConfig } from './config/defaults';
+ import { formatDiagnosticReport } from './observability/metrics';
+ import type { SearchResult } from './types';
+ 
+@@ -11,6 +12,24 @@
+     vi.restoreAllMocks();
+     vi.unstubAllGlobals();
+     globalThis.fetch = originalFetch;
++  });
++
++  it('preserves bounded status diagnostics when a direct URL read fails', async () => {
++    const body = 'Page Not Found. '.repeat(500);
++    const engine = new WebSearchEngine({
++      config: { fetch: { ...createConfig().fetch, waybackFallback: false } },
++      fetcher: {
++        fetch: async (url) => ({
++          url, finalUrl: url, success: false, status: 403, body,
++          error: 'Page unavailable: HTTP 403', durationMs: 1,
++        }),
++      },
++    });
++    const error = await engine.fetchUrl('https://source.example/blocked').catch((value) => value);
++    expect(error).toBeInstanceOf(FetchFailure);
++    expect(error.status).toBe(403);
++    expect(error.diagnosticBody).toContain('Page Not Found');
++    expect(error.diagnosticBody.length).toBeLessThanOrEqual(4000);
+   });
+ 
+   // Test A: Weather Structured Retrieval
+
+--- a/src/web/planning/research_state.test.ts
++++ b/src/web/planning/research_state.test.ts
+@@ -49,8 +49,11 @@
+     expect(decision.shouldRetry).toBe(false);
+   });
+ 
+-  it('refuses to retry an already-tried targeted query', () => {
+-    expect(isRepeatedQuery('Model X parameters benchmark', ['benchmark parameters model x'])).toBe(true);
++  it('deduplicates normalized repeats without erasing query word order', () => {
++    expect(isRepeatedQuery('Model X parameters benchmark', ['model x parameters benchmark'])).toBe(true);
++    expect(isRepeatedQuery('Model   X parameters benchmark', ['model x parameters benchmark'])).toBe(true);
++    expect(isRepeatedQuery('Model X parameters benchmark', ['benchmark parameters model x'])).toBe(false);
++    expect(isRepeatedQuery('C++ language', ['C language'])).toBe(false);
+     const decision = evaluateResearchRetry(
+       { claims: [{ claim: 'Model X parameters unknown', status: 'UNSUPPORTED', sources: [] }], allSupported: false, supportedCount: 0, unsupportedCount: 1, conflictingCount: 0 },
+       0, 3, ['model parameters unknown'],
+
+--- a/src/web/verification/research_retry.ts
++++ b/src/web/verification/research_retry.ts
+@@ -16,7 +16,7 @@
+ 
+ /** Normalize a query for repeat detection. */
+ export function normalizeQueryText(query: string): string {
+-  return query.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(Boolean).sort().join(' ');
++  return query.toLowerCase().trim().replace(/\s+/g, ' ');
+ }
+ 
+ export function isRepeatedQuery(query: string, tried: string[]): boolean {

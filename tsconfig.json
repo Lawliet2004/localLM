@@ -21,5 +21,7 @@
     "noFallthroughCasesInSwitch": true
   },
   "include": ["src"],
+  // Live-GPU fixture test uses node:* builtins and `process`; the project has no @types/node.
+  "exclude": ["src/web/extraction/minicpm-live-fixtures.test.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

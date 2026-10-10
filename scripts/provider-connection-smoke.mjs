@@ -10,6 +10,7 @@ const server = createServer((request, response) => {
     response.end(JSON.stringify({ data: [{ id: 'fixture-model', description: 'x'.repeat(20000) }] }));
   } else if (request.url === '/custom/chat/completions') {
     let body = '';
+    request.setEncoding('utf8');
     request.on('data', chunk => { body += chunk; });
     request.on('end', () => {
       const payload = JSON.parse(body);

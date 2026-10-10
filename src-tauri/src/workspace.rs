@@ -17,7 +17,10 @@ pub struct Workspace {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadRequest {
-    path: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
     #[serde(default = "first_line")]
     start_line: usize,
     #[serde(default = "default_lines")]
@@ -29,6 +32,12 @@ fn first_line() -> usize {
 fn default_lines() -> usize {
     200
 }
+// Batching bounds: one call replaces many round trips, but the response
+// must stay small enough for a local model's context.
+const BATCH_READ_LIMIT: usize = 8;
+const BATCH_READ_OUTPUT_LIMIT: usize = 262_144;
+const BATCH_CREATE_LIMIT: usize = 8;
+const BATCH_EDIT_LIMIT: usize = 20;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PathRequest {
@@ -90,6 +99,7 @@ struct SearchLimits {
 /// Depth-first walk collecting files whose name or `/`-joined relative path
 /// contains `needle` (already lowercased). Links are never entered or
 /// returned. A bound stops the walk and names which limit was hit.
+#[allow(clippy::too_many_arguments)]
 fn search_in(
     directory: &Dir,
     prefix: &str,
@@ -154,8 +164,40 @@ fn search_in(
 struct EditRequest {
     path: String,
     expected_sha256: String,
+    #[serde(default)]
+    old_text: Option<String>,
+    #[serde(default)]
+    new_text: Option<String>,
+    #[serde(default)]
+    replacements: Option<Vec<Replacement>>,
+    #[serde(default)]
+    content: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Replacement {
     old_text: String,
     new_text: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileDraft {
+    path: String,
+    content: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRequest {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    files: Option<Vec<FileDraft>>,
+}
+enum EditMode {
+    Replace(Vec<(String, String)>),
+    Rewrite(String),
 }
 fn parse_hash(value: &str) -> Result<[u8; 32], String> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -206,6 +248,24 @@ fn is_device(part: &str) -> bool {
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.as_bytes()[3].is_ascii_digit())
 }
+/// Stage beside the destination using its pinned directory capability. Until
+/// rename succeeds, a failed write/sync leaves the original file untouched.
+fn replace_file(
+    directory: &Dir,
+    name: &std::ffi::OsStr,
+    prepare: impl FnOnce(&mut cap_std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let temporary = format!(".locallm-edit-{}.tmp", uuid::Uuid::new_v4());
+    let mut staged = directory.open_with(&temporary, OpenOptions::new().write(true).create_new(true))?;
+    let prepared = prepare(&mut staged);
+    drop(staged);
+    let result = prepared.and_then(|()| directory.rename(&temporary, directory, name));
+    if result.is_err() {
+        let _ = directory.remove_file(&temporary);
+    }
+    result
+}
+
 fn unified_diff(path: &str, before: &str, after: &str) -> String {
     // A small reviewable hunk around the single unique replacement site.
     // The edit backend already guarantees exactly one match.
@@ -268,6 +328,56 @@ impl Workspace {
                 .map_err(|error| format!("Could not open workspace: {error}"))?,
         })
     }
+    fn read_entry(&self, path: &str, start_line: usize, line_count: usize) -> Result<Value, String> {
+        valid_path(path, false)?;
+        let file = self
+            .directory
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.len() > 1_048_576 {
+            return Err("Read supports regular UTF-8 files up to 1 MiB.".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(1_048_577)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > 1_048_576 {
+            return Err("File grew beyond the read limit.".into());
+        }
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let text = String::from_utf8(bytes).map_err(|_| "File is not UTF-8 text.")?;
+        let content = text
+            .lines()
+            .enumerate()
+            .skip(start_line - 1)
+            .take(line_count)
+            .map(|(index, line)| format!("{}: {line}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if content.len() > 131_072 {
+            return Err("Selected lines exceed 128 KiB. Read a smaller range.".into());
+        }
+        Ok(
+            json!({"path":path,"sha256":sha256,"totalLines":text.lines().count(),"content":content}),
+        )
+    }
+    fn create_entry(&self, path: &str, content: &str) -> Result<Value, String> {
+        let mut file = self
+            .directory
+            .open_with(path, OpenOptions::new().write(true).create_new(true))
+            .map_err(|error| {
+                format!("Could not create file (existing files are preserved): {error}")
+            })?;
+        file.write_all(content.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|error| {
+                format!("File write failed; a partial file may remain: {error}")
+            })?;
+        Ok(
+            json!({"path":path,"bytesWritten":content.len(),"sha256":format!("{:x}",Sha256::digest(content.as_bytes()))}),
+        )
+    }
     pub fn call(&self, name: &str, arguments: Value) -> Result<Value, String> {
         match name {
             "list_files" => {
@@ -295,74 +405,100 @@ impl Workspace {
             "read_file" => {
                 let request: ReadRequest =
                     serde_json::from_value(arguments).map_err(|error| error.to_string())?;
-                valid_path(&request.path, false)?;
                 if request.start_line == 0 || request.line_count == 0 || request.line_count > 500 {
                     return Err(
                         "Use a positive start_line and line_count between 1 and 500.".into(),
                     );
                 }
-                let file = self
-                    .directory
-                    .open(&request.path)
-                    .map_err(|error| error.to_string())?;
-                let metadata = file.metadata().map_err(|error| error.to_string())?;
-                if !metadata.is_file() || metadata.len() > 1_048_576 {
-                    return Err("Read supports regular UTF-8 files up to 1 MiB.".into());
+                let batch = request.paths.is_some();
+                let paths = match (request.path, request.paths) {
+                    (Some(path), None) => vec![path],
+                    (None, Some(paths)) if (1..=BATCH_READ_LIMIT).contains(&paths.len()) => paths,
+                    (None, None) => {
+                        return Err("Pass path for one file or paths for 1–8 files.".into())
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err("Pass either path or paths, not both.".into())
+                    }
+                    (None, Some(_)) => return Err("Read 1–8 files per call.".into()),
+                };
+                if !batch {
+                    return self.read_entry(&paths[0], request.start_line, request.line_count);
                 }
-                let mut bytes = Vec::new();
-                file.take(1_048_577)
-                    .read_to_end(&mut bytes)
-                    .map_err(|error| error.to_string())?;
-                if bytes.len() > 1_048_576 {
-                    return Err("File grew beyond the read limit.".into());
+                let mut files = Vec::new();
+                let mut used = 0usize;
+                for path in paths {
+                    let entry =
+                        match self.read_entry(&path, request.start_line, request.line_count) {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                files.push(json!({"path":path,"error":error}));
+                                continue;
+                            }
+                        };
+                    let size = entry["content"].as_str().map_or(0, str::len);
+                    if used + size > BATCH_READ_OUTPUT_LIMIT {
+                        files.push(json!({"path":path,"error":"Batch output limit reached; read this file in a separate call."}));
+                        continue;
+                    }
+                    used += size;
+                    files.push(entry);
                 }
-                let sha256 = format!("{:x}", Sha256::digest(&bytes));
-                let text = String::from_utf8(bytes).map_err(|_| "File is not UTF-8 text.")?;
-                let content = text
-                    .lines()
-                    .enumerate()
-                    .skip(request.start_line - 1)
-                    .take(request.line_count)
-                    .map(|(index, line)| format!("{}: {line}", index + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if content.len() > 131_072 {
-                    return Err("Selected lines exceed 128 KiB. Read a smaller range.".into());
-                }
-                Ok(
-                    json!({"path":request.path,"sha256":sha256,"totalLines":text.lines().count(),"content":content}),
-                )
+                Ok(json!({"files":files}))
             }
             "create_file" => {
-                #[derive(Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct WriteRequest {
-                    path: String,
-                    content: String,
-                }
-                let request: WriteRequest =
+                let request: CreateRequest =
                     serde_json::from_value(arguments).map_err(|error| error.to_string())?;
-                valid_path(&request.path, false)?;
-                if request.content.len() > 65_536 {
-                    return Err("New file content exceeds 64 KiB.".into());
+                let single = request.files.is_none();
+                let drafts = match (request.path, request.content, request.files) {
+                    (Some(path), Some(content), None) => vec![FileDraft { path, content }],
+                    (None, None, Some(files)) if (1..=BATCH_CREATE_LIMIT).contains(&files.len()) => {
+                        files
+                    }
+                    (Some(_), Some(_), Some(_)) => {
+                        return Err("Pass either path with content or files, not both.".into())
+                    }
+                    (None, None, Some(_)) => return Err("Create 1–8 files per call.".into()),
+                    _ => {
+                        return Err(
+                            "Pass path and content together for one file, or files for 1–8."
+                                .into(),
+                        )
+                    }
+                };
+                for (index, draft) in drafts.iter().enumerate() {
+                    valid_path(&draft.path, false)?;
+                    if draft.content.len() > 65_536 {
+                        return Err("New file content exceeds 64 KiB.".into());
+                    }
+                    if drafts[..index].iter().any(|other| other.path == draft.path) {
+                        return Err(format!("Duplicate path in one call: {}.", draft.path));
+                    }
+                    if !single && self.directory.metadata(&draft.path).is_ok() {
+                        return Err(format!(
+                            "{} already exists (existing files are preserved); nothing was created.",
+                            draft.path
+                        ));
+                    }
                 }
-                let mut file = self
-                    .directory
-                    .open_with(
-                        &request.path,
-                        OpenOptions::new().write(true).create_new(true),
-                    )
-                    .map_err(|error| {
-                        format!("Could not create file (existing files are preserved): {error}")
-                    })?;
-                file.write_all(request.content.as_bytes())
-                    .and_then(|_| file.sync_all())
-                    .map_err(|error| {
-                        format!("File write failed; a partial file may remain: {error}")
-                    })?;
-                Ok(
-                    json!({"path":request.path,"bytesWritten":request.content.len(),"sha256":format!("{:x}",Sha256::digest(request.content.as_bytes()))}),
-                )
+                let mut created = Vec::new();
+                for draft in &drafts {
+                    match self.create_entry(&draft.path, &draft.content) {
+                        Ok(entry) => created.push(entry),
+                        Err(error) if created.is_empty() => return Err(error),
+                        Err(error) => {
+                            let done: Vec<&str> = created
+                                .iter()
+                                .filter_map(|entry| entry["path"].as_str())
+                                .collect();
+                            return Err(format!("{error} Already created: {}.", done.join(", ")));
+                        }
+                    }
+                }
+                if single {
+                    return Ok(created.remove(0));
+                }
+                Ok(json!({"files":created}))
             }
             "create_directory" => {
                 let request: PathRequest =
@@ -377,19 +513,69 @@ impl Workspace {
                 let request: EditRequest =
                     serde_json::from_value(arguments).map_err(|error| error.to_string())?;
                 valid_path(&request.path, false)?;
-                if request.old_text.is_empty() || request.old_text.len() > 65_536 {
-                    return Err("The text to replace must contain 1–65536 bytes.".into());
+                let mode = match (
+                    request.old_text,
+                    request.new_text,
+                    request.replacements,
+                    request.content,
+                ) {
+                    (Some(old), Some(new), None, None) => EditMode::Replace(vec![(old, new)]),
+                    (None, None, Some(replacements), None)
+                        if (1..=BATCH_EDIT_LIMIT).contains(&replacements.len()) =>
+                    {
+                        EditMode::Replace(
+                            replacements
+                                .into_iter()
+                                .map(|replacement| (replacement.old_text, replacement.new_text))
+                                .collect(),
+                        )
+                    }
+                    (None, None, Some(_), None) => {
+                        return Err("Apply 1–20 replacements per call.".into())
+                    }
+                    (None, None, None, Some(content)) => EditMode::Rewrite(content),
+                    (Some(_), Some(_), Some(_), None)
+                    | (Some(_), Some(_), None, Some(_))
+                    | (None, None, Some(_), Some(_)) => {
+                        return Err(
+                            "Pass one edit mode: old_text with new_text, replacements, or content."
+                                .into(),
+                        )
+                    }
+                    _ => {
+                        return Err("Pass old_text with new_text, replacements, or content.".into())
+                    }
+                };
+                if let EditMode::Replace(edits) = &mode {
+                    for (old, new) in edits {
+                        if old.is_empty() || old.len() > 65_536 {
+                            return Err("The text to replace must contain 1–65536 bytes.".into());
+                        }
+                        if new.len() > 65_536 {
+                            return Err("Replacement text exceeds 64 KiB.".into());
+                        }
+                        if old == new {
+                            return Err(
+                                "Replacement text must differ from the text it replaces.".into()
+                            );
+                        }
+                    }
                 }
-                if request.new_text.len() > 65_536 {
-                    return Err("Replacement text exceeds 64 KiB.".into());
-                }
-                if request.old_text == request.new_text {
-                    return Err("Replacement text must differ from the text it replaces.".into());
+                if let EditMode::Rewrite(content) = &mode {
+                    if content.len() > 1_048_576 {
+                        return Err("Rewrite content exceeds 1 MiB.".into());
+                    }
                 }
                 let expected = parse_hash(&request.expected_sha256)?;
-                let file = self
-                    .directory
-                    .open_with(&request.path, OpenOptions::new().read(true).write(true))
+                let path = Path::new(&request.path);
+                let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                let directory = self.directory.open_dir(parent).map_err(|error| error.to_string())?;
+                let name = path.file_name().ok_or("File name is missing.")?;
+                if directory.symlink_metadata(name).map_err(|error| error.to_string())?.file_type().is_symlink() {
+                    return Err("Edit requires a regular file, not a symbolic link.".into());
+                }
+                let file = directory
+                    .open_with(name, OpenOptions::new().read(true).write(true))
                     .map_err(|error| error.to_string())?;
                 let metadata = file.metadata().map_err(|error| error.to_string())?;
                 if !metadata.is_file() || metadata.len() > 1_048_576 {
@@ -407,27 +593,52 @@ impl Workspace {
                     return Err("This file changed after it was read. Read it again and retry the edit.".into());
                 }
                 let text = String::from_utf8(bytes).map_err(|_| "File is not UTF-8 text.")?;
-                let matches = text.matches(&request.old_text).count();
-                if matches == 0 {
-                    return Err("The text to replace was not found. Read the current file and retry.".into());
-                }
-                if matches > 1 {
-                    return Err("The text to replace occurs more than once. Use a longer unique match.".into());
-                }
-                let updated = text.replacen(&request.old_text, &request.new_text, 1);
-                {
-                    use std::io::{Seek, SeekFrom};
-                    let mut writer = file;
-                    writer.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
-                    writer.set_len(0).map_err(|error| error.to_string())?;
-                    writer
-                        .write_all(updated.as_bytes())
-                        .and_then(|_| writer.sync_all())
-                        .map_err(|error| {
-                            format!("File write failed; the file may be incomplete: {error}")
-                        })?;
-                }
-                Ok(json!({"path":request.path,"replacements":1,"bytesWritten":updated.len(),"sha256":format!("{:x}",Sha256::digest(updated.as_bytes())),"diff":unified_diff(&request.path,&text,&updated)}))
+                let (updated, replacements) = match mode {
+                    EditMode::Rewrite(content) => {
+                        if content == text {
+                            return Err(
+                                "Replacement text must differ from the text it replaces.".into()
+                            );
+                        }
+                        (content, 1)
+                    }
+                    EditMode::Replace(edits) => {
+                        let count = edits.len();
+                        let mut updated = text.clone();
+                        for (index, (old, new)) in edits.into_iter().enumerate() {
+                            let occurrences = updated.matches(&old).count();
+                            if occurrences == 0 {
+                                return Err(if count == 1 {
+                                    "The text to replace was not found. Read the current file and retry.".into()
+                                } else {
+                                    format!("Replacement {} text was not found. Read the current file and retry.", index + 1)
+                                });
+                            }
+                            if occurrences > 1 {
+                                return Err(if count == 1 {
+                                    "The text to replace occurs more than once. Use a longer unique match.".into()
+                                } else {
+                                    format!("Replacement {} text occurs more than once. Use a longer unique match.", index + 1)
+                                });
+                            }
+                            updated = updated.replacen(&old, &new, 1);
+                        }
+                        (updated, count)
+                    }
+                };
+                replace_file(&directory, name, |staged| {
+                    staged.write_all(updated.as_bytes())?;
+                    staged.set_permissions(metadata.permissions())?;
+                    staged.sync_all()?;
+                    // Recheck after staging so edits made while writing are preserved.
+                    let mut current = Vec::new();
+                    directory.open(name)?.take(1_048_577).read_to_end(&mut current)?;
+                    if Sha256::digest(&current).as_slice() != expected {
+                        return Err(std::io::Error::other("This file changed while staging the edit. Read it again and retry."));
+                    }
+                    Ok(())
+                }).map_err(|error| format!("File replacement failed; the original file was preserved: {error}"))?;
+                Ok(json!({"path":request.path,"replacements":replacements,"bytesWritten":updated.len(),"sha256":format!("{:x}",Sha256::digest(updated.as_bytes())),"diff":unified_diff(&request.path,&text,&updated)}))
             }
             "search_files" => {
                 let request: SearchRequest =
@@ -473,10 +684,10 @@ impl Workspace {
     pub fn tools(self: Arc<Self>) -> Vec<crate::connectors::AgentTool> {
         let definitions=[
             ("list_files","List up to 500 entries in a workspace directory. Use path . for the root.",json!({"path":{"type":"string"}}),vec!["path"]),
-            ("read_file","Read UTF-8 workspace text with line numbers and SHA-256. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":500}}),vec!["path"]),
-            ("create_file","Create a new UTF-8 file inside the workspace. Existing files are never overwritten. Parent directory must exist.",json!({"path":{"type":"string"},"content":{"type":"string"}}),vec!["path","content"]),
+            ("read_file","Read UTF-8 workspace text with line numbers and SHA-256. Pass exactly one of path (one file) or paths (1–8 files in one call — batch instead of repeating single reads). start_line and line_count apply to every file. Batch results carry per-file content or error. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":500}}),vec![]),
+            ("create_file","Create new UTF-8 files inside the workspace. Existing files are never overwritten. Pass exactly one of path with content (one file) or files (1–8 files in one call). Parent directory must exist.",json!({"path":{"type":"string"},"content":{"type":"string"},"files":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false},"minItems":1,"maxItems":8}}),vec![]),
             ("create_directory","Create one directory inside the workspace. Parent directory must exist.",json!({"path":{"type":"string"}}),vec!["path"]),
-            ("edit_file","Replace one unique text match in an existing UTF-8 file. Requires the SHA-256 from a fresh read_file; fails when the file changed, the match is missing, or it occurs more than once. Returns a unified diff of the change for review. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"expected_sha256":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}}),vec!["path","expected_sha256","old_text","new_text"]),
+            ("edit_file","Edit an existing UTF-8 file in one call. Pass exactly one mode: old_text with new_text (one unique match), replacements (1–20 unique-match replacements applied in order — batch instead of repeating single edits), or content (rewrite the whole file). Requires the SHA-256 from a fresh read_file; fails when the file changed, or a match is missing or repeated. All edits apply together or not at all. Returns a unified diff of the change for review. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"expected_sha256":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"replacements":{"type":"array","items":{"type":"object","properties":{"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["old_text","new_text"],"additionalProperties":false},"minItems":1,"maxItems":20},"content":{"type":"string"}}),vec!["path","expected_sha256"]),
         ];
         definitions.into_iter().map(|(name,description,properties,required)| crate::connectors::AgentTool::workspace(self.clone(),crate::connectors::ToolView { name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}) })).collect()
     }
@@ -606,6 +817,187 @@ mod tests {
             std::fs::read_to_string(temp.path().join("note.txt")).unwrap(),
             "alpha\nBETA\ngamma\nbeta again"
         );
+    }
+    #[test]
+    fn batch_reads_report_each_file_or_error_in_one_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        workspace
+            .call("create_file", json!({"path":"a.txt","content":"one\ntwo"}))
+            .unwrap();
+        workspace
+            .call("create_file", json!({"path":"b.txt","content":"three"}))
+            .unwrap();
+        let read = workspace
+            .call("read_file", json!({"paths":["a.txt","b.txt","missing.txt"]}))
+            .unwrap();
+        let files = read["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0]["content"], "1: one\n2: two");
+        assert_eq!(files[0]["totalLines"], 2);
+        assert_eq!(files[0]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(files[1]["content"], "1: three");
+        assert!(files[2].get("content").is_none() && files[2].get("error").is_some());
+        assert!(workspace.call("read_file", json!({})).is_err());
+        assert!(workspace
+            .call("read_file", json!({"path":"a.txt","paths":["a.txt"]}))
+            .is_err());
+        let too_many: Vec<String> = (0..9).map(|index| format!("f{index}.txt")).collect();
+        assert!(workspace.call("read_file", json!({"paths":too_many})).is_err());
+        // The batch output cap degrades later files to error entries.
+        for index in 0..5 {
+            workspace
+                .call(
+                    "create_file",
+                    json!({"path":format!("big{index}.txt"),"content":"x".repeat(60_000)}),
+                )
+                .unwrap();
+        }
+        let big = workspace
+            .call(
+                "read_file",
+                json!({"paths":["big0.txt","big1.txt","big2.txt","big3.txt","big4.txt"]}),
+            )
+            .unwrap();
+        let entries = big["files"].as_array().unwrap();
+        assert!(entries
+            .iter()
+            .take(4)
+            .all(|entry| entry.get("content").is_some()));
+        assert!(entries[4].get("error").is_some());
+    }
+    #[test]
+    fn batch_edits_apply_many_replacements_in_one_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        workspace
+            .call("create_file", json!({"path":"note.txt","content":"one\ntwo\nthree"}))
+            .unwrap();
+        let read = workspace.call("read_file", json!({"path":"note.txt"})).unwrap();
+        let hash = read["sha256"].as_str().unwrap().to_string();
+        // Replacements apply in order: the second only matches the first
+        // one's output, which no earlier text contained.
+        let edited = workspace
+            .call("edit_file", json!({"path":"note.txt","expected_sha256":hash,"replacements":[{"old_text":"one","new_text":"start"},{"old_text":"start","new_text":"end"}]}))
+            .unwrap();
+        assert_eq!(edited["replacements"], 2);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("note.txt")).unwrap(),
+            "end\ntwo\nthree"
+        );
+        // A failing replacement applies nothing at all.
+        assert!(workspace
+            .call("edit_file", json!({"path":"note.txt","expected_sha256":edited["sha256"],"replacements":[{"old_text":"end","new_text":"x"},{"old_text":"absent","new_text":"y"}]}))
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("note.txt")).unwrap(),
+            "end\ntwo\nthree"
+        );
+    }
+    #[test]
+    fn audit_edit_replaces_instead_of_truncating_original() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "original").unwrap();
+        std::fs::hard_link(temp.path().join("note.txt"), temp.path().join("original-copy.txt")).unwrap();
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        let read = workspace.call("read_file", json!({"path":"note.txt"})).unwrap();
+        workspace.call("edit_file", json!({"path":"note.txt","expected_sha256":read["sha256"],"content":"replacement"})).unwrap();
+        assert_eq!(std::fs::read_to_string(temp.path().join("note.txt")).unwrap(), "replacement");
+        assert_eq!(std::fs::read_to_string(temp.path().join("original-copy.txt")).unwrap(), "original");
+    }
+
+    #[test]
+    fn audit_failed_staging_preserves_original_and_removes_temporary_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "original").unwrap();
+        let directory = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+        let result = replace_file(&directory, std::ffi::OsStr::new("note.txt"), |staged| {
+            staged.write_all(b"partial replacement")?;
+            Err(std::io::Error::other("Injected write failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(temp.path().join("note.txt")).unwrap(), "original");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audit_failed_rename_preserves_original_and_removes_temporary_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "original").unwrap();
+        let locked = std::fs::OpenOptions::new().read(true).share_mode(0).open(temp.path().join("note.txt")).unwrap();
+        let directory = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+        let result = replace_file(&directory, std::ffi::OsStr::new("note.txt"), |staged| {
+            staged.write_all(b"replacement")?;
+            staged.sync_all()
+        });
+        assert!(result.is_err());
+        drop(locked);
+        assert_eq!(std::fs::read_to_string(temp.path().join("note.txt")).unwrap(), "original");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn edit_can_rewrite_a_whole_file_in_one_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        workspace
+            .call("create_file", json!({"path":"big.txt","content":"old body"}))
+            .unwrap();
+        let read = workspace.call("read_file", json!({"path":"big.txt"})).unwrap();
+        let hash = read["sha256"].as_str().unwrap().to_string();
+        let rewritten = workspace
+            .call("edit_file", json!({"path":"big.txt","expected_sha256":hash,"content":"brand new body"}))
+            .unwrap();
+        assert_eq!(rewritten["replacements"], 1);
+        assert!(rewritten["diff"].as_str().unwrap().contains("+brand new body"));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("big.txt")).unwrap(),
+            "brand new body"
+        );
+        assert!(workspace
+            .call("edit_file", json!({"path":"big.txt","expected_sha256":rewritten["sha256"],"content":"brand new body"}))
+            .is_err());
+        assert!(workspace
+            .call("edit_file", json!({"path":"big.txt","expected_sha256":rewritten["sha256"],"content":"x","old_text":"a","new_text":"b"}))
+            .is_err());
+    }
+    #[test]
+    fn batch_creates_files_and_refuses_conflicts_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        workspace
+            .call("create_file", json!({"path":"exists.txt","content":"keep"}))
+            .unwrap();
+        // A conflict anywhere rejects the whole batch before anything is written.
+        assert!(workspace
+            .call("create_file", json!({"files":[{"path":"new.txt","content":"x"},{"path":"exists.txt","content":"overwrite"}]}))
+            .is_err());
+        assert!(!temp.path().join("new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("exists.txt")).unwrap(),
+            "keep"
+        );
+        let created = workspace
+            .call("create_file", json!({"files":[{"path":"one.txt","content":"1"},{"path":"two.txt","content":"2"}]}))
+            .unwrap();
+        let files = created["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["path"], "one.txt");
+        assert_eq!(files[0]["bytesWritten"], 1);
+        assert_eq!(files[1]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("one.txt")).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("two.txt")).unwrap(),
+            "2"
+        );
+        assert!(workspace
+            .call("create_file", json!({"files":[{"path":"dup.txt","content":"a"},{"path":"dup.txt","content":"b"}]}))
+            .is_err());
     }
     #[test]
     fn rejects_escape_devices_binary_oversized_and_invalid_arguments() {

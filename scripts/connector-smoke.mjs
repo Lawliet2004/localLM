@@ -1,9 +1,9 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { connectSmoke } from './smoke-lib.mjs';
 
 // Run against a debug Tauri process with WebView2 CDP enabled on port 9223.
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-const page = browser.contexts()[0].pages().find(value => value.url().includes('1420'));
+let { browser, page } = await connectSmoke();
 if (!page) throw new Error('Native LocalLM webview is unavailable.');
 page.setDefaultTimeout(15000);
 try {

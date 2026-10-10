@@ -10,7 +10,7 @@ The router is deterministic. The local model receives a separate schema-constrai
 
 Normal mode allows up to 4 queries, 8 pages, 600-token paragraph-aware chunks with 80-token overlap, 2,500 evidence tokens and 6,000 total input tokens. BM25 is enabled; embeddings, reranking, model evidence extraction and model verification are disabled by default. Existing later-phase modules remain opt-in and are not established as production-ready by Phase 1 tests. The hashing embedding and heuristic reranker are not trained neural models.
 
-Sources and citation IDs are application-owned. `web_open` and `web_find` expose only the selected evidence, not raw document slices. Full pages remain outside model context. Diagnostics print planned queries, raw and unique results, fetched pages, chunks, evidence/prompt counts and compression ratio.
+Sources and citation IDs are application-owned. `web_open` and `web_find` expose bounded passages from the full stored document, with stable references for follow-ups. Research prompts use compressed evidence rather than full pages; stored passages and raw fetch results are sanitized before returning to the model. Diagnostics print planned queries, raw and unique results, fetched pages, chunks, evidence/prompt counts and compression ratio.
 
 ## Run from the app
 
@@ -23,8 +23,8 @@ For overrides, create `%APPDATA%/app.locallm.desktop/web-search.json`. Example:
 ```json
 {
   "searxngBaseUrl": "http://127.0.0.1:8080",
+  "searxngWslDistro": "Ubuntu-24.04",
   "searchProvider": "searxng",
-  "googleApiKey": "",
   "googleCxId": "",
   "searchFallback": { "enabled": true, "googleDailyLimit": 90 },
   "queries": { "fast": 2, "normal": 4, "deep": 6 },
@@ -39,7 +39,13 @@ For overrides, create `%APPDATA%/app.locallm.desktop/web-search.json`. Example:
 }
 ```
 
+On Windows, `searxngWslDistro` names the WSL distribution whose `locallm-searxng` systemd unit serves search; while set, the app holds the distro open for its own lifetime and stops the unit on exit, so no external keepalive is needed. It applies only when the provider is SearXNG on a loopback URL and web search is not disabled.
+
 The native bridge preserves context overrides while capping them to the loaded model context, reserving output space. Configuration interfaces and remaining tunables are in `src/web/config/schema.ts` and `defaults.ts`.
+
+Configure Google credentials in Settings → Web search, which stores the key in the encrypted vault and returns only `hasGoogleApiKey`. Legacy plaintext settings migrate on first read and are blanked after a successful vault write. Blank saves retain the key; the clear checkbox removes it on save. Keep credentials out of `web-search.json`; CLI callers must protect their own credential configuration. Fallback defaults on and reports the actual provider and reason. Google requests (primary, fallback, and retries) atomically claim a daily SQLite quota of 90. Google health is `configured_not_tested` and spends no query. SearXNG path prefixes are retained, all-engine failures are errors, and Retry-After cooldowns persist per endpoint in the shared store.
+
+Offline blocks network worker actions before installation/spawn. Stored open/find and deterministic verification remain available. External retrieval includes weather and AREX. Shell and unknown-network MCP keep their own permissions; offline is not network isolation. Explicit search operators and quoted phrases are preserved. Staged research retains table facts across prose-model failures and returns partial evidence before the outer deadline.
 
 ## CLI and tests
 
@@ -70,8 +76,8 @@ Recorded fixture run on 2026-09-17: 2 queries, 10 raw results, 3 unique public r
 
 ## Security and measurement boundaries
 
-Public pages use DNS resolution plus socket address pinning, reject non-public addresses, validate every redirect and respect robots policies. Configured SearXNG and local inference are explicit trusted service endpoints, separate from public-page fetching; they do not follow redirects. HTTP 429/503 Retry-After establishes a cooldown. Failed pages are isolated; available search snippets can be used as fallback evidence and are marked in document metadata. The opt-in `jsRenderFallback` renders failed, challenged or thin pages with headless Edge in the worker (temporary profile, bounded DOM output, hard timeout); it repeats the public-address check before spawning because browser DNS bypasses the pinned fetch path, and it never runs for robots.txt refusals.
+Public pages use DNS resolution plus socket address pinning, reject non-public addresses, validate every redirect and respect robots policies. Configured SearXNG and local inference are explicit trusted service endpoints, separate from public-page fetching; they do not follow redirects. HTTP 429/503 Retry-After establishes a cooldown. Failed pages are isolated; available search snippets can be used as fallback evidence and are marked in document metadata. The opt-in `jsRenderFallback` renders failed, challenged or thin pages with headless Edge in the worker (temporary profile, bounded DOM output, hard timeout); it mediates resource requests through the pinned transport, blocks service workers and WebSockets, and uses a dead proxy to fail closed if routing is bypassed, and it never runs for robots.txt refusals.
 
 Web text is untrusted data. Known directives are neutralized, model output is checked against supplied evidence and application-owned citations, and research model calls have no tools or credentials in their prompts. Pattern matching and lexical verification do not prove immunity to every prompt injection or prove semantic truth. Source claims may themselves be wrong, stale or incomplete.
 
-Without a model, token counts are planning estimates. With a local tokenizer, the context builder checks runtime counts and drops whole claims until both budgets fit. Without a tokenizer endpoint, the local provider uses conservative UTF-8 byte counts. The entire user message counts against the evidence limit conservatively; prompt accounting reserves 64 chat-template tokens and the configured safety margin. Unsupported or oversized inference fails back to attributed evidence instead of sending oversized pages.
+Without a model, token counts are planning estimates. With a local tokenizer, the context builder checks runtime counts and drops whole claims until both budgets fit. Without a tokenizer endpoint, the local provider uses conservative UTF-8 byte counts. The entire user message counts against the evidence limit conservatively; worker generation prefers the exact chat input_tokens endpoint, with a 64-token template reserve on its tokenizer/byte fallback and the configured safety margin. Unsupported or oversized inference fails back to attributed evidence instead of sending oversized pages.

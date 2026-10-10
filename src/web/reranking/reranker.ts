@@ -55,45 +55,9 @@ export class RerankerService implements Reranker {
       return chunks.slice(0, limit);
     }
 
-    // Score the full pool (the heuristic scorer early-returns unsorted when
-    // limit >= chunk count), blend recency, then slice to the final limit.
+    // Score the full pool before blending recency and selecting the final limit.
     const ranked = await this.crossEncoder.rerank(query, chunks, Number.MAX_SAFE_INTEGER);
     const blended = applyRecencyBlend(ranked, this.recencyWeight);
     return blended.slice(0, limit);
-  }
-}
-
-/**
- * Wraps a model-backed reranker (e.g. a llama.cpp /reranking cross-encoder)
- * with the lexical fallback: an unavailable or erroring reranker degrades to
- * heuristic ordering instead of failing the whole research turn. A single
- * throttled notice marks the degradation so ranking-quality drops stay
- * answerable from logs.
- */
-export class ResilientReranker implements Reranker {
-  private warned = false;
-  private heuristic: LocalCrossEncoderReranker;
-  constructor(
-    private primary: Reranker,
-    private recencyWeight: number = 0,
-    private onDegrade?: (error: unknown) => void,
-  ) {
-    this.heuristic = new LocalCrossEncoderReranker();
-  }
-
-  async rerank(query: string, chunks: EvidenceChunk[], limit: number): Promise<EvidenceChunk[]> {
-    if (chunks.length === 0) return [];
-    let ranked: EvidenceChunk[];
-    try {
-      ranked = await this.primary.rerank(query, chunks, Number.MAX_SAFE_INTEGER);
-      if (!Array.isArray(ranked) || ranked.length === 0) throw new Error('reranker returned no results');
-    } catch (error) {
-      if (!this.warned) {
-        this.warned = true;
-        this.onDegrade?.(error);
-      }
-      ranked = await this.heuristic.rerank(query, chunks, Number.MAX_SAFE_INTEGER);
-    }
-    return applyRecencyBlend(ranked, this.recencyWeight).slice(0, limit);
   }
 }

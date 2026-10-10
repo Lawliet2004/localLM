@@ -3,6 +3,25 @@ import { ClaimVerifier, arithmeticRecord, citationSupportsQuote, trustedSourceUr
 import type { EvidenceClaim, LLMProvider } from '../types';
 
 describe('Claim Verifier (Section 53-55)', () => {
+  it('does not transfer an unrelated source disagreement to an unsupported answer claim', () => {
+    const report = new ClaimVerifier().verifyClaimsDeterministic(['The service launched in 2025.'], [
+      { id:'A', claim:'The adapter supplies 60 watts.', supportingSources:['S1'], status:'conflicting', confidence:0.25 },
+      { id:'B', claim:'The adapter supplies 90 watts.', supportingSources:['S2'], status:'conflicting', confidence:0.25 },
+    ]);
+    expect(report.claims[0].status).toBe('UNSUPPORTED');
+    expect(report.conflictingCount).toBe(0);
+  });
+
+  it('prefers the exact version excerpt when lexical scores tie', () => {
+    const evidence: EvidenceClaim[] = ['24.1.0', '24.2.0'].map((version, index) => ({
+      id:`E${index}`, claim:`Node.js version ${version} is current.`,
+      supportingSources:[`S${index}`], status:'conflicting', confidence:0.25,
+    }));
+    const report = new ClaimVerifier().verifyClaimsDeterministic(evidence.map(item => item.claim), evidence);
+    expect(report.conflictingCount).toBe(2);
+    expect(report.claims[1].sources).toContain('S1');
+  });
+
   const evidence: EvidenceClaim[] = [
     {
       id: 'CLM-1',
@@ -165,7 +184,7 @@ describe('Claim Verifier (Section 53-55)', () => {
     expect(report.claims[0].status).toBe('UNSUPPORTED');
   });
 
-  it('labels model-graded support as model_assessed', async () => {
+  it('does not promote a model-graded paraphrase to verified support', async () => {
     const claim = 'Model X has about eight billion parameters.';
     const evidence: EvidenceClaim[] = [{
       id: 'CLM-1',
@@ -184,8 +203,15 @@ describe('Claim Verifier (Section 53-55)', () => {
       },
     };
     const report = await new ClaimVerifier(llm).verifyClaims([claim], evidence);
-    expect(report.claims[0].status).toBe('SUPPORTED');
-    expect(report.claims[0].assessment).toBe('model_assessed');
-    expect(report.supportedCount).toBe(1);
+    expect(report.claims[0].status).toBe('UNSUPPORTED');
+    expect(report.claims[0].assessment).toBe('unresolved');
+    expect(report.supportedCount).toBe(0);
   });
+});
+it('model cannot certify an invented claim using a real source ID', async () => {
+  const claim = 'The adapter supplies 999 watts.';
+  const verifier = new ClaimVerifier({ generate: async () => ({ text: JSON.stringify({ claims: [{ claim, status: 'SUPPORTED', sources: ['S1'] }] }) }) });
+  const report = await verifier.verifyClaims([claim], [{ id: 'E1', claim: 'The adapter supplies 60 watts.', supportingSources: ['S1'], status: 'supported', confidence: 1 }]);
+  expect(report.allSupported).toBe(false);
+  expect(report.claims[0].status).toBe('UNSUPPORTED');
 });

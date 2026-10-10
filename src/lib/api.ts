@@ -9,11 +9,20 @@ import type {
   ConnectorView,
   Conversation,
   ConversationTools,
+  EffectiveTool,
   ExecutionConfig,
   HardwareStatus,
+  InteractionMode,
+  IsolationSettings,
+  IsolationStatus,
   Message,
   ModelSelection,
   Preferences,
+  Profile,
+  Qualification,
+  QualificationEvent,
+  Readiness,
+  Recipe,
   RememberedTools,
   RunEvent,
   RunRecord,
@@ -21,6 +30,8 @@ import type {
   RuntimeStatus,
   SessionEvent,
   ForkSessionResult,
+  Task,
+  TaskTransition,
   Hit,
   SkillDependencyStatus,
   SkillUpdateStatus,
@@ -31,6 +42,20 @@ import type {
   CompactionOutcome,
   CompactionStatus,
   WebSearchConfig,
+  BrowserConfig,
+  TaskApplyResult,
+  TaskCheckpoint,
+  TaskConflictResolution,
+  TaskFileDiff,
+  TaskReview,
+  TaskUndoResult,
+  TaskWorkspace,
+  TaskCriterion,
+  VerificationOutput,
+  VerificationRecord,
+  VerificationSummary,
+  ContextPreview,
+  MemoryFact,
 } from './types';
 
 export const nativeAvailable = isTauri();
@@ -46,10 +71,28 @@ export interface LocalServerConfig {
 export interface ModelInstallStatus {
   busy: boolean;
   phase: string;
+  /** Aggregate bytes for the whole job across every archive or shard. */
   received: number;
   total: number;
   path: string | null;
   error: string | null;
+  /** 0 marks a recovered-on-disk state rather than a job this process ran. */
+  jobId: number;
+  /** Stable asset identity: "runtime:standard",
+   * "model:catalog:<filename>", "model:hf:<repo>@<revision>:<filename>". */
+  key: string;
+  label: string;
+  asset: string | null;
+  assetIndex: number;
+  assetCount: number;
+  assetReceived: number;
+  assetTotal: number;
+  /** Bytes already on disk when the job started; not network transfer. */
+  saved: number;
+  /** Current transfer attempt, 1-based. */
+  attempt: number;
+  notice: string | null;
+  updatedAt: number;
 }
 export interface ModelDownloadInfo {
   filename: string;
@@ -58,17 +101,20 @@ export interface ModelDownloadInfo {
   destination: string;
   availableBytes: number;
   requiredBytes: number;
+  savedBytes: number;
+  remainingBytes: number;
   destinationExists: boolean;
+}
+export interface RuntimeDownloadInfoShape {
+  bytes: number;
+  requiredBytes: number;
+  availableBytes: number;
+  savedBytes: number;
+  reusable: boolean;
+  destination: string;
 }
 
 export const api = {
-  bonsaiEnabled: () => invoke<boolean>('bonsai_enabled'),
-  setBonsaiEnabled: (enabled: boolean) => invoke<boolean>('set_bonsai_enabled', { enabled }),
-  bonsaiInfo: () => invoke<import('../features/bonsai/types').BonsaiInfo | null>('bonsai_info'),
-  installBonsai: (asset: import('../features/bonsai/types').BonsaiAsset) => invoke<ModelInstallStatus>('install_bonsai', { asset }),
-  bonsaiInstallStatus: (asset: import('../features/bonsai/types').BonsaiAsset) => invoke<ModelInstallStatus>('bonsai_install_status', { asset }),
-  cancelBonsaiInstall: (asset: import('../features/bonsai/types').BonsaiAsset) => invoke<void>('cancel_bonsai_install', { asset }),
-  activateBonsai: (usePreset?: boolean) => invoke<RuntimeStatus>('activate_bonsai', { usePreset }),
   workspaceIndex: () => invoke<WorkspaceIndex>('workspace_index'),
   saveProject: (project: Project) => invoke<WorkspaceIndex>('save_project', { project }),
   removeProject: (id: string) => invoke<WorkspaceIndex>('remove_project', { id }),
@@ -76,6 +122,58 @@ export const api = {
   workspaceInspect: (path: string, directory: boolean, root?: string) => invoke<{ entries?: {name: string; kind: string}[]; content?: string; truncated?: boolean; totalLines?: number; workspaceId?: string; root?: string }>('workspace_inspect', { path, directory, root }),
   workspaceSearch: (query: string, root?: string) => invoke<{ results: { path: string; kind: string }[]; truncated: boolean; truncation?: 'result' | 'scan' | 'depth' | null; workspaceId?: string; root?: string }>('workspace_search', { query, root }),
   workspaceGit: (branch?: string) => invoke<{ branch: string; branches: string[]; status: string; diff: string }>('workspace_git', { branch }),
+  taskWorkspaceStatus: (conversationId: string) => invoke<TaskWorkspace | null>('task_workspace_status', { conversationId }),
+  taskWorkspaceCreate: (conversationId: string) => invoke<TaskWorkspace>('task_workspace_create', { conversationId }),
+  taskReview: (taskId: string) => invoke<TaskReview>('task_review', { taskId }),
+  taskFileDiff: (taskId: string, path: string) => invoke<TaskFileDiff>('task_file_diff', { taskId, path }),
+  taskCheckpoints: (taskId: string) => invoke<TaskCheckpoint[]>('task_checkpoints', { taskId }),
+  taskRestoreCheckpoint: (taskId: string, commit: string) => invoke<void>('task_restore_checkpoint', { taskId, commit }),
+  taskApply: (taskId: string, paths?: string[], resolutions?: Record<string, TaskConflictResolution>) =>
+    invoke<TaskApplyResult>('task_apply', { taskId, paths: paths ?? null, resolutions: resolutions ?? null }),
+  taskUndoApply: (taskId: string, applyId: string) => invoke<TaskUndoResult>('task_undo_apply', { taskId, applyId }),
+  taskDiscard: (taskId: string) => invoke<void>('task_discard', { taskId }),
+  verificationSummary: (conversationId: string) => invoke<VerificationSummary>('verification_summary', { conversationId }),
+  criteriaUpsert: (conversationId: string, id: string | null, text: string) =>
+    invoke<TaskCriterion>('criteria_upsert', { conversationId, id, text }),
+  criteriaDelete: (conversationId: string, id: string) => invoke<void>('criteria_delete', { conversationId, id }),
+  verificationRunUser: (conversationId: string, command: string, criterionId?: string) =>
+    invoke<VerificationRecord>('verification_run_user', { conversationId, command, criterionId: criterionId ?? null }),
+  verificationRecordOutput: (recordId: string) => invoke<VerificationOutput>('verification_record_output', { recordId }),
+  contextPreview: (conversationId: string) => invoke<ContextPreview>('context_preview', { conversationId }),
+  memoryFacts: (conversationId: string) => invoke<MemoryFact[]>('memory_facts', { conversationId }),
+  memoryCreate: (conversationId: string, scope: 'user' | 'project' | 'conversation', fact: string, reason?: string) =>
+    invoke<MemoryFact>('memory_create', { conversationId, scope, fact, reason: reason ?? null }),
+  memoryUpdate: (conversationId: string, id: string, text: string, reason?: string) =>
+    invoke<MemoryFact>('memory_update', { conversationId, id, text, reason: reason ?? null }),
+  memoryDelete: (conversationId: string, id: string) => invoke<void>('memory_delete', { conversationId, id }),
+  memorySetPinned: (conversationId: string, id: string, pinned: boolean) =>
+    invoke<void>('memory_set_pinned', { conversationId, id, pinned }),
+  memorySetExcluded: (conversationId: string, id: string, excluded: boolean) =>
+    invoke<void>('memory_set_excluded', { conversationId, id, excluded }),
+  memoryAutoRetain: () => invoke<boolean>('memory_auto_retain'),
+  memorySetAutoRetain: (enabled: boolean) => invoke<void>('memory_set_auto_retain', { enabled }),
+  tasksList: (statuses?: string[]) => invoke<Task[]>('tasks_list', { statuses }),
+  taskEnqueue: (conversationId: string, content: string, interactionMode?: string) =>
+    invoke<Task>('task_enqueue', { conversationId, content, interactionMode }),
+  taskSteer: (taskId: string, text: string) => invoke<void>('task_steer', { taskId, text }),
+  taskPause: (taskId: string) => invoke<void>('task_pause', { taskId }),
+  taskResume: (taskId: string) => invoke<void>('task_resume', { taskId }),
+  taskCancel: (taskId: string) => invoke<void>('task_cancel', { taskId }),
+  taskRetry: (taskId: string) => invoke<Task>('task_retry', { taskId }),
+  taskBranch: (taskId: string, fromSeq: number) => invoke<Task>('task_branch', { taskId, fromSeq }),
+  taskResolveUncertain: (taskId: string, callId: string, resolution: 'done' | 'retry') =>
+    invoke<void>('task_resolve_uncertain', { taskId, callId, resolution }),
+  taskTransitions: (taskId: string) => invoke<TaskTransition[]>('task_transitions', { taskId }),
+
+  readiness: () => invoke<Readiness>('readiness'),
+  profiles: () => invoke<Profile[]>('profiles'),
+  qualificationResults: (selection?: ModelSelection) => invoke<Qualification | null>('qualification_results', { selection }),
+  qualificationRun: (selection: ModelSelection, onEvent: (event: QualificationEvent) => void) => {
+    const channel = new Channel<QualificationEvent>();
+    channel.onmessage = onEvent;
+    return invoke('qualification_run', { selection, channel });
+  },
+  qualificationCancel: () => invoke('qualification_cancel'),
   terminalOpen: (cols: number, rows: number) => invoke<{ id: string }>('terminal_open', { cols, rows }),
   terminalAttach: (id: string, onEvent: (event: TerminalEvent) => void) => {
     const channel = new Channel<TerminalEvent>(); channel.onmessage = onEvent;
@@ -87,6 +185,7 @@ export const api = {
   browserShow: (label: string, x: number, y: number, width: number, height: number) => invoke<void>('browser_show', { label, x, y, width, height }),
   browserHide: (label: string) => invoke<void>('browser_hide', { label }),
   browserClose: (label: string) => invoke<void>('browser_close', { label }),
+  browserCloseAll: () => invoke<void>('browser_close_all'),
   browserNavigate: (label: string, url: string) => invoke<void>('browser_navigate', { label, url }),
   browserReload: (label: string) => invoke<void>('browser_reload', { label }),
   browserGoBack: (label: string) => invoke<void>('browser_go_back', { label }),
@@ -95,11 +194,12 @@ export const api = {
   readLocalConnector: (id: string) => invoke<LocalServerConfig>('read_local_connector', { id }),
   saveLocalConnector: (server: LocalServerConfig) => invoke<void>('save_local_connector', { server }),
   removeLocalConnector: (id: string) => invoke<void>('remove_local_connector', { id }),
-  listInstalledRuntimes: () => invoke<{ id: string; path: string; complete: boolean; problem: string | null }[]>('list_installed_runtimes'),
-  runtimeDownloadInfo: () => invoke<{ bytes: number; requiredBytes: number; availableBytes: number; destination: string }>('runtime_download_info'),
+  listInstalledRuntimes: () => invoke<{ id: string; path: string; complete: boolean; problem: string | null }[]>('list_installed_runtimes', {}),
+  runtimeDownloadInfo: () => invoke<RuntimeDownloadInfoShape>('runtime_download_info'),
   runtimeInstallStatus: () => invoke<ModelInstallStatus>('runtime_install_status'),
   installRuntime: () => invoke<ModelInstallStatus>('install_runtime'),
-  cancelRuntimeInstall: () => invoke<void>('cancel_runtime_install'),
+  cancelRuntimeInstall: (jobId?: number) => invoke<void>('cancel_runtime_install', { jobId: jobId ?? null }),
+  downloadJobs: () => invoke<ModelInstallStatus[]>('download_jobs'),
   modelDownloadInfo: (filename?: string) => invoke<ModelDownloadInfo>('model_download_info', { filename }),
   listInstalledModels: () => invoke<import('./types').InstalledModel[]>('list_installed_models'),
   searchHuggingFace: (query: string, token?: string) => invoke<import('./types').HubSearchHit[]>('search_hugging_face', { query, token }),
@@ -110,7 +210,7 @@ export const api = {
   readModelMetadata: (path: string) => invoke<import('./types').ModelMetadata>('read_model_metadata', { path }),
   modelInstallStatus: () => invoke<ModelInstallStatus>('model_install_status'),
   installModel: (filename?: string) => invoke<ModelInstallStatus>('install_model', { filename }),
-  cancelModelInstall: () => invoke<void>('cancel_model_install'),
+  cancelModelInstall: (jobId?: number) => invoke<void>('cancel_model_install', { jobId: jobId ?? null }),
   readRuntimeLog: () => invoke<{ content: string; truncated: boolean }>('read_runtime_log'),
   hasDaytonaKey: () => invoke<boolean>('has_daytona_key'),
   saveDaytonaKey: (key: string) => invoke<void>('save_daytona_key', { key }),
@@ -121,15 +221,27 @@ export const api = {
   getExecutionConfig: () => invoke<ExecutionConfig>('get_execution_config'),
   saveExecutionConfig: (config: ExecutionConfig) => invoke<void>('save_execution_config', { config }),
   detectInterpreters: () => invoke<ExecutionConfig>('detect_interpreters'),
+  isolationGet: () => invoke<IsolationSettings>('isolation_get'),
+  isolationSave: (settings: IsolationSettings) => invoke<void>('isolation_save', { settings }),
+  isolationStatus: () => invoke<IsolationStatus>('isolation_status'),
+  recipesList: () => invoke<Recipe[]>('recipes_list'),
+  recipeSave: (input: { id?: string; name: string; prompt: string; intervalMinutes: number | null; enabled: boolean }) => invoke<Recipe>('recipe_save', { input }),
+  recipeDelete: (id: string) => invoke<void>('recipe_delete', { id }),
+  recipeRunNow: (id: string) => invoke<Task>('recipe_run_now', { id }),
+  documentsListCollections: () => invoke<DocCollection[]>('documents_list_collections'),
+  documentsAddCollection: (root: string, name: string) => invoke<DocCollection>('documents_add_collection', { root, name }),
+  documentsRemoveCollection: (id: string) => invoke<void>('documents_remove_collection', { id }),
+  documentsReindex: (id: string) => invoke<DocCollection>('documents_reindex', { id }),
+  documentsSearch: (query: string, collectionId: string | null) => invoke<DocHit[]>('documents_search', { query, collectionId }),
   testInterpreter: (path: string) => invoke<string>('test_interpreter', { path }),
   getWorkspace: () => invoke<{ path: string }>('get_workspace'),
   setWorkspace: (path: string) => invoke<void>('set_workspace', { path }),
-  listSkills: () => invoke<SkillView[]>('list_skills'),
+  listSkills: (conversationId?: string | null) => invoke<SkillView[]>('list_skills', { conversationId }),
   installSkill: (id: string) => invoke<void>('install_skill', { id }),
   removeSkill: (id: string) => invoke<void>('remove_skill', { id }),
-  setSkillActive: (id: string, active: boolean) => invoke<void>('set_skill_active', { id, active }),
+  setSkillActive: (id: string, active: boolean, conversationId?: string | null) => invoke<void>('set_skill_active', { id, active, conversationId }),
   readSkillFile: (id: string, path: string) => invoke<string>('read_skill_file', { id, path }),
-  skillDependencies: (id: string) => invoke<SkillDependencyStatus[]>('skills_skill_dependencies', { id }),
+  skillDependencies: (id: string) => invoke<SkillDependencyStatus[]>('skill_dependencies', { id }),
   skillUpdateStatus: (id: string) => invoke<SkillUpdateStatus>('skill_update_status', { id }),
   listConnectors: () => invoke<ConnectorView[]>('list_connectors'),
   listLocalConnectors: () => invoke<ConnectorView[]>('list_local_connectors'),
@@ -156,8 +268,10 @@ export const api = {
   listCapabilities: (conversationId?: string | null) => invoke<Capability[]>('list_capabilities', { conversationId }),
   setCapabilityEnabled: (id: string, enabled: boolean) => invoke<Capability[]>('set_capability_enabled', { id, enabled }),
   dumpConfig: (conversationId?: string | null) => invoke<Record<string, unknown>>('dump_config', { conversationId }),
-  contextPreflight: (conversationId: string | null, draft: string, preset: string | null, connectorIds: string[], connectorTools: ToolSelection[], planMode = false) =>
-    invoke<{ available: boolean; reason?: string; breakdown?: PreflightBreakdown }>('context_preflight', { conversationId, draft, preset, connectorIds, connectorTools, planMode }),
+  contextPreflight: (conversationId: string | null, draft: string, preset: string | null, connectorIds: string[], connectorTools: ToolSelection[], planMode = false, interactionMode?: InteractionMode) =>
+    invoke<{ available: boolean; reason?: string; breakdown?: PreflightBreakdown }>('context_preflight', { conversationId, draft, preset, connectorIds, connectorTools, planMode, interactionMode }),
+  effectiveCapabilities: (conversationId: string, preset?: string | null, interactionMode?: InteractionMode) =>
+    invoke<EffectiveTool[]>('effective_capabilities', { conversationId, preset: preset ?? null, interactionMode: interactionMode ?? null }),
   listPresets: () => invoke<Preset[]>('list_presets'),
   getPreset: (conversationId: string) => invoke<Preset>('get_preset', { conversationId }),
   setPreset: (conversationId: string, preset: string) => invoke<Preset>('set_preset', { conversationId, preset }),
@@ -170,10 +284,10 @@ export const api = {
   loadModel: () => invoke<RuntimeStatus>('load_model'),
   unloadModel: () => invoke<RuntimeStatus>('unload_model'),
   runtimeStatus: () => invoke<RuntimeStatus>('runtime_status'),
-  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = [], connectorTools: ToolSelection[] = [], planMode = false) => {
+  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = [], connectorTools: ToolSelection[] = [], planMode = false, interactionMode?: InteractionMode) => {
     const channel = new Channel<ChatEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools, planMode });
+    return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools, planMode, interactionMode });
   },
   cancelGeneration: () => invoke<void>('cancel_generation'),
   pauseGeneration: () => invoke<void>('pause_generation'),
@@ -193,13 +307,16 @@ export const api = {
   searchSessions: (query: string, limit?: number | null) =>
     invoke<Hit[]>('search_sessions', { query, limit }),
   getWebSearchConfig: () => invoke<WebSearchConfig>('get_web_search_config'),
-  saveWebSearchConfig: (config: WebSearchConfig) => invoke<void>('save_web_search_config', {
+  saveWebSearchConfig: (config: WebSearchConfig, googleApiKey = '', clearGoogleApiKey = false) => invoke<void>('save_web_search_config', {
     provider: config.provider,
     searxngBaseUrl: config.searxngBaseUrl,
-    googleApiKey: config.googleApiKey,
+    googleApiKey,
+    clearGoogleApiKey,
     googleCxId: config.googleCxId,
     searchFallbackEnabled: config.searchFallbackEnabled,
   }),
+  getBrowserConfig: () => invoke<BrowserConfig>('get_browser_config'),
+  saveBrowserConfig: (config: BrowserConfig) => invoke<void>('save_browser_config', { config }),
   webSearchHealth: () => invoke<Record<string, unknown>>('web_search_health'),
 };
 

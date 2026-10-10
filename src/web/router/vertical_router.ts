@@ -8,9 +8,10 @@ import type { VerticalType } from '../types';
 export function routeVertical(query: string): VerticalType {
   const q = query.toLowerCase().trim();
 
-  // 1. Weather
+  // 1. Weather — requires a real weather-context word; a bare 'temperature'
+  // (e.g. "room-temperature superconductivity") must not trigger the vertical.
   if (
-    /\b(weather|temperature|forecast|rain|snow|humidity|wind speed|weather report)\b/i.test(q)
+    /\b(weather|forecast|rain|snow|humidity|wind speed)\b/i.test(q)
   ) {
     return 'WEATHER';
   }

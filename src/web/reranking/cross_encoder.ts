@@ -1,6 +1,5 @@
 /**
  * Lexical fallback scorer. This is not a trained cross-encoder.
- * Use LocalModelReranker for model inference on query/passage pairs.
  */
 
 import type { EvidenceChunk, Reranker } from '../types';
@@ -74,10 +73,6 @@ export class LocalCrossEncoderReranker implements Reranker {
     chunks: EvidenceChunk[],
     limit: number = 8
   ): Promise<EvidenceChunk[]> {
-    if (chunks.length <= limit) {
-      return chunks;
-    }
-
     const scored = chunks.map((chunk) => {
       const score = this.scorePassage(query, chunk.text);
       return {

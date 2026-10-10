@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { InMemoryStorageAdapter } from '../cache/sqlite';
 import { DomainStatsStore, orderByDomainHealth } from './domain_stats';
 
@@ -25,4 +25,17 @@ it('moves chronic domains behind healthy ones', async () => {
   ], store);
   expect(ordered.map((r) => r.domain)).toEqual(['ok.example', 'bad.example']);
   expect(deprioritized).toEqual(['bad.example']);
+});
+
+it('learns repeated failures again after the previous window expires', async () => {
+  const storage = new InMemoryStorageAdapter();
+  const store = new DomainStatsStore(storage, { windowMs: 1000, minAttempts: 4 });
+  const now = Date.now();
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  try {
+    await storage.set('domain_stats', 'blocked.example', { attempts: 4, ok: 0, fail: 4, windowStartMs: now - 2000 });
+    expect((await store.status('blocked.example')).chronic).toBe(false);
+    for (let i = 0; i < 4; i++) await store.record('blocked.example', false, 'HTTP 403');
+    expect(await store.status('blocked.example')).toMatchObject({ attempts: 4, fail: 4, chronic: true });
+  } finally { clock.mockRestore(); }
 });

@@ -14,7 +14,7 @@ export function coverageMatrix(question: string, evidence: EvidenceClaim[]): Cov
     ['license', /licen[sc]e|apache|mit|commercial/i],
     ['release', /release|launch|version/i],
   ] as const;
-  const needed = dimensions.filter(([_, pattern]) => pattern.test(question));
+  const needed = dimensions.filter(([, pattern]) => pattern.test(question));
   return entities.flatMap(entity => (needed.length ? needed : [dimensions[0]]).map(([dimension, pattern]) => ({
     entity, dimension, covered: evidence.some(e => e.claim.toLowerCase().includes(entity.toLowerCase()) && pattern.test(e.claim)),
   })));

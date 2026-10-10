@@ -16,6 +16,18 @@ export class SqliteStorage {
       .get(table, key, Date.now());
     return row ? JSON.parse(row.value) : null;
   }
+  async claimQuota(table, key, count, limit, ttl = 90000) {
+    if (!Number.isInteger(count) || count < 1 || count > limit) return false;
+    const now = Date.now();
+    // One upsert is atomic across worker processes, including expiry reset.
+    const result = this.db.prepare(`INSERT INTO cache(namespace,key,value,expires_at) VALUES(?,?,?,?)
+      ON CONFLICT(namespace,key) DO UPDATE SET
+        value = CASE WHEN cache.expires_at <= ? THEN ? ELSE CAST(cache.value AS INTEGER) + ? END,
+        expires_at = CASE WHEN cache.expires_at <= ? THEN excluded.expires_at ELSE cache.expires_at END
+      WHERE cache.expires_at <= ? OR CAST(cache.value AS INTEGER) + ? <= ?`)
+      .run(table, key, String(count), now + ttl * 1000, now, count, count, now, now, count, limit);
+    return result.changes === 1;
+  }
   async set(table, key, value, ttl = 86400) {
     this.db.prepare('INSERT OR REPLACE INTO cache VALUES(?,?,?,?)')
       .run(table, key, JSON.stringify(value), Date.now() + ttl * 1000);

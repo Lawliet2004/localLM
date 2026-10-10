@@ -3,12 +3,14 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({ isMaximized: async () => false, onResized: async () => () => {} }) }));
-import { defaultRuntimeConfig } from './lib/types';
+import { defaultRuntimeConfig, type ChatEvent } from './lib/types';
+import { saveDraft } from './lib/drafts';
 const mocks = vi.hoisted(() => ({
-  save: vi.fn(), exportConversation: vi.fn(), bootstrap: vi.fn(),
+  save: vi.fn(), exportConversation: vi.fn(), bootstrap: vi.fn(), messages: vi.fn(), sendMessage: vi.fn(),
   saveRememberedTools: vi.fn(), saveConversationTools: vi.fn(), conversationTools: vi.fn(),
   setWorkspace: vi.fn(), workspaceIndex: vi.fn(), removeProject: vi.fn(), confirm: vi.fn(),
   saveTaskMeta: vi.fn(), deleteConversation: vi.fn(),
+  loadModel: vi.fn(), unloadModel: vi.fn(), runtimeStatus: vi.fn(), useInstalledModel: vi.fn(),
 }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: mocks.save, open: vi.fn(), confirm: mocks.confirm }));
 vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) => e instanceof Error ? e.message : String(e), api: {
@@ -17,14 +19,32 @@ vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) 
   saveRememberedTools: mocks.saveRememberedTools, saveConversationTools: mocks.saveConversationTools, conversationTools: mocks.conversationTools,
   setWorkspace: mocks.setWorkspace, workspaceIndex: mocks.workspaceIndex, removeProject: mocks.removeProject,
   saveTaskMeta: mocks.saveTaskMeta, deleteConversation: mocks.deleteConversation,
+  browserCloseAll: async () => {},
+  downloadJobs: async () => [],
+  loadModel: mocks.loadModel, unloadModel: mocks.unloadModel,
+  runtimeStatus: mocks.runtimeStatus, useInstalledModel: mocks.useInstalledModel,
+  listInstalledModels: async () => [], hardwareStatus: async () => null,
+  searchHuggingFace: async () => [], huggingFaceFiles: async () => ({ files: [] }),
   listConnectors: async () => [{ id: 'example', description: 'Example service', url: '', authType: 'apiKey', connected: true, hasCredential: true, tools: [{ name: 'kept_tool', description: 'Kept for new chats', inputSchema: {} }] }],
   listSkills: async () => [], getWorkspace: async () => ({ path: 'C:/workspace' }), hasDaytonaKey: async () => false,
-  messages: async () => [{ id: 'message', conversationId: 'chat', role: 'user', content: 'Export this message', reasoning: '', status: 'complete', createdAt: 0 }],
+  messages: mocks.messages, sendMessage: mocks.sendMessage,
+  effectiveCapabilities: async () => null, taskWorkspaceStatus: async () => null, tasksList: async () => [],
+  isolationGet: async () => ({ mode: 'unsandboxed', network: false, lan: false, lpac: false, toolchainDirs: [], processLimit: 32, memoryMb: 2048 }),
+    readiness: async () => ({ step: 'ready', message: '', nextAction: null }),
+    qualificationResults: async () => null,
+    profiles: async () => [],
+  verificationSummary: async () => ({ criteria: [], records: [], state: { state: 'work-completed', summary: '' } }),
+  contextPreflight: async () => ({ available: false }),
+  getTodos: async () => [], getSessionEvents: async () => [], getConversationRun: async () => null,
+  getPreset: async () => null, workspaceGit: async () => null, listInstalledRuntimes: async () => [],
 } }));
 const baseBootstrap = { conversations: [{ id: 'chat', title: 'Saved chat', updatedAt: 0 }], config: defaultRuntimeConfig,
   preferences: { runtimePath: '', modelPath: '', projectorPath: '', temperature: 1, topP: 0.95, maxTokens: 100, systemPrompt: '' }, runtime: { phase: 'stopped', message: '', modelPath: null },
   providers: [], preferredModel: { providerId: null, modelId: '' } };
 beforeEach(() => {
+  localStorage.clear();
+  saveDraft(null, '');
+  saveDraft('chat', '');
   vi.clearAllMocks();
   mocks.confirm.mockResolvedValue(true);
   mocks.workspaceIndex.mockResolvedValue({ projects: [], tasks: {} });
@@ -39,12 +59,61 @@ beforeEach(() => {
   mocks.saveRememberedTools.mockResolvedValue(undefined);
   mocks.saveConversationTools.mockResolvedValue(undefined);
   mocks.exportConversation.mockResolvedValue(undefined);
+  mocks.messages.mockResolvedValue([{ id: 'message', conversationId: 'chat', role: 'user', content: 'Export this message', reasoning: '', status: 'complete', createdAt: 0 }]);
 });
 async function openChat() {
   render(<App />);
   await userEvent.click(await screen.findByRole('button', { name: 'Saved chat' }));
   await screen.findByText('Export this message');
 }
+
+describe('send failure recovery', () => {
+  it('retains a draft when the model is ready but no project exists', async () => {
+    mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, runtime: { phase: 'ready', message: 'Ready', modelPath: 'model.gguf' } });
+    render(<App />);
+    await screen.findByRole('button', { name: 'Saved chat' });
+    const input = screen.getByRole('textbox', { name: 'Message' });
+    await userEvent.type(input, 'Keep this prompt');
+    await userEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Add a project folder first');
+    expect(input).toHaveValue('Keep this prompt');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps progress-only events out of the transcript', async () => {
+    mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, runtime: { phase: 'ready', message: 'Ready', modelPath: 'model.gguf' } });
+    let finish!: () => void;
+    mocks.sendMessage.mockImplementation((_id: string, _content: string, onEvent: (event: ChatEvent) => void) => {
+      onEvent({ messageId: '', content: '', reasoning: '', activity: 'Preparing request…' });
+      return new Promise<void>(resolve => { finish = resolve; });
+    });
+    await openChat();
+    await userEvent.type(screen.getByRole('textbox', { name: 'Message' }), 'A new prompt');
+    await userEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalled());
+    expect(document.querySelector('[data-message-id=""]')).toBeNull();
+    finish();
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop generation' })).not.toBeInTheDocument());
+  });
+
+  it.each([true, false])('restores the draft only when the user message was not saved (accepted=%s)', async accepted => {
+    mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, runtime: { phase: 'ready', message: 'Ready', modelPath: 'model.gguf' } });
+    mocks.sendMessage.mockImplementation(async () => {
+      if (accepted) mocks.messages.mockResolvedValue([
+        { id: 'message', conversationId: 'chat', role: 'user', content: 'Export this message', reasoning: '', status: 'complete', createdAt: 0 },
+        { id: 'new-message', conversationId: 'chat', role: 'user', content: 'A new prompt', reasoning: '', status: 'complete', createdAt: 1 },
+      ]);
+      throw new Error('Model disconnected');
+    });
+    await openChat();
+    const input = screen.getByRole('textbox', { name: 'Message' });
+    await userEvent.type(input, 'A new prompt');
+    await userEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalled());
+    expect(await screen.findByRole('alert')).toHaveTextContent('Model disconnected');
+    await waitFor(() => expect(input).toHaveValue(accepted ? '' : 'A new prompt'));
+  });
+});
 describe('desktop conversation export', () => {
   it('saves to the chosen native path and reports completion', async () => {
     mocks.save.mockResolvedValue('C:/exports/chat.json');
@@ -104,11 +173,19 @@ describe('conversation permission modes', () => {
   });
 });
 
+async function openTools() {
+  await userEvent.click(screen.getByRole('button', { name: 'Settings' }));
+  await userEvent.click(await screen.findByRole('button', { name: 'Tools' }));
+}
+async function backToApp() {
+  await userEvent.click(screen.getByRole('button', { name: 'Back to app' }));
+}
+
 describe('remembered tool selection', () => {
   it('restores non-workspace remembered selections for an unscoped new chat at startup', async () => {
     mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: ['__workspace'], tools: [{ connectorId: 'example', toolName: 'kept_tool' }] } });
     render(<App />);
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     const workspace = await screen.findByRole('checkbox', { name: 'Workspace files' });
     await waitFor(() => expect(workspace).not.toBeChecked());
     expect(screen.getByText('Tools · 1 selected')).toBeInTheDocument();
@@ -116,7 +193,7 @@ describe('remembered tool selection', () => {
   });
   it('saves a change in a fresh chat immediately as the remembered selection', async () => {
     render(<App />);
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     const workspace = await screen.findByRole('checkbox', { name: 'Workspace files' });
     await waitFor(() => expect(workspace).toBeEnabled());
     await userEvent.click(workspace);
@@ -128,7 +205,7 @@ describe('remembered tool selection', () => {
   it('reports a failed save without claiming the choice was applied', async () => {
     mocks.saveRememberedTools.mockRejectedValue(new Error('The disk is full.'));
     render(<App />);
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     const workspace = await screen.findByRole('checkbox', { name: 'Workspace files' });
     await waitFor(() => expect(workspace).toBeEnabled());
     await userEvent.click(workspace);
@@ -139,10 +216,11 @@ describe('remembered tool selection', () => {
   it('a new conversation inherits the remembered selection without writing it again', async () => {
     mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: [], tools: [{ connectorId: 'example', toolName: 'kept_tool' }] } });
     render(<App />);
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     await screen.findByText('Tools · 1 selected');
+    await backToApp();
     await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     expect(await screen.findByText('Tools · 1 selected')).toBeInTheDocument();
     expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
   });
@@ -150,12 +228,13 @@ describe('remembered tool selection', () => {
     mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: ['__workspace', '__execution'], tools: [] } });
     render(<App />);
     expect(await screen.findByRole('textbox', { name: 'Message' })).toBeVisible();
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     expect(await screen.findByRole('checkbox', { name: 'Workspace files' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'Local code' })).not.toBeChecked();
 
+    await backToApp();
     await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     expect(await screen.findByRole('checkbox', { name: 'Workspace files' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'Local code' })).not.toBeChecked();
     expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
@@ -168,30 +247,33 @@ describe('remembered tool selection', () => {
     mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: [], tools: [{ connectorId: 'example', toolName: 'kept_tool' }] } });
     mocks.conversationTools.mockResolvedValue({ sources: ['__workspace'], tools: [], accessMode: 'ask' });
     render(<App />);
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     await screen.findByText('Tools · 1 selected');
+    await backToApp();
     await userEvent.click(screen.getByRole('button', { name: 'Saved chat' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     const workspace = await screen.findByRole('checkbox', { name: 'Workspace files' });
     await waitFor(() => expect(workspace).toBeChecked());
     expect(screen.getByText('Tools · 5 selected')).toBeInTheDocument();
     expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
     // Opening another chat never changes the future-chat default.
+    await backToApp();
     await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     expect(await screen.findByText('Tools · 1 selected')).toBeInTheDocument();
     expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
   });
   it('changing tools in a saved conversation updates it and the remembered selection', async () => {
     mocks.conversationTools.mockResolvedValue({ sources: ['__workspace'], tools: [], accessMode: 'ask' });
     render(<App />);
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
+    await backToApp();
     await userEvent.click(await screen.findByRole('button', { name: 'Saved chat' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     await screen.findByText('Tools · 5 selected');
     await userEvent.click(screen.getByRole('checkbox', { name: 'Workspace files' }));
-    await waitFor(() => expect(mocks.saveConversationTools).toHaveBeenCalledWith('chat', { sources: [], tools: [], accessMode: 'ask' }));
-    expect(mocks.saveRememberedTools).toHaveBeenCalledWith({ sources: [], tools: [], accessMode: 'ask' });
+    await waitFor(() => expect(mocks.saveConversationTools).toHaveBeenCalledWith('chat', { sources: [], tools: [], accessMode: 'ask', interactionMode: 'act' }));
+    expect(mocks.saveRememberedTools).toHaveBeenCalledWith({ sources: [], tools: [], accessMode: 'ask', interactionMode: undefined });
     expect(screen.getByText('Tools · Off')).toBeInTheDocument();
   });
 });
@@ -203,10 +285,10 @@ describe('tools navigation', () => {
     const input = screen.getByRole('textbox', { name: 'Message' });
     await userEvent.type(input, 'Keep my draft');
     expect(screen.queryByRole('checkbox', { name: 'Workspace files' })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await openTools();
     expect(await screen.findByRole('heading', { name: 'Tools' })).toBeVisible();
     expect(screen.getByRole('checkbox', { name: 'Workspace files' })).toBeVisible();
-    await userEvent.click(screen.getByRole('button', { name: 'Back to chat' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Back to app' }));
     expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('Keep my draft');
   });
 });
@@ -247,5 +329,26 @@ describe('project folders and scoping', () => {
       expect.objectContaining({ title: 'Remove project folder?', kind: 'warning' })
     );
     await waitFor(() => expect(mocks.removeProject).toHaveBeenCalledWith('proj-1'));
+  });
+});
+
+describe('model load failures', () => {
+  it('shows the real runtime status instead of a manufactured error state', async () => {
+    mocks.bootstrap.mockResolvedValue({
+      ...baseBootstrap,
+      rememberedTools: { sources: [], tools: [] },
+      preferences: { ...baseBootstrap.preferences, runtimePath: 'C:/runtime/llama-server.exe', modelPath: 'C:/models/model.gguf' },
+      runtime: { phase: 'stopped', message: 'No model loaded', modelPath: null },
+    });
+    mocks.loadModel.mockRejectedValue(new Error('llama-server exited'));
+    mocks.runtimeStatus.mockResolvedValue({ phase: 'ready', message: 'Model ready', modelPath: 'C:/models/model.gguf' });
+    render(<App />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Saved chat' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Models' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Load model' }));
+    await waitFor(() => expect(mocks.runtimeStatus).toHaveBeenCalled());
+    expect(await screen.findByText('Model ready')).toBeVisible();
+    expect(screen.getByText(/llama-server exited/)).toBeVisible();
   });
 });

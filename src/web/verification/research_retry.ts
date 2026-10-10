@@ -16,7 +16,7 @@ export interface RetryDecision {
 
 /** Normalize a query for repeat detection. */
 export function normalizeQueryText(query: string): string {
-  return query.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(Boolean).sort().join(' ');
+  return query.toLowerCase().trim().replace(/\s+/g, ' ');
 }
 
 export function isRepeatedQuery(query: string, tried: string[]): boolean {
@@ -27,7 +27,8 @@ export function isRepeatedQuery(query: string, tried: string[]): boolean {
 export function evaluateResearchRetry(
   verification: VerificationReport,
   currentRetryCount: number,
-  maxRetries: number = 1,
+  // Required: callers pass the mode's `ResearchBudget.retries`.
+  maxRetries: number,
   triedQueries: string[] = [],
   roundsWithoutNewEvidence = 0,
 ): RetryDecision {

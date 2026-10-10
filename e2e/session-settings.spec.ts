@@ -23,7 +23,13 @@ test('permission choice survives a new chat and page restart', async ({ page }) 
         listConnectors: async () => [{id:'deepwiki',description:'Documentation',url:'https://example.invalid/mcp',authType:'none',connected:false,hasCredential:false,tools:[],connectionError:'Service unavailable.'}], listSkills: async () => [],
         listInstalledModels: async () => [], listCapabilities: async () => [],
         modelInstallStatus: async () => ({busy:false,phase:'idle'}),
-        hasDaytonaKey: async () => false
+        downloadJobs: async () => [],
+        hasDaytonaKey: async () => false,
+        browserCloseAll: async () => {},
+                readiness: async () => ({step:'ready',message:'',nextAction:null}),
+        qualificationResults: async () => null,
+        profiles: async () => [],
+        tasksList: async () => []
       };
     `,
   }));
@@ -42,7 +48,8 @@ test('permission choice survives a new chat and page restart', async ({ page }) 
     await expect(page.getByRole('button', { name: `Permission mode: ${mode}`, exact: true })).toBeEnabled();
   }
   await page.screenshot({ path: 'test-results/session-settings.png' });
-  await page.getByRole('button', { name: 'Connectors', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Settings sections' }).getByRole('button', { name: 'Connectors', exact: true }).click();
   await page.locator('.catalog-item summary').filter({ hasText: 'Deepwiki' }).click();
   await expect(page.getByRole('alert')).toContainText('Could not reconnect: Service unavailable.');
   await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeEnabled();

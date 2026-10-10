@@ -1,8 +1,8 @@
 //! Local MCP process ownership. Explicit connection is the only launch operation.
 use crate::local_mcp_config::LocalServer;
-use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
+use process_wrap::tokio::ChildWrapper;
 use rmcp::{service::RunningService, RoleClient, ServiceExt};
-use std::{process::Stdio, time::Duration};
+use std::time::Duration;
 use tokio::io::AsyncRead;
 
 /// Maximum bytes accepted for one newline-delimited stdio frame (including
@@ -41,62 +41,46 @@ pub struct ShutdownReport {
     pub reaped: bool,
 }
 
-pub async fn connect(config: &LocalServer) -> Result<LocalSession, String> {
-    connect_with_timeout(config, Duration::from_secs(30)).await
+pub async fn connect(
+    config: &LocalServer,
+    isolation: &crate::isolation::IsolationSettings,
+    db_path: Option<&std::path::Path>,
+) -> Result<LocalSession, String> {
+    connect_with_timeout(config, isolation, db_path, Duration::from_secs(30)).await
 }
 
 async fn connect_with_timeout(
     config: &LocalServer,
+    isolation: &crate::isolation::IsolationSettings,
+    db_path: Option<&std::path::Path>,
     handshake_timeout: Duration,
 ) -> Result<LocalSession, String> {
     config.validate_launch()?;
-    let mut command = tokio::process::Command::new(&config.executable);
-    command
-        .args(&config.arguments)
-        .current_dir(&config.working_directory)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Server stderr can contain credentials. Discard it without an unread
-        // pipe that could block negotiation; protocol errors remain actionable.
-        .stderr(Stdio::null());
-    for name in [
-        "SystemRoot",
-        "WINDIR",
-        "TEMP",
-        "TMP",
-        "PATH",
-        "PATHEXT",
-        "COMSPEC",
-        "USERPROFILE",
-        "HOME",
-        "APPDATA",
-        "LOCALAPPDATA",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    command
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUTF8", "1")
-        .env("NO_COLOR", "1")
-        .envs(&config.environment);
-    let mut command = CommandWrap::from(command);
-    command.wrap(KillOnDrop);
-    #[cfg(windows)]
-    {
-        command.wrap(process_wrap::tokio::CreationFlags(
-            windows::Win32::System::Threading::CREATE_NO_WINDOW,
-        ));
-        command.wrap(process_wrap::tokio::JobObject);
-    }
-    #[cfg(unix)]
-    command.wrap(process_wrap::tokio::ProcessGroup::leader());
-    let mut child = command.spawn().map_err(|error| {
+    let mut env = crate::isolation::SpawnSpec::standard_env(&[(
+        "NO_COLOR".into(),
+        "1".into(),
+    )]);
+    env.extend(
+        config
+            .environment
+            .iter()
+            .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v))),
+    );
+    // stderr stays off the wire: server stderr can carry credentials and an
+    // unread pipe could block negotiation.
+    let spec = crate::isolation::SpawnSpec {
+        program: config.executable.clone(),
+        args: config.arguments.clone(),
+        cwd: std::path::PathBuf::from(&config.working_directory),
+        env,
+        stdin: true,
+        stderr: false,
+        writable: vec![std::path::PathBuf::from(&config.working_directory)],
+        cpu_seconds: 0,
+    };
+    let mut child = crate::isolation::spawn(&spec, isolation, db_path).map_err(|error| {
         format!(
-            "Local connector launch failed ({:?}). Check its executable and working directory.",
-            error.kind()
+            "Local connector launch failed ({error}). Check its executable and working directory."
         )
     })?;
     let input = child
@@ -275,7 +259,7 @@ mod tests {
             working_directory: temp.path().to_string_lossy().into_owned(),
             environment: Default::default(),
         };
-        let error = match connect_with_timeout(&hub_config, Duration::from_secs(15)).await {
+        let error = match connect_with_timeout(&hub_config, &Default::default(), None, Duration::from_secs(15)).await {
             Ok(_) => panic!("oversized frame unexpectedly connected"),
             Err(error) => error,
         };
@@ -327,7 +311,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             };
             let task =
                 tokio::spawn(
-                    async move { connect_with_timeout(&config, Duration::from_secs(3)).await },
+                    async move { connect_with_timeout(&config, &Default::default(), None, Duration::from_secs(3)).await },
                 );
             let pids: Vec<u32> = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -399,7 +383,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
             !config.executable.is_empty(),
             "Node is required for this process integration test"
         );
-        let session = connect(&config).await.unwrap();
+        let session = connect(&config, &Default::default(), None).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(5), session.service.list_tools(None))
             .await
             .unwrap()
@@ -421,7 +405,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
             working_directory: directory.path().to_string_lossy().into_owned(),
             environment: [("PRIVATE_TOKEN".into(), "secret-value".into())].into(),
         };
-        let error = match connect(&config).await {
+        let error = match connect(&config, &Default::default(), None).await {
             Ok(_) => panic!("unexpected launch"),
             Err(error) => error,
         };

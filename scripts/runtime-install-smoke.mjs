@@ -1,7 +1,12 @@
-import { chromium, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import { writeFileSync } from 'node:fs';
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
-const page = browser.contexts()[0].pages().find(page => page.url().includes('1420'));
+import { connectSmoke, openSettingsSection } from './smoke-lib.mjs';
+
+if (process.env.LOCALLM_NATIVE_SMOKE_ISOLATED !== '1') {
+  console.error("Refusing to run: this smoke drives the running app's real app-data. Set LOCALLM_NATIVE_SMOKE_ISOLATED=1 only against an isolated debug instance.");
+  process.exit(1);
+}
+let { browser, page } = await connectSmoke();
 if (!page) throw new Error('Native LocalLM webview required.');
 const invoke = (command, args = {}) => page.evaluate(async ({ command, args }) => { const { invoke } = await import('/node_modules/@tauri-apps/api/core.js'); return invoke(command, args); }, { command, args });
 const original = await invoke('bootstrap');
@@ -10,8 +15,8 @@ let changed = false;
 try {
   const before = await invoke('runtime_install_status');
   if (before.busy) throw new Error('An installation is already running; do not duplicate it.');
-  await page.getByRole('button', { name: 'Models & runtime', exact: true }).click();
-  await page.getByRole('tab', { name: 'Model files', exact: true }).click();
+  await openSettingsSection(page, 'Models');
+  await openSettingsSection(page, 'Model files');
   const panel = page.getByRole('region', { name: 'CUDA runtime download' });
   if (reuse && before.phase !== 'ready') throw new Error('No completed installation is available to resume.');
   if (!reuse) await expect(panel.getByRole('button', { name: 'Install CUDA runtime' })).toBeEnabled();

@@ -391,7 +391,7 @@ mod tests {
         if std::env::var("LOCALLM_MODEL_MESSAGE").is_ok() {
             assert_eq!(model_invoked, 1);
         }
-        crate::chat::begin_catalog_op(&store, &mut task, "calc", "run_code");
+        crate::chat::begin_tool_operation(&store, &mut task, "calc", "run_code").unwrap();
         let ran = runtime.block_on(crate::chat::run_catalog_and_record(
             &db_path, &task.id, &workspace_path, config.clone(), "calc", "run_code", arguments,
         )).unwrap_or_else(|error| panic!("run_code failed: {error}"));
@@ -400,19 +400,20 @@ mod tests {
         assert_eq!(text, "21.59", "run_code result was {ran}; model code was {model_code}");
         assert_eq!(malformed_executions, 0);
         task = store.research_task(&task.id).unwrap().unwrap();
-        crate::chat::begin_catalog_op(&store, &mut task, "done-file", "file_write");
+        crate::chat::begin_tool_operation(&store, &mut task, "done-file", "file_write").unwrap();
         runtime.block_on(crate::chat::run_catalog_and_record(
             &db_path, &task.id, &workspace_path, config.clone(), "done-file", "file_write",
             serde_json::json!({"path": "done.txt", "content": "DONE"}),
         )).unwrap();
         task = store.research_task(&task.id).unwrap().unwrap();
-        crate::chat::begin_catalog_op(&store, &mut task, "save-result", "file_write");
+        crate::chat::begin_tool_operation(&store, &mut task, "save-result", "file_write").unwrap();
         runtime.block_on(crate::chat::run_catalog_and_record(
             &db_path, &task.id, &workspace_path, config.clone(), "save-result", "file_write",
             serde_json::json!({"path": "result.txt", "content": text}),
         )).unwrap();
         let read = runtime.block_on(crate::harness::execute_workspace_tool(
             &workspace_path, config.clone(), "file_read", serde_json::json!({"path": "result.txt"}),
+            &Default::default(), None,
         )).unwrap();
         let body = read["content"].as_str().unwrap();
         assert!(body.contains(&text));
@@ -433,7 +434,7 @@ mod tests {
         let cancel_blocks_later = super::cancel_matches(control.cancel_generation, later);
 
         task = store.research_task(&task.id).unwrap().unwrap();
-        crate::chat::begin_catalog_op(&store, &mut task, "not-run", "file_write");
+        crate::chat::begin_tool_operation(&store, &mut task, "not-run", "file_write").unwrap();
         let recovered = crate::research_tasks::recover_interrupted(&store).unwrap();
         assert!(recovered.replayed_write_ids.is_empty());
         assert!(!recovered.unconditional_success);
@@ -444,6 +445,7 @@ mod tests {
         assert_eq!(reloaded.operations.iter().find(|op| op.id == "op-not-run").unwrap().status, crate::research_tasks::OperationStatus::Unknown);
         let again = runtime.block_on(crate::harness::execute_workspace_tool(
             &workspace_path, config, "file_read", serde_json::json!({"path": "result.txt"}),
+            &Default::default(), None,
         )).unwrap();
         assert_eq!(again["content"].as_str().unwrap().matches(&text).count(), 1);
         let staged = crate::chat::stage_paused_resume(&store, &task.conversation_id).unwrap();
@@ -472,7 +474,7 @@ mod tests {
         let remote = crate::local_only::inference_allowed("https://api.openai.com/v1");
         let remote_rejected = remote.as_ref().err().map(|error| error.contains("was not called")).unwrap_or(false);
         assert!(remote_rejected);
-        let inflight = reloaded.operations.iter().find(|op| op.id == "op-not-run").unwrap().status.as_str();
+        let inflight = serde_json::to_value(&reloaded.operations.iter().find(|op| op.id == "op-not-run").unwrap().status).unwrap();
         assert_eq!(inflight, "unknown");
         assert!(resume_from_checkpoint);
         assert!(!cancel_blocks_later);

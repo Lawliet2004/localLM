@@ -11,25 +11,45 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { localModels } from '../lib/localModels';
 import { api, nativeAvailable } from '../lib/api';
 import { ModelLibrary } from './ModelLibrary';
-import { BonsaiSettings } from '../features/bonsai/BonsaiSettings';
+import { QualificationPanel } from './Qualification';
 import { samePath } from '../lib/pathUtils';
+import { SettingsHeader } from './Settings';
+import { moveWithinGroup } from '../lib/roving';
 
 interface Props {
   config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus; busy: boolean;
-  onSaveConfig: (config: RuntimeConfig) => Promise<void>;
-  onSavePreferences: (preferences: Preferences) => Promise<void>;
+  /** Resolves to undefined on success, or a refresh-failure message when the
+   * save persisted but the reload of settings failed. Rejects on save failure. */
+  onSaveConfig: (config: RuntimeConfig) => Promise<string | undefined>;
+  onSavePreferences: (preferences: Preferences) => Promise<string | undefined>;
   onSaveSelection?: (selection: ModelSelection) => Promise<void>;
   onLoad: () => void; onUnload: () => void;
   requestedModel?: string;
   onRequestedModelHandled?: () => void;
   onRefresh?: () => Promise<void>;
+  /** When set, the settings rail owns navigation and the in-page tabs are hidden. */
+  section?: ModelSection;
+  onSection?: (section: ModelSection) => void;
 }
-export function Models({ config, preferences, runtime, busy, onSaveConfig, onSavePreferences, onSaveSelection = async () => {}, onLoad, onUnload, requestedModel, onRequestedModelHandled, onRefresh }: Props) {
+export type ModelSection = 'models' | 'model-files' | 'runtime' | 'generation' | 'diagnostics';
+type Tab = 'library' | 'model' | 'runtime' | 'generation' | 'diagnostics';
+const tabOf = (section: ModelSection): Tab => section === 'models' ? 'library' : section === 'model-files' ? 'model' : section;
+const sectionOf = (tab: Tab): ModelSection => tab === 'library' ? 'models' : tab === 'model' ? 'model-files' : tab;
+const TITLES: Record<Tab, [string, string]> = {
+  library: ['Models', 'Discover GGUF models on Hugging Face and manage the ones on this computer.'],
+  model: ['Model files', 'The llama.cpp runtime and GGUF files used for the local model.'],
+  runtime: ['Runtime', 'Tune GPU offload, context window, and memory for the selected model.'],
+  generation: ['Generation', 'How responses are sampled, and the instructions sent with every chat.'],
+  diagnostics: ['Diagnostics', 'Recent runtime output for troubleshooting.'],
+};
+export function Models({ config, preferences, runtime, busy, onSaveConfig, onSavePreferences, onSaveSelection = async () => {}, onLoad, onUnload, requestedModel, onRequestedModelHandled, onRefresh, section, onSection }: Props) {
   const [draft, setDraft] = useState(preferences);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [localFilename, setLocalFilename] = useState(requestedModel ?? localModels.find(model => preferences.modelPath.endsWith(model.filename))?.filename ?? localModels[0].filename);
-  const [tab, setTab] = useState<'library' | 'model' | 'runtime' | 'generation' | 'diagnostics'>('library');
+  const [localTab, setLocalTab] = useState<Tab>('library');
+  const tab = section ? tabOf(section) : localTab;
+  const setTab = (next: Tab) => { if (onSection) onSection(sectionOf(next)); else setLocalTab(next); };
   const [installed, setInstalled] = useState<InstalledModel[]>([]);
   const [libraryLoading, setLibraryLoading] = useState(Boolean(nativeAvailable));
   const [switching, setSwitching] = useState(false);
@@ -46,21 +66,25 @@ export function Models({ config, preferences, runtime, busy, onSaveConfig, onSav
     try {
       await api.useInstalledModel(model.id);
       await onSaveSelection({ providerId: null, modelId: '' });
-      if (model.projectorPath) {
-        const next = { ...draftRef.current, projectorPath: model.projectorPath };
-        updateDraft(next);
-        await onSavePreferences(next);
-      }
       setLocalFilename(model.id);
     } finally { try { await onRefresh?.(); } finally { setSwitching(false); } }
   }
   const draftRef = useRef(draft);
   const selectionRequest = useRef(0);
+  const baseline = useRef(preferences);
+  const [savingPrefs, setSavingPrefs] = useState(false);
   const modelMatches = runtime.phase === 'ready' && samePath(runtime.modelPath, preferences.modelPath);
 
+  // Adopt persisted preferences only while the draft is clean; edits the user
+  // has not saved yet survive unrelated bootstrap refreshes.
   useEffect(() => {
-    draftRef.current = preferences;
-    setDraft(preferences);
+    const dirty = (Object.keys(preferences) as (keyof Preferences)[]).some(
+      key => (draftRef.current[key] ?? '') !== (baseline.current[key] ?? ''));
+    baseline.current = preferences;
+    if (!dirty) {
+      draftRef.current = preferences;
+      setDraft(preferences);
+    }
     const matched = localModels.find(model => preferences.modelPath.endsWith(model.filename));
     if (matched) {
       setLocalFilename(matched.filename);
@@ -126,26 +150,50 @@ export function Models({ config, preferences, runtime, busy, onSaveConfig, onSav
   const pendingConfig = runtime.phase === 'ready' && runtime.loadedConfig &&
     (Object.keys(config) as (keyof RuntimeConfig)[]).some(key => config[key] !== runtime.loadedConfig?.[key]);
   busy = busy || switching;
-  return <div className="settings-page models-page">
-    <div className="page-heading"><p className="eyebrow">LOCAL &amp; REMOTE HARNESS</p><h1>Models &amp; Runtime</h1><p>Run local GGUF models with llama.cpp and tune GPU &amp; CPU runtime settings.</p></div>
-    <div className="model-status"><div className="model-icon"><Cpu size={24} /></div><div><strong>{runtime.modelPath?.split(/[\\/]/).pop() || 'Your local model'}</strong><p><span className={`status-dot ${runtime.phase === 'ready' ? 'ready' : ''}`} />{runtime.message}</p></div>{runtime.phase === 'ready' ? <>
+  const [title, description] = section ? TITLES[tab] : ['Models & runtime', 'Run local GGUF models with llama.cpp and tune GPU and CPU runtime settings.'];
+  return <div className={`settings-page models-page${tab === 'library' ? ' models-page-wide' : ''}`}>
+    <SettingsHeader title={title} description={description} />
+    {(!section || tab === 'library' || tab === 'runtime') && (() => {
+      // When the runtime message only restates the title ("No model loaded"),
+      // show it once — in the title — not again underneath.
+      const modelTitle = runtime.modelPath?.split(/[\\/]/).pop() || 'No model loaded';
+      return <div className="model-status"><div className="model-icon"><Cpu size={18} /></div><div><strong>{modelTitle}</strong>{runtime.message !== modelTitle && <p><span className={`status-dot ${runtime.phase === 'ready' ? 'ready' : runtime.phase === 'loading' ? 'loading' : runtime.phase === 'error' ? 'error' : ''}`} />{runtime.message}</p>}</div>{runtime.phase === 'ready' ? <>
       {preferences.modelPath && !modelMatches && <button className="primary" disabled={busy} onClick={onLoad}><Play size={14} />Switch to {preferences.modelPath.split(/[\\/]/).pop()}</button>}
       <button className="secondary" disabled={busy} onClick={onUnload}><Square size={14} />Unload</button>
-    </> : <button className="primary" disabled={busy || !preferences.modelPath || !preferences.runtimePath} onClick={onLoad}><Play size={14} />{busy ? 'Loading…' : 'Load model'}</button>}</div>
+    </> : <button className="primary" disabled={busy || !preferences.modelPath || !preferences.runtimePath} onClick={onLoad}><Play size={14} />{runtime.phase === 'loading' ? 'Loading…' : 'Load model'}</button>}</div>; })()}
     {tab === 'runtime' && <HardwareStatus runtime={runtime} />}
     {runtime.phase === 'ready' && !modelMatches && <div className="loaded-settings"><p role="status">A different model file is saved. Reload to use {preferences.modelPath.split(/[\\/]/).pop()}.</p><button type="button" className="primary" disabled={busy} onClick={onLoad}>Load selected model</button></div>}
     {pendingConfig && <div className="loaded-settings"><p role="status">Saved configuration is not active. Context: {config.contextLength.toLocaleString()} saved / {runtime.loadedConfig!.contextLength.toLocaleString()} loaded. Apply to reload the model with your saved settings.</p><button className="primary" disabled={busy} onClick={onLoad}>Apply saved configuration</button></div>}
-    <div className="tabs" role="tablist" aria-label="Model settings">{(['library','runtime','generation','model','diagnostics'] as const).map(value => <button role="tab" aria-selected={tab === value} key={value} onClick={() => { setTab(value); setNotice(''); }}>{value === 'library' ? 'Models' : value === 'model' ? 'Model files' : value === 'runtime' ? 'Runtime' : value === 'generation' ? 'Generation' : 'Diagnostics'}</button>)}</div>
+    {!section && (() => {
+      const tabs = ['library','runtime','generation','model','diagnostics'] as const;
+      return <div className="tabs" role="tablist" aria-label="Model settings"
+        onKeyDown={event => moveWithinGroup(event, tabs, tab, next => { setTab(next); setNotice(''); })}>
+        {tabs.map(value => <button type="button" role="tab" aria-selected={tab === value} tabIndex={tab === value ? 0 : -1} key={value} onClick={() => { setTab(value); setNotice(''); }}>{value === 'library' ? 'Models' : value === 'model' ? 'Model files' : value === 'runtime' ? 'Runtime' : value === 'generation' ? 'Generation' : 'Diagnostics'}</button>)}
+      </div>;
+    })()}
     {notice && <p className="success" role="status">{notice}</p>}
     {error && <p className="error" role="alert">{error}</p>}
-    {(['library', 'runtime', 'model'] as Tab[]).includes(tab) && <BonsaiSettings busy={busy} modelPath={preferences.modelPath}
-      onActivated={async () => { await onSaveSelection({ providerId: null, modelId: '' }); await onRefresh?.(); await refreshLibrary(); }}
-      onRefresh={async () => { await onRefresh?.(); await refreshLibrary(); }} onPreset={async preset => { await onSaveConfig(preset); if (runtime.phase === 'ready' || runtime.phase === 'error') onLoad(); }} />}
-    {tab === 'library' ? <ModelLibrary models={installed} loading={libraryLoading} busy={busy || switching} selectedPath={preferences.modelPath} loadedPath={runtime.modelPath} onRefresh={refreshLibrary} onUse={useModel} onDeleted={async () => { await onRefresh?.(); }} /> : <>
+    {tab === 'library' ? <><ModelLibrary models={installed} loading={libraryLoading} busy={busy || switching} selectedPath={preferences.modelPath} loadedPath={runtime.modelPath} onRefresh={refreshLibrary} onUse={useModel} onDeleted={async () => { await onRefresh?.(); }} />
+    <QualificationPanel selection={{ providerId: null, modelId: '' }} busy={busy || switching || runtime.phase === 'loading'} /></> : <>
     {tab === 'model' && localModels.some(m => m.filename === localFilename) && <ModelDownload key={localFilename} filename={localFilename} busy={busy} onSelect={path => { updateDraft(current => ({ ...current, modelPath: path })); setNotice('Verified model selected. Save settings to apply it, then load the model.'); }} />}
     {tab === 'model' && <RuntimeDownload busy={busy} onSelect={path => { updateDraft(current => ({ ...current, runtimePath: path })); setNotice('Installed runtime selected. Save settings to apply it.'); }} />}
-    {tab === 'diagnostics' ? <RuntimeDiagnostics /> : tab === 'runtime' ? <RuntimeForm key={preferences.modelPath} modelPath={preferences.modelPath} runtime={runtime} initial={config} busy={busy || switching} onSave={async value => { try { setError(''); await onSaveConfig(value); if (runtime.phase === 'ready' || runtime.phase === 'error') { setNotice('Runtime configuration saved. Reloading the model so the new context applies.'); onLoad(); } else { setNotice('Runtime configuration saved. Load the model to use it.'); } } catch (e) { setError(String(e)); } }} /> :
-      <form className="runtime-form" onSubmit={async event => { event.preventDefault(); try { setError(''); await onSavePreferences(draft); setNotice('Settings saved.'); } catch (e) { setError(String(e)); } }}>
+    {tab === 'diagnostics' ? <RuntimeDiagnostics /> : tab === 'runtime' ? <RuntimeForm key={preferences.modelPath} modelPath={preferences.modelPath} runtime={runtime} initial={config} busy={busy || switching} onSave={async value => {
+      setError('');
+      const issue = await onSaveConfig(value);
+      if (runtime.phase === 'ready' || runtime.phase === 'error') {
+        setNotice(issue ?? 'Runtime configuration saved. Reloading the model so the new context applies.');
+        onLoad();
+      } else {
+        setNotice(issue ?? 'Runtime configuration saved. Load the model to use it.');
+      }
+    }} /> :
+      <form className="runtime-form" onSubmit={async event => {
+        event.preventDefault();
+        setError(''); setSavingPrefs(true);
+        try { const issue = await onSavePreferences(draft); baseline.current = draft; setNotice(issue ?? 'Settings saved.'); }
+        catch (e) { setError(`Not saved: ${e instanceof Error ? e.message : String(e)}`); }
+        finally { setSavingPrefs(false); }
+      }}>
         <fieldset disabled={busy}>{tab === 'model' ? <><legend>Local files</legend><p className="section-description">Use a GGUF model and a compatible llama.cpp runtime. Q6_K is the recommended starting point for MiniCPM5-2B.</p><label>llama-server executable<input aria-label="llama-server executable" placeholder="C:\path\to\llama-server.exe" value={draft.runtimePath} onChange={e => updateDraft(current => ({ ...current, runtimePath: e.target.value }))} required spellCheck={false} /><small>Choose the CUDA build to use your NVIDIA GPU.</small></label><label>GGUF model file<input aria-label="GGUF model file" placeholder="C:\path\to\MiniCPM5-2B.Q6_K.gguf" value={draft.modelPath} onChange={e => updateDraft(current => ({ ...current, modelPath: e.target.value }))} required spellCheck={false} /></label><label>Vision projector (optional, enables image input)<input aria-label="Vision projector file" placeholder="C:\path\to\mmproj-model-f16.gguf (leave empty for text-only)" value={draft.projectorPath ?? ''} onChange={e => updateDraft(current => ({ ...current, projectorPath: e.target.value }))} spellCheck={false} /><small>Multimodal GGUF models need their matching mmproj file to see images. Leave empty for text-only chat.</small></label></> : <><legend>Response behavior</legend><div className="field-pair"><label>Temperature<input type="number" min="0" max="2" step="0.05" required value={draft.temperature} onChange={e => updateDraft(current => ({ ...current, temperature: e.target.valueAsNumber }))} /></label><label>Top-p<input type="number" min="0.01" max="1" step="0.01" required value={draft.topP} onChange={e => updateDraft(current => ({ ...current, topP: e.target.valueAsNumber }))} /></label></div><label>Maximum response tokens<input type="number" min="1" max="32768" required value={draft.maxTokens} onChange={e => updateDraft(current => ({ ...current, maxTokens: e.target.valueAsNumber }))} /><small>Includes reasoning and the final answer. This reserve must leave room for the prompt in the loaded context. For reasoning models, start with 2,048 tokens or more.</small></label>
             {draft.maxTokens >= config.contextLength && <p className="error" role="alert">The response reserve uses the entire {config.contextLength.toLocaleString()}-token context, so every message will fail. Lower this value or increase Context window and reload the model.</p>}<label>System instructions<textarea rows={5} maxLength={32768} value={draft.systemPrompt} onChange={e => updateDraft(current => ({ ...current, systemPrompt: e.target.value }))} /></label></>}</fieldset>
         {tab === 'model' && <div className="file-actions">{(['runtimePath','modelPath','projectorPath'] as const).map(key => <button type="button" className="secondary" key={key} disabled={busy} onClick={async () => {
@@ -154,7 +202,7 @@ export function Models({ config, preferences, runtime, busy, onSaveConfig, onSav
             if (path) updateDraft(current => ({ ...current, [key]: path }));
           } catch (e) { setError(String(e)); }
         }}>{key === 'modelPath' ? 'Browse model…' : key === 'projectorPath' ? 'Browse projector…' : 'Browse runtime…'}</button>)}</div>}
-        <div className="form-footer"><small>{tab === 'model' ? 'Model files stay on your computer.' : 'Applies to your next response.'}</small><button className="primary" disabled={busy}>Save settings</button></div>
+        <div className="form-footer"><small>{tab === 'model' ? 'Model files stay on your computer.' : 'Applies to your next response.'}</small><button className="primary" disabled={busy || savingPrefs}>{savingPrefs ? 'Saving…' : 'Save settings'}</button></div>
       </form>}
     </>}
   </div>;

@@ -169,7 +169,7 @@ export function normalizeRequest(rawQuery: string): NormalizedRequest {
 
   // 5. Question type classification
   let questionType: NormalizedRequest['questionType'] = 'general';
-  if (/\b(weather|temperature|forecast|rain|snow|humidity|wind)\b/i.test(lower)) {
+  if (/\b(weather|forecast|rain|snow|humidity|wind speed)\b/i.test(lower)) {
     questionType = 'weather';
   } else if (/\b(compare|versus|vs\.?|differences between)\b/i.test(lower)) {
     questionType = 'comparison';

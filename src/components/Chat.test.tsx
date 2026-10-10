@@ -1,4 +1,5 @@
-import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Chat } from './Chat';
 import type { Message, ProviderConnection } from '../lib/types';
@@ -8,40 +9,98 @@ const apiMocks = vi.hoisted(() => ({
   contextPreflight: vi.fn(),
   compactConversation: vi.fn(),
   getTodos: vi.fn<() => Promise<any[]>>(async () => []),
+  listInstalledModels: vi.fn<() => Promise<any[]>>(async () => []),
+  getSessionEvents: vi.fn<() => Promise<any[]>>(async () => []),
 }));
 vi.mock('../lib/api', () => ({
   nativeAvailable: true,
   errorMessage: (e: unknown) => (e instanceof Error ? e.message : String(e)),
   api: {
-    listInstalledModels: async () => [],
+    readiness: async () => ({ step: 'model-missing', message: 'No model is selected.', nextAction: { label: 'Choose a model in Models', target: 'models' } }),
+    listInstalledModels: apiMocks.listInstalledModels,
     compactionStatus: async () => ({ auto: true, keepLast: 10, checkpoint: null }),
     getArtifact: apiMocks.getArtifact,
     contextPreflight: apiMocks.contextPreflight,
     compactConversation: apiMocks.compactConversation,
     getTodos: apiMocks.getTodos,
+    getSessionEvents: apiMocks.getSessionEvents,
+    verificationSummary: async () => ({ criteria: [], records: [], state: { state: 'work-completed', summary: '' } }),
   },
 }));
 
 afterEach(() => {
+  apiMocks.listInstalledModels.mockReset();
+  apiMocks.listInstalledModels.mockResolvedValue([]);
   apiMocks.getTodos.mockReset();
   apiMocks.getTodos.mockResolvedValue([]);
+  apiMocks.getSessionEvents.mockReset();
+  apiMocks.getSessionEvents.mockResolvedValue([]);
   apiMocks.contextPreflight.mockReset();
   apiMocks.contextPreflight.mockResolvedValue({ available: false });
   apiMocks.compactConversation.mockReset();
   apiMocks.compactConversation.mockResolvedValue({ note: '', checkpoint: null });
 });
 
+it('offers the existing K2 model with its custom runtime in the chat picker', async () => {
+  const onConfigureLocalModel = vi.fn();
+  apiMocks.listInstalledModels.mockResolvedValue([{
+    id: 'C:/k2/K2-Horizon-4B-Q4_K_M.gguf', filename: 'K2-Horizon-4B-Q4_K_M.gguf',
+    complete: true, external: true,
+  }]);
+  render(<Chat {...props} messages={[]} providers={[]} onSelectModel={vi.fn()} modelLabel="Local model" onConfigureLocalModel={onConfigureLocalModel} />);
+  fireEvent.click(screen.getByRole('button', { name: /Local model/ }));
+  expect(await screen.findByText(/K2 custom llama\.cpp runtime/)).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: /K2 Horizon 3.7B/ }));
+  expect(onConfigureLocalModel).toHaveBeenCalledWith('C:/k2/K2-Horizon-4B-Q4_K_M.gguf');
+});
+
 const props = { generating: false, ready: true, loading: false, onSend: vi.fn(), onCancel: vi.fn(), onConfigure: vi.fn() };
+
+it('shows the next setup step before a model is ready', async () => {
+  render(<Chat {...props} ready={false} messages={[]} />);
+  expect(screen.getByRole('heading', { name: 'Start a local conversation' })).toBeVisible();
+  // The readiness card names the actual missing step rather than a generic
+  // "load a model" hint.
+  await screen.findByText('No model is selected.');
+  expect(screen.getByRole('button', { name: /Open Models/ })).toBeEnabled();
+});
+
+it('keeps malformed attachment envelopes readable without crashing the transcript', () => {
+  const message: Message = { id: 'u', conversationId: 'chat', role: 'user', content: '', reasoning: '', status: 'complete', createdAt: 1 };
+  const view = render(<Chat {...props} messages={[{ ...message, content: '{"kind":"locallm-attachments-v1","text":"No attachments"}' }]} />);
+  expect(screen.getByText(/No attachments/)).toBeVisible();
+  view.rerender(<Chat {...props} messages={[{ ...message, content: JSON.stringify({ kind: 'locallm-attachments-v1', text: 'Files', attachments: [null, {}, { name: 'note.txt', content: 'Readable' }] }) }]} />);
+  expect(screen.getByText('note.txt')).toBeInTheDocument();
+});
+
+it('shows a persisted failure even when no assistant text was generated', () => {
+  const message: Message = { id: 'a', conversationId: 'chat', role: 'assistant', content: '', reasoning: '', status: 'error', error: 'Runtime exited before producing a response.', createdAt: 1 };
+  const view = render(<Chat {...props} messages={[message]} />);
+  expect(screen.getByText('Runtime exited before producing a response.')).toBeVisible();
+  view.rerender(<Chat {...props} messages={[{ ...message, status: 'interrupted', error: null }]} />);
+  expect(screen.getByText('Response stopped')).toBeVisible();
+});
+
 describe('chat action reporting and submission', () => {
-  it('pause and resume call the generation controls while a response is running', () => {
-    const onPause = vi.fn();
-    const onResume = vi.fn();
-    const { rerender } = render(<Chat {...props} messages={[]} generating onPause={onPause} onResume={onResume} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Pause response' }));
-    expect(onPause).toHaveBeenCalledOnce();
-    rerender(<Chat {...props} messages={[]} generating={false} paused onPause={onPause} onResume={onResume} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Resume response' }));
-    expect(onResume).toHaveBeenCalledOnce();
+  it('shows all three abbreviated speeds on one line after an assistant response completes', () => {
+    const message: Message = { id: 'measured', conversationId: 'c1', role: 'assistant', content: 'Done.', reasoning: '', status: 'complete', createdAt: 1,
+      metrics: { promptTokPerSec: 125.4, ttftSecs: 0.42, genTokPerSec: 38.6 } };
+    const { rerender } = render(<Chat {...props} messages={[{ ...message, status: 'streaming' }]} />);
+    expect(screen.queryByText(/PPS 125 t\/s/)).not.toBeInTheDocument();
+    rerender(<Chat {...props} messages={[message]} />);
+    expect(screen.getByText('PPS 125 t/s · TTFT 0.42 s · TGS 38.6 t/s')).toHaveClass('message-perf');
+  });
+  it('opens image previews by keyboard and returns focus after Escape', async () => {
+    const message: Message = { id: 'image', conversationId: 'chat', role: 'assistant', status: 'complete', content: '![Chart](https://example.com/chart.png)', reasoning: '', createdAt: 1 };
+    render(<Chat {...props} messages={[message]} />);
+    const preview = screen.getByRole('button', { name: 'Enlarge Chart' });
+    preview.focus();
+    await userEvent.keyboard('{Enter}');
+    expect(screen.getByRole('dialog', { name: 'Chart' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close preview' })).toHaveFocus();
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Chart' })).not.toBeInTheDocument();
+    await waitFor(() => expect(preview).toHaveFocus());
   });
   it('shows a collapsible plan checklist and hides todo harness cards', async () => {
     apiMocks.getTodos.mockResolvedValue([
@@ -53,27 +112,52 @@ describe('chat action reporting and submission', () => {
       id: 't', conversationId: 'c1', role: 'tool', status: 'complete', reasoning: '', createdAt: 2,
       content: JSON.stringify({ request: { connector: 'Harness', name: 'todo_write', arguments: { todos: [] } }, result: { saved: 2 } }),
     };
-    render(<Chat {...props} conversationKey="c1" messages={[user, todoTool]} generating planMode />);
+    render(<Chat {...props} conversationKey="c1" messages={[user, todoTool]} generating interactionMode="plan" />);
     const checklist = await screen.findByLabelText('Plan checklist');
+    await screen.findByText('Search papers');
     expect(checklist).toHaveTextContent('1 of 2');
     expect(screen.getByText('Search papers')).toBeInTheDocument();
     expect(screen.queryByText('Harness · todo_write')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Plan\s*1 of 2/i }));
     expect(screen.queryByRole('list')).not.toBeInTheDocument();
   });
-  it('toggles plan mode from the composer', () => {
-    const onPlanModeChange = vi.fn();
-    const { rerender } = render(<Chat {...props} messages={[]} planMode={false} onPlanModeChange={onPlanModeChange} />);
-    const toggle = screen.getByRole('button', { name: 'Plan mode' });
-    expect(toggle).toHaveAttribute('aria-pressed', 'false');
-    expect(toggle).not.toHaveTextContent('Plan');
-    fireEvent.click(toggle);
-    expect(onPlanModeChange).toHaveBeenCalledWith(true);
-    rerender(<Chat {...props} messages={[]} planMode onPlanModeChange={onPlanModeChange} />);
-    const active = screen.getByRole('button', { name: 'Plan mode' });
-    expect(active).toHaveAttribute('aria-pressed', 'true');
-    expect(active).toHaveTextContent('Plan');
+  it('keeps completed plan and model setup in the composer line for existing chats', async () => {
+    apiMocks.getTodos.mockResolvedValue([{ text: 'Finish the answer', status: 'completed', updatedAt: 1 }]);
+    const message: Message = { id: 'u', conversationId: 'c1', role: 'user', status: 'complete', content: 'Explain this', reasoning: '', createdAt: 1 };
+    render(<Chat {...props} conversationKey="c1" messages={[message]} ready={false} projectName="Project" />);
+    await screen.findByText('1 of 1 done');
+    expect(screen.getByLabelText('Plan checklist').closest('.composer-meta-bar')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Set up model' }).closest('.composer-meta-bar')).toBeInTheDocument();
+    expect(screen.queryByText('Load a local model or choose a tested API provider to start a conversation.')).not.toBeInTheDocument();
+  });
+  it('switches Ask/Plan/Act from the composer segmented control', () => {
+    const onMode = vi.fn();
+    const { rerender } = render(<Chat {...props} messages={[]} interactionMode="act" onInteractionModeChange={onMode} />);
+    const group = screen.getByRole('radiogroup', { name: 'Interaction mode' });
+    const radios = within(group).getAllByRole('radio');
+    expect(radios.map(radio => radio.textContent)).toEqual(['Ask', 'Plan', 'Act']);
+    expect(within(group).getByRole('radio', { name: 'Act' })).toHaveAttribute('aria-checked', 'true');
+    expect(within(group).getByRole('radio', { name: 'Act' })).toHaveAttribute('tabIndex', '0');
+    expect(within(group).getByRole('radio', { name: 'Ask' })).toHaveAttribute('tabIndex', '-1');
+    fireEvent.keyDown(group, { key: 'ArrowLeft' });
+    expect(onMode).toHaveBeenCalledWith('plan');
+    rerender(<Chat {...props} messages={[]} interactionMode="plan" onInteractionModeChange={onMode} />);
+    expect(within(screen.getByRole('radiogroup', { name: 'Interaction mode' })).getByRole('radio', { name: 'Plan' })).toHaveAttribute('aria-checked', 'true');
     expect(screen.getByLabelText('Message')).toHaveAttribute('placeholder', 'Describe the task to plan…');
+  });
+  it('offers an Implement plan action after a plan reply', async () => {
+    const onImplementPlan = vi.fn();
+    const message: Message = { id: 'a', conversationId: 'c1', role: 'assistant', content: '1. Research\n2. Write', reasoning: '', status: 'complete', createdAt: 1 };
+    render(<Chat {...props} conversationKey="c1" messages={[message]} interactionMode="plan" planReady onImplementPlan={onImplementPlan} />);
+    const implement = screen.getByRole('button', { name: /Implement plan/ });
+    expect(implement).toBeEnabled();
+    await userEvent.click(implement);
+    expect(onImplementPlan).toHaveBeenCalledExactlyOnceWith();
+  });
+  it('hides Implement plan while generating or without a completed plan', () => {
+    const message: Message = { id: 'a', conversationId: 'c1', role: 'assistant', content: 'plan', reasoning: '', status: 'complete', createdAt: 1 };
+    render(<Chat {...props} conversationKey="c1" messages={[message]} interactionMode="plan" planReady={false} onImplementPlan={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: /Implement plan/ })).not.toBeInTheDocument();
   });
   it('shows unavailable tools as a notice without blocking ordinary chat', () => {
     render(<Chat {...props} messages={[]} draft="Hello" chatNotice="Unavailable for this reply: parallel-web, deepwiki." />);
@@ -86,7 +170,7 @@ describe('chat action reporting and submission', () => {
     const assistant: Message = {...user,id:'a',role:'assistant',content:'Updated the styles.'};
     const tool: Message = {...user,id:'t',role:'tool',content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'styles.css'}},result:{diff:'--- a/styles.css\n+++ b/styles.css\n@@ -1 +1 @@\n-old\n+new'}})};
     render(<Chat {...props} messages={[user,assistant,tool]} />);
-    expect(screen.getByText('Edited styles.css')).toBeVisible();
+    expect(screen.getByText('styles.css', { selector: '.file-change-heading strong' })).toBeVisible();
     expect(screen.getByText('Review')).toBeVisible();
   });
   it('shows send failures before the first message is saved', () => {
@@ -165,9 +249,8 @@ describe('chat action reporting and submission', () => {
   it('shows a reviewable unified diff for workspace edits', () => {
     const message: Message = { id:'edit', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'note.txt'},decision:'allowed'},result:{replacements:1,diff:'--- a/note.txt\n+++ b/note.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n'}}) };
     render(<Chat {...props} messages={[message]} />);
-    fireEvent.click(screen.getByText('note.txt'));
-    expect(screen.getByText('Diff')).toBeVisible();
-    expect(screen.getByText(/--- a\/note\.txt/, { exact: false })).toBeVisible();
+    fireEvent.click(screen.getByText('Review'));
+    expect(screen.getByText(/--- a\/note\.txt/, { selector: '.file-change-review pre' })).toBeVisible();
   });
   it('retries the failed prompt as a new send without changing the draft', async () => {
     const onSend = vi.fn(async (_content: string) => {});
@@ -183,10 +266,41 @@ describe('chat action reporting and submission', () => {
     expect(screen.getByText('Partial answer')).toBeInTheDocument();
   });
 it('shows measured context usage in the context popover', () => {
-     render(<Chat {...props} messages={[]} contextUsage={{ inputTokens: 123, responseReserve: 512, contextLength: 8192 }} />);
+     render(<Chat {...props} messages={[]} contextUsage={{ inputTokens: 123, outputTokens: 10, cachedInputTokens: 80, responseReserve: 512, contextLength: 8192 }} />);
+     fireEvent.mouseEnter(screen.getByRole('button', { name: /Context 8% used/ }));
      const popover = screen.getByRole('dialog', { name: 'Context usage and compaction' });
-     expect(popover).toHaveTextContent('123 input + 512 reserved / 8,192 tokens');
+     expect(popover).toHaveTextContent('635 / 8,192 tokens');
+     expect(popover).toHaveTextContent('Output tokens10');
+     expect(popover).toHaveTextContent('Cached input80');
    });
+    it('preflights attachment-only messages using the submitted contents', async () => {
+      const onSend = vi.fn(async (_content: string) => {});
+      render(<Chat {...props} messages={[]} onSend={onSend} />);
+      fireEvent.change(screen.getByLabelText('Attach files'), { target: { files: [new File(['attached context'], 'context.txt')] } });
+      await screen.findByRole('button', { name: 'Remove context.txt' });
+      await waitFor(() => expect(apiMocks.contextPreflight).toHaveBeenCalled());
+      const estimated = apiMocks.contextPreflight.mock.calls[apiMocks.contextPreflight.mock.calls.length - 1][1];
+      expect(estimated).toContain('attached context');
+      fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+      await waitFor(() => expect(onSend).toHaveBeenCalledWith(estimated));
+    });
+    it('ignores a context estimate returned after changing conversations', async () => {
+      let resolveOld!: (value: any) => void;
+      apiMocks.contextPreflight.mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve; }));
+      const { rerender } = render(<Chat {...props} conversationKey="old" messages={[]} draft="Same draft" />);
+      await waitFor(() => expect(apiMocks.contextPreflight).toHaveBeenCalledTimes(1));
+      rerender(<Chat {...props} conversationKey="newer" messages={[]} draft="Same draft" />);
+      await waitFor(() => expect(apiMocks.contextPreflight).toHaveBeenCalledTimes(2));
+      await act(async () => resolveOld({ available: true, breakdown: { total: 9000, instructions: 0, tools: 0, history: 9000, draft: 0, responseReserve: 512, contextLength: 8192, exact: true, fits: false, overflow: 'Old conversation overflow' } }));
+      expect(screen.queryByText('Old conversation overflow')).not.toBeInTheDocument();
+    });
+    it('refreshes an unchanged draft estimate when conversation history changes', async () => {
+      const { rerender } = render(<Chat {...props} conversationKey="chat" messages={[]} draft="Same draft" />);
+      await waitFor(() => expect(apiMocks.contextPreflight).toHaveBeenCalledTimes(1));
+      const history: Message[] = [{ id: 'new-message', conversationId: 'chat', role: 'assistant', content: 'Saved reply', reasoning: '', status: 'complete', createdAt: 1 }];
+      rerender(<Chat {...props} conversationKey="chat" messages={history} draft="Same draft" />);
+      await waitFor(() => expect(apiMocks.contextPreflight).toHaveBeenCalledTimes(2));
+    });
     it('warns when the draft overflows the context window', async () => {
       apiMocks.contextPreflight.mockResolvedValue({ available: true, breakdown: { total: 9000, instructions: 50, tools: 30, history: 4000, draft: 4920, responseReserve: 512, contextLength: 8192, exact: true, fits: false, overflow: 'Over the context limit — compact history or shorten the draft.' } });
       render(<Chat {...props} messages={[]} ready={true} draft="test prompt" />);
@@ -202,6 +316,7 @@ it('shows measured context usage in the context popover', () => {
         { id: '3', conversationId: 'c1', role: 'user', content: 'Turn 2', reasoning: '', status: 'complete', createdAt: 3 },
       ];
       render(<Chat {...props} conversationKey="c1" messages={messages} ready={true} draft="Next message" />);
+      fireEvent.mouseEnter(screen.getByRole('button', { name: /Context usage details/ }));
       const compactBtn = await screen.findByRole('button', { name: 'Compact history' });
       fireEvent.click(compactBtn);
       await waitFor(() => expect(apiMocks.compactConversation).toHaveBeenCalledWith('c1'));
@@ -251,7 +366,8 @@ it('renders live activity timeline during generation', () => {
     />
   );
   expect(screen.getByRole('status')).toHaveTextContent('Querying system_time…');
-  expect(screen.getByText('ExecutingTools')).toBeInTheDocument();
+  // The internal run state is not surfaced; the activity text already describes it.
+  expect(screen.queryByText('ExecutingTools')).not.toBeInTheDocument();
 });
 
 it('inspects bounded tool output artifact on demand', async () => {
@@ -297,13 +413,13 @@ it('inspects bounded tool output artifact on demand', async () => {
   expect(screen.getByRole('button', { name: 'Loaded' })).toBeInTheDocument();
 });
 
-it('opens model popover and triggers onSelectModel for local and remote models', async () => {
+it('offers local and loopback models while excluding unsupported remote inference', async () => {
   const onSelectModel = vi.fn(async () => {});
   const providers: ProviderConnection[] = [
     {
       id: 'prov-openai',
       name: 'OpenAI',
-      baseUrl: 'https://api.openai.com/v1',
+      baseUrl: 'http://127.0.0.1:8080/v1',
       apiFormat: 'openai-chat-completions',
       hasApiKey: true,
       verified: true,
@@ -318,7 +434,7 @@ it('opens model popover and triggers onSelectModel for local and remote models',
     <Chat
       {...props}
       messages={[]}
-      providers={providers}
+      providers={[...providers, { ...providers[0], id: 'remote', name: 'Unavailable remote', baseUrl: 'https://api.openai.com/v1' }]}
       onSelectModel={onSelectModel}
       modelLabel="Local · llama.cpp"
     />
@@ -328,6 +444,7 @@ it('opens model popover and triggers onSelectModel for local and remote models',
   fireEvent.click(modelTrigger);
 
   expect(screen.getByRole('dialog', { name: 'Select model' })).toBeInTheDocument();
+  expect(screen.queryByText('Unavailable remote')).not.toBeInTheDocument();
   expect(screen.getByText('OpenAI')).toBeInTheDocument();
   expect(screen.getByText('gpt-4o-mini')).toBeInTheDocument();
 
@@ -376,7 +493,7 @@ it('renders reasoning block with thinking indicator while streaming and thought 
 
   const { rerender } = render(<Chat {...props} messages={[streamingMsg]} generating={true} />);
 
-  expect(screen.getByText(/Thinking \(/)).toBeInTheDocument();
+  expect(screen.getByText('Working…')).toBeInTheDocument();
   expect(screen.getByText('Analyzing query parameters...')).toBeInTheDocument();
 
   const completedMsg: Message = {
@@ -385,7 +502,7 @@ it('renders reasoning block with thinking indicator while streaming and thought 
   };
 
   rerender(<Chat {...props} messages={[completedMsg]} generating={false} />);
-  expect(screen.getByText(/Thought/)).toBeInTheDocument();
+  expect(screen.getByText('Worked')).toBeInTheDocument();
 });
 
 it('renders copy button on markdown code blocks', async () => {
@@ -413,3 +530,34 @@ it('renders copy button on markdown code blocks', async () => {
 });
 
 
+
+it('shows a disclosure naming the memories an answer used', async () => {
+  apiMocks.getSessionEvents.mockResolvedValue([{
+    id: 'e1', conversationId: 'c1', seq: 5, eventType: 'memory_used', ignorable: false, createdAt: 10,
+    payload: { facts: [{ id: 'm1', fact: 'use pnpm not npm' }, { id: 'm2', fact: 'tests live in tests/' }] },
+  }]);
+  const user: Message = { id: 'u', conversationId: 'c1', role: 'user', status: 'complete', content: 'Set it up', reasoning: '', createdAt: 1 };
+  const assistant: Message = { id: 'a', conversationId: 'c1', role: 'assistant', status: 'complete', content: 'Done.', reasoning: '', createdAt: 20 };
+  render(<Chat {...props} conversationKey="c1" messages={[user, assistant]} />);
+  const summary = await screen.findByText('Used 2 memories');
+  fireEvent.click(summary);
+  expect(await screen.findByText('use pnpm not npm')).toBeInTheDocument();
+  expect(screen.getByText('tests live in tests/')).toBeInTheDocument();
+});
+
+it('queues the composer draft on Enter while a task is running', async () => {
+  const onQueue = vi.fn(async () => {});
+  const onSend = vi.fn(async () => {});
+  render(<Chat {...props} generating messages={[]} draft="follow up on that" onSend={onSend} onQueue={onQueue} onSteer={vi.fn(async () => {})} />);
+  const input = screen.getByRole('textbox', { name: 'Message' });
+  fireEvent.keyDown(input, { key: 'Enter' });
+  await waitFor(() => expect(onQueue).toHaveBeenCalledWith('follow up on that'));
+  expect(onSend).not.toHaveBeenCalled();
+});
+
+it('steers the running task from the composer', async () => {
+  const onSteer = vi.fn(async () => {});
+  render(<Chat {...props} generating messages={[]} draft="focus on tests" onSteer={onSteer} />);
+  fireEvent.click(screen.getByRole('button', { name: /Steer the running task/ }));
+  await waitFor(() => expect(onSteer).toHaveBeenCalledWith('focus on tests'));
+});

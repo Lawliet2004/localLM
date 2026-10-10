@@ -52,9 +52,6 @@ pub fn build_label_from_path(path: &str) -> String {
             return label;
         }
     }
-    if let Some(index) = name.find("prism-") {
-        return name[index..].split(['/', '\\']).next().unwrap_or(name).to_string();
-    }
     "unknown-build".into()
 }
 

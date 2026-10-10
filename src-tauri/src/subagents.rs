@@ -129,20 +129,23 @@ pub fn harness_detached(
         "memory_teach" => {
             let fact = args.get("fact").and_then(|v| v.as_str())
                 .ok_or("memory_teach needs a 'fact' string.")?.to_string();
-            let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let scope = if scope.trim().is_empty() {
-                if workspace_path.is_empty() { "global".to_string() } else { workspace_path.clone() }
-            } else { scope };
-            let record = store.teach_fact(&scope, &fact, "model")?;
+            if !crate::memory::auto_retain(&store) {
+                return Ok(serde_json::json!({"denied": true, "message": "Memory auto-retain is off; the fact was not stored."}));
+            }
+            let raw_scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            let scope = crate::memory::resolve_scope(&store, &request.conversation_id, raw_scope)?;
+            let record = store.teach_fact_ex(&scope, &fact, "agent", None, Some(&request.conversation_id), None, None, None)?;
             Ok(serde_json::json!({"id": record.id, "scope": record.scope}))
         }
         "memory_recall" => {
-            let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let scope = if scope.trim().is_empty() {
-                if workspace_path.is_empty() { "global".to_string() } else { workspace_path.clone() }
-            } else { scope };
+            let raw_scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("");
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-            let facts = store.recall_facts(&scope, limit.min(50))?;
+            let facts = if raw_scope.trim().is_empty() {
+                crate::memory::facts_for_conversation(&store, &request.conversation_id, limit.min(50))?
+            } else {
+                let scope = crate::memory::resolve_scope(&store, &request.conversation_id, raw_scope)?;
+                store.recall_facts(&scope, limit.min(50))?
+            };
             Ok(serde_json::json!({"facts": facts}))
         }
         "file_search" => {
@@ -193,6 +196,7 @@ pub type ChildEmit = Arc<dyn Fn(String, Option<serde_json::Value>) + Send + Sync
 #[derive(Clone, Debug)]
 pub struct BackendSnapshot {
     pub kind: String,
+    pub api_format: String,
     pub endpoint: String,
     pub key: String,
     pub base_url: String,
@@ -211,11 +215,13 @@ pub struct BackendSnapshot {
     pub data_dir: std::path::PathBuf,
     pub account_id: Option<String>,
     pub inference_slots: u32,
+    pub offered_tool_aliases: Vec<String>,
 }
 
 impl BackendSnapshot {
     pub fn backend(&self) -> Result<crate::inference::Backend, String> {
-        if self.kind == "local" {
+        crate::local_only::inference_allowed(if self.base_url.is_empty() { &self.endpoint } else { &self.base_url })?;
+        if self.kind == "local" && self.base_url.is_empty() {
             crate::inference::Backend::local(self.endpoint.clone(), self.key.clone(), self.context_length)
         } else if self.kind == "subscription" {
             let model = crate::providers::RemoteModel {
@@ -239,7 +245,7 @@ impl BackendSnapshot {
             let provider = crate::providers::ProviderConnection {
                 id: "snapshot".into(),
                 name: "snapshot".into(),
-                api_format: crate::providers::OPENAI_CHAT_COMPLETIONS.into(),
+                api_format: self.api_format.clone(),
                 base_url: self.base_url.clone(),
                 verified: true,
                 last_tested_at: None,
@@ -273,7 +279,7 @@ pub async fn snapshot_for_conversation(
         preferences.validate()?;
         let workspace_path = store.workspace_path().unwrap_or_default();
         let execution_config = store.execution_config().unwrap_or(crate::execution::ExecutionConfig::default());
-        let active_skills = store.active_skills().unwrap_or_default();
+        let active_skills = store.active_skills_for(conversation_id).unwrap_or_default();
         let remote_info = if let Some(ref provider_id) = selection.provider_id {
             let provider = store.provider(provider_id)?.ok_or("The selected provider was deleted.")?;
             let model = provider
@@ -290,6 +296,7 @@ pub async fn snapshot_for_conversation(
     };
     let mut snapshot = BackendSnapshot {
         kind: "local".into(),
+        api_format: crate::providers::OPENAI_CHAT_COMPLETIONS.into(),
         endpoint: String::new(),
         key: String::new(),
         account_id: None,
@@ -308,8 +315,11 @@ pub async fn snapshot_for_conversation(
         db_path: state.db_path.clone(),
         data_dir: state.data_dir.clone(),
         inference_slots: state.database().ok().and_then(|store| store.runtime_config().ok()).map(|config| config.inference_slots).unwrap_or(1),
+        offered_tool_aliases: Vec::new(),
     };
     if let (Some(provider_id), Some((provider, model))) = (selection.provider_id, remote_info) {
+        crate::local_only::inference_allowed(&provider.base_url)?;
+        snapshot.api_format = provider.api_format.clone();
         if crate::providers::is_subscription_format(&provider.api_format) {
             let kind = if provider.api_format == crate::providers::CHATGPT_SUBSCRIPTION || provider.id == "chatgpt-subscription" {
                 "chatgpt"
@@ -330,8 +340,10 @@ pub async fn snapshot_for_conversation(
             let key = state
                 .daytona_vault
                 .load(&crate::providers::credential_id(&provider_id))?
+                .or_else(|| (crate::providers::is_loopback_base_url(&provider.base_url)
+                    && provider.api_format != crate::providers::CLAUDE_MESSAGES).then(Vec::new))
                 .ok_or("Save an API key for the selected provider.")?;
-            snapshot.kind = "remote".into();
+            snapshot.kind = "local".into();
             snapshot.key = String::from_utf8(key).map_err(|_| "Saved provider API key is invalid.")?;
             snapshot.base_url = provider.base_url;
             snapshot.context_length = model.context_length.ok_or("Configure the selected remote model's context capacity.")?;
@@ -427,6 +439,9 @@ pub struct ChildRequest {
     pub persona: Option<String>,
     pub output_schema: Option<serde_json::Value>,
     pub policy: ChildPolicy,
+    /// The parent run's Ask/Plan/Act mode, inherited unchanged so a child can
+    /// never launch with broader permissions than the turn that spawned it.
+    pub mode: crate::permissions::InteractionMode,
     pub parent_run_id: String,
     pub conversation_id: String,
 }
@@ -477,7 +492,7 @@ pub fn tool_allowed(filter: &Option<Vec<String>>, tool: &crate::connectors::Agen
 }
 
 fn child_system_prompt(snapshot: &BackendSnapshot, request: &ChildRequest) -> String {
-    let mut prompt = snapshot.system_prompt.clone();
+    let mut prompt = crate::prompt::frozen_system(&snapshot.system_prompt, "", None);
     if let Some(persona) = &request.persona {
         prompt.push_str(&format!("\nAdopt this persona for the subtask: {persona}"));
     }
@@ -531,7 +546,11 @@ pub fn local_tools(snapshot: &BackendSnapshot) -> Vec<crate::connectors::AgentTo
         if let Ok(workspace) = crate::workspace::Workspace::open(&snapshot.workspace_path) {
             tools.extend(std::sync::Arc::new(workspace).tools());
         }
-        if let Ok(execution) = crate::execution::LocalExecution::new(snapshot.execution_config.clone(), &snapshot.workspace_path) {
+        let allowed = crate::store::Store::open(&snapshot.db_path)
+            .and_then(|store| crate::sandbox::ensure_local_execution(&store)).is_ok();
+        if let Ok(execution) = crate::execution::LocalExecution::new(snapshot.execution_config.clone(), &snapshot.workspace_path)
+            .and_then(|execution| if allowed { Ok(execution) } else { Err("The saved execution provider is unavailable.".into()) })
+        {
             tools.push(std::sync::Arc::new(execution).tool());
         }
     }
@@ -542,6 +561,7 @@ pub fn local_tools(snapshot: &BackendSnapshot) -> Vec<crate::connectors::AgentTo
         }
     }
     tools.push(crate::connectors::AgentTool::system_time());
+    tools.retain(|tool| snapshot.offered_tool_aliases.contains(&tool.alias));
     tools
 }
 
@@ -671,7 +691,8 @@ pub async fn drive_child(
                     "content": "Unknown tool for this subagent. Use only the offered tools."}));
                 continue;
             };
-            let allowed = request.policy.allows(tool.trusted_read());
+            let allowed = request.policy.allows(tool.trusted_read())
+                && request.mode.permits_tool(tool);
             let result = if !allowed && !matches!(request.policy, ChildPolicy::Full) && emit.is_some() {
                 match request_approval_for_child(state, request, child_run_id, emit.as_ref(), &call).await {
                     Some(true) => call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call).await,
@@ -738,13 +759,16 @@ async fn call_child_tool(
         // Rebuild owned AgentTools: HarnessCtx needs &[AgentTool], and AgentTool
         // is Clone (MCP peers become detached markers that fail loud on call).
         let owned: Vec<crate::connectors::AgentTool> = tools.iter().map(|tool| (*tool).clone()).collect();
+        let mut child_snapshot = snapshot.clone();
+        child_snapshot.offered_tool_aliases = owned.iter().map(|tool| tool.alias.clone()).collect();
         let ctx = crate::harness::HarnessCtx {
             state,
-            snapshot: snapshot.clone(),
+            snapshot: child_snapshot,
             conversation_id: request.conversation_id.clone(),
             run_id: child_run_id.to_string(),
             step_id: format!("round-{round}"),
             access_mode: request.policy.access_mode(),
+            interaction_mode: request.mode,
             depth: request.depth + 1,
             preset_id: "standard".into(),
             inherit_tools: &owned,
@@ -811,8 +835,8 @@ async fn request_approval_for_child(
 
 use std::time::Duration;
 
-/// Foreground child: runs inline with the caller's reconstructed local tools
-/// plus any inherited tools the filter admits. Returns the final answer.
+/// Foreground child: runs inline with the caller's offered tools admitted by
+/// the filter. Returns the final answer.
 pub async fn run_child_inline(
     state: &crate::AppState,
     snapshot: &BackendSnapshot,
@@ -861,15 +885,9 @@ pub async fn run_child_inline(
             created_at: now,
         });
     }
-    let mut owned = local_tools(snapshot);
-    let mut tools: Vec<ChildTool> = owned
-        .drain(..)
-        .map(ChildTool::Owned)
-        .collect();
-    tools.extend(inherit.iter().map(ChildTool::Borrowed));
-    let tools: Vec<ChildTool> = tools
-        .into_iter()
-        .filter(|tool| tool_allowed(&request.tool_filter, tool.tool()))
+    let tools: Vec<ChildTool> = inherit.iter().map(ChildTool::Borrowed)
+        .filter(|tool| tool_allowed(&request.tool_filter, tool.tool())
+            && request.mode.permits_tool(tool.tool()))
         .collect();
     let interrupt = state.subagents.register(&child_run_id);
     let answer = drive_child(state, snapshot, &request, tools, &backend, interrupt, Some(state.subagents.clone()), &child_run_id, emit).await;
@@ -951,7 +969,8 @@ async fn run_background_core(
     let owned = local_tools(&snapshot);
     let tools: Vec<&crate::connectors::AgentTool> = owned
         .iter()
-        .filter(|tool| tool_allowed(&request.tool_filter, tool))
+        .filter(|tool| tool_allowed(&request.tool_filter, tool)
+            && request.mode.permits_tool(tool))
         .collect();
     // Drive without &AppState: cancellation comes from the interrupt flag.
     let answer = drive_detached(&snapshot, &request, tools, &backend, interrupt, Some(registry), &child_run_id, store.clone()).await;
@@ -1081,7 +1100,9 @@ pub async fn drive_detached(
                     "content": "Unknown tool for this subagent. Use only the offered tools."}));
                 continue;
             };
-            let result = if !request.policy.allows(tool.trusted_read()) {
+            let result = if !request.policy.allows(tool.trusted_read())
+                || !request.mode.permits_tool(tool)
+            {
                 serde_json::json!({"isError": true, "message": "Denied by the subagent approval pin (reads-only)."})
             } else if let Some(alias) = tool.harness_name() {
                 // Background children have no AppState: serve the store-only
@@ -1203,6 +1224,7 @@ pub async fn run_workflow(
     parent_run_id: &str,
     depth: i64,
     policy: ChildPolicy,
+    interaction_mode: crate::permissions::InteractionMode,
     mode: &str,
     steps: Vec<WorkflowStep>,
     max_rounds: usize,
@@ -1237,6 +1259,7 @@ pub async fn run_workflow(
                 persona: None,
                 output_schema: None,
                 policy,
+                mode: interaction_mode,
                 parent_run_id: parent_run_id.to_string(),
                 conversation_id: conversation_id.to_string(),
             };
@@ -1270,6 +1293,7 @@ pub async fn run_workflow(
             persona: None,
             output_schema: None,
             policy,
+            mode: interaction_mode,
             parent_run_id: parent_run_id.to_string(),
             conversation_id: conversation_id.to_string(),
         };
@@ -1354,6 +1378,7 @@ pub async fn run_ralph(
     parent_run_id: &str,
     depth: i64,
     policy: ChildPolicy,
+    interaction_mode: crate::permissions::InteractionMode,
     objective: &str,
     max_rounds: usize,
     inherit: &[crate::connectors::AgentTool],
@@ -1384,6 +1409,7 @@ pub async fn run_ralph(
             persona: None,
             output_schema: None,
             policy,
+            mode: interaction_mode,
             parent_run_id: parent_run_id.to_string(),
             conversation_id: conversation_id.to_string(),
         };
@@ -1483,7 +1509,8 @@ mod tests {
         let base = ChildRequest {
             label: "x".into(), prompt: "do it".into(), depth: 0, max_rounds: 4,
             tool_filter: None, persona: None, output_schema: None,
-            policy: ChildPolicy::ReadsOnly, parent_run_id: "p".into(), conversation_id: "c".into(),
+            policy: ChildPolicy::ReadsOnly, mode: crate::permissions::InteractionMode::Act,
+            parent_run_id: "p".into(), conversation_id: "c".into(),
         };
         assert!(validate_child_request(&base).is_ok());
         assert!(validate_child_request(&ChildRequest { prompt: "".into(), ..base.clone() }).is_err());

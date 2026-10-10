@@ -35,7 +35,7 @@ describe('SearXNG reliability', () => {
     const provider = new SearXNGProvider();
     const hits = await provider.search({ query: 'release' });
     expect(hits).toEqual([]);
-    expect(provider.lastDiagnostics?.engines).toEqual({ duckduckgo: 'timeout' });
+    expect(provider.lastDiagnostics?.engines).toEqual({ duckduckgo: 'timeout', wikipedia: 'engine failed' });
     expect(provider.lastDiagnostics?.unresponsiveEngines).toEqual(['wikipedia']);
   });
 

@@ -127,6 +127,10 @@ pub async fn test_provider(state: State<'_, AppState>, id: String) -> Result<Pro
     };
     let models = if result.model_list_supported { providers::merge_listed_models(&provider.models, &result.models) } else { provider.models.clone() };
     state.database()?.update_provider_test(&id, result.verified, Some(crate::store::now()), &models)?;
+    if result.verified {
+        // A live test proves the stored key works — stamp last_verified_at.
+        let _ = state.daytona_vault.mark_verified(&providers::credential_id(&provider.id));
+    }
     Ok(result)
 }
 
@@ -232,29 +236,42 @@ pub fn save_runtime_config(
     state: State<'_, AppState>,
     config: RuntimeConfig,
 ) -> Result<(), String> {
+    persist_runtime_config(&state, &config)
+}
+/// Preferences (with the fitted response budget) and the configuration are
+/// committed in one transaction, then the active model profile records the
+/// saved runtime so switching away and back keeps it.
+pub(crate) fn persist_runtime_config(state: &AppState, config: &RuntimeConfig) -> Result<(), String> {
     {
         let store = state.database()?;
-        store.save_runtime_config(&config)?;
         let mut preferences = store.preferences()?;
         let fitted = crate::context::fit_response_budget(preferences.max_tokens, config.context_length);
         if fitted != preferences.max_tokens {
             preferences.max_tokens = fitted;
-            store.save_preferences(&preferences)?;
         }
+        store.save_model_runtime(&preferences, config)?;
     }
-    crate::model_library::save_active_profile(&state, &config)?;
-    Ok(())
+    crate::model_library::save_active_profile(state, config)
 }
 #[tauri::command]
 pub fn save_preferences(
     state: State<'_, AppState>,
-    mut preferences: Preferences,
+    preferences: Preferences,
 ) -> Result<(), String> {
-    let store = state.database()?;
-    let config = store.runtime_config()?;
-    preferences.max_tokens =
-        crate::context::fit_response_budget(preferences.max_tokens, config.context_length);
-    store.save_preferences(&preferences)
+    persist_preferences(&state, preferences)
+}
+/// The active profile keeps the executable alongside the model so a later Use
+/// restores the newly saved runtime for this model.
+pub(crate) fn persist_preferences(state: &AppState, mut preferences: Preferences) -> Result<(), String> {
+    let config = {
+        let store = state.database()?;
+        let config = store.runtime_config()?;
+        preferences.max_tokens =
+            crate::context::fit_response_budget(preferences.max_tokens, config.context_length);
+        store.save_model_runtime(&preferences, &config)?;
+        config
+    };
+    crate::model_library::save_active_profile(state, &config)
 }
 #[tauri::command]
 pub async fn load_model(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
@@ -264,7 +281,10 @@ pub async fn load_model(state: State<'_, AppState>) -> Result<RuntimeStatus, Str
         .map_err(|_| "A model operation is already in progress.")?;
     match load_selected_model(&state).await {
         Ok(status) => Ok(status),
-        Err(error) => Err(crate::experimental::bonsai::recover_selected_failure(&state, error).await),
+        Err(error) => {
+            let error = preserve_load_failure(&state, &error, &failure_log(&state));
+            Err(error)
+        }
     }
 }
 
@@ -291,29 +311,24 @@ fn find_standard_runtime(data_dir: &Path, project_root: &Path) -> Option<std::pa
     if development.is_file() {
         return Some(development);
     }
-    let root = data_dir.join("runtimes");
-    let mut candidates = std::fs::read_dir(root)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            name.starts_with("llama-b10855-cuda12.4-")
-                .then(|| entry.path().join("llama-server.exe"))
-        })
-        .filter(|path| path.is_file())
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.into_iter().next()
+    let assets = crate::runtime_archive::catalog().ok()?;
+    crate::runtime_inventory::find_complete(
+        &data_dir.join("runtimes"),
+        crate::runtime_install::STANDARD_PREFIX,
+        &assets,
+    )
+    .ok()
+    .flatten()
 }
 
 /// Ensure a llama-server executable is selected before loading. An empty
 /// runtime path falls back to the managed standard runtime; user-selected
-/// executables are left untouched.
+/// executables are left untouched. The caller persists the updated
+/// preferences — this is discovery, not a save.
 fn configure_local_model_runtime(
     preferences: &mut crate::store::Preferences,
     state: &AppState,
 ) -> Result<(), String> {
-    crate::experimental::bonsai::configure_runtime(state, preferences)?;
     if !preferences.runtime_path.is_empty() {
         return Ok(());
     }
@@ -326,13 +341,113 @@ fn configure_local_model_runtime(
     let canonical = std::fs::canonicalize(&runtime)
         .map_err(|error| format!("Standard runtime exists but cannot be resolved: {error}"))?;
     preferences.runtime_path = canonical.to_string_lossy().into_owned();
-    state.database()?.save_preferences(preferences)?;
     Ok(())
+}
+
+fn failure_log(state: &AppState) -> std::path::PathBuf {
+    state.data_dir.join("last-load-failure.log")
+}
+
+/// Copy the failed load's runtime log aside and translate well-known causes
+/// (GPU OOM) into actionable text. Loads use the data-root path.
+pub(crate) fn preserve_load_failure(
+    state: &AppState,
+    error: &str,
+    destination: &Path,
+) -> String {
+    let log = std::fs::read(state.data_dir.join("runtime.log")).unwrap_or_default();
+    let saved = std::fs::create_dir_all(destination.parent().unwrap_or(destination))
+        .and_then(|()| std::fs::write(destination, &log))
+        .is_ok();
+    let lower = String::from_utf8_lossy(&log).to_lowercase();
+    let details = if saved {
+        format!(" See {}", destination.display())
+    } else {
+        String::new()
+    };
+    if lower.contains("out of memory")
+        || lower.contains("cudamalloc failed")
+        || lower.contains("failed to allocate cuda")
+    {
+        format!("Insufficient GPU memory. Reduce GPU layers, context, or batch size and retry.{details}")
+    } else {
+        format!("{error}{details}")
+    }
+}
+
+/// Commit a new model selection and load it as one recoverable operation.
+/// Validation happens before anything is persisted; on a load failure the
+/// previous selection is restored and the previous model reloaded when it had
+/// been running.
+pub(crate) async fn switch_and_load(
+    state: &AppState,
+    next: Preferences,
+    config: RuntimeConfig,
+) -> Result<RuntimeStatus, String> {
+    config.validate()?;
+    next.validate()?;
+    if !std::fs::canonicalize(&next.model_path)
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+    {
+        return Err("Select an existing GGUF model in Models.".into());
+    }
+    let projector = next.projector_path.trim();
+    if !projector.is_empty()
+        && !std::fs::canonicalize(projector)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+    {
+        return Err("Select an existing mmproj projector file in Models, or clear it for text-only chat.".into());
+    }
+    // Resolve the executable on a copy first: an empty path falls back
+    // to the managed standard runtime.
+    let mut resolved = next;
+    configure_local_model_runtime(&mut resolved, state)?;
+    if resolved.runtime_path.is_empty()
+        || !std::fs::canonicalize(&resolved.runtime_path)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+    {
+        return Err("Select an existing llama-server executable in Models.".into());
+    }
+    let (previous_preferences, previous_config) = {
+        let store = state.database()?;
+        (store.preferences()?, store.runtime_config()?)
+    };
+    let was_ready = state.runtime.lock().await.inspect().phase == "ready";
+    state.database()?.save_model_runtime(&resolved, &config)?;
+    crate::model_library::save_active_profile(state, &config)?;
+    match load_selected_model(state).await {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            let error = preserve_load_failure(state, &error, &failure_log(state));
+            {
+                let store = state.database()?;
+                store.save_model_runtime(&previous_preferences, &previous_config)?;
+            }
+            let still_ready = state.runtime.lock().await.inspect().phase == "ready";
+            // Runtime::load only stops the old process after its own
+            // validation; a still-ready phase means it never got that far.
+            let outcome = if still_ready {
+                "previous model is still running".to_string()
+            } else if was_ready {
+                match load_selected_model(state).await {
+                    Ok(_) => "previous model reloaded".to_string(),
+                    Err(reload) => format!("previous model could not be reloaded: {reload}"),
+                }
+            } else {
+                "no model was running".to_string()
+            };
+            Err(format!("{error}. Previous model settings restored; {outcome}."))
+        }
+    }
 }
 
 #[cfg(test)]
 mod model_runtime_tests {
     use super::*;
+    use crate::web_search::tests::test_state;
 
     #[test]
     fn finds_development_standard_runtime_before_managed_copies() {
@@ -342,6 +457,91 @@ mod model_runtime_tests {
         std::fs::create_dir_all(development.parent().unwrap()).unwrap();
         std::fs::write(&development, b"runtime").unwrap();
         assert_eq!(find_standard_runtime(data.path(), project.path()), Some(development));
+    }
+
+    #[tokio::test]
+    async fn switch_load_rejects_a_missing_model_before_committing() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        let (preferences, config) = {
+            let store = state.database().unwrap();
+            (store.preferences().unwrap(), store.runtime_config().unwrap())
+        };
+        let next = Preferences {
+            model_path: directory.path().join("missing.gguf").to_string_lossy().into_owned(),
+            ..preferences.clone()
+        };
+        let error = switch_and_load(&state, next, config.clone()).await.err().unwrap();
+        assert!(error.contains("GGUF"), "{error}");
+        let store = state.database().unwrap();
+        assert_eq!(store.preferences().unwrap().model_path, preferences.model_path);
+        assert_eq!(store.runtime_config().unwrap(), config);
+    }
+
+    #[tokio::test]
+    async fn switch_load_rejects_a_missing_runtime_before_committing() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        let model = directory.path().join("model.gguf");
+        std::fs::write(&model, b"GGUF").unwrap();
+        let (preferences, config) = {
+            let store = state.database().unwrap();
+            (store.preferences().unwrap(), store.runtime_config().unwrap())
+        };
+        let next = Preferences {
+            model_path: model.to_string_lossy().into_owned(),
+            runtime_path: directory.path().join("missing.exe").to_string_lossy().into_owned(),
+            ..preferences.clone()
+        };
+        let error = switch_and_load(&state, next, config.clone()).await.err().unwrap();
+        assert!(error.contains("llama-server"), "{error}");
+        let store = state.database().unwrap();
+        assert_eq!(store.preferences().unwrap().model_path, preferences.model_path);
+    }
+
+    #[tokio::test]
+    async fn switch_load_restores_the_previous_selection_after_a_load_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        let model = directory.path().join("model.gguf");
+        std::fs::write(&model, b"GGUF").unwrap();
+        // The file exists but cannot run, so the pre-spawn compatibility check fails.
+        let exe = directory.path().join("llama-server.exe");
+        std::fs::write(&exe, b"not an executable").unwrap();
+        let (preferences, config) = {
+            let store = state.database().unwrap();
+            (store.preferences().unwrap(), store.runtime_config().unwrap())
+        };
+        let previous_model = preferences.model_path.clone();
+        let next = Preferences {
+            model_path: model.to_string_lossy().into_owned(),
+            runtime_path: exe.to_string_lossy().into_owned(),
+            ..preferences
+        };
+        let error = switch_and_load(&state, next, config.clone()).await.err().unwrap();
+        assert!(error.contains("Previous model settings restored"), "{error}");
+        let store = state.database().unwrap();
+        assert_eq!(store.preferences().unwrap().model_path, previous_model);
+        assert_eq!(store.runtime_config().unwrap(), config);
+        assert!(directory.path().join("last-load-failure.log").is_file());
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_is_readable_while_the_runtime_is_locked() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        let mut runtime = state.runtime.lock().await;
+        runtime.status.phase = "loading".into();
+        runtime.status.message = "Loading model into memory".into();
+        runtime.inspect();
+        let phase = state
+            .runtime_snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .phase
+            .clone();
+        assert_eq!(phase, "loading");
+        assert!(state.runtime.try_lock().is_err());
     }
 }
 
@@ -355,7 +555,17 @@ pub async fn unload_model(state: State<'_, AppState>) -> Result<RuntimeStatus, S
 }
 #[tauri::command]
 pub async fn runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
-    Ok(state.runtime.lock().await.inspect())
+    // A model load holds the runtime lock for its whole duration; status
+    // queries must not queue behind it, so fall back to the snapshot the
+    // runtime publishes on every mutation.
+    if let Ok(mut runtime) = state.runtime.try_lock() {
+        return Ok(runtime.inspect());
+    }
+    Ok(state
+        .runtime_snapshot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone())
 }
 
 #[tauri::command]
@@ -421,6 +631,22 @@ pub fn detect_subscription_cli() -> crate::subscription_auth::CliDetectionResult
     crate::subscription_auth::detect_cli_sessions()
 }
 
+/// Record whether the subscription provider currently has working credentials.
+fn mark_subscription_tested(state: &AppState, provider: &str, tested: bool) {
+    if tested {
+        if let Ok(id) = crate::subscription_auth::vault_id_for_provider(provider) {
+            let _ = state.daytona_vault.mark_verified(id);
+        }
+    }
+    if let Ok(store) = state.database() {
+        let provider_id = if provider == "chatgpt" { "chatgpt-subscription" } else { "grok-subscription" };
+        if let Ok(Some(prov)) = store.provider(provider_id) {
+            let at = if tested { Some(crate::store::now()) } else { None };
+            let _ = store.update_provider_test(provider_id, tested, at, &prov.models);
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn import_subscription_cli(
     state: State<'_, AppState>,
@@ -431,12 +657,7 @@ pub async fn import_subscription_cli(
         .try_lock()
         .map_err(|_| "Wait for the active operation before syncing credentials.")?;
     crate::subscription_auth::import_cli_session(&state.daytona_vault, &provider)?;
-    if let Ok(store) = state.database() {
-        let provider_id = if provider == "chatgpt" { "chatgpt-subscription" } else { "grok-subscription" };
-        if let Ok(Some(prov)) = store.provider(provider_id) {
-            let _ = store.update_provider_test(provider_id, true, Some(crate::store::now()), &prov.models);
-        }
-    }
+    mark_subscription_tested(&state, &provider, true);
     crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
 }
 
@@ -467,12 +688,7 @@ pub async fn save_manual_subscription_token(
         refresh_token.as_deref(),
         account_id.as_deref(),
     )?;
-    if let Ok(store) = state.database() {
-        let provider_id = if provider == "chatgpt" { "chatgpt-subscription" } else { "grok-subscription" };
-        if let Ok(Some(prov)) = store.provider(provider_id) {
-            let _ = store.update_provider_test(provider_id, true, Some(crate::store::now()), &prov.models);
-        }
-    }
+    mark_subscription_tested(&state, &provider, true);
     crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
 }
 
@@ -486,12 +702,7 @@ pub async fn disconnect_subscription(
         .try_lock()
         .map_err(|_| "Wait for the active operation before disconnecting.")?;
     crate::subscription_auth::clear_session(&state.daytona_vault, &provider)?;
-    if let Ok(store) = state.database() {
-        let provider_id = if provider == "chatgpt" { "chatgpt-subscription" } else { "grok-subscription" };
-        if let Ok(Some(prov)) = store.provider(provider_id) {
-            let _ = store.update_provider_test(provider_id, false, None, &prov.models);
-        }
-    }
+    mark_subscription_tested(&state, &provider, false);
     Ok(())
 }
 
@@ -513,12 +724,7 @@ pub async fn start_subscription_sign_in(
         state.oauth_cancel.subscribe(),
     )
     .await?;
-    if let Ok(store) = state.database() {
-        let provider_id = if provider == "chatgpt" { "chatgpt-subscription" } else { "grok-subscription" };
-        if let Ok(Some(prov)) = store.provider(provider_id) {
-            let _ = store.update_provider_test(provider_id, true, Some(crate::store::now()), &prov.models);
-        }
-    }
+    mark_subscription_tested(&state, &provider, true);
     crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
 }
 

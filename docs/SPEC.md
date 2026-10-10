@@ -9,7 +9,7 @@ Ship a polished Windows desktop agent harness using Rust, TypeScript, React and 
 - A pinned llama.cpp binary runs as a managed child process on loopback with a random API key. CUDA is preferred, CPU fallback is explicit. Do not download model weights until provenance and storage paths are recorded.
 - MCP connectors use remote HTTP with OAuth/PKCE or bearer credentials, plus configurable local stdio servers. Tools are discovered on demand. Secrets stay outside model context.
 - Skills install pinned upstream instruction packs with provenance and dependencies. Instructions do not confer execution permissions.
-- Code execution supports Daytona and an explicit local execution mode. Local processes must not be represented as an isolation boundary.
+- Code execution uses an explicit local execution mode. Docker is deferred and new Daytona cloud execution is unavailable. Historical cloud cleanup remains supported. Local processes must not be represented as an isolation boundary.
 - Initial target: Windows x64, 4 GB NVIDIA VRAM, 16 GB system RAM. Other operating systems require separate release verification.
 
 ## Commands
@@ -34,7 +34,7 @@ Use named types, explicit errors and small functions. Example: `async function l
 - [ ] Runtime download verification, model import/download progress, cancellation, disk-space checks, useful load errors, logs and memory/performance measurement.
 - [ ] All 14 presets: Linear, Notion, Sentry, DeepWiki, Exa, Parallel Web, GitHub, Tavily, Bright Data, Supabase, Stripe, Confluence, Jira, PostHog. Connection test, tool discovery, auth refresh/disconnect, per-chat selection and actual tool calls.
 - [ ] All 13 skills: algorithmic-art, skill-creator, mcp-builder, web-artifacts-builder, tavily-research, supabase, wiki-architect, wiki-qa, linear, gh-fix-ci, notion-knowledge-capture, sentry, jupyter-notebook. Install/remove/update, pinned provenance, inspect content, dependency status, activation and real execution workflows.
-- [ ] Local and Daytona execution with timeouts, cancellation, bounded output, workspace restrictions and the selected permission policy; file and artifact previews.
+- [ ] Local execution with timeouts, cancellation, bounded output, workspace restrictions and the selected permission policy; historical cloud cleanup and broader file/artifact preview acceptance.
 - [x] Per-conversation Ask for approval, Auto-approve reads and Full access modes, with visible scope, durable settings and audited authorization.
 - [ ] Credential protection, IPC input validation, CSP, hostile content handling, permission boundaries and no secrets in logs or prompts.
 - [ ] Polished light/dark interface, keyboard navigation, responsive layout, useful empty/loading/error states, readable Markdown/code/tables.

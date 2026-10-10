@@ -4,6 +4,8 @@ A local AI desktop workspace built with Rust, TypeScript, React and Tauri 2. Min
 
 **Status:** native Windows application under active development. See [the full acceptance checklist](docs/SPEC.md). A successful installer build does not establish production readiness.
 
+Reliability fixes and their regression coverage are recorded in [the October 1 audit follow-up](docs/AUDIT-FIXES-2026-10-01.md).
+
 ## Development
 
 Install Node.js, Rust with the MSVC toolchain, Visual Studio C++ Build Tools and Microsoft Edge WebView2. The tested environment uses Node 24 and Rust 1.98. The pinned GPU runtime requires an NVIDIA driver compatible with CUDA 12.4.
@@ -35,9 +37,13 @@ GPU layers `-1` requests all supported layers; `0` uses CPU layers. Context leng
 
 Local web grounding is available through the Research preset's `web_search` tool. It uses self-hosted SearXNG and the loaded local model, with bounded evidence and source citations. See [Phase 1 setup and diagnostic test commands](docs/WEB_SEARCH_PHASE1.md).
 
+Offline mode blocks external retrieval, including AREX search/visit, direct URL reads, weather, and search health checks. Stored open/find and claim audits remain available. It does not isolate local shell or unknown-network MCP tools. Keyless OpenAI-compatible loopback providers work; inference to remote hosts is rejected. Runtime context is per slot, including with two slots.
+
+Search fallback defaults on. Google credentials use the encrypted vault; settings show only whether a key exists. Blank key saves keep the credential, and clearing it is explicit. Google connection checks report that the service was not tested. SQLite enforces a 90-request daily limit across primary/fallback searches and retries; traces identify the provider that supplied evidence.
+
 Connectors includes 14 TrueForge presets. Connect and authenticate a service, then select individual discovered tools above the chat. Account-specific services require your credentials. Public DeepWiki calls have native end-to-end coverage; this does not prove every authenticated service works with your account.
 
-Choose a workspace folder to enable file tools. Configure an installed Python, Node.js or PowerShell executable in Execution to enable local code. Local code runs with your account's filesystem and network permissions and is not sandboxed.
+Choose a workspace folder to enable file tools. Configure an installed Python, Node.js or PowerShell executable in Execution to enable local code. Local code runs with your account's filesystem and network permissions and is not sandboxed. Saving local execution settings explicitly selects this mode. Docker execution is deferred; old container settings block execution until local mode is selected.
 
 Every conversation has **Ask for approval**, **Auto-approve reads** and **Full access** modes. New chats default to Ask. Auto-approve permits known workspace reads; other tools ask. Full access runs enabled tools without prompts. Decisions and results remain in tool history. See [permissions](docs/PERMISSIONS.md).
 
@@ -52,7 +58,10 @@ Inference uses an authenticated loopback endpoint. Connector calls and skill dow
 ## Checks and packaging
 
 ```powershell
+npm run lint
+npm run typecheck
 npm test
+npm run test:scripts
 npm run build
 npx playwright test
 cargo test --manifest-path src-tauri/Cargo.toml
@@ -60,7 +69,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 npm run tauri build
 ```
 
-The configured Windows target is NSIS under `src-tauri/target/release/bundle/nsis/`. Model weights and llama.cpp are currently prepared separately, not bundled. Native smoke scripts exercise the debug application; release install/uninstall testing is a separate requirement.
+The configured Windows target is NSIS under `src-tauri/target/release/bundle/nsis/`. Model weights and llama.cpp are currently prepared separately, not bundled. Native smoke scripts exercise the debug application; release install/uninstall testing is a separate requirement. `npm run smoke` runs the `scripts/*-smoke.mjs` suite from `scripts/smokes.manifest.json`, skipping entries whose prerequisites (debug app CDP, model files, SearXNG) are unavailable; `--only <name>` filters and `--json` writes `test-results/smoke-run.json`.
 
 ## Troubleshooting
 
@@ -70,4 +79,4 @@ The configured Windows target is NSIS under `src-tauri/target/release/bundle/nsi
 - **Tool denied:** denial prevents further tool calls for that turn. Change permissions before sending a new message if needed.
 - **Skill integrity failure:** remove and reinstall the affected package.
 
-Outstanding work includes managed-download crash recovery and full model-transfer acceptance, live Daytona verification and credential rotation, skill script execution workflows and representative per-skill coverage, file browsing/artifact previews beyond the edit diff, retry/compaction, and full release verification. Current installer provenance, dependency audits, and third-party notices are in [release notes](docs/RELEASE.md). [Progress](docs/PROGRESS.md) records evidence and limitations; [desktop lifecycle](docs/DESKTOP.md) describes launch behavior.
+Docker and new cloud execution are outside the current product scope. Historical cloud cleanup remains available. Outstanding acceptance work includes managed-download crash recovery and full model-transfer acceptance, skill script execution workflows and representative per-skill coverage, broader file and artifact preview acceptance, and full release verification. Current installer provenance, dependency audits, and third-party notices are in [release notes](docs/RELEASE.md). [Progress](docs/PROGRESS.md) records evidence and limitations; [desktop lifecycle](docs/DESKTOP.md) describes launch behavior.

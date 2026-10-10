@@ -8,6 +8,7 @@
  */
 
 import { extractMainContent } from '../extraction/main_content';
+import type { HttpFetcher } from './http_fetcher';
 
 const CDX_URL = 'https://archive.org/wayback/available';
 const CDX_TIMEOUT_MS = 8000;
@@ -37,7 +38,7 @@ function isHttpUrl(url: string): boolean {
 /** Look up the closest archived snapshot for a URL. Returns null on any miss. */
 export async function queryWaybackSnapshot(
   url: string,
-  fetcher: Pick<HttpFetcherLike, 'fetch'>,
+  fetcher: Pick<HttpFetcher, 'fetch'>,
 ): Promise<WaybackSnapshot | null> {
   if (!isHttpUrl(url)) return null;
   try {
@@ -63,13 +64,6 @@ export async function queryWaybackSnapshot(
   }
 }
 
-export interface HttpFetcherLike {
-  fetch(url: string, options?: FetchOptionsLike): Promise<FetchResultLike>;
-}
-
-export interface FetchOptionsLike { timeoutSeconds?: number; maxBytes?: number; maxRedirects?: number; userAgent?: string }
-export interface FetchResultLike { url: string; finalUrl: string; success: boolean; status?: number; body?: string; mimeType?: string; error?: string; durationMs: number }
-
 /**
  * Attempt full recovery of a URL from the Wayback Machine: snapshot lookup,
  * bounded download, main-content extraction, and an explicit provenance line
@@ -77,7 +71,7 @@ export interface FetchResultLike { url: string; finalUrl: string; success: boole
  */
 export async function fetchViaWayback(
   originalUrl: string,
-  fetcher: Pick<HttpFetcherLike, 'fetch'>,
+  fetcher: Pick<HttpFetcher, 'fetch'>,
   options: { timeoutSeconds?: number; maxBytes?: number; titleHint?: string } = {},
 ): Promise<WaybackRecovery | null> {
   const snapshot = await queryWaybackSnapshot(originalUrl, fetcher);

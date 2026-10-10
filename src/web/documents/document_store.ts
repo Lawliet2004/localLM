@@ -68,9 +68,9 @@ export class DocumentStore {
       }];
     }
 
+    const chunks = chunkDocument({ ...doc, text: fullText }, { targetTokens: 500, overlapTokens: 60 });
     if (options.section) {
       const needle = options.section.toLowerCase();
-      const chunks = chunkDocument({ ...doc, text: fullText }, { targetTokens: 500, overlapTokens: 60 });
       const hit = chunks.find((c) => (c.headingPath || []).join(' ').toLowerCase().includes(needle));
       if (hit) {
         return [{
@@ -83,7 +83,6 @@ export class DocumentStore {
       }
     }
 
-    const chunks = chunkDocument({ ...doc, text: fullText }, { targetTokens: 500, overlapTokens: 60 });
     const index = Math.max(0, (options.passage ?? options.offset ?? 1) - 1);
     return chunks.slice(index, index + 1).map((chunk, i) => ({
       ref: `${docId}:passage:${index + i + 1}`,
@@ -99,13 +98,14 @@ export class DocumentStore {
     const doc = this.docs.get(docId);
     if (!doc) throw new Error('Unknown document in this session');
     const fullText = doc.fullText || doc.text;
+    const searchable = fullText.toLowerCase();
     const needle = term.toLowerCase();
     if (!needle.trim()) throw new Error('Search term must not be empty');
     const out: Passage[] = [];
     let from = 0;
     let hitIndex = 0;
     while (out.length < MAX_PASSAGES) {
-      const at = fullText.toLowerCase().indexOf(needle, from);
+      const at = searchable.indexOf(needle, from);
       if (at < 0) break;
       hitIndex++;
       const start = Math.max(0, at - contextChars);
