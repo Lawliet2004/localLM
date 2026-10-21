@@ -1,7 +1,11 @@
-import { useState, useEffect, useRef } from 'react';
-import { Check, Copy, ChevronRight, FileCode, FileText, AlertCircle, Clock, XCircle, Atom, ExternalLink } from 'lucide-react';
+import { safeSourceUrl, sourceIdentity } from '../lib/sources';
+import { useState, useEffect, useMemo, useRef, type ReactNode } from 'react';
+import { ArrowDown, Check, Copy, ChevronRight, FileCode, FileText, AlertCircle, XCircle, Atom, ExternalLink, LoaderCircle } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
+import { parseAnsi, type AnsiLine } from '../lib/ansi';
 import { TRACE_ICONS, toolKindOf, type TraceKind } from './TraceIcon';
+import { CodeBlock } from './CodeBlock';
+import { DiffLines, diffCounts } from './DiffView';
 
 export function FileIcon({ filename, size = 14 }: { filename?: string; size?: number }) {
   if (!filename) return <FileCode size={size} className="cmd-icon" />;
@@ -49,85 +53,6 @@ export interface CommandRunCardProps {
   onStop?: () => void;
 }
 
-const ANSI_COLORS: Record<number, string> = {
-  30: 'var(--terminal-black, #4b5563)',
-  31: 'var(--terminal-red, #ef4444)',
-  32: 'var(--terminal-green, #10b981)',
-  33: 'var(--terminal-yellow, #f59e0b)',
-  34: 'var(--terminal-blue, #3b82f6)',
-  35: 'var(--terminal-magenta, #ec4899)',
-  36: 'var(--terminal-cyan, #06b6d4)',
-  37: 'var(--terminal-white, #f3f4f6)',
-  90: 'var(--terminal-bright-black, #6b7280)',
-  91: 'var(--terminal-bright-red, #f87171)',
-  92: 'var(--terminal-bright-green, #34d399)',
-  93: 'var(--terminal-bright-yellow, #fbbf24)',
-  94: 'var(--terminal-bright-blue, #60a5fa)',
-  95: 'var(--terminal-bright-magenta, #f472b6)',
-  96: 'var(--terminal-bright-cyan, #22d3ee)',
-  97: 'var(--terminal-bright-white, #ffffff)',
-};
-
-interface AnsiSpan {
-  text: string;
-  color?: string;
-  bold?: boolean;
-  dim?: boolean;
-}
-
-function parseAnsiLine(line: string): AnsiSpan[] {
-  const regex = /\x1b\[([0-9;]*)m/g;
-  const spans: AnsiSpan[] = [];
-  let lastIndex = 0;
-  let currentColor: string | undefined = undefined;
-  let currentBold = false;
-  let currentDim = false;
-
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(line)) !== null) {
-    if (match.index > lastIndex) {
-      spans.push({
-        text: line.slice(lastIndex, match.index),
-        color: currentColor,
-        bold: currentBold,
-        dim: currentDim,
-      });
-    }
-
-    const codes = match[1] ? match[1].split(';').map(Number) : [0];
-    for (const code of codes) {
-      if (code === 0) {
-        currentColor = undefined;
-        currentBold = false;
-        currentDim = false;
-      } else if (code === 1) {
-        currentBold = true;
-      } else if (code === 2) {
-        currentDim = true;
-      } else if (code === 22) {
-        currentBold = false;
-        currentDim = false;
-      } else if (code === 39) {
-        currentColor = undefined;
-      } else if (ANSI_COLORS[code]) {
-        currentColor = ANSI_COLORS[code];
-      }
-    }
-    lastIndex = regex.lastIndex;
-  }
-
-  if (lastIndex < line.length) {
-    spans.push({
-      text: line.slice(lastIndex),
-      color: currentColor,
-      bold: currentBold,
-      dim: currentDim,
-    });
-  }
-
-  return spans.length > 0 ? spans : [{ text: line }];
-}
-
 interface WebSource {
   id: string;
   title?: string;
@@ -153,38 +78,63 @@ function domainOf(url?: string): string | undefined {
   }
 }
 
-function webSourcesFrom(result: Record<string, unknown> | null): WebSource[] {
-  if (!result) return [];
-  const sources = result.sources;
-  if (Array.isArray(sources)) {
-    return sources.slice(0, 6).flatMap((item, index): WebSource[] => {
-      if (typeof item === 'string') return [{ id: String(index + 1), url: item }];
-      if (item && typeof item === 'object') {
-        const rec = item as Record<string, unknown>;
-        return [{
-          id: String(rec.id ?? rec.sid ?? index + 1),
-          title: typeof rec.title === 'string' ? rec.title : typeof rec.name === 'string' ? rec.name : undefined,
-          url: typeof rec.url === 'string' ? rec.url : undefined,
-        }];
-      }
-      return [];
-    });
+/** One terminal channel (stdout or stderr) with its own gutter and fold. */
+function OutputChannel({ name, lines }: { name?: 'stdout' | 'stderr'; lines: AnsiLine[] }) {
+  const [folded, setFolded] = useState(true);
+  const foldable = lines.length > 30;
+  const visible = foldable && folded ? lines.slice(0, 30) : lines;
+  return (
+    <div className={name ? `output-channel channel-${name}` : 'output-channel'}>
+      {name && <p className="channel-label">{name}</p>}
+      <div className="terminal-lines">
+        {visible.map((line, idx) => (
+          <div key={idx} className="terminal-line">
+            <span className="terminal-gutter">{idx + 1}</span>
+            <span className="terminal-content">
+              {line.spans.map((span, spanIdx) => (
+                <span
+                  key={spanIdx}
+                  style={{
+                    color: span.dim ? 'var(--secondary)' : span.color,
+                    fontWeight: span.bold ? 600 : 'normal',
+                    fontStyle: span.italic ? 'italic' : 'normal',
+                    textDecoration: span.underline ? 'underline' : 'none',
+                    opacity: 1,
+                  }}
+                >
+                  {span.text}
+                </span>
+              ))}
+            </span>
+          </div>
+        ))}
+      </div>
+      {foldable && (
+        <div className="terminal-folding-bar">
+          <button type="button" className="fold-toggle-btn" onClick={() => setFolded(previous => !previous)}>
+            {folded ? `Show all ${lines.length} lines` : 'Show fewer lines'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function webSourcesFrom(result: Record<string, unknown> | null): WebSource[] {
+  const raw = result?.sources;
+  if (!raw || typeof raw !== 'object') return [];
+  const entries = Array.isArray(raw) ? raw.map((source, index) => [String(index + 1), source] as const) : Object.entries(raw);
+  const sources = new Map<string, WebSource>();
+  for (const [id, value] of entries) {
+    const source = typeof value === 'string' ? { url: value } : value as Record<string, unknown> | null;
+    if (!source || typeof source.url !== 'string') continue;
+    const url = safeSourceUrl(source.url);
+    if (!url) continue;
+    const key = sourceIdentity(url);
+    const prior = sources.get(key);
+    sources.set(key, { id: prior?.id ?? String(source.id ?? source.sid ?? id), url: source.url, title: typeof source.title === 'string' ? source.title : typeof source.name === 'string' ? source.name : prior?.title });
   }
-  if (sources && typeof sources === 'object') {
-    return Object.entries(sources as Record<string, unknown>).slice(0, 6).map(([id, value]) => {
-      if (typeof value === 'string') return { id, url: value };
-      if (value && typeof value === 'object') {
-        const rec = value as Record<string, unknown>;
-        return {
-          id,
-          title: typeof rec.title === 'string' ? rec.title : typeof rec.name === 'string' ? rec.name : undefined,
-          url: typeof rec.url === 'string' ? rec.url : undefined,
-        };
-      }
-      return { id };
-    });
-  }
-  return [];
+  return [...sources.values()];
 }
 
 export function CommandRunCard({
@@ -216,11 +166,10 @@ export function CommandRunCard({
   const [activeTab, setActiveTab] = useState<'terminal' | 'diff' | 'code' | 'raw' | 'result'>(diff ? 'diff' : structuredResult ? 'result' : 'terminal');
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(status === 'running');
-  const [isFolded, setIsFolded] = useState(true);
   const [artifactContent, setArtifactContent] = useState<string | null>(null);
   const [loadingArtifact, setLoadingArtifact] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
-  const userScrolledUp = useRef(false);
+  const [scrolledUp, setScrolledUp] = useState(false);
 
   const path = typeof args?.path === 'string'
     ? args.path
@@ -236,16 +185,7 @@ export function CommandRunCard({
   const endLine = args?.EndLine ?? args?.endLine ?? args?.end;
   const lineRange = startLine !== undefined && endLine !== undefined ? `${startLine}-${endLine}` : undefined;
 
-  let addedCount = 0;
-  let removedCount = 0;
-  if (diff) {
-    let inHunk = false;
-    for (const line of diff.split('\n')) {
-      if (line.startsWith('@@')) inHunk = true;
-      else if (inHunk && line.startsWith('+')) addedCount++;
-      else if (inHunk && line.startsWith('-')) removedCount++;
-    }
-  }
+  const { added: addedCount, removed: removedCount } = diff ? diffCounts(diff) : { added: 0, removed: 0 };
 
   const summaryTitle = typeof args?.toolSummary === 'string'
     ? args.toolSummary
@@ -276,7 +216,7 @@ export function CommandRunCard({
   if (isWeb) {
     displayVerb = toolName === 'web_open' ? 'Opened' : toolName === 'web_fetch_url' || toolName === 'web_fetch' ? 'Fetched' : toolName === 'web_find' ? 'Found' : 'Searched the web';
   } else if (isEdit) displayVerb = 'Edited';
-  else if (isRead) displayVerb = 'Analyzed';
+  else if (isRead) displayVerb = 'Read';
   else if (isSearch) displayVerb = 'Searched';
   else if (isTask) {
     const action = typeof args?.Action === 'string' ? args.Action : '';
@@ -341,9 +281,7 @@ export function CommandRunCard({
   const resultObject = parseObjectJson(structuredResult) ?? parseObjectJson(stdout);
   const webSources = isWeb ? webSourcesFrom(resultObject) : [];
   const webAnswer = isWeb && resultObject && typeof resultObject.answer === 'string' ? resultObject.answer.trim() : '';
-  if (isWeb && searchResultCount === undefined && webSources.length > 0) {
-    searchResultCount = webSources.length;
-  }
+  if (isWeb) searchResultCount = webSources.length;
 
   const traceKind: TraceKind = toolKindOf(toolName, args ?? {}, { diff });
   const HeaderGlyph = TRACE_ICONS[traceKind];
@@ -356,9 +294,10 @@ export function CommandRunCard({
   );
 
   const combinedOutput = stdout + (stderr ? (stdout ? '\n' : '') + stderr : '');
-  const lines = combinedOutput ? combinedOutput.split(/\r?\n/) : [];
-  const shouldAllowFolding = lines.length > 30;
-  const visibleLines = shouldAllowFolding && isFolded ? lines.slice(0, 30) : lines;
+  const hasOutput = stdout.length > 0 || stderr.length > 0;
+  // Channels parse independently so ANSI state never bleeds across streams.
+  const stdoutLines = useMemo(() => (stdout ? parseAnsi(stdout) : []), [stdout]);
+  const stderrLines = useMemo(() => (stderr ? parseAnsi(stderr) : []), [stderr]);
 
   useEffect(() => {
     if (diff && !combinedOutput && !structuredResult) {
@@ -369,15 +308,21 @@ export function CommandRunCard({
   }, [diff, combinedOutput, structuredResult]);
 
   useEffect(() => {
-    if (status === 'running' && viewportRef.current && !userScrolledUp.current) {
+    if (status === 'running' && viewportRef.current && !scrolledUp) {
       viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
     }
-  }, [combinedOutput, status]);
+  }, [combinedOutput, status, scrolledUp]);
 
   const handleScroll = () => {
     if (!viewportRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = viewportRef.current;
-    userScrolledUp.current = scrollHeight - scrollTop - clientHeight > 40;
+    setScrolledUp(scrollHeight - scrollTop - clientHeight > 40);
+  };
+
+  const jumpToLatest = () => {
+    if (!viewportRef.current) return;
+    viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
+    setScrolledUp(false);
   };
 
   const copyOutput = async () => {
@@ -413,7 +358,7 @@ export function CommandRunCard({
     if (status === 'running') {
       return (
         <span className="status-badge running" data-testid="status-running">
-          <span className="pulse-dot" />
+          <LoaderCircle size={13} className="spinning" />
           Running…
         </span>
       );
@@ -422,22 +367,6 @@ export function CommandRunCard({
       return (
         <span className="status-badge awaiting" data-testid="status-awaiting">
           Awaiting Approval
-        </span>
-      );
-    }
-    if (exitCode !== null && exitCode !== undefined) {
-      if (exitCode === 0) {
-        return (
-          <span className="status-badge success" data-testid="status-exit-0">
-            <span className="exit-text">Exit 0</span>
-            <span className="finished-tag">finished</span>
-          </span>
-        );
-      }
-      return (
-        <span className="status-badge failure" data-testid={`status-exit-${exitCode}`}>
-          <XCircle size={12} />
-          Exit {exitCode}
         </span>
       );
     }
@@ -461,12 +390,30 @@ export function CommandRunCard({
       return (
         <span className="status-badge failure" data-testid="status-failed">
           <AlertCircle size={12} />
-          Failed
+          Failed{exitCode != null && <span data-testid={`status-exit-${exitCode}`}>Exit {exitCode}</span>}
+        </span>
+      );
+    }
+    if (exitCode !== null && exitCode !== undefined) {
+      if (exitCode === 0) {
+        return (
+          <span className="status-badge success" data-testid="status-exit-0">
+            <Check size={14} />
+            <span className="exit-text">Exit 0</span>
+            <span className="finished-tag">finished</span>
+          </span>
+        );
+      }
+      return (
+        <span className="status-badge failure" data-testid={`status-exit-${exitCode}`}>
+          <XCircle size={12} />
+          Exit {exitCode}
         </span>
       );
     }
     return (
       <span className="status-badge success" data-testid="status-finished">
+        <Check size={14} />
         {isCommand ? (
           <>
             <span className="finished-text sr-only">Finished</span>
@@ -479,10 +426,12 @@ export function CommandRunCard({
     );
   };
 
+  const ResultDetails = isWeb ? 'details' : 'div';
   return (
     <details
       className={`command-run-card ${status} tool-record`}
       data-testid="command-run-card"
+      data-kind={traceKind}
       open={expanded}
       onToggle={e => setExpanded((e.currentTarget as HTMLDetailsElement).open)}
     >
@@ -490,7 +439,7 @@ export function CommandRunCard({
       <summary className="card-header">
         <div className="header-left">
           {headerIcon}
-          {!(isCommand && status === 'completed') && <strong className="activity-kind">{displayVerb}</strong>}
+          <strong className="activity-kind">{displayVerb}</strong>
           <span className={`cmd-title ${isCommand || path ? 'cmd-title-mono' : ''}`} title={path ?? displayTitle}>
             <span>{displayTitle}</span>
           </span>
@@ -516,7 +465,6 @@ export function CommandRunCard({
 
           {durationMs !== undefined && (
             <span className="duration-pill" title="Execution duration">
-              <Clock size={11} />
               {formatDuration(durationMs)}
             </span>
           )}
@@ -527,14 +475,22 @@ export function CommandRunCard({
 
       <div className="card-body">
         {path && path !== displayTitle && <p className="muted">{path}</p>}
+        {(cwd || (command && environment) || localServerId || authorization) && (
+          <p className="tool-meta">
+            {[
+              cwd ? <span key="cwd">Working directory <code className="tool-meta-value">{cwd}</code></span> : null,
+              command && environment ? <span key="env">Environment <code className="tool-meta-value">{environment}</code></span> : null,
+              localServerId ? <span key="lsid">Local server <code className="tool-meta-value">{localServerId}</code></span> : null,
+              authorization ? <span key="auth">Authorization: {authorization}</span> : null,
+            ].filter(Boolean).reduce<ReactNode[]>((items, item) => items.length ? [...items, <span key={`sep-${items.length}`} aria-hidden="true">·</span>, item] : [item], [])}
+          </p>
+        )}
         {error && <p className="error-banner" role="alert">{error}</p>}
         {(resultStatus || envelopeStatus) && (
           <p className="muted" data-testid="result-status">
             Structured result: {resultStatus ?? 'n/a'}{envelopeStatus ? ` · outcome ${envelopeStatus}` : ''}
           </p>
         )}
-        {localServerId && <p>Local server ID: <code>{localServerId}</code></p>}
-        {authorization && <p>Authorization: {authorization}</p>}
         {environment === 'Workspace' && toolName === 'edit_file' && (
           <p>Review the unified diff below before continuing. Re-read the file when the hash no longer matches.</p>
         )}
@@ -549,13 +505,15 @@ export function CommandRunCard({
                   return (
                     <li key={source.id} className="web-source">
                       <span className="web-source-index" aria-hidden="true">{index + 1}</span>
-                      {source.url ? (
-                        <a className="web-source-link" href={source.url} target="_blank" rel="noreferrer">{label}</a>
-                      ) : (
-                        <span className="web-source-link web-source-static">{label}</span>
-                      )}
-                      {source.url && domain && <span className="web-source-domain">{domain}</span>}
-                      {source.url && <ExternalLink size={11} className="web-source-open" aria-hidden="true" />}
+                      <span className="web-source-main">
+                        {source.url ? (
+                          <a className="web-source-link" href={source.url} target="_blank" rel="noreferrer">{label}</a>
+                        ) : (
+                          <span className="web-source-link web-source-static">{label}</span>
+                        )}
+                        {source.url && domain && <span className="web-source-domain">{domain}</span>}
+                      </span>
+                      {source.url && <ExternalLink size={12} className="web-source-open" aria-hidden="true" />}
                     </li>
                   );
                 })}
@@ -564,12 +522,21 @@ export function CommandRunCard({
           </div>
         )}
 
+        {command && (
+          <div className="tool-input" data-testid="command-input">
+            <CodeBlock code={command} language="bash" streaming={status === 'running'} ariaLabel={`Command: ${command}`} />
+          </div>
+        )}
+
+        <ResultDetails className={isWeb ? 'web-technical-details' : 'tool-output-details'}>
+          {isWeb && <summary>Raw result, logs and parameters</summary>}
         {/* Subheader tabs & actions */}
         <div className="terminal-actions-bar">
-          <div className="tab-group">
+          <div className="tab-group" role="group" aria-label="Result view">
             <button
               type="button"
-              className={`tab-btn ${activeTab === 'terminal' ? 'active' : ''}`}
+              aria-pressed={activeTab === 'terminal'}
+                className={`tab-btn ${activeTab === 'terminal' ? 'active' : ''}`}
               onClick={() => setActiveTab('terminal')}
             >
               Output
@@ -577,6 +544,7 @@ export function CommandRunCard({
             {structuredResult && (
               <button
                 type="button"
+                aria-pressed={activeTab === 'result'}
                 className={`tab-btn ${activeTab === 'result' ? 'active' : ''}`}
                 onClick={() => setActiveTab('result')}
               >
@@ -586,6 +554,7 @@ export function CommandRunCard({
             {diff && (
               <button
                 type="button"
+                aria-pressed={activeTab === 'diff'}
                 className={`tab-btn ${activeTab === 'diff' ? 'active' : ''}`}
                 onClick={() => setActiveTab('diff')}
               >
@@ -595,6 +564,7 @@ export function CommandRunCard({
             {code && (
               <button
                 type="button"
+                aria-pressed={activeTab === 'code'}
                 className={`tab-btn ${activeTab === 'code' ? 'active' : ''}`}
                 aria-label="Code" onClick={() => setActiveTab('code')}
               >
@@ -604,6 +574,7 @@ export function CommandRunCard({
             {args && (
               <button
                 type="button"
+                aria-pressed={activeTab === 'raw'}
                 className={`tab-btn ${activeTab === 'raw' ? 'active' : ''}`}
                 onClick={() => setActiveTab('raw')}
               >
@@ -635,7 +606,7 @@ export function CommandRunCard({
             onScroll={handleScroll}
             data-testid="terminal-viewport"
           >
-            {visibleLines.length === 0 ? (
+            {!hasOutput ? (
               <div className="terminal-empty">
                 {status === 'running' ? (
                   <span className="terminal-waiting">Waiting for command output…</span>
@@ -644,83 +615,37 @@ export function CommandRunCard({
                 )}
               </div>
             ) : (
-              <div className="terminal-lines">
-                {visibleLines.map((line, idx) => (
-                  <div key={idx} className="terminal-line">
-                    <span className="terminal-gutter">{idx + 1}</span>
-                    <span className="terminal-content">
-                      {parseAnsiLine(line).map((span, spanIdx) => (
-                        <span
-                          key={spanIdx}
-                          style={{
-                            color: span.color,
-                            fontWeight: span.bold ? 600 : 'normal',
-                            opacity: span.dim ? 0.7 : 1,
-                          }}
-                        >
-                          {span.text}
-                        </span>
-                      ))}
-                    </span>
-                  </div>
-                ))}
-              </div>
+              <>
+                {stdoutLines.length > 0 && <OutputChannel name={stderrLines.length ? 'stdout' : undefined} lines={stdoutLines} />}
+                {stderrLines.length > 0 && <OutputChannel name="stderr" lines={stderrLines} />}
+              </>
             )}
-
-            {shouldAllowFolding && (
-              <div className="terminal-folding-bar">
-                <button
-                  type="button"
-                  className="fold-toggle-btn"
-                  onClick={() => setIsFolded(prev => !prev)}
-                >
-                  {isFolded ? `Show all ${lines.length} lines` : 'Show fewer lines'}
-                </button>
-              </div>
+            {scrolledUp && hasOutput && (
+              <button type="button" className="terminal-latest" onClick={jumpToLatest} aria-label="Jump to latest output">
+                <ArrowDown size={12} /> Latest
+              </button>
             )}
           </div>
         )}
 
         {/* Tab 1b: Structured result (separate from logs) */}
         {activeTab === 'result' && structuredResult && (
-          <div className="terminal-viewport" data-testid="result-viewport">
-            <pre className="tool-result-json">{structuredResult}</pre>
+          <div className="code-view" data-testid="result-viewport">
+            <CodeBlock code={structuredResult} language="json" ariaLabel="Structured result" />
           </div>
         )}
 
         {/* Tab 2: Diff View */}
         {activeTab === 'diff' && diff && (
           <div className="diff-viewport" data-testid="diff-viewport">
-            <pre className="tool-diff diff-lines">
-              {diff.split('\n').map((line, idx) => {
-                const isAdd = line.startsWith('+') && !line.startsWith('+++');
-                const isDel = line.startsWith('-') && !line.startsWith('---');
-                const isHdr = line.startsWith('@@');
-                const lineClass = isAdd ? 'diff-line add' : isDel ? 'diff-line del' : isHdr ? 'diff-line hdr' : 'diff-line';
-                return (
-                  <div key={idx} className={lineClass}>
-                    <span className="diff-gutter">{idx + 1}</span>
-                    <span className="diff-content">{line}</span>
-                  </div>
-                );
-              })}
-            </pre>
+            <DiffLines diff={diff} />
           </div>
         )}
 
         {/* Tab 3: Code View */}
         {activeTab === 'code' && code && (
-          <div className="terminal-viewport" data-testid="code-viewport">
-            <div className="terminal-lines">
-              {code.split(/\r?\n/).map((line, idx) => (
-                <div key={idx} className="terminal-line">
-                  <span className="terminal-gutter">{idx + 1}</span>
-                  <span className="terminal-content">
-                    <code>{line}</code>
-                  </span>
-                </div>
-              ))}
-            </div>
+          <div className="code-view" data-testid="code-viewport">
+            <CodeBlock code={code} language={language} ariaLabel={`${language ?? 'code'} input`} />
           </div>
         )}
 
@@ -750,8 +675,7 @@ export function CommandRunCard({
               )}
               <button
                 type="button"
-                className="secondary text-btn"
-                style={{ fontSize: '11px', padding: '2px 8px', marginLeft: 'auto' }}
+                className="secondary text-btn artifact-inspect-btn"
                 onClick={() => void inspectArtifact()}
                 disabled={loadingArtifact}
               >
@@ -763,6 +687,7 @@ export function CommandRunCard({
             )}
           </div>
         )}
+        </ResultDetails>
       </div>
     </details>
   );

@@ -1,0 +1,293 @@
+{
+  "startedAtUtc": "2026-10-20T21:09:16Z",
+  "model": "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+  "modelSha256": "79dde517866cfbb5c00230b530de17910fc7fc78f8827554d0e14281ce5faf03",
+  "runtimeSha256": "3f6d3ddddc1de7a86073cb890d952cb63216055df190c2db4b11dddbe758f009",
+  "sourceSha256": {
+    "src/genui/Chart.tsx": "2dc8b21f5350eb020a93c7e88cb530105e7bc0834b463ffd7f0a39c66f6e3eb6",
+    "src/genui/Coding.tsx": "c0c853ded4d3fdee55159c794f4f8ba5ef5fb74b26e1ee18bb57fbd90f6496dd",
+    "src/genui/DataTable.tsx": "405d4bd4789e38231d62e2c68be55b5923e0c16348516a114fc2af9c1b073ec4",
+    "src/genui/Diagram.tsx": "1b0b148e97db6fa30aa460890250d37ccecf4d505776ce04e8f6c465b41e6b72",
+    "src/genui/Education.tsx": "228f7d4cc68b9b84ffa8c9148b7317a3b8fde3cbe8f6a9fff0e53dab9ea3d3b7",
+    "src/genui/Experiences.tsx": "2273e89ea6055bf22fac8ad5593ba194b2c4c8d484bb126f5ebeab4d9510ea4f",
+    "src/genui/GenUiSurface.tsx": "2b002fcca5de822e8048ec33430dc6e757bbbd450e351216fc2f9ee2f7f8f0c0",
+    "src/genui/MessageRenderer.tsx": "ff36687f1cb7cc547ca2cefccc1c0aba20b53565249e0956408da81199f84a04",
+    "src/genui/RichComponents.tsx": "cafce3a05ac6bf113fc8e5ecf839bcfddf3856c06050e4ded53647fb361ee2d5",
+    "src/genui/ValidatedRenderer.test.tsx": "7e4148e5626bbc1ebb2395ac4a6a1f2e7b6094ee056f3a358f99f4f3fe7196d6",
+    "src/genui/ValidatedRenderer.tsx": "c5a74c20bc69520e34b67077374e2fc09c44e0047bdb0533388ecc19b00e2d58",
+    "src/genui/VisualAnswer.test.tsx": "80925bea850c2199ad0625a52c62636684838bc75dde42c507848ee10f571f64",
+    "src/genui/VisualAnswer.tsx": "c5929998cceeb48da79c18119e9db28b29f94eaea44425e72131b98ba055e49c",
+    "src/genui/VisualErrorBoundary.tsx": "cf98143c77e0a7e25eb2ea7312b1fd07c5772e19d015c3e3ab5a01b332e9783d",
+    "src/genui/VisualMarkdown.tsx": "6b55e3eb0c0a0f00e77196456a0c9565443d5b7f92f1136d38fd7c1d027c63db",
+    "src/genui/actions.test.ts": "acc0e8e97362c892e8121cf3405153b62af21398df60c7b54933acd0e6da35c3",
+    "src/genui/actions.ts": "05351e97a616cc45e80b73405945f62695965f546ffcdc603a626628974d3281",
+    "src/genui/audit-regressions.test.tsx": "e7472a5430ec256476f1440053ffbd37addb92438d12f7c7444ab1a7e40dd338",
+    "src/genui/authoritativeData.test.tsx": "ff12b63741d49cc78b58b685b7a62b3f589fc743dce7b1da2102549728d991a5",
+    "src/genui/authoritativeData.ts": "2d513aaf6a9d4879f204859a29679ca21c7a7bc009b7787a228987f2d50d7759",
+    "src/genui/catalog.ts": "c97d2dcdc7f07b36d7d0fc32be4e02383a0dd51c700ae5d7740c58677b7e91d8",
+    "src/genui/componentTypes.ts": "11dc9921a0f00b6ec2b60de8e6734988d9fd38d1fdedc3d202fc3cb578563011",
+    "src/genui/dataGrounding.test.ts": "cde7e9935267e37206dd50af199da5409c8e95dc8cbfb50da2441d1d03500960",
+    "src/genui/dataGrounding.ts": "5300031e56997e7df841d43e3adfa73ecc38d84ecf441838d58e27dbb5d0c172",
+    "src/genui/diff.ts": "b99cc3c1e3b83f4149eac9232853ba0bb4576f9e0474250a81c02e992e413584",
+    "src/genui/experiences.test.tsx": "e0a4e1983ae0119ffaef7f9f4d524cb0acce7ec06432d3a95e82c444d45723ef",
+    "src/genui/grounding.test.ts": "c27349f8ca4b70306adcc4f5ed732eb665d6f704b3ddced617988c8f2021b5e5",
+    "src/genui/grounding.tsx": "a2bb8d3e07d27acb40dd460cf1d95f0b9afa5c5a2eec11343de17c3a6266b5c7",
+    "src/genui/library.test.ts": "84acb2f22d2c3835aefc17a2a17cafdf1797da4b15bf4148c4ee582f0e00cb94",
+    "src/genui/library.tsx": "de8b2566a3a97e95660112dd5c7196b7ba4e52cdd35ad80846c20d4887cadc87",
+    "src/genui/model-output.test.tsx": "d4d604de0fca96968553bc2af65cdcbf98e61602c8026bba0d4b21b02a8ffae1",
+    "src/genui/progressive.ts": "c46254e9dcafe67ae1f68fb7dbc09afea63b9acd00794f70a8c7d55e74e54284",
+    "src/genui/render-failure.test.tsx": "4a07360e7d2f08824ef50d110ca9205105db937219545935d03cfecf8fbdb4cf",
+    "src/genui/repair.test.ts": "29c794fe3abcfb284e0f522b59c1853459ec7c027a0bff4e54c74ada003d1b1e",
+    "src/genui/repair.ts": "f330272eceebeafc748dcf803a6b76d7053233298ba61fb6a6c409142d5da368",
+    "src/genui/rich.test.tsx": "176ce99120f5bc33f6b78898873bbd791ed378860890be1e83a1079ac743bbe4",
+    "src/genui/richCatalog.ts": "76893293ee1483d5e48c3fe741f637ccc7aeacfe90f108787305aac27232fa3a",
+    "src/genui/simulations.ts": "684874598552014c25c40e112b6cd66eed2274f91d7141cc4d97813721d53293",
+    "src/genui/specification.test.ts": "dc24ec2386ca83bcff5d231bba891c04ad3496f8f0af16a066f204bb282c7fd8",
+    "src/genui/specification.ts": "5f0a4f8f8fcf9d616efa562fee027540393a86f5e1ca44bcbcc357fa397fbc68",
+    "src/genui/validation.test.ts": "2754047ca682428bc80e51f110fe5cfbfa38b3515101b19b48ff17c0ea11a7e0",
+    "src/genui/validation.ts": "bec18b67fc5a53290d1fcf33400270c64b53a44385e43d01d5247b2e879fbbb5"
+  },
+  "hardware": {
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+    "cpu": "AMD Ryzen 5 7535HS with Radeon Graphics",
+    "logicalCpus": 12
+  },
+  "cpuOnly": true,
+  "contextLength": 8192,
+  "maxOutputTokens": 512,
+  "repetitions": 3,
+  "cachePolicy": "disabled",
+  "loadPolicy": "Wait for observed Rust/link compiler idle before each request; before/after compiler observations recorded. Desktop background activity is not controlled; OS page cache not flushed.",
+  "cases": [
+    {
+      "name": "chart-bound",
+      "sample": 0,
+      "failure": null,
+      "compilerWaitMs": 12.469093999243341,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "chart",
+      "authoritativeInput": "Plot this authoritative supplied table as a bar chart. Use SourceChart with tableIndex 0.\n| Month | Units Sold |\n| --- | --- |\n| Jan | 10 |\n| Feb | 15 |\n| Mar | 25 |",
+      "rawContentTokens": 1000,
+      "promptTokens": 1000,
+      "timeToFirstTokenMs": 3077.324423000391,
+      "totalMs": 4259.717138003907,
+      "finishReason": "stop",
+      "source": "root = Response([SourceChart(\"chart\", 0, \"bar\")])",
+      "usage": {
+        "completion_tokens": 17,
+        "prompt_tokens": 1009,
+        "total_tokens": 1026,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1009,
+        "prompt_ms": 3071.342,
+        "prompt_per_token_ms": 3.043946481665015,
+        "prompt_per_second": 328.52088761199497,
+        "predicted_n": 17,
+        "predicted_ms": 1169.111,
+        "predicted_per_token_ms": 73.0694375,
+        "predicted_per_second": 13.685612401217677
+      },
+      "runtimePeakRssKiB": 3983916,
+      "rawValidation": {
+        "valid": true
+      },
+      "repairApplied": false,
+      "renderProgram": "root = Response([SourceChart(\"chart\", 0, \"bar\")])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "requiredComponent": "SourceChart",
+      "requestedComponentPresent": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 28.010504999999966,
+        "htmlChars": 1906,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      }
+    },
+    {
+      "name": "chart-bound",
+      "sample": 1,
+      "failure": null,
+      "compilerWaitMs": 11.441495997132733,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "chart",
+      "authoritativeInput": "Plot this authoritative supplied table as a bar chart. Use SourceChart with tableIndex 0.\n| Month | Units Sold |\n| --- | --- |\n| Jan | 10 |\n| Feb | 15 |\n| Mar | 25 |",
+      "rawContentTokens": 1000,
+      "promptTokens": 1000,
+      "timeToFirstTokenMs": 2892.7630569960456,
+      "totalMs": 4120.124039000075,
+      "finishReason": "stop",
+      "source": "root = Response([SourceChart(\"chart\", 0, \"bar\")])",
+      "usage": {
+        "completion_tokens": 17,
+        "prompt_tokens": 1009,
+        "total_tokens": 1026,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1009,
+        "prompt_ms": 2887.121,
+        "prompt_per_token_ms": 2.861368681863231,
+        "prompt_per_second": 349.48310098537604,
+        "predicted_n": 17,
+        "predicted_ms": 1214.478,
+        "predicted_per_token_ms": 75.904875,
+        "predicted_per_second": 13.174384385719625
+      },
+      "runtimePeakRssKiB": 3987500,
+      "rawValidation": {
+        "valid": true
+      },
+      "repairApplied": false,
+      "renderProgram": "root = Response([SourceChart(\"chart\", 0, \"bar\")])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "requiredComponent": "SourceChart",
+      "requestedComponentPresent": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 5.858161999999993,
+        "htmlChars": 1906,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      }
+    },
+    {
+      "name": "chart-bound",
+      "sample": 2,
+      "failure": null,
+      "compilerWaitMs": 10.556966997683048,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "chart",
+      "authoritativeInput": "Plot this authoritative supplied table as a bar chart. Use SourceChart with tableIndex 0.\n| Month | Units Sold |\n| --- | --- |\n| Jan | 10 |\n| Feb | 15 |\n| Mar | 25 |",
+      "rawContentTokens": 1000,
+      "promptTokens": 1000,
+      "timeToFirstTokenMs": 2873.2503740029642,
+      "totalMs": 4035.369981000258,
+      "finishReason": "stop",
+      "source": "root = Response([SourceChart(\"chart\", 0, \"bar\")])",
+      "usage": {
+        "completion_tokens": 17,
+        "prompt_tokens": 1009,
+        "total_tokens": 1026,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1009,
+        "prompt_ms": 2867.612,
+        "prompt_per_token_ms": 2.8420336967294353,
+        "prompt_per_second": 351.86071197916596,
+        "predicted_n": 17,
+        "predicted_ms": 1149.472,
+        "predicted_per_token_ms": 71.842,
+        "predicted_per_second": 13.919434314189472
+      },
+      "runtimePeakRssKiB": 3987880,
+      "rawValidation": {
+        "valid": true
+      },
+      "repairApplied": false,
+      "renderProgram": "root = Response([SourceChart(\"chart\", 0, \"bar\")])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "requiredComponent": "SourceChart",
+      "requestedComponentPresent": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 6.060774000000038,
+        "htmlChars": 1906,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      }
+    }
+  ],
+  "limitations": [
+    "Isolated CPU process loaded once; first pass OS/model warmth is not controlled. cache_prompt is explicit and case order rotates.",
+    "TTFT is model transport, not first paint. Native interaction/memory are measured separately.",
+    "Actual Python process execution is fixed benchmark orchestration, not a model-selected permission-controlled harness call.",
+    "Direct program-generation experiment; production tool-free second-pass inference is separately measured in native acceptance. No remote provider or GPU inference."
+  ],
+  "loadSeconds": 3.319687117000285,
+  "finishedAtUtc": "2026-10-20T21:09:34Z",
+  "validationSourceSha256": {
+    "Chart.tsx": "2dc8b21f5350eb020a93c7e88cb530105e7bc0834b463ffd7f0a39c66f6e3eb6",
+    "Coding.tsx": "c0c853ded4d3fdee55159c794f4f8ba5ef5fb74b26e1ee18bb57fbd90f6496dd",
+    "DataTable.tsx": "405d4bd4789e38231d62e2c68be55b5923e0c16348516a114fc2af9c1b073ec4",
+    "Diagram.tsx": "1b0b148e97db6fa30aa460890250d37ccecf4d505776ce04e8f6c465b41e6b72",
+    "Education.tsx": "228f7d4cc68b9b84ffa8c9148b7317a3b8fde3cbe8f6a9fff0e53dab9ea3d3b7",
+    "Experiences.tsx": "2273e89ea6055bf22fac8ad5593ba194b2c4c8d484bb126f5ebeab4d9510ea4f",
+    "GenUiSurface.tsx": "2b002fcca5de822e8048ec33430dc6e757bbbd450e351216fc2f9ee2f7f8f0c0",
+    "MessageRenderer.tsx": "ff36687f1cb7cc547ca2cefccc1c0aba20b53565249e0956408da81199f84a04",
+    "RichComponents.tsx": "cafce3a05ac6bf113fc8e5ecf839bcfddf3856c06050e4ded53647fb361ee2d5",
+    "ValidatedRenderer.test.tsx": "7e4148e5626bbc1ebb2395ac4a6a1f2e7b6094ee056f3a358f99f4f3fe7196d6",
+    "ValidatedRenderer.tsx": "c5a74c20bc69520e34b67077374e2fc09c44e0047bdb0533388ecc19b00e2d58",
+    "VisualAnswer.test.tsx": "80925bea850c2199ad0625a52c62636684838bc75dde42c507848ee10f571f64",
+    "VisualAnswer.tsx": "c5929998cceeb48da79c18119e9db28b29f94eaea44425e72131b98ba055e49c",
+    "VisualErrorBoundary.tsx": "cf98143c77e0a7e25eb2ea7312b1fd07c5772e19d015c3e3ab5a01b332e9783d",
+    "VisualMarkdown.tsx": "6b55e3eb0c0a0f00e77196456a0c9565443d5b7f92f1136d38fd7c1d027c63db",
+    "actions.test.ts": "acc0e8e97362c892e8121cf3405153b62af21398df60c7b54933acd0e6da35c3",
+    "actions.ts": "05351e97a616cc45e80b73405945f62695965f546ffcdc603a626628974d3281",
+    "audit-regressions.test.tsx": "e7472a5430ec256476f1440053ffbd37addb92438d12f7c7444ab1a7e40dd338",
+    "authoritativeData.test.tsx": "ff12b63741d49cc78b58b685b7a62b3f589fc743dce7b1da2102549728d991a5",
+    "authoritativeData.ts": "2d513aaf6a9d4879f204859a29679ca21c7a7bc009b7787a228987f2d50d7759",
+    "catalog.ts": "c97d2dcdc7f07b36d7d0fc32be4e02383a0dd51c700ae5d7740c58677b7e91d8",
+    "componentTypes.ts": "11dc9921a0f00b6ec2b60de8e6734988d9fd38d1fdedc3d202fc3cb578563011",
+    "dataGrounding.test.ts": "cde7e9935267e37206dd50af199da5409c8e95dc8cbfb50da2441d1d03500960",
+    "dataGrounding.ts": "5300031e56997e7df841d43e3adfa73ecc38d84ecf441838d58e27dbb5d0c172",
+    "diff.ts": "b99cc3c1e3b83f4149eac9232853ba0bb4576f9e0474250a81c02e992e413584",
+    "experiences.test.tsx": "e0a4e1983ae0119ffaef7f9f4d524cb0acce7ec06432d3a95e82c444d45723ef",
+    "grounding.test.ts": "c27349f8ca4b70306adcc4f5ed732eb665d6f704b3ddced617988c8f2021b5e5",
+    "grounding.tsx": "a2bb8d3e07d27acb40dd460cf1d95f0b9afa5c5a2eec11343de17c3a6266b5c7",
+    "library.test.ts": "84acb2f22d2c3835aefc17a2a17cafdf1797da4b15bf4148c4ee582f0e00cb94",
+    "library.tsx": "de8b2566a3a97e95660112dd5c7196b7ba4e52cdd35ad80846c20d4887cadc87",
+    "model-output.test.tsx": "d4d604de0fca96968553bc2af65cdcbf98e61602c8026bba0d4b21b02a8ffae1",
+    "progressive.ts": "c46254e9dcafe67ae1f68fb7dbc09afea63b9acd00794f70a8c7d55e74e54284",
+    "render-failure.test.tsx": "4a07360e7d2f08824ef50d110ca9205105db937219545935d03cfecf8fbdb4cf",
+    "repair.test.ts": "29c794fe3abcfb284e0f522b59c1853459ec7c027a0bff4e54c74ada003d1b1e",
+    "repair.ts": "f330272eceebeafc748dcf803a6b76d7053233298ba61fb6a6c409142d5da368",
+    "rich.test.tsx": "176ce99120f5bc33f6b78898873bbd791ed378860890be1e83a1079ac743bbe4",
+    "richCatalog.ts": "76893293ee1483d5e48c3fe741f637ccc7aeacfe90f108787305aac27232fa3a",
+    "simulations.ts": "684874598552014c25c40e112b6cd66eed2274f91d7141cc4d97813721d53293",
+    "specification.test.ts": "dc24ec2386ca83bcff5d231bba891c04ad3496f8f0af16a066f204bb282c7fd8",
+    "specification.ts": "5f0a4f8f8fcf9d616efa562fee027540393a86f5e1ca44bcbcc357fa397fbc68",
+    "validation.test.ts": "2754047ca682428bc80e51f110fe5cfbfa38b3515101b19b48ff17c0ea11a7e0",
+    "validation.ts": "bec18b67fc5a53290d1fcf33400270c64b53a44385e43d01d5247b2e879fbbb5"
+  },
+  "summary": {
+    "chart-bound": {
+      "samples": 3,
+      "totalP50Ms": 4120.124039000075,
+      "totalP95Ms": 4259.717138003907,
+      "rawValid": 3,
+      "repairedValid": 3,
+      "grounded": 3,
+      "requestedComponentPresent": 3,
+      "serverRendered": 3,
+      "transportFailures": 0
+    }
+  }
+}

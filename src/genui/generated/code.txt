@@ -1,0 +1,55 @@
+Output exactly one complete OpenUI Lang program for the original code. No fences or prose outside the program.
+
+## Syntax Rules
+
+1. Each statement is on its own line: `identifier = Expression`
+2. `root` is the entry point — every program must define `root = Response(...)`
+3. Expressions are: strings ("..."), numbers, booleans (true/false), null, arrays ([...]), objects ({...}), or component calls TypeName(arg1, arg2, ...)
+4. Use references for readability: define `name = ...` on one line, then use `name` later
+5. EVERY variable (except root) MUST be referenced by at least one other variable. Unreferenced variables are silently dropped and will NOT render. Always include defined variables in their parent's children/items array.
+6. Arguments are POSITIONAL (order matters, not names). Write `SomeComp([children], "row", "l")` NOT `SomeComp([children], direction: "row", gap: "l")` — colon syntax is NOT supported and silently breaks
+7. Optional arguments can be omitted from the end
+- Strings use double quotes with backslash escaping
+
+## Component Signatures
+
+Arguments marked with ? are optional. Sub-components can be inline or referenced; prefer references for better streaming.
+
+### Coding
+SourceCode(fenceIndex: number, path?: string) — Read-only exact code from a closed fence in the authoritative answer. Never transcribe, edit or execute it.
+
+### Content
+Heading(text: string, level?: "h2" | "h3" | "h4") — A section heading.
+Text(text: string) — Plain text, no Markdown.
+
+### Layout
+Response(children: (SourceCode | Heading | Text)[]) — Root container of every UI block. Assign it to `root` and pass content as children.
+
+## Hoisting & Streaming (CRITICAL)
+
+openui-lang supports hoisting: a reference can be used BEFORE it is defined. The parser resolves all references after the full input is parsed.
+
+During streaming, the output is re-parsed on every chunk. Undefined references are temporarily unresolved and appear once their definitions stream in. This creates a progressive top-down reveal — structure first, then data fills in.
+
+**Recommended statement order for optimal streaming:**
+1. `root = Response(...)` — UI shell appears immediately
+2. Component definitions — fill in as they stream
+3. Data values — leaf content last
+
+Always write the root = Response(...) statement first so the UI shell appears immediately, even before child data has streamed in.
+
+## Examples
+
+root = Response([SourceCode(0)])
+
+## Important Rules
+- Choose components that best represent the content (tables for comparisons, charts for trends, forms for input, etc.)
+
+## Final Verification
+Before finishing, walk your output and verify:
+1. root = Response(...) is the FIRST line (for optimal streaming).
+2. Every referenced name is defined. Every defined name (other than root) is reachable from root.
+
+- When the authoritative answer contains fenced code, output root = Response([SourceCode(0)]). The host supplies exact code bytes; never transcribe them.
+- Use positional arguments and close all arrays and parentheses. Add SourceCode(1) only if a second complete code fence exists.
+- Never execute code, call tools, invent files, or add actions. If no original code exists, use Text instead of inventing it.

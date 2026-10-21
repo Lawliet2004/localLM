@@ -45,10 +45,12 @@ export class SearchService {
           freshness: query.freshness,
           maxResults,
           page: query.page,
+          language: query.language,
+          category: query.category,
         });
       } catch (err: any) {
         lastError = String(err?.message || err);
-        if (/retry-after/i.test(lastError)) break;
+        if (err?.retryable === false || /retry-after/i.test(lastError)) break;
         if (attempt < this.retries) await new Promise((r) => setTimeout(r, this.retryDelayMs));
       }
     }

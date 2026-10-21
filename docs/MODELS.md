@@ -9,11 +9,24 @@ The chat picker also lists the downloaded library.
 
 1. Discover loads up to 30 popular GGUF repositories on open. Search by model or
    publisher, paste an `owner/repository`, or drop a Hugging Face URL.
-2. The right pane lists every GGUF quantization with size and a **Fits GPU** /
-   **Fits RAM** / **May not fit** estimate for this machine. Split GGUF models
-   download all shards from the same immutable revision together. Q4_K_M is
+2. The right pane lists standalone GGUF quantizations with sizes in both binary
+   GiB and Hugging Face's decimal GB/MB. MTP heads, calibration files, projectors,
+   and adapters are excluded from standalone models and cannot be downloaded as
+   the main model. **GPU candidate** / **RAM candidate** / **Memory tight**
+   estimates use currently free memory, include the selected projector, and
+   reserve the greater of 1 GiB or 10% of the weight size for runtime headroom.
+   Context cache and image buffers are additional, unknown costs at discovery
+   time, so a candidate label does not guarantee that inference will fit.
+   Split GGUF models download all shards from the same immutable revision
+   together. Q4_K_M is
    preselected when present.
-3. Download. The harness checks disk space and verifies every file's SHA-256
+3. For image input, choose one matching vision projector when the repository
+   supplies mmproj files. Native multimodal capability still requires the
+   encoder/projector weights, stored separately in these GGUF packages. F16 and
+   BF16 are 16-bit alternatives; F32 is larger. **None · text only** deliberately
+   downloads only the text weights. The download summary shows weights,
+   projector, and the combined total. The harness checks disk space and verifies
+   every file's SHA-256
    before publishing the completed model. Progress and cancellation remain
    available while downloading. If the transfer is cancelled, stalled, or the
    app closes, the unfinished `{name}.gguf.part` file and a `download.json`
@@ -36,6 +49,12 @@ in page memory and are not persisted in model manifests, preferences, or logs.
 
 ## Compatibility
 
+Hugging Face discovery and verified GGUF/model-projector downloads work on
+Linux, macOS, and Windows, with native disk-space checks. The pinned CUDA runtime
+installer supplies Windows binaries only. On Linux/macOS, Model files displays
+native runtime guidance; use **Browse runtime…** to select a compatible local
+`llama-server` executable. The picker accepts extensionless native executables.
+
 Downloads are not restricted to a curated catalog. Any repository's GGUF weight
 files with Hugging Face LFS size/checksum metadata can be selected. Inference
 requires an architecture and quantization supported by the selected llama.cpp
@@ -49,6 +68,28 @@ produces an actionable error. **Model files** retains manual model and runtime
 paths, runtime installation, and the original pinned download controls.
 
 ## Runtime guidance
+
+Runtime includes a **Vision projector** component. **Load vision projector**
+turns it on or off while retaining its configured file. Choose **GPU preferred**
+to allow GPU acceleration, or **CPU only** to keep projector weights in system
+RAM. These controls are independent of language-model GPU layers and KV-cache
+placement. Use **Choose projector file…** in Runtime to select a compatible
+mmproj, then save configuration to apply it.
+The path and vision settings are saved with each model's runtime profile; older
+profiles retain the previous default of loading a configured projector.
+
+Saving while a model is loaded reloads llama-server to apply the changes. It
+clears the server's in-memory prompt cache and keeps saved conversation history.
+The current server interface does not support hot-swapping just the projector
+or splitting its layers with these controls. Tasks containing image attachments
+require vision to be enabled. Unsupported CPU/off controls fail before stopping
+a running model and explain how to update the runtime. The Runtime page shows
+the loaded projector separately from the settings for the next load.
+
+Memory estimates charge projector weights to the selected device and reserve
+them before estimating language-model GPU layers. Image-processing buffers are
+additional costs. GPU preferred is a request, not evidence of GPU placement; a
+CPU-only llama.cpp build can fall back to CPU.
 
 The Runtime page reads architecture, context capacity, transformer blocks,
 attention dimensions, and weight size from the GGUF header. Split-model sizes

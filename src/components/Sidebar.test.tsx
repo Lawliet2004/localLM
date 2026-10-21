@@ -69,7 +69,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
       />
     );
@@ -95,7 +94,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
       />
     );
@@ -122,7 +120,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
       />
     );
@@ -155,7 +152,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
         onWorkspace={onWorkspace}
         onProject={onProject}
@@ -199,7 +195,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
         onWorkspace={onWorkspace}
       />
@@ -231,7 +226,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
       />
     );
@@ -257,7 +251,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
       />
     );
@@ -283,7 +276,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
       />
     );
@@ -307,7 +299,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
       />
     );
@@ -336,7 +327,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={{ projects: [], tasks: {} }}
       />
     );
@@ -344,8 +334,214 @@ describe('Sidebar project folders and actions', () => {
     await userEvent.click(screen.getByRole('button', { name: 'New conversation' }));
 
     expect(mocks.open).toHaveBeenCalled();
-    await waitFor(() => expect(mocks.saveProject).toHaveBeenCalledWith({ id: 'gamma', name: 'gamma', path: 'C:/projects/gamma' }));
-    await waitFor(() => expect(onNew).toHaveBeenCalledWith('gamma'));
+    await waitFor(() => expect(mocks.saveProject).toHaveBeenCalled());
+    const savedProject = mocks.saveProject.mock.calls[0][0] as { id: string; name: string; path: string };
+    expect(savedProject).toMatchObject({ name: 'gamma', path: 'C:/projects/gamma' });
+    // New projects get a unique generated id, never a basename-derived one (A02).
+    expect(savedProject.id).not.toBe('gamma');
+    expect(savedProject.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    await waitFor(() => expect(onNew).toHaveBeenCalledWith(savedProject.id));
+  });
+
+  it('assigns distinct ids to two folders that share the same basename (A02)', async () => {
+    const onWorkspace = vi.fn();
+    mocks.open
+      .mockResolvedValueOnce('C:/one/api')
+      .mockResolvedValueOnce('C:/two/api');
+    mocks.saveProject.mockImplementation(async (project: { id: string; name: string; path: string }) => ({
+      projects: [project],
+      tasks: {},
+    }));
+
+    render(
+      <Sidebar
+        page="chat"
+        onPage={vi.fn()}
+        conversations={[]}
+        activeId={null}
+        onSelect={vi.fn()}
+        onNew={vi.fn()}
+        busy={false}
+        search=""
+        onSearch={vi.fn()}
+        theme="dark"
+        onTheme={vi.fn()}
+        workspace={{ projects: [], tasks: {} }}
+        onWorkspace={onWorkspace}
+      />
+    );
+
+    const addBtn = screen.getByRole('button', { name: 'Add project' });
+    await userEvent.click(addBtn);
+    await waitFor(() => expect(mocks.saveProject).toHaveBeenCalledTimes(1));
+    await userEvent.click(addBtn);
+    await waitFor(() => expect(mocks.saveProject).toHaveBeenCalledTimes(2));
+
+    const first = mocks.saveProject.mock.calls[0][0] as { id: string; name: string; path: string };
+    const second = mocks.saveProject.mock.calls[1][0] as { id: string; name: string; path: string };
+    expect(first).toMatchObject({ name: 'api', path: 'C:/one/api' });
+    expect(second).toMatchObject({ name: 'api', path: 'C:/two/api' });
+    expect(first.id).not.toBe(second.id);
+    expect(first.id).not.toBe('api');
+    expect(second.id).not.toBe('api');
+  });
+
+  it('does not start a chat or surface an id when the project save fails (A02)', async () => {
+    const onNew = vi.fn();
+    mocks.open.mockResolvedValue('C:/projects/gamma');
+    mocks.saveProject.mockRejectedValue(new Error('project id already exists with a different path'));
+
+    render(
+      <Sidebar
+        page="chat"
+        onPage={vi.fn()}
+        conversations={[]}
+        activeId={null}
+        onSelect={vi.fn()}
+        onNew={onNew}
+        busy={false}
+        search=""
+        onSearch={vi.fn()}
+        theme="dark"
+        onTheme={vi.fn()}
+        workspace={{ projects: [], tasks: {} }}
+      />
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+    await waitFor(() => expect(mocks.saveProject).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('project id already exists'));
+    expect(onNew).not.toHaveBeenCalled();
+  });
+
+  it('re-adding an already registered folder path keeps the existing project untouched (A02)', async () => {
+    const onWorkspace = vi.fn();
+    mocks.open.mockResolvedValue('C:/projects/alpha');
+
+    render(
+      <Sidebar
+        page="chat"
+        onPage={vi.fn()}
+        conversations={sampleConversations}
+        activeId={null}
+        onSelect={vi.fn()}
+        onNew={vi.fn()}
+        busy={false}
+        search=""
+        onSearch={vi.fn()}
+        theme="dark"
+        onTheme={vi.fn()}
+        workspace={sampleWorkspace}
+        onWorkspace={onWorkspace}
+      />
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Add project' }));
+    await waitFor(() => expect(mocks.open).toHaveBeenCalled());
+    expect(mocks.saveProject).not.toHaveBeenCalled();
+    expect(onWorkspace).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('stays usable when sidebar width storage throws (A05)', () => {
+    const getSpy = vi.spyOn(Storage.prototype, 'getItem')
+      .mockImplementation(() => { throw new DOMException('Access denied', 'SecurityError'); });
+    const setSpy = vi.spyOn(Storage.prototype, 'setItem')
+      .mockImplementation(() => { throw new DOMException('Quota exceeded', 'QuotaExceededError'); });
+    try {
+      render(
+        <Sidebar
+          page="chat"
+          onPage={vi.fn()}
+          conversations={sampleConversations}
+          activeId={null}
+          onSelect={vi.fn()}
+          onNew={vi.fn()}
+          busy={false}
+          search=""
+          onSearch={vi.fn()}
+          theme="dark"
+          onTheme={vi.fn()}
+          workspace={sampleWorkspace}
+        />
+      );
+      expect(document.querySelector('aside.sidebar')).not.toBeNull();
+      expect(screen.getByRole('button', { name: 'New conversation' })).toBeEnabled();
+      expect(screen.getByRole('button', { name: 'Alpha Project' })).toBeInTheDocument();
+    } finally {
+      getSpy.mockRestore();
+      setSpy.mockRestore();
+    }
+  });
+
+  it('exposes the project disclosure as a button with expanded state (A14)', async () => {
+    render(
+      <Sidebar
+        page="chat"
+        onPage={vi.fn()}
+        conversations={sampleConversations}
+        activeId={null}
+        onSelect={vi.fn()}
+        onNew={vi.fn()}
+        busy={false}
+        search=""
+        onSearch={vi.fn()}
+        theme="dark"
+        onTheme={vi.fn()}
+        workspace={sampleWorkspace}
+      />
+    );
+
+    const disclosure = screen.getByRole('button', { name: 'Alpha Project' });
+    // A real button — not a div — and it is not nested inside another button.
+    expect(disclosure.tagName).toBe('BUTTON');
+    expect(disclosure.closest('button')).toBe(disclosure);
+    expect(disclosure.querySelector('button')).toBeNull();
+    expect(disclosure).toHaveAttribute('aria-expanded', 'true');
+
+    await userEvent.click(disclosure);
+    expect(disclosure).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: 'Alpha task chat' })).not.toBeInTheDocument();
+
+    await userEvent.click(disclosure);
+    expect(disclosure).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: 'Alpha task chat' })).toBeInTheDocument();
+  });
+
+  it('reaches project actions from the keyboard without hover (A14)', async () => {
+    const onNew = vi.fn();
+    render(
+      <Sidebar
+        page="chat"
+        onPage={vi.fn()}
+        conversations={sampleConversations}
+        activeId={null}
+        onSelect={vi.fn()}
+        onNew={onNew}
+        busy={false}
+        search=""
+        onSearch={vi.fn()}
+        theme="dark"
+        onTheme={vi.fn()}
+        workspace={sampleWorkspace}
+      />
+    );
+
+    const disclosure = screen.getByRole('button', { name: 'Beta Project' });
+    disclosure.focus();
+
+    await userEvent.tab();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'New chat in Beta Project' }));
+    await userEvent.tab();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Delete folder Beta Project' }));
+    await userEvent.tab();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Options for Beta Project' }));
+
+    // The keyboard can start a chat in the second project without any hover.
+    await userEvent.keyboard('{Enter}');
+    expect(screen.getByRole('menuitem', { name: 'New chat in Beta Project' })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('menuitem', { name: 'New chat in Beta Project' }));
+    expect(onNew).toHaveBeenCalledWith('beta-proj');
   });
 
   it('allows deleting custom project folders directly via the trash icon button', async () => {
@@ -363,7 +559,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
         onWorkspace={onWorkspace}
       />
@@ -396,7 +591,6 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
         onProject={onProject}
       />
@@ -409,7 +603,7 @@ describe('Sidebar project folders and actions', () => {
     expect(onProject).not.toHaveBeenCalled();
   });
 
-  it('renders localLM brand button and navigates through feature toolsets', async () => {
+  it('renders the localLM brand button and navigates home', async () => {
     const onPage = vi.fn();
 
     render(
@@ -425,49 +619,16 @@ describe('Sidebar project folders and actions', () => {
         onSearch={vi.fn()}
         theme="dark"
         onTheme={vi.fn()}
-        onCollapse={vi.fn()}
         workspace={sampleWorkspace}
       />
     );
 
-    // Workspace brand button
-    const brandBtn = screen.getByRole('button', { name: 'Workspace menu' });
+    const brandBtn = screen.getByRole('button', { name: 'localLM home' });
     expect(brandBtn).toHaveTextContent('localLM');
 
-    // Open brand menu
     await userEvent.click(brandBtn);
-    expect(await screen.findByRole('menuitem', { name: 'LocalLM Workspace' })).toBeInTheDocument();
-    expect(screen.getByRole('menuitem', { name: 'Connectors' })).toBeInTheDocument();
-    expect(screen.getByRole('menuitem', { name: 'Skills' })).toBeInTheDocument();
-    expect(screen.getByRole('menuitem', { name: 'Tools & Permissions' })).toBeInTheDocument();
-
-    // Verify toolsets navigation buttons
-    const connectorsBtn = screen.getByRole('button', { name: 'Connectors' });
-    const skillsBtn = screen.getByRole('button', { name: 'Skills' });
-    const toolsBtn = screen.getByRole('button', { name: 'Tools' });
-    const modelsBtn = screen.getByRole('button', { name: 'Models & runtime' });
-    const executionBtn = screen.getByRole('button', { name: 'Execution' });
-
-    expect(connectorsBtn).toBeInTheDocument();
-    expect(skillsBtn).toBeInTheDocument();
-    expect(toolsBtn).toBeInTheDocument();
-    expect(modelsBtn).toBeInTheDocument();
-    expect(executionBtn).toBeInTheDocument();
-
-    await userEvent.click(connectorsBtn);
-    expect(onPage).toHaveBeenCalledWith('connectors');
-
-    await userEvent.click(skillsBtn);
-    expect(onPage).toHaveBeenCalledWith('skills');
-
-    await userEvent.click(toolsBtn);
-    expect(onPage).toHaveBeenCalledWith('tools');
-
-    await userEvent.click(modelsBtn);
-    expect(onPage).toHaveBeenCalledWith('models');
-
-    await userEvent.click(executionBtn);
-    expect(onPage).toHaveBeenCalledWith('execution');
+    expect(onPage).toHaveBeenCalledWith('chat');
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
   });
 });
 

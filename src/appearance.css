@@ -1,0 +1,32 @@
+/* Appearance preferences share the existing palette and layout vocabulary. */
+.desktop-app .message .markdown,
+.desktop-app .codex-composer-body textarea {
+  font-family: var(--chat-font);
+  font-size: var(--chat-font-size);
+}
+.desktop-app .markdown pre code,
+.desktop-app .markdown .code-block-pre,
+.desktop-app .markdown .code-block-pre code {
+  font-size: var(--code-font-size);
+}
+.desktop-app .markdown .code-block-pre { color: var(--code-fg); }
+.desktop-app .composer-region { max-width: var(--chat-max-width); }
+.desktop-app .messages { max-width: calc(var(--chat-max-width) - 80px); }
+:root[data-chat-width=full] .desktop-app .messages { max-width: none; }
+
+:root[data-density=compact] .settings-navigation-group > button { padding-block: 7px; }
+:root[data-density=compact] .preference-row { min-height: 65px; padding-block: 12px; }
+:root[data-density=compact] .preference-section { margin-bottom: 20px; padding-top: 20px; }
+:root[data-density=compact] .desktop-app .codex-folder-header,
+:root[data-density=compact] .desktop-app .codex-chat-btn { padding-block: 5px; }
+:root[data-density=compact] .desktop-app .message { padding-bottom: 16px; }
+:root[data-density=compact] .desktop-app .message-user { padding: 9px 15px; margin-bottom: 18px; }
+:root[data-density=compact] .desktop-app .markdown { line-height: 1.65; }
+
+:root[data-motion=reduced] *,
+:root[data-motion=reduced] *::before,
+:root[data-motion=reduced] *::after {
+  animation: none !important;
+  transition: none !important;
+  scroll-behavior: auto !important;
+}

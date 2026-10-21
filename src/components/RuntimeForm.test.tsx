@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { RuntimeForm } from './RuntimeForm';
@@ -21,7 +21,50 @@ const hardware: HardwareStatus = {
 };
 
 describe('runtime settings', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.readModelMetadata.mockImplementation(async (path: string) => path.includes('mmproj') ? { ...llama, fileBytes: 2 ** 30 } : llama);
+    api.hardwareStatus.mockResolvedValue(hardware);
+  });
+  it('can disable vision without clearing its configured projector file', async () => {
+    const onSave = vi.fn();
+    render(<RuntimeForm initial={{ ...defaultRuntimeConfig, contextLength: 8192 }} onSave={onSave} busy={false}
+      modelPath="model.gguf" projectorPath="mmproj-model-F16.gguf" />);
+    await screen.findByText('1.00 GiB');
+    await userEvent.click(screen.getByLabelText('Load vision projector'));
+    expect(screen.getByLabelText('Projector placement')).toBeDisabled();
+    expect(screen.getByText('mmproj-model-F16.gguf')).toBeVisible();
+    expect(screen.getByText('Off · text only')).toBeVisible();
+    await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ visionEnabled: false }));
+  });
+
+  it('can put the projector on CPU independently of language-model GPU layers', async () => {
+    const onSave = vi.fn();
+    render(<RuntimeForm initial={{ ...defaultRuntimeConfig, contextLength: 8192 }} onSave={onSave} busy={false}
+      modelPath="model.gguf" projectorPath="mmproj-model-F16.gguf" />);
+    await screen.findByText('1.00 GiB');
+    await userEvent.selectOptions(screen.getByLabelText('Projector placement'), 'cpu');
+    await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ gpuLayers: -1, visionEnabled: true, offloadProjector: false }));
+  });
+
+  it('keeps GPU projector memory visible when the language model is on CPU', async () => {
+    render(<RuntimeForm initial={{ ...defaultRuntimeConfig, gpuLayers: 0, contextLength: 8192 }} onSave={vi.fn()} busy={false}
+      modelPath="model.gguf" projectorPath="mmproj-model-F16.gguf" />);
+    const meter = await screen.findByRole('progressbar', { name: 'Estimated GPU memory' });
+    await waitFor(() => expect(meter).toHaveAttribute('value', String(2 ** 30)));
+    await userEvent.click(screen.getByLabelText('Load vision projector'));
+    expect(meter).toHaveAttribute('value', '0');
+  });
+
+  it('distinguishes the loaded projector from pending placement settings', async () => {
+    render(<RuntimeForm initial={{ ...defaultRuntimeConfig, contextLength: 8192 }} onSave={vi.fn()} busy={false}
+      modelPath="model.gguf" projectorPath="mmproj-model-F16.gguf"
+      runtime={{ phase: 'ready', message: 'Model ready', modelPath: 'model.gguf', projector: { path: 'mmproj-model-F16.gguf', offload: false, fileBytes: 2 ** 30 } }} />);
+    expect(screen.getByText('On · GPU preferred')).toBeVisible();
+    expect(screen.getByText('On · CPU only')).toBeVisible();
+  });
   it('says saving will reload when a model is already loaded', () => {
     render(<RuntimeForm initial={defaultRuntimeConfig} onSave={vi.fn()} busy={false}
       runtime={{ phase: 'ready', message: 'Model ready', modelPath: 'model.gguf', loadedConfig: defaultRuntimeConfig }} />);

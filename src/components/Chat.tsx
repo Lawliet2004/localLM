@@ -1,27 +1,45 @@
-import { type Dispatch, type SetStateAction, type ReactNode, useEffect, useRef, useState } from 'react';
-import { ArrowDown, Check, ChevronDown, ChevronRight, Copy, Cpu, FileText, Folder, ListTodo, MessageSquare, Plus, SendHorizontal, Square, Terminal, WandSparkles, X } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { FileResult } from './FileResult';
+import { partitionActivity } from '../lib/activity';
+import { WorkSummary } from './WorkSummary';
+import { AnswerSources, collectAnswerSources } from './AnswerSources';
+import { ScreenshotPreview } from './ScreenshotPreview';
+import { type Dispatch, type SetStateAction, type ReactNode, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowDown, Check, ChevronDown, ChevronRight, Copy, Cpu, FileText, Folder, Play, Plus, SendHorizontal, Settings, Square, X } from 'lucide-react';
 import { attachmentAccept, composeMessage, readAttachment, type Attachment } from '../lib/attachments';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
+import { prefersReducedMotion } from '../lib/appearance';
+import { isSubscriptionFormat, remoteModelReady } from '../lib/providers';
 import { modelLabel as localModelLabel } from '../lib/localModels';
 import type { Message, ContextUsage, ModelSelection, ProviderConnection, PreflightBreakdown, ToolSelection } from '../lib/types';
+import { ResponseMetrics } from './ResponseMetrics';
+import { ToolResultExtras } from './ToolResultExtras';
 import type { InstalledModel } from '../lib/types';
-import { WorkSummary } from './WorkSummary';
 import { ActivityTimeline, useSessionActivity } from './ActivityTimeline';
-import { TraceIcon, groupKindOf, toolKindOf, type TraceKind } from './TraceIcon';
+import { TraceIcon } from './TraceIcon';
 import { ContextControl } from './ContextControl';
 import { CommandRunCard } from './CommandRunCard';
-import { PlanChecklist, isPlanStateTool, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
+import { PlanChecklist, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
+import { CanvasPanel } from './CanvasPanel';
+import { artifactVersions, extractArtifacts, findArtifact } from '../lib/canvas';
 import type { RunRecord } from '../lib/types';
+import { MarkdownView } from './MarkdownView';
+import { MessageRenderer } from '../genui/MessageRenderer';
+import { ResearchContext, type HostClaim } from '../genui/grounding';
+import { usePresentationMode } from '../hooks/usePresentationMode';
+
+const EMPTY_ATTACHMENTS: Attachment[] = [];
+const EMPTY_SOURCES: string[] = [];
+const EMPTY_TOOLS: ToolSelection[] = [];
 
 interface Props {
-  composerTools?: ReactNode;
+  composerPermissions?: ReactNode;
+  reasoningMode?: 'auto' | 'quick' | 'think';
   conversationKey?: string;
   attachmentDrafts?: Record<string, Attachment[]>;
   onAttachmentDraftsChange?: Dispatch<SetStateAction<Record<string, Attachment[]>>>;
   contextUsage?: ContextUsage;
   modelLabel?: string;
+  modelIdentity?: string;
   selectionIssue?: boolean;
   draft?: string;
   onDraftChange?: (value: string | ((previous: string) => string)) => void;
@@ -35,12 +53,10 @@ interface Props {
   connectorTools?: ToolSelection[];
   onSend: (content: string) => Promise<void>;
   onCancel: () => void;
-  onPause?: () => void;
   onResume?: () => void;
   paused?: boolean;
   onConfigure: () => void;
   planMode?: boolean;
-  onPlanModeChange?: (next: boolean) => void;
   onConfigureLocalModel?: (filename: string) => void;
   liveActivity?: { state?: string; activity?: string } | null;
   providers?: ProviderConnection[];
@@ -67,9 +83,16 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
   const resultRecord = result !== null && typeof result === 'object' && !Array.isArray(result) ? (result as Record<string, unknown>) : null;
   const dataRecord = resultRecord && resultRecord.data && typeof resultRecord.data === 'object' && !Array.isArray(resultRecord.data) ? (resultRecord.data as Record<string, unknown>) : null;
   const logsRecord = dataRecord && dataRecord.logs && typeof dataRecord.logs === 'object' && !Array.isArray(dataRecord.logs) ? (dataRecord.logs as Record<string, unknown>) : null;
+  // A tool result is either the `locallm.tool-envelope/1` envelope (whose
+  // payload lives under `data`) or a legacy bare object. Both shapes are
+  // read here so a result is never silently dropped from the transcript.
+  const isStructured = (value: Record<string, unknown> | null) =>
+    !!value && (typeof value.answer === 'string' || value.sources !== undefined || value.documents !== undefined);
   const structuredResult = dataRecord && 'result' in dataRecord
     ? dataRecord.result
-    : resultRecord && (typeof resultRecord.answer === 'string' || resultRecord.sources !== undefined || resultRecord.documents !== undefined)
+    : isStructured(dataRecord)
+    ? dataRecord
+    : isStructured(resultRecord)
     ? resultRecord
     : undefined;
   const resultStatus = dataRecord && typeof dataRecord.resultStatus === 'string' ? dataRecord.resultStatus : undefined;
@@ -117,8 +140,14 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
     ? (() => { try { return JSON.stringify(structuredResult, null, 2); } catch { return String(structuredResult); } })()
     : null;
 
+  if (/^(read_file|view_file|file_read)$/.test(name) && status === 'completed' && typeof resultRecord?._artifactId !== 'string' && typeof resultRecord?.content === 'string') {
+    const args = request.arguments as Record<string, unknown> | undefined;
+    return <article className="message message-tool" aria-label="tool message"><FileResult path={String(resultRecord.path ?? args?.path ?? 'File')} content={resultRecord.content} totalLines={typeof resultRecord.totalLines === 'number' ? resultRecord.totalLines : undefined} sha256={typeof resultRecord.sha256 === 'string' ? resultRecord.sha256 : undefined} raw={record} /></article>;
+  }
+
   return (
     <article className="message message-tool" aria-label="tool message">
+      <ToolResultExtras name={name} result={resultRecord} conversationId={message.conversationId} />
       <CommandRunCard
         onStop={onStop}
         toolName={name}
@@ -145,205 +174,12 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
         originalBytes={originalBytes}
         authorization={authorization}
       />
+      {Array.isArray(resultRecord?._screenshotArtifactIds) && resultRecord._screenshotArtifactIds.filter((id): id is string => typeof id === 'string' && /^art_[a-f0-9]{32}$/.test(id)).slice(0, 2).map(id => <ScreenshotPreview key={id} id={id} conversationId={message.conversationId} />)}
     </article>
   );
 }
 
-function toolNameOf(message: Message): string {
-  try {
-    const value = JSON.parse(message.content);
-    const request = value.request || value;
-    return typeof request.name === 'string' ? request.name : '';
-  } catch {
-    return '';
-  }
-}
-
-function TurnTools({ tools, onCancel }: { tools: Message[]; onCancel: () => void }) {
-  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
-  tools = tools.filter(message => !isPlanStateTool(toolNameOf(message)));
-  if (!tools.length) return null;
-
-  // Segment tools into edits vs non-edits
-  const segments: { type: 'edit' | 'group'; tools: Message[]; title?: string; icon?: TraceKind; key: string }[] = [];
-  let currentGroup: Message[] = [];
-
-  const flushGroup = () => {
-    if (!currentGroup.length) return;
-    const groupTools = [...currentGroup];
-    let fileCount = 0;
-    let searchCount = 0;
-    let folderCount = 0;
-    let taskCount = 0;
-    let commandCount = 0;
-    const kinds: TraceKind[] = [];
-    const isStreaming = groupTools.some(t => t.status === 'streaming');
-
-    for (const msg of groupTools) {
-      try {
-        const val = JSON.parse(msg.content);
-        const req = val.request || val;
-        const res = val.result || {};
-        const name = req.name || '';
-        const args = req.arguments || {};
-        kinds.push(toolKindOf(name, args, res));
-        if (/search|grep|find|locate/.test(name)) searchCount++;
-        else if (/list_dir|list_files|browse_dir/.test(name)) folderCount++;
-        else if (name === 'manage_task') taskCount++;
-        else if (args.command || args.CommandLine || /exec|run_code|terminal|run_command/.test(name)) commandCount++;
-        else fileCount++;
-      } catch {
-        fileCount++;
-      }
-    }
-
-    let title = '';
-    if (commandCount > 0 && fileCount === 0 && searchCount === 0 && folderCount === 0 && taskCount === 0) {
-      const prefix = isStreaming ? 'Running' : 'Ran';
-      title = `${prefix} ${commandCount} ${commandCount === 1 ? 'command' : 'commands'}`;
-    } else {
-      const parts: string[] = [];
-      if (fileCount > 0) parts.push(`${fileCount} ${fileCount === 1 ? 'file' : 'files'}`);
-      if (folderCount > 0) parts.push(`${folderCount} ${folderCount === 1 ? 'folder' : 'folders'}`);
-      if (searchCount > 0) parts.push(`${searchCount} ${searchCount === 1 ? 'search' : 'searches'}`);
-      if (taskCount > 0) parts.push(`${taskCount} ${taskCount === 1 ? 'task' : 'tasks'}`);
-      if (!parts.length && commandCount > 0) parts.push(`${commandCount} ${commandCount === 1 ? 'command' : 'commands'}`);
-      if (!parts.length) parts.push(`${groupTools.length} ${groupTools.length === 1 ? 'item' : 'items'}`);
-      const prefix = isStreaming ? 'Exploring' : 'Explored';
-      title = `${prefix} ${parts.join(', ')}`;
-    }
-
-    segments.push({
-      type: 'group',
-      tools: groupTools,
-      title,
-      icon: groupKindOf(kinds),
-      key: `grp-${groupTools[0].id}`,
-    });
-    currentGroup = [];
-  };
-
-  for (const tool of tools) {
-    let isEdit = false;
-    try {
-      const val = JSON.parse(tool.content);
-      const req = val.request || val;
-      const res = val.result || {};
-      const name = req.name || '';
-      isEdit = /edit|create_file|write_to_file|replace/.test(name) || Boolean(res.diff);
-    } catch { /* ignore */ }
-
-    if (isEdit) {
-      flushGroup();
-      segments.push({ type: 'edit', tools: [tool], key: `edit-${tool.id}` });
-    } else {
-      currentGroup.push(tool);
-    }
-  }
-  flushGroup();
-
-  return (
-    <div className="activity-feed">
-      {segments.map((seg, segIdx) => {
-        if (seg.type === 'edit') {
-          return <ToolMessage key={seg.key} message={seg.tools[0]} onStop={onCancel} />;
-        }
-        const isLast = segIdx === segments.length - 1;
-        const isStreaming = seg.tools.some(t => t.status === 'streaming');
-        const defaultExpanded = isStreaming || isLast || seg.tools.length <= 1;
-        const isExpanded = openGroups[seg.key] ?? defaultExpanded;
-        return (
-          <div key={seg.key} className={`activity-group ${isStreaming && isLast ? 'is-live' : ''}`}>
-            <button
-              type="button"
-              className={`activity-group-header ${isExpanded ? 'expanded' : ''}`}
-              onClick={() => setOpenGroups(curr => ({ ...curr, [seg.key]: !isExpanded }))}
-              aria-expanded={isExpanded}
-            >
-              <TraceIcon kind={seg.icon ?? 'explore'} size={13} />
-              <span className="activity-group-title">{seg.title}</span>
-              <span className="activity-group-count">{seg.tools.length}</span>
-              <ChevronRight size={13} className="activity-group-chevron" />
-            </button>
-            <div className="activity-group-items" style={{ display: isExpanded ? 'flex' : 'none' }}>
-              {seg.tools.map(tool => (
-                <ToolMessage key={tool.id} message={tool} onStop={onCancel} />
-              ))}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function MarkdownCodeBlock({ language, code }: { language: string; code: string }) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-
-  const onCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(code);
-      setCopied(true);
-      clearTimeout(timer.current);
-      timer.current = setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* ignore */
-    }
-  };
-
-  useEffect(() => () => clearTimeout(timer.current), []);
-
-  return (
-    <div className="code-block-wrapper">
-      <div className="code-block-header">
-        <span className="code-block-lang">{language || 'code'}</span>
-        <button
-          type="button"
-          className="code-block-copy-btn"
-          onClick={() => void onCopy()}
-          aria-label="Copy code block"
-          title="Copy code"
-        >
-          {copied ? <Check size={12} className="text-success" /> : <Copy size={12} />}
-          <span>{copied ? 'Copied!' : 'Copy'}</span>
-        </button>
-      </div>
-      <pre className="code-block-pre">
-        <code>{code}</code>
-      </pre>
-    </div>
-  );
-}
-
-function ImageLightbox({ src, alt }: { src?: string; alt?: string }) {
-  const [isOpen, setIsOpen] = useState(false);
-  if (!src) return <span className="image-reference">Image: {alt || 'image'}</span>;
-  return (
-    <>
-      <span className="image-preview-wrapper" onClick={() => setIsOpen(true)} title="Click to enlarge">
-        <img src={src} alt={alt || 'Image preview'} className="image-preview-thumb" />
-      </span>
-      {isOpen && (
-        <div className="image-lightbox-overlay" onClick={() => setIsOpen(false)}>
-          <div className="image-lightbox-modal" onClick={e => e.stopPropagation()}>
-            <img src={src} alt={alt || 'Enlarged image'} className="lightbox-img" />
-            <button
-              type="button"
-              className="lightbox-close-btn"
-              onClick={() => setIsOpen(false)}
-              aria-label="Close preview"
-            >
-              <X size={18} />
-            </button>
-          </div>
-        </div>
-      )}
-    </>
-  );
-}
-
-function MessageBody({ message }: { message: Message }) {
+const MessageBody = memo(function MessageBody({ message, suppressReasoning = false, sourceLinks = '{}', onSendPrompt, onOpenCanvas }: { message: Message; suppressReasoning?: boolean; sourceLinks?: string; onSendPrompt?: (text: string) => void; onOpenCanvas?: (code: string, language: string) => void }) {
   let attached: { name: string; imageUrl?: string; content?: string }[] = [];
   let displayContent = message.content;
   if (message.role === 'user') {
@@ -352,87 +188,43 @@ function MessageBody({ message }: { message: Message }) {
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState('');
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const startTime = useRef(Date.now());
-  const isStreamingInitially = useRef(message.status === 'streaming');
-  const [elapsed, setElapsed] = useState('0.0');
-  const [finalDuration, setFinalDuration] = useState<string | null>(null);
-  const [isOpen, setIsOpen] = useState(message.status === 'streaming');
-  const userToggled = useRef(false);
-
+  const [isOpen, setIsOpen] = useState(false);
   useEffect(() => () => clearTimeout(timer.current), []);
 
-  useEffect(() => {
-    if (message.status === 'streaming') {
-      isStreamingInitially.current = true;
-      setIsOpen(true);
-      userToggled.current = false;
-      const interval = setInterval(() => {
-        const secs = ((Date.now() - startTime.current) / 1000).toFixed(1);
-        setElapsed(secs);
-      }, 100);
-      return () => clearInterval(interval);
-    } else {
-      if (isStreamingInitially.current && !finalDuration) {
-        const secs = Math.max(0.5, (Date.now() - startTime.current) / 1000).toFixed(1);
-        setFinalDuration(secs);
-      }
-      if (!userToggled.current) {
-        setIsOpen(false);
-      }
-    }
-  }, [message.status]);
-
-  const thoughtSummary = message.status === 'streaming'
-    ? `Thinking (${elapsed}s)…`
-    : finalDuration
-    ? `Thought for ${Math.round(parseFloat(finalDuration)) || finalDuration}s`
-    : 'Thought';
+  const thoughtSummary = message.status === 'streaming' ? 'Thinking…' : 'Thought';
+  const streaming = message.status === 'streaming';
 
   return (
     <article data-message-id={message.id} className={`message message-${message.role}`} aria-label={`${message.role} message`}>
       <div className="message-byline">{message.role === 'user' ? 'You' : <><span className="mini-mark">L</span>LocalLM</>}</div>
-      {message.reasoning && (
+      {message.reasoning && !suppressReasoning && (
         <details
           className="reasoning trace-thought-details"
           open={isOpen}
           onToggle={e => {
-            userToggled.current = true;
             setIsOpen((e.currentTarget as HTMLDetailsElement).open);
           }}
         >
           <summary className="trace-thought-pill">
             <TraceIcon kind="thought" size={12}>
-              {message.status === 'streaming' ? <span className="thinking-pulsar" /> : undefined}
+              {streaming ? <span className="thinking-pulsar" /> : undefined}
             </TraceIcon>
             <span className="trace-thought-label">{thoughtSummary}</span>
             <ChevronRight size={13} className="thought-chevron" />
           </summary>
-          <div className="reasoning-content trace-thought-content">{message.reasoning}</div>
+          <div className="reasoning-content trace-thought-content"><MarkdownView content={message.reasoning} assistant={false} streaming={streaming} /></div>
         </details>
       )}
-      <div className={`markdown ${message.status === 'streaming' && displayContent ? 'is-streaming' : ''}`}>
-        <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
-          components={{
-            a: ({ children, href }) => <a href={href} target="_blank" rel="noreferrer">{children}</a>,
-            img: ({ src, alt }) => <ImageLightbox src={src} alt={alt} />,
-            code: ({ inline, className, children, ...rest }: any) => {
-              const match = /language-(\w+)/.exec(className || '');
-              const textContent = String(children).replace(/\n$/, '');
-              if (!inline && (match || textContent.includes('\n'))) {
-                return <MarkdownCodeBlock language={match ? match[1] : ''} code={textContent} />;
-              }
-              return <code className={className} {...rest}>{children}</code>;
-            },
-          }}
-        >
-          {displayContent}
-        </ReactMarkdown>
-        {attached.map((file, index) => <details key={index} className="message-attachment"><summary>{file.name}</summary>{file.imageUrl ? <img src={file.imageUrl} alt={file.name} style={{ maxWidth: '100%', maxHeight: 320 }} /> : <pre>{file.content}</pre>}</details>)}
-      </div>
-      {message.status === 'streaming' && !message.content && !message.reasoning && (
-        <span className="thinking" role="status">Thinking<span>···</span></span>
-      )}
+      <MessageRenderer
+        message={{...message, content:displayContent}}
+        assistant={message.role === 'assistant'}
+        streaming={streaming}
+        sourceLinks={sourceLinks}
+        onSendPrompt={onSendPrompt}
+        onOpenCanvas={onOpenCanvas}
+      />
+      {attached.length > 0 && <div className="markdown">{attached.map((file, index) => <details key={index} className="message-attachment"><summary>{file.name}</summary>{file.imageUrl ? <img src={file.imageUrl} alt={file.name} style={{ maxWidth: '100%', maxHeight: 320 }} /> : <pre>{file.content}</pre>}</details>)}</div>}
+      {message.metrics && <ResponseMetrics message={message} />}
       {(message.status === 'interrupted' || message.status === 'error') && (
         <p className="message-state">{message.error || (message.status === 'interrupted' ? 'Response stopped' : 'Response interrupted by an error')}</p>
       )}
@@ -458,15 +250,17 @@ function MessageBody({ message }: { message: Message }) {
       {copyError && <small role="alert">{copyError}</small>}
     </article>
   );
-}
+});
 
 export function Chat({
   attachmentDrafts: controlledAttachments,
   onAttachmentDraftsChange,
-  composerTools,
+  composerPermissions,
+  reasoningMode,
   conversationKey = 'new',
   contextUsage,
   modelLabel = 'Local model',
+  modelIdentity = modelLabel,
   selectionIssue = false,
   messages,
   generating,
@@ -474,16 +268,14 @@ export function Chat({
   loading,
   disabled = false,
   preset = 'standard',
-  connectorIds = [],
-  connectorTools = [],
+  connectorIds = EMPTY_SOURCES,
+  connectorTools = EMPTY_TOOLS,
   onSend,
   onCancel,
-  onPause,
   onResume,
   paused = false,
   onConfigure,
   planMode = false,
-  onPlanModeChange,
   onConfigureLocalModel,
   draft: controlledDraft,
   onDraftChange,
@@ -495,6 +287,7 @@ export function Chat({
   onDismissError,
   projectName,
 }: Props) {
+  const presentation = usePresentationMode(conversationKey);
   const sessionActivity = useSessionActivity(conversationKey, generating);
   const planFallback = todosFromPlanEvents(sessionActivity);
   const todos = useConversationTodos(conversationKey, generating, planFallback);
@@ -511,7 +304,7 @@ export function Chat({
   const setAttachmentDrafts = onAttachmentDraftsChange ?? setLocalAttachments;
   const latestConversation = useRef(conversationKey);
   latestConversation.current = conversationKey;
-  const attachments = attachmentDrafts[conversationKey] ?? [];
+  const attachments = attachmentDrafts[conversationKey] ?? EMPTY_ATTACHMENTS;
   const [attachmentError, setAttachmentError] = useState('');
   useEffect(() => {
     setAttachmentError('');
@@ -520,6 +313,22 @@ export function Chat({
   const [readingFiles, setReadingFiles] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
+  const modelTrigger = useRef<HTMLButtonElement>(null);
+  const modelPopover = useRef<HTMLDivElement>(null);
+  function closeModelPicker() { setShowModelPicker(false); modelTrigger.current?.focus(); }
+  useEffect(() => {
+    if (!showModelPicker) return;
+    modelPopover.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+    function dismiss(event: PointerEvent) {
+      if (!modelPopover.current?.contains(event.target as Node) && !modelTrigger.current?.contains(event.target as Node)) setShowModelPicker(false);
+    }
+    function escape(event: KeyboardEvent) {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeModelPicker(); }
+    }
+    document.addEventListener('pointerdown', dismiss);
+    document.addEventListener('keydown', escape);
+    return () => { document.removeEventListener('pointerdown', dismiss); document.removeEventListener('keydown', escape); };
+  }, [showModelPicker]);
   const [downloadedModels, setDownloadedModels] = useState<InstalledModel[]>([]);
   const [libraryError, setLibraryError] = useState('');
   useEffect(() => {
@@ -558,9 +367,11 @@ export function Chat({
   const [localDraft, setLocalDraft] = useState('');
   const draft = controlledDraft ?? localDraft;
   const setDraft = onDraftChange ?? setLocalDraft;
+  const [preflightIssue, setPreflightIssue] = useState('');
   const [preflight, setPreflight] = useState<{ breakdown: PreflightBreakdown; draft: string } | null>(null);
   const [compacting, setCompacting] = useState(false);
   const [compactionNotice, setCompactionNotice] = useState<string | null>(null);
+  const [preflightRevision, setPreflightRevision] = useState(0);
   const preflightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -574,11 +385,7 @@ export function Chat({
     try {
       const outcome = await api.compactConversation(conversationKey);
       setCompactionNotice(outcome.note);
-      if (draft.trim()) {
-        void api.contextPreflight(conversationKey, draft, preset, connectorIds, connectorTools, planMode).then(result => {
-          if (result.available) setPreflight({ breakdown: result.breakdown!, draft });
-        });
-      }
+      setPreflightRevision(value => value + 1);
     } catch (e) {
       setCompactionNotice(errorMessage(e));
     } finally {
@@ -593,12 +400,40 @@ export function Chat({
     ['error', 'interrupted'].includes(lastResponse.status) ||
     (lastTool && ['error', 'streaming'].includes(lastTool.status))
   );
-  const turns: Message[][] = [];
-  for (const message of messages) {
-    if (message.role === 'user' || !turns.length) turns.push([]);
-    turns[turns.length - 1].push(message);
-  }
+  const turns = useMemo(() => {
+    const grouped: Message[][] = [];
+    for (const message of messages) {
+      if (message.role === 'user' || !grouped.length) grouped.push([]);
+      grouped[grouped.length - 1].push(message);
+    }
+    return grouped;
+  }, [messages]);
+  const turnActivity = useMemo(() => partitionActivity(turns, sessionActivity), [turns, sessionActivity]);
 
+
+  // Buttons rendered by generated UI submit a follow-up like a typed message.
+  const sendFromUi = useCallback((text: string) => {
+    if (!text.trim() || !ready || generating || loading || disabled || submitting.current) return;
+    void onSend(text);
+  }, [ready, generating, loading, disabled, onSend]);
+
+  // Canvas: every fenced artifact in the conversation, grouped so later
+  // blocks with the same title supersede earlier versions.
+  const canvasArtifacts = useMemo(() => extractArtifacts(messages), [messages]);
+  const canvasArtifactsRef = useRef(canvasArtifacts);
+  canvasArtifactsRef.current = canvasArtifacts;
+  const [canvasSel, setCanvasSel] = useState<{ group: string; version: number } | null>(null);
+  const canvasVersions = canvasSel ? artifactVersions(canvasArtifacts, canvasSel.group) : [];
+  const canvasArtifact = canvasSel && canvasVersions.length
+    ? canvasVersions[Math.min(canvasSel.version, canvasVersions.length) - 1]
+    : null;
+  // Switching conversations closes the canvas — its artifacts belong to this thread.
+  useEffect(() => { setCanvasSel(null); }, [conversationKey]);
+  // Stable identity so memoized message bodies are not re-parsed per turn.
+  const openCanvas = useCallback((code: string, language: string) => {
+    const artifact = findArtifact(canvasArtifactsRef.current, code, language);
+    if (artifact) setCanvasSel({ group: artifact.groupKey, version: artifact.version });
+  }, []);
 
   async function retry() {
     if (!lastPrompt || !ready || generating || loading || disabled || submitting.current) return;
@@ -626,19 +461,21 @@ export function Chat({
   }, [draft, conversationKey]);
 
   useEffect(() => {
-    if (preflightTimer.current) clearTimeout(preflightTimer.current);
-    if (!draft.trim() || !ready) { setPreflight(null); return; }
+    let disposed = false;
+    setPreflight(null); setPreflightIssue('');
+    if ((!draft.trim() && !attachments.length) || !ready) return;
+    let payload: string;
+    try { payload = composeMessage(draft, attachments); } catch { return; }
     preflightTimer.current = setTimeout(() => {
-      void api.contextPreflight(conversationKey === 'new' ? null : conversationKey, draft, preset, connectorIds, connectorTools, planMode).then(result => {
-        if (result.available) setPreflight({ breakdown: result.breakdown!, draft });
-        else setPreflight(null);
-      }).catch(() => setPreflight(null));
+      void api.contextPreflight(conversationKey === 'new' ? null : conversationKey, payload, preset, connectorIds, connectorTools, planMode, reasoningMode, presentation.effectiveMode).then(result => {
+        if (!disposed) { setPreflight(result.available ? { breakdown: result.breakdown!, draft: payload } : null); setPreflightIssue(!result.available && result.reason?.includes('at most 64 tools') ? result.reason : ''); }
+      }).catch(() => { if (!disposed) setPreflight(null); });
     }, 400);
-    return () => { if (preflightTimer.current) clearTimeout(preflightTimer.current); };
-  }, [draft, ready, conversationKey, connectorIds, connectorTools, preset, planMode]);
+    return () => { disposed = true; if (preflightTimer.current) clearTimeout(preflightTimer.current); };
+  }, [draft, attachments, ready, conversationKey, connectorIds, connectorTools, preset, planMode, reasoningMode, modelIdentity, preflightRevision, presentation.effectiveMode]);
 
   async function submit() {
-    if ((!draft.trim() && !attachments.length) || !ready || generating || loading || disabled || reading.current || submitting.current) return;
+    if ((!draft.trim() && !attachments.length) || !ready || generating || loading || disabled || preflightIssue || reading.current || submitting.current) return;
     let content: string;
     try {
       content = composeMessage(draft, attachments);
@@ -662,8 +499,11 @@ export function Chat({
     input.current?.focus();
   }
 
+  const isHome = !loading && !messages.length && !generating;
+
   return (
-    <div className="chat-layout" style={{ position: 'relative' }}>
+    <div className="chat-shell">
+    <div className={`chat-layout ${isHome ? 'chat-home' : ''}`} style={{ position: 'relative' }}>
       <div
         className="chat-scroll"
         ref={scroll}
@@ -681,20 +521,19 @@ export function Chat({
         ) : messages.length || generating ? (
           <div className="messages">
             {turns.map((turn, turnIndex) => {
-              const assistants = turn.filter(message => message.role === 'assistant');
               const user = turn.find(message => message.role === 'user');
-              const recordedRun = user?.id === lastPrompt?.id && latestRun?.conversationId === conversationKey && latestRun.createdAt >= (user?.createdAt ?? 0) ? latestRun : null;
-              const activity = sessionActivity.filter(e => e.createdAt >= (user?.createdAt ?? 0) && e.createdAt < (turns[turnIndex + 1]?.[0].createdAt ?? Infinity));
-              if (activity.length > 0) return <div key={turn[0].id} className="conversation-turn">
-                {user && <MessageBody message={user} />}
-                <ActivityTimeline events={activity} messages={turn} renderMessage={m => <MessageBody message={m} />} renderTool={m => <ToolMessage message={m} onStop={onCancel} />} />
-              </div>;
+              const activity = turnActivity[turnIndex];
+              const evidenceSources = collectAnswerSources(turn, activity);
+              const hostClaims: HostClaim[] = activity.filter(event => event.eventType === "verification").flatMap(event => {
+                const claims = (event.payload as {claims?:unknown[]})?.claims;
+                return Array.isArray(claims) ? claims.slice(0,100).flatMap(raw => { if (!raw || typeof raw !== "object" || Array.isArray(raw)) return []; const claim = raw as {claim?:unknown;status?:unknown;sources?:unknown}; return typeof claim.claim === "string" && typeof claim.status === "string" ? [{claim:claim.claim.slice(0,4000),verdict:claim.status,citations:Array.isArray(claim.sources)?claim.sources.filter((id): id is string => typeof id === "string").flatMap(reference => evidenceSources.find(source => source.url === reference)?.ids ?? [reference]).slice(0,32):[]}] : []; }) : [];
+              });
+              const sourceLinks = JSON.stringify(Object.fromEntries(evidenceSources.flatMap(source => source.ids.map(id => [id, source.url]))));
               return <div key={turn[0].id} className="conversation-turn">
                 {user && <MessageBody message={user} />}
-                <TurnTools tools={turn.filter(message => message.role === 'tool')} onCancel={onCancel} />
-                {assistants.map((message, index) => index === assistants.length - 1 && message.status !== 'streaming'
-                  ? <WorkSummary key={message.id} messages={turn} run={recordedRun}><MessageBody message={message} /></WorkSummary>
-                  : <MessageBody key={message.id} message={message} />)}
+                <ResearchContext.Provider value={{sources:evidenceSources,claims:hostClaims}}><WorkSummary messages={turn} events={activity} run={turnIndex === turns.length - 1 ? latestRun : undefined}><ActivityTimeline events={activity} messages={turn} generating={generating && turnIndex === turns.length - 1} renderMessage={m => <MessageBody message={m} suppressReasoning sourceLinks={sourceLinks} onSendPrompt={sendFromUi} onOpenCanvas={openCanvas} />} renderTool={m => <ToolMessage message={m} onStop={onCancel} />} /></WorkSummary></ResearchContext.Provider>
+                <AnswerSources messages={turn} events={activity} />
+                {turnIndex === turns.length - 1 && latestRun && ['failed', 'outcome_unknown', 'paused', 'cancelled'].includes(latestRun.status) && <p role="status" className="run-outcome">Run {latestRun.status.replace(/_/g, ' ')}. Review the activity above before retrying.</p>}
               </div>;
             })}
             {generating && (
@@ -706,43 +545,27 @@ export function Chat({
             )}
           </div>
         ) : (
-          <div className="sr-only">
-              <div className="welcome-mark"><span /> <span /> <span /></div>
-              <p className="eyebrow">YOUR LOCAL WORKSPACE</p>
-              <h1>A little model.<br />Room for big ideas.</h1>
-              <p className="welcome-description">
-                Think out loud, work through a problem, or start something new.<br className="wide-only" /> Your model runs right here, on your computer.
-              </p>
-              <div className="suggestions">
-                {[
-                  { icon: MessageSquare, title: 'Think it through', prompt: 'Help me think through an idea. Start by asking me what I want to achieve.' },
-                  { icon: Terminal, title: 'Write some code', prompt: 'Help me write a small, useful program. Ask me what it should do.' },
-                  { icon: WandSparkles, title: 'Make a plan', prompt: 'Help me turn a goal into a practical plan. Ask me about my goal first.' },
-                ].map(({ icon: Icon, title, prompt }) => (
-                  <button
-                    key={title}
-                    onClick={() => {
-                      setDraft(prompt);
-                      input.current?.focus();
-                    }}
-                  >
-                    <Icon size={18} />
-                    <span>{title}</span>
-                    <span className="suggestion-arrow">↗</span>
-                  </button>
-                ))}
-              </div>
+          <>
+            <h1 className="sr-only">New conversation</h1>
+            <div className="welcome" aria-hidden="true">
+              <svg viewBox="0 0 512 512" width="44" height="44">
+                <rect width="512" height="512" rx="112" fill="#191b22" />
+                <path d="M154 126h64v230h146v58H154z" fill="#eceef2" />
+                <circle cx="339" cy="155" r="42" fill="#3ec98d" />
+              </svg>
             </div>
+          </>
         )}
       </div>
 
+      <div className="composer-region">
       {showJumpToLatest && (
         <button
           type="button"
           className="jump-to-latest"
           onClick={() => {
             if (scroll.current) {
-              scroll.current.scrollTo({ top: scroll.current.scrollHeight, behavior: 'smooth' });
+              scroll.current.scrollTo({ top: scroll.current.scrollHeight, behavior: prefersReducedMotion() ? 'instant' : 'smooth' });
               follow.current = true;
               setShowJumpToLatest(false);
             }
@@ -753,7 +576,7 @@ export function Chat({
         </button>
       )}
 
-      <div className="composer-region">
+
         {chatNotice && <div className="setup-hint" role="status">{chatNotice}</div>}
         {chatError && (
           <div className="error-banner" role="alert" style={{ margin: '8px 0' }}>
@@ -774,7 +597,7 @@ export function Chat({
         {!ready && (
           <div className="setup-hint">
             <Cpu size={15} />
-            <span>{selectionIssue ? 'Choose a tested provider and configure its model limits, or select the local model.' : 'Load a local model or choose a tested API provider to start a conversation.'}</span>
+            <span>{selectionIssue ? 'Choose a tested provider and configure its model limits, or select the local model.' : isHome ? 'Choose a model to get started.' : 'Load a local model or choose a tested API provider to start a conversation.'}</span>
             <button onClick={onConfigure}>Open Models <span>↗</span></button>
           </div>
         )}
@@ -787,9 +610,10 @@ export function Chat({
           />
           <div className="composer-meta-bar">
             <div className="composer-meta-item">
-              <Folder size={13} className="composer-meta-icon" />
+              <Folder size={14} className="composer-meta-icon" />
               <span>{projectName || 'No workspace'}</span>
             </div>
+            <button type="button" className="icon-button composer-tray-settings" aria-label="Model settings" title="Models & runtime" onClick={onConfigure}><Settings size={15} /></button>
           </div>
           <form
             className={`composer codex-composer-body ${dragging ? 'composer-dragging' : ''}`}
@@ -855,7 +679,7 @@ export function Chat({
           <textarea
             ref={input}
             aria-label="Message"
-            placeholder={planMode ? 'Describe the task to plan…' : 'Do anything'}
+            placeholder={planMode ? 'Describe the task to plan…' : 'Ask a question, or describe a task…'}
             value={draft}
             rows={1}
             maxLength={100000}
@@ -887,31 +711,22 @@ export function Chat({
               >
                 <Plus size={20} />
               </button>
-              <button
-                type="button"
-                className={`icon-button plan-toggle ${planMode ? 'active' : ''}`}
-                aria-pressed={planMode}
-                aria-label="Plan mode"
-                title={planMode ? 'Plan mode is on: write a checklist, then complete one task at a time' : 'Plan mode: write a checklist first, then complete one task at a time'}
-                disabled={generating || loading || disabled}
-                onClick={() => onPlanModeChange?.(!planMode)}
-              >
-                <ListTodo size={16} />
-                {planMode && <span className="plan-toggle-label">Plan</span>}
-              </button>
-              <div className="composer-tools">{composerTools}</div>
+              {composerPermissions}
             </div>
             <div className="composer-send" style={{ position: 'relative' }}>
-              <ContextControl
+              {(!isHome || contextUsage) && <ContextControl
                 conversationId={conversationKey}
                 busy={generating || loading}
                 usage={contextUsage}
                 compacting={compacting}
                 onCompact={messages.length > 2 ? () => void handleCompact() : undefined}
-              />
+              />}
               <button
                 type="button"
+                ref={modelTrigger}
                 className="composer-model"
+                aria-expanded={showModelPicker}
+                aria-haspopup="dialog"
                 onClick={() => {
                   if (providers && onSelectModel) {
                     setShowModelPicker(prev => !prev);
@@ -928,22 +743,22 @@ export function Chat({
               </button>
 
               {showModelPicker && (
-                <div className="composer-model-popover" role="dialog" aria-label="Select model">
+                <div ref={modelPopover} className="composer-model-popover" role="dialog" aria-label="Select model">
                   <div className="composer-model-header">
                     <span>Select model</span>
-                    <button type="button" className="icon-button" onClick={() => setShowModelPicker(false)}>
+                    <button type="button" className="icon-button" aria-label="Close model picker" onClick={closeModelPicker}>
                       <X size={13} />
                     </button>
                   </div>
                   <div className="composer-model-list">
                     {libraryError && <p className="error" role="alert">{libraryError}</p>}
-                    {onConfigureLocalModel && downloadedModels.filter(model => model.complete).map(model => <button type="button" className="composer-model-option" key={model.id} onClick={() => { setShowModelPicker(false); onConfigureLocalModel(model.id); }}><strong>{localModelLabel(model.filename)}</strong><small>{model.repo ?? "Local GGUF"} · Use model</small></button>)}
+                    {onConfigureLocalModel && downloadedModels.filter(model => model.complete).map(model => <button type="button" className="composer-model-option" key={model.id} onClick={() => { closeModelPicker(); onConfigureLocalModel(model.id); }}><strong>{localModelLabel(model.filename)}</strong><small>{model.repo ?? "Local GGUF"} · Use model</small></button>)}
                     <button
                       type="button"
                       className="composer-model-option"
                       onClick={() => {
                         void onSelectModel?.({ providerId: null, modelId: '' });
-                        setShowModelPicker(false);
+                        closeModelPicker();
                       }}
                     >
                       <strong>Local model</strong>
@@ -952,20 +767,23 @@ export function Chat({
                     {providers?.filter(p => p.verified).map(p => (
                       <div key={p.id} className="composer-provider-group">
                         <span className="composer-provider-title">{p.name}</span>
-                        {p.models.map(m => (
-                          <button
+                        {p.models.map(m => {
+                          const ready = remoteModelReady(p, m);
+                          return <button
                             key={m.id}
                             type="button"
                             className="composer-model-option"
+                            disabled={!ready}
+                            title={ready ? undefined : isSubscriptionFormat(p.apiFormat) ? 'Subscription providers are not selectable in this build' : !m.contextLength ? 'Set a context capacity in Models & runtime to use this model' : 'Add an API key in Models & runtime to use this model'}
                             onClick={() => {
                               void onSelectModel?.({ providerId: p.id, modelId: m.id });
-                              setShowModelPicker(false);
+                              closeModelPicker();
                             }}
                           >
                             <strong>{m.id}</strong>
-                            {m.contextLength && <small>{(m.contextLength / 1024).toFixed(0)}k context capacity</small>}
-                          </button>
-                        ))}
+                            <small>{m.contextLength ? `${(m.contextLength / 1024).toFixed(0)}k context capacity` : 'Context not configured'}</small>
+                          </button>;
+                        })}
                       </div>
                     ))}
                   </div>
@@ -973,7 +791,7 @@ export function Chat({
                     <button
                       type="button"
                       onClick={() => {
-                        setShowModelPicker(false);
+                        closeModelPicker();
                         onConfigure();
                       }}
                     >
@@ -983,20 +801,17 @@ export function Chat({
                 </div>
               )}
 
-              {paused && onResume && <button type="button" className="send-button" aria-label="Resume response" onClick={onResume}>Resume</button>}
+              {paused && !generating && onResume && <button type="button" className="send-button" aria-label="Resume response" onClick={onResume}><Play size={15} fill="currentColor" /></button>}
               {generating ? (
                 <>
-                  {onPause && <button type="button" className="send-button send-stop" aria-label="Pause response" onClick={onPause}>Pause</button>}
-                  <button type="button" className="send-button send-stop" aria-label="Stop response" onClick={onCancel}>
-                    <Square size={15} fill="currentColor" />
-                  </button>
+                  <button type="button" className="send-button send-stop" aria-label="Stop response" onClick={onCancel}><Square size={15} fill="currentColor" /></button>
                 </>
               ) : (
                 <button
                   className={`send-button ${(!draft.trim() && !attachments.length) ? 'sr-only' : ''}`}
                   type="submit"
                   aria-label="Send message"
-                  disabled={(!draft.trim() && !attachments.length) || !ready || loading || disabled || readingFiles}
+                  disabled={(!draft.trim() && !attachments.length) || !ready || loading || disabled || readingFiles || Boolean(preflightIssue)}
                 >
                   <SendHorizontal size={17} />
                 </button>
@@ -1010,12 +825,24 @@ export function Chat({
             {compactionNotice}
           </p>
         )}
+        {preflightIssue && <p className="composer-note" role="alert">{preflightIssue}</p>}
+        {preflight?.breakdown.presentation && <details className="composer-note"><summary>Visual response budget</summary><p>Separate formatting request: at least {preflight.breakdown.presentation.minimumInputTokens.toLocaleString()} input tokens plus the original answer, with {preflight.breakdown.presentation.responseReserve.toLocaleString()} output tokens reserved. The full request is checked before generation; text remains available if it does not fit.</p></details>}
         {preflight?.breakdown.overflow && (
           <p className="composer-note" role="alert">
             <span className="context-overflow">{preflight.breakdown.overflow}</span>
           </p>
         )}
       </div>
+    </div>
+    {canvasArtifact && (
+      <CanvasPanel
+        artifact={canvasArtifact}
+        versionCount={canvasVersions.length}
+        onVersion={version => setCanvasSel({ group: canvasArtifact.groupKey, version })}
+        onClose={() => setCanvasSel(null)}
+        onFollowUp={sendFromUi}
+      />
+    )}
     </div>
   );
 }

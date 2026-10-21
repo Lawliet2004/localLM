@@ -76,13 +76,10 @@ impl Client {
         value.set_sensitive(true);
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, value);
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|_| "Could not initialize Daytona networking.")?;
+        let http = crate::http_client::client(
+            crate::http_client::Policy::no_redirects(Duration::from_secs(30)).headers(headers),
+            "Could not initialize Daytona networking.",
+        )?;
         Ok(Self {
             http,
             base: Url::parse("https://app.daytona.io/api/").expect("fixed URL"),

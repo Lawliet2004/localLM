@@ -11,7 +11,7 @@ use tokio::io::AsyncRead;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct LocalSession {
-    pub service: RunningService<RoleClient, ()>,
+    pub service: RunningService<RoleClient, crate::mcp_input::McpSessionHandler>,
     // KillOnDrop and the Windows job own the entire process tree, including when
     // handshake cancellation drops the future before a session is returned.
     child: Box<dyn ChildWrapper>,
@@ -28,7 +28,11 @@ impl LocalSession {
             .await
             .map(|result| result.is_ok())
             .unwrap_or(false);
-        ShutdownReport { protocol, signal, reaped }
+        ShutdownReport {
+            protocol,
+            signal,
+            reaped,
+        }
     }
 }
 
@@ -41,12 +45,16 @@ pub struct ShutdownReport {
     pub reaped: bool,
 }
 
-pub async fn connect(config: &LocalServer) -> Result<LocalSession, String> {
-    connect_with_timeout(config, Duration::from_secs(30)).await
+pub async fn connect(
+    config: &LocalServer,
+    handler: crate::mcp_input::McpSessionHandler,
+) -> Result<LocalSession, String> {
+    connect_with_timeout(config, handler, Duration::from_secs(30)).await
 }
 
 async fn connect_with_timeout(
     config: &LocalServer,
+    handler: crate::mcp_input::McpSessionHandler,
     handshake_timeout: Duration,
 ) -> Result<LocalSession, String> {
     config.validate_launch()?;
@@ -108,7 +116,7 @@ async fn connect_with_timeout(
         .take()
         .ok_or("Local connector output pipe unavailable.")?;
     let output = FramedStdout::new(output);
-    let service = tokio::time::timeout(handshake_timeout, ().serve((output, input)))
+    let service = tokio::time::timeout(handshake_timeout, handler.serve((output, input)))
         .await
         .map_err(|_| "Local connector handshake timed out.")?
         .map_err(|_| {
@@ -132,7 +140,12 @@ struct FramedStdout<R> {
 
 impl<R> FramedStdout<R> {
     fn new(inner: R) -> Self {
-        Self { inner, pending: Vec::new(), observed: 0, failed: false }
+        Self {
+            inner,
+            pending: Vec::new(),
+            observed: 0,
+            failed: false,
+        }
     }
     fn fail(&mut self) -> std::io::Error {
         self.pending.clear();
@@ -198,9 +211,14 @@ impl<R: AsyncRead + Unpin> AsyncRead for FramedStdout<R> {
                     context.waker().wake_by_ref();
                     return std::task::Poll::Pending;
                 }
-                // A complete frame resets the bound for the next line; any
-                // bytes after the delimiter start the next frame's count.
-                self.observed = rest.len();
+                // A complete frame resets the bound for the next line; only
+                // the bytes after the LAST newline in this chunk start the
+                // next frame's count — counting all of `rest` would reject a
+                // legitimately-sized frame early at the bound edge.
+                self.observed = match rest.iter().rposition(|byte| *byte == b'\n') {
+                    Some(position) => rest.len() - position - 1,
+                    None => rest.len(),
+                };
                 let take = frame.len().min(buffer.remaining());
                 buffer.put_slice(&frame[..take]);
                 self.pending.extend_from_slice(&frame[take..]);
@@ -215,6 +233,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for FramedStdout<R> {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    fn handler() -> crate::mcp_input::McpSessionHandler {
+        crate::mcp_input::McpSessionHandler::new(crate::mcp_input::SessionInput::new(
+            "test".into(),
+            None,
+        ))
+    }
     #[tokio::test]
     async fn oversized_frame_fails_connection_instead_of_buffering() {
         async fn read_all(reader: FramedStdout<&[u8]>) -> std::io::Result<Vec<u8>> {
@@ -248,7 +273,9 @@ mod tests {
             Ok(output)
         }
         assert_eq!(
-            read_all(FramedStdout::new(&b"{\"a\":1}\n{\"b\":2}\n"[..])).await.unwrap(),
+            read_all(FramedStdout::new(&b"{\"a\":1}\n{\"b\":2}\n"[..]))
+                .await
+                .unwrap(),
             b"{\"a\":1}\n{\"b\":2}\n",
         );
         let mut oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
@@ -256,7 +283,29 @@ mod tests {
         assert!(read_small(FramedStdout::new(&oversized[..])).await.is_err());
         // Unterminated accumulation cannot grow without limit either.
         let unterminated = vec![b'y'; MAX_FRAME_BYTES + 16];
-        assert!(read_small(FramedStdout::new(&unterminated[..])).await.is_err());
+        assert!(read_small(FramedStdout::new(&unterminated[..]))
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn frame_at_exact_bound_after_multi_newline_chunk_is_accepted() {
+        // A chunk holding several complete lines must not inflate the next
+        // frame's byte count: only bytes after the LAST newline carry over.
+        let mut input = Vec::with_capacity(MAX_FRAME_BYTES + 7);
+        input.extend_from_slice(b"a\nbb\n");
+        input.extend(std::iter::repeat_n(b'f', MAX_FRAME_BYTES));
+        input.push(b'\n');
+        let mut reader = FramedStdout::new(&input[..]);
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 64];
+        loop {
+            let count = reader.read(&mut chunk).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&chunk[..count]);
+        }
+        assert_eq!(output.len(), input.len());
     }
     #[tokio::test]
     async fn oversized_stdio_frame_fails_hub_connection() {
@@ -275,10 +324,11 @@ mod tests {
             working_directory: temp.path().to_string_lossy().into_owned(),
             environment: Default::default(),
         };
-        let error = match connect_with_timeout(&hub_config, Duration::from_secs(15)).await {
-            Ok(_) => panic!("oversized frame unexpectedly connected"),
-            Err(error) => error,
-        };
+        let error =
+            match connect_with_timeout(&hub_config, handler(), Duration::from_secs(15)).await {
+                Ok(_) => panic!("oversized frame unexpectedly connected"),
+                Err(error) => error,
+            };
         assert!(error.contains("handshake"), "unexpected error: {error}");
     }
     #[cfg(windows)]
@@ -399,7 +449,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
             !config.executable.is_empty(),
             "Node is required for this process integration test"
         );
-        let session = connect(&config).await.unwrap();
+        let session = connect(&config, handler()).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(5), session.service.list_tools(None))
             .await
             .unwrap()
@@ -421,7 +471,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
             working_directory: directory.path().to_string_lossy().into_owned(),
             environment: [("PRIVATE_TOKEN".into(), "secret-value".into())].into(),
         };
-        let error = match connect(&config).await {
+        let error = match connect(&config, handler()).await {
             Ok(_) => panic!("unexpected launch"),
             Err(error) => error,
         };

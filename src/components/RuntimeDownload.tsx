@@ -39,6 +39,11 @@ export function RuntimeDownload({ busy, onSelect }: { busy: boolean; onSelect: (
   }
   const active = Boolean(starting || status?.busy);
   const insufficient = info && info.availableBytes < info.requiredBytes;
+  if (info?.supported === false) return <section className="catalog-notice" aria-label="Native runtime setup">
+    <h2>llama.cpp · {info.platform === 'linux' ? 'Linux' : info.platform === 'macos' ? 'macOS' : 'Native runtime'}</h2>
+    <p>{info.message}</p>
+    <p>Use Browse runtime below to select your installed native llama-server, then save settings. Model search and GGUF downloads work on this platform.</p>
+  </section>;
   return <section className="catalog-notice" aria-label="CUDA runtime download">
     <h2>llama.cpp · CUDA 12.4</h2><p>Install the pinned b10855 Windows runtime and CUDA libraries. Each installation uses a new directory; existing runtimes are preserved.</p>
     {info && <p>{gib(info.bytes)} download · {gib(info.requiredBytes)} required for download, extraction and reserve · {gib(info.availableBytes)} free</p>}

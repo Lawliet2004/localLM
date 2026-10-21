@@ -1,0 +1,210 @@
+/* Answer surfaces: quiet prose, distinct code, and room for rich content.
+   Appearance preferences remain authoritative for font, size and width. */
+.message-assistant { min-width: 0; }
+.desktop-app .message-assistant > .markdown { line-height: 1.8; color: var(--text); }
+.message-assistant .markdown p { margin-block: 1em; }
+.message-assistant .markdown :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--text);
+  line-height: 1.35;
+  margin-block: 1.7em .65em;
+  text-wrap: pretty;
+}
+.message-assistant .markdown h1 { font-size: 1.65em; }
+.message-assistant .markdown h2 { font-size: 1.4em; }
+.message-assistant .markdown h3 { font-size: 1.2em; }
+.message-assistant .markdown :is(h4, h5, h6) { font-size: 1em; }
+.message-assistant .markdown > :first-child { margin-top: 0; }
+.message-assistant .markdown > :last-child { margin-bottom: 0; }
+.message-assistant .markdown :is(ul, ol) { margin-block: 1em; padding-inline-start: 1.7em; }
+.message-assistant .markdown li { padding-inline-start: .25em; margin-block: .45em; }
+.message-assistant .markdown li::marker { color: var(--text); }
+.message-assistant .markdown li > p { margin-block: .5em; }
+.message-assistant .markdown li > :is(ul, ol) { margin-block: .4em; }
+.message-assistant .markdown hr { margin-block: 1.8em; }
+.message-assistant .markdown blockquote {
+  border-inline-start: 1px solid var(--border-strong);
+  margin-block: 1.25em;
+  padding: .15em 0 .15em 1em;
+}
+.markdown a { text-underline-offset: .2em; }
+.markdown :is(del, blockquote) { color: var(--secondary); }
+.markdown .contains-task-list { list-style: none; padding-inline-start: .3em; }
+.markdown .task-list-item input { accent-color: var(--accent); margin-inline-end: .55em; }
+.markdown-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  margin-block: 1.4em;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.markdown .markdown-table-scroll table {
+  display: table;
+  width: 100%;
+  margin: 0;
+  border-radius: 0;
+  font-size: .93em;
+  font-variant-numeric: tabular-nums;
+}
+.markdown .markdown-table-scroll :is(th, td) {
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  padding: .75em 1em;
+  min-width: 7em;
+}
+.markdown .markdown-table-scroll th { background: transparent; border-bottom-color: var(--border-strong); }
+.markdown .markdown-table-scroll tr:hover td { background: var(--accent-subtle); }
+.markdown-table-scroll:focus-visible,
+.code-block-pre:focus-visible { outline: 2px solid var(--focus-border); outline-offset: -2px; }
+.message-assistant .code-block-wrapper { margin-block: 1.4em; }
+.code-block-lang { text-transform: none; overflow-wrap: anywhere; }
+.code-block-header { min-height: 42px; }
+.code-block-copy-btn { min-height: 30px; gap: 6px; }
+.code-block-copy-error { color: var(--error); padding-inline: 14px; font: 12px/1.5 var(--font-sans); }
+.code-block-pre { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+.markdown .code-block-pre code { display: block; }
+/* Streaming markers belong to prose, never to a frame's action toolbar. */
+.markdown.is-streaming > :is(.code-block-wrapper, .markdown-table-scroll, .genui-block):last-child::after { display: none; }
+.markdown .katex { font-size: 1.1em; color: inherit; }
+.markdown .katex-display {
+  margin-block: 1.5em;
+  padding-block: .5em;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.markdown .katex-error { color: var(--error); font-family: var(--font-mono); }
+.message-assistant .image-preview-wrapper { max-width: 100%; border-radius: 14px; }
+.message-assistant .image-preview-thumb {
+  width: auto;
+  height: auto;
+  max-width: min(100%, 560px);
+  max-height: 420px;
+  object-fit: contain;
+}
+@media (max-width: 600px) {
+  .desktop-app .markdown .code-block-pre { padding: 14px; }
+  .markdown .markdown-table-scroll :is(th, td) { padding: .65em .8em; }
+  .code-block-copy-btn { min-height: 34px; }
+}
+
+/* Conversation activity follows the reference's quiet, inline work log. */
+.activity-feed { gap: 12px; font-size: var(--chat-font-size, 16px); }
+.activity-feed > * { animation: none; }
+.activity-feed .message-assistant { padding-block: 8px 16px; }
+.activity-feed :is(details.activity-summary, details.trace-thought-details) {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
+}
+.activity-feed :is(details.activity-summary > summary.card-header, details.trace-thought-details > summary.trace-thought-pill) {
+  justify-content: flex-start;
+  gap: 8px;
+  min-height: 34px;
+  padding: 3px 0;
+  border-radius: 4px;
+}
+.activity-feed :is(details.activity-summary .activity-summary-label, details.trace-thought-details .trace-thought-label) {
+  color: var(--secondary);
+  font-size: .94em;
+  font-weight: 400;
+  white-space: normal;
+}
+.activity-feed :is(details.activity-summary, details.trace-thought-details) > summary .trace-chevron {
+  margin-left: 0;
+  transform: rotate(90deg);
+}
+.activity-feed :is(details.activity-summary, details.trace-thought-details)[open] > summary .trace-chevron { transform: rotate(-90deg); }
+.activity-feed .trace-icon {
+  width: 18px;
+  height: 20px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: var(--secondary);
+  box-shadow: none;
+}
+.activity-summary-rows {
+  max-height: 300px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+  padding-block: 4px;
+}
+.activity-feed details.activity-summary .command-run-card {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.activity-summary-rows .command-run-card > summary.card-header { min-height: 34px; gap: 8px; padding: 3px 0; }
+.activity-summary-rows .command-run-card .header-left { gap: 8px; }
+.activity-summary-rows .command-run-card :is(.activity-kind, .cmd-title, .cmd-title-mono) {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--secondary);
+}
+.activity-summary-rows .command-run-card:is([data-kind=read], [data-kind=edit]) .cmd-title { text-decoration: underline dotted; text-underline-offset: 3px; }
+.activity-summary-rows .command-run-card:not([open]) :is(.header-right, .trace-badge, .trace-line-range, .trace-diff-counts) { display: none; }
+.activity-summary-rows .command-run-card > summary .trace-chevron { margin-left: 0; }
+.activity-summary-rows .command-run-card .card-body { margin-block: 6px 12px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.activity-summary-rows .file-result { border: 0; padding: 3px 0; font-size: 14px; color: var(--secondary); }
+.activity-summary-rows .file-result > summary { min-height: 28px; list-style: none; }
+.activity-summary-rows .file-result > summary::-webkit-details-marker { display: none; }
+.activity-feed details.trace-thought-details .trace-thought-content {
+  background: transparent;
+  border: 0;
+  padding: 8px 0 12px 26px;
+}
+.desktop-app .assistant-work > .work-summary { margin: 8px 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); font-size: 14px; }
+.desktop-app .assistant-work > .work-summary > summary { padding: 3px 0; flex-direction: row-reverse; color: var(--secondary); }
+.desktop-app .assistant-work > .work-summary > summary::before { margin-inline: 5px 0; transform: rotate(45deg); }
+.desktop-app .assistant-work > .work-summary[open] > summary::before { transform: rotate(225deg); }
+
+.assistant-work .file-change-list {
+  display: block;
+  margin: 10px 0 24px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.file-changes-header { display: flex; align-items: center; gap: 12px; padding: 16px; }
+.file-changes-icon { display: grid; place-items: center; width: 44px; height: 44px; flex-shrink: 0; border-radius: 12px; background: var(--hover); color: var(--secondary); }
+.file-changes-title { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 3px; font-size: 16px; color: var(--text); }
+.assistant-work .file-change-counts { display: inline-flex; flex-shrink: 0; gap: 5px; font-family: var(--font-sans); font-size: 14px; font-variant-numeric: tabular-nums; }
+.assistant-work .file-change-counts .diff-added { color: var(--diff-add-fg); }
+.assistant-work .file-change-counts .diff-removed { color: var(--diff-del-fg); }
+.file-changes-body { border-top: 1px solid var(--border); }
+.assistant-work .file-change-list .file-change-card { border: 0; border-radius: 0; background: transparent; overflow: visible; }
+.assistant-work .file-change-review > summary.file-change-heading {
+  position: static;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  height: auto;
+  padding: 10px 16px;
+  font-size: 15px;
+  color: var(--text);
+}
+.assistant-work .file-change-heading strong { font-size: inherit; font-weight: 400; }
+.file-change-path { min-width: 0; overflow-wrap: anywhere; }
+.file-change-path > span { color: var(--secondary); }
+.assistant-work .file-change-review > summary:hover { background: var(--hover); }
+.file-changes-toggle { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 10px 16px; border: 0; background: transparent; color: var(--text); font: inherit; cursor: pointer; }
+.file-changes-toggle:hover { background: var(--hover); }
+.file-changes-toggle .is-open { transform: rotate(180deg); }
+.activity-feed summary:focus-visible,
+.assistant-work :is(summary, button):focus-visible { outline: 2px solid var(--focus-border); outline-offset: -2px; }
+@media (max-width: 600px) {
+  .file-changes-header { gap: 10px; padding: 12px; flex-wrap: wrap; }
+  .file-changes-icon { width: 36px; height: 36px; }
+  .file-changes-title { font-size: 15px; }
+  .file-changes-view { font-size: 12px; }
+  .assistant-work .file-change-review > summary.file-change-heading { padding-inline: 12px; font-size: 14px; }
+  .activity-summary-rows .command-run-card .header-left { flex-wrap: wrap; gap: 4px 8px; }
+  .activity-summary-rows .command-run-card .cmd-title { min-width: 0; max-width: 100%; }
+}

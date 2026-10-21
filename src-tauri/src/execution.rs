@@ -2,6 +2,7 @@ use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -14,14 +15,71 @@ pub struct ExecutionConfig {
     pub python_path: String,
     pub node_path: String,
     pub powershell_path: String,
+    #[serde(default = "default_shell")]
+    pub bash_path: String,
+    #[serde(default)]
+    pub bash: ExecutionPolicy,
+    #[serde(default)]
+    pub python: ExecutionPolicy,
+    #[serde(default)]
+    pub python_venv: String,
 }
+
+/// User configuration only. Model arguments cannot change enablement,
+/// environment, interpreter selection or the approval policy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionPolicy {
+    pub enabled: bool,
+    pub timeout_seconds: u64,
+    pub working_directory: String,
+    pub environment: BTreeMap<String, String>,
+    pub always_ask: bool,
+    pub memory_limit_mib: Option<u64>,
+}
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_seconds: 60,
+            working_directory: String::new(),
+            environment: BTreeMap::new(),
+            always_ask: false,
+            memory_limit_mib: None,
+        }
+    }
+}
+fn default_shell() -> String {
+    detect(if cfg!(windows) {
+        "powershell.exe"
+    } else {
+        "bash"
+    })
+}
+pub(crate) fn executable(path: &str) -> bool {
+    let path = Path::new(path);
+    if !path.is_absolute() || !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    true
+}
+
 fn detect(name: &str) -> String {
-    let mut found = std::env::var_os("PATH")
+    let found = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
         .map(|directory| directory.join(name))
-        .find(|path| path.is_absolute() && path.is_file());
+        .find(|path| executable(&path.to_string_lossy()));
 
+    #[cfg(windows)]
+    let mut found = found;
     #[cfg(windows)]
     if found.is_none() && (name == "powershell.exe" || name == "pwsh.exe") {
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
@@ -52,13 +110,21 @@ impl Default for ExecutionConfig {
             let p = detect("python.exe");
             if p.is_empty() {
                 let py = detect("py.exe");
-                if py.is_empty() { detect("python3.exe") } else { py }
+                if py.is_empty() {
+                    detect("python3.exe")
+                } else {
+                    py
+                }
             } else {
                 p
             }
         } else {
             let p = detect("python3");
-            if p.is_empty() { detect("python") } else { p }
+            if p.is_empty() {
+                detect("python")
+            } else {
+                p
+            }
         };
 
         Self {
@@ -69,12 +135,21 @@ impl Default for ExecutionConfig {
             } else {
                 "pwsh"
             }),
+            bash_path: default_shell(),
+            bash: ExecutionPolicy::default(),
+            python: ExecutionPolicy::default(),
+            python_venv: String::new(),
         }
     }
 }
 impl ExecutionConfig {
     pub fn validate(&self) -> Result<(), String> {
-        for path in [&self.python_path, &self.node_path, &self.powershell_path] {
+        for path in [
+            &self.python_path,
+            &self.node_path,
+            &self.powershell_path,
+            &self.bash_path,
+        ] {
             if !path.is_empty()
                 && (path.len() > 32768
                     || !Path::new(path).is_absolute()
@@ -86,8 +161,57 @@ impl ExecutionConfig {
                 );
             }
         }
+        self.validate_limits()?;
+        if !self.python_venv.is_empty()
+            && (!Path::new(&self.python_venv).is_absolute()
+                || !venv_python(&self.python_venv).is_file())
+        {
+            return Err(
+                "Select a virtual environment containing bin/python or Scripts/python.exe.".into(),
+            );
+        }
         Ok(())
     }
+    fn validate_limits(&self) -> Result<(), String> {
+        for (policy, maximum) in [(&self.bash, 300), (&self.python, 90)] {
+            if policy
+                .memory_limit_mib
+                .is_some_and(|mib| !(64..=65536).contains(&mib))
+            {
+                return Err("Memory limit must be 64–65536 MiB, or empty for no limit.".into());
+            }
+            if cfg!(windows) && policy.memory_limit_mib.is_some() {
+                return Err(
+                    "Per-process memory limits are currently available on Unix only.".into(),
+                );
+            }
+            if !(1..=maximum).contains(&policy.timeout_seconds) {
+                return Err(format!("Execution timeout must be 1–{maximum} seconds."));
+            }
+            if policy.working_directory.len() > 32768 || policy.environment.len() > 64 {
+                return Err("Execution settings exceed their size limit.".into());
+            }
+            for (name, value) in &policy.environment {
+                if name.is_empty()
+                    || name.len() > 128
+                    || name.starts_with(|c: char| c.is_ascii_digit())
+                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    || value.len() > 8192
+                    || value.contains('\0')
+                {
+                    return Err("Environment names must be identifiers and values must be at most 8192 bytes without NUL characters.".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+fn venv_python(directory: &str) -> PathBuf {
+    Path::new(directory).join(if cfg!(windows) {
+        "Scripts/python.exe"
+    } else {
+        "bin/python"
+    })
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Language {
@@ -110,7 +234,9 @@ fn parse_language(raw: &str) -> Option<Language> {
         _ => None,
     }
 }
-fn deserialize_language<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Language, D::Error> {
+fn deserialize_language<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Language, D::Error> {
     match Value::deserialize(deserializer)? {
         Value::Null => Ok(Language::Python),
         Value::String(raw) => parse_language(&raw)
@@ -141,8 +267,18 @@ fn normalize_code(code: &str) -> String {
             .next()
             .unwrap_or("");
         let known = [
-            "", "python", "py", "python3", "javascript", "js", "typescript", "ts", "powershell",
-            "pwsh", "ps1", "code",
+            "",
+            "python",
+            "py",
+            "python3",
+            "javascript",
+            "js",
+            "typescript",
+            "ts",
+            "powershell",
+            "pwsh",
+            "ps1",
+            "code",
         ];
         if known.contains(&tag.as_str()) || known.contains(&tag_head) {
             rest = &rest[newline + 1..];
@@ -151,24 +287,132 @@ fn normalize_code(code: &str) -> String {
         return text.to_string();
     }
     let rest = rest.trim_end();
-    rest.strip_suffix("```").unwrap_or(rest).trim_end().to_string()
+    rest.strip_suffix("```")
+        .unwrap_or(rest)
+        .trim_end()
+        .to_string()
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CodeRequest {
+    approved_source: Option<ApprovedSource>,
     #[serde(default, alias = "lang", deserialize_with = "deserialize_language")]
     language: Language,
+    #[serde(default)]
     code: String,
-    #[serde(default = "default_timeout")]
-    timeout_seconds: u64,
+    file: Option<String>,
+    cwd: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    stdin: String,
+    #[serde(default)]
+    artifacts: Vec<String>,
+    timeout_seconds: Option<u64>,
     /// Optional requested output schema for the structured result channel.
     #[serde(default)]
     result_schema: Option<Value>,
 }
-fn default_timeout() -> u64 {
-    60
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovedSource {
+    code: String,
+    sha256: String,
 }
 pub type ChunkCallback = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// process-wrap's KillOnDrop only sets Tokio's flag on Unix; that kills the
+/// leader, not its process group. Explicitly invoke the wrapper's tree kill
+/// when the execution future is dropped by Stop, cancellation or a timeout.
+pub(crate) struct ExecutionChild(Box<dyn process_wrap::tokio::ChildWrapper>);
+impl std::ops::Deref for ExecutionChild {
+    type Target = dyn process_wrap::tokio::ChildWrapper;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+impl std::ops::DerefMut for ExecutionChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut()
+    }
+}
+impl Drop for ExecutionChild {
+    fn drop(&mut self) {
+        let _ = self.0.start_kill();
+    }
+}
+pub(crate) fn managed_spawn(command: tokio::process::Command) -> std::io::Result<ExecutionChild> {
+    let mut command = CommandWrap::from(arm_parent_death_signal(command));
+    command.wrap(KillOnDrop);
+    #[cfg(windows)]
+    {
+        command.wrap(process_wrap::tokio::CreationFlags(
+            windows::Win32::System::Threading::CREATE_NO_WINDOW,
+        ));
+        command.wrap(process_wrap::tokio::JobObject);
+    }
+    #[cfg(unix)]
+    command.wrap(process_wrap::tokio::ProcessGroup::leader());
+    command.spawn().map(ExecutionChild)
+}
+
+/// Arm `PR_SET_PDEATHSIG` so the operating system kills the child when this
+/// process dies.
+///
+/// Tauri ends the application with `std::process::exit`, so no destructor
+/// runs and a `Drop`-based kill never fires. Every child this app owns would
+/// therefore outlive it — orphaned, reparented to init, and unreachable
+/// through the tool that started it. Arming the parent-death signal makes the
+/// kernel kill the child instead, which also covers a crash, a forced
+/// termination and a development restart.
+///
+/// The same guard is already applied to the llama-server runtime; this brings
+/// every other model-spawned child under the same rule.
+#[cfg(target_os = "linux")]
+fn arm_parent_death_signal(mut command: tokio::process::Command) -> tokio::process::Command {
+    let parent = rustix::process::getpid();
+    // SAFETY: this hook only makes async-signal-safe system calls between
+    // fork and exec; it does not allocate or acquire locks.
+    unsafe {
+        command.pre_exec(move || {
+            rustix::process::set_parent_process_death_signal(Some(
+                rustix::process::Signal::KILL,
+            ))?;
+            // The parent might have exited before the signal was armed.
+            if rustix::process::getppid() != Some(parent) {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+#[cfg(not(target_os = "linux"))]
+fn arm_parent_death_signal(command: tokio::process::Command) -> tokio::process::Command {
+    command
+}
+pub(crate) fn memory_limit(command: &mut tokio::process::Command, policy: &ExecutionPolicy) {
+    #[cfg(unix)]
+    if let Some(mib) = policy.memory_limit_mib {
+        // setrlimit is applied in the child immediately before exec. No
+        // allocation or parent-process resource limit is changed here.
+        unsafe {
+            command.pre_exec(move || {
+                rustix::process::setrlimit(
+                    rustix::process::Resource::As,
+                    rustix::process::Rlimit {
+                        current: Some(mib * 1024 * 1024),
+                        maximum: Some(mib * 1024 * 1024),
+                    },
+                )?;
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (command, policy);
+}
 
 /// Name of the structured result channel. `locallm_result(...)` still wins.
 /// If the process exits 0 with no marker, a last Python expression/assignment
@@ -183,36 +427,164 @@ pub const MAX_RESULT_BYTES: usize = 65_536;
 struct CommandRequest {
     command: String,
     cwd: Option<String>,
-    #[serde(default = "default_command_timeout")]
-    timeout_seconds: u64,
-}
-fn default_command_timeout() -> u64 {
-    60
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
+    stdin: String,
+    #[serde(default)]
+    artifacts: Vec<String>,
 }
 
 pub struct LocalExecution {
     config: ExecutionConfig,
     directory: PathBuf,
-    _workspace: crate::workspace::Workspace,
+    workspace: crate::workspace::Workspace,
 }
 impl LocalExecution {
     pub fn new(config: ExecutionConfig, directory: &str) -> Result<Self, String> {
-        config.validate()?;
+        config.validate_limits()?;
         Ok(Self {
             config,
-            directory: PathBuf::from(directory),
-            _workspace: crate::workspace::Workspace::open(directory)?,
+            directory: std::fs::canonicalize(directory).map_err(|e| e.to_string())?,
+            workspace: crate::workspace::Workspace::open(directory)?,
         })
     }
+    pub fn code_available(&self) -> bool {
+        self.python_available()
+            || executable(&self.config.node_path)
+            || executable(&self.config.powershell_path)
+    }
+    fn python_available(&self) -> bool {
+        self.config.python.enabled
+            && if self.config.python_venv.is_empty() {
+                executable(&self.config.python_path)
+            } else {
+                executable(&venv_python(&self.config.python_venv).to_string_lossy())
+            }
+    }
+    pub fn command_available(&self) -> bool {
+        self.config.bash.enabled && executable(&self.config.bash_path)
+    }
+    pub fn requires_approval(&self, name: &str, arguments: &Value) -> bool {
+        if name == "execute_command" {
+            self.config.bash.always_ask
+        } else {
+            arguments
+                .get("language")
+                .and_then(Value::as_str)
+                .and_then(parse_language)
+                .unwrap_or_default()
+                == Language::Python
+                && self.config.python.always_ask
+        }
+    }
+    /// Compile a requested result schema through the bounded offline validator
+    /// so invalid or remote-`$ref` schemas are rejected before a process runs.
+    fn check_result_schema(schema: &Value) -> Result<(), String> {
+        if !schema.is_object() {
+            return Err("result_schema must be a JSON object.".into());
+        }
+        crate::tool_validation::compile(schema).map(|_| ())
+    }
+
+    pub fn prepare_arguments(&self, name: &str, mut arguments: Value) -> Result<Value, String> {
+        if arguments.get("approved_source").is_some() {
+            return Err("Approval snapshots are set by the native dispatcher only.".into());
+        }
+        if let Some(schema) = arguments
+            .get("result_schema")
+            .filter(|_| name == "run_code")
+        {
+            Self::check_result_schema(schema)?;
+        }
+        let configured = if name == "execute_command" {
+            &self.config.bash.working_directory
+        } else if arguments["language"]
+            .as_str()
+            .and_then(parse_language)
+            .unwrap_or_default()
+            == Language::Python
+        {
+            &self.config.python.working_directory
+        } else {
+            ""
+        };
+        let cwd = self.working_directory(arguments["cwd"].as_str(), configured)?;
+        arguments["cwd"] = json!(cwd.to_string_lossy());
+        if let Some(path) = arguments["file"].as_str().filter(|_| name == "run_code") {
+            use sha2::Digest;
+            let source = self.workspace.read_script(path)?;
+            arguments["approved_source"] = json!({"sha256":format!("{:x}", sha2::Sha256::digest(source.as_bytes())),"code":source});
+        }
+        Ok(arguments)
+    }
+    fn working_directory(
+        &self,
+        requested: Option<&str>,
+        configured: &str,
+    ) -> Result<PathBuf, String> {
+        let path = requested.filter(|p| !p.is_empty()).unwrap_or(configured);
+        let path = if path.is_empty() {
+            self.directory.clone()
+        } else {
+            self.directory.join(path)
+        };
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|e| format!("Cannot open working directory: {e}"))?;
+        if !resolved.starts_with(&self.directory) || !resolved.is_dir() {
+            return Err("Working directory must be a directory within the authorized workspace. Native execution still runs with your account permissions; this is not OS isolation.".into());
+        }
+        Ok(resolved)
+    }
+    pub(crate) fn shell_directory(&self) -> Result<PathBuf, String> {
+        self.working_directory(None, &self.config.bash.working_directory)
+    }
+    fn collect_artifacts(&self, paths: &[String]) -> (Vec<Value>, Vec<Value>) {
+        let mut artifacts = Vec::new();
+        let mut errors = Vec::new();
+        for path in paths {
+            match self.workspace.output_artifact(path) {
+                Ok((bytes, mime)) => {
+                    use sha2::Digest;
+                    artifacts.push(json!({"path":path, "bytes":bytes.len(), "mimeType":mime, "sha256":format!("{:x}", sha2::Sha256::digest(&bytes))}));
+                }
+                Err(error) => errors.push(json!({"path":path, "error":error})),
+            }
+        }
+        (artifacts, errors)
+    }
     pub fn tool(self: std::sync::Arc<Self>) -> crate::connectors::AgentTool {
-        crate::connectors::AgentTool::execution(self,crate::connectors::ToolView { name:"run_code".into(),description:"Run code in the selected workspace. Python is the default (also javascript, powershell). NOT sandboxed: same files and network as this Windows user. Timeout 1–90 seconds. For exact math, dates, parsing, or data work, use this instead of calculating by hand. Write plain source — no markdown fences. The last expression, last assignment, or printed output is the answer. locallm_result(value) is optional JSON. Example: {\"language\":\"python\",\"code\":\"round(19.99 * 1.08, 2)\"}".into(),input_schema:json!({"type":"object","properties":{"language":{"type":"string","enum":["python","javascript","powershell"],"description":"Defaults to python. py, js, and pwsh aliases are accepted."},"code":{"type":"string","description":"Source to run. Last expression, last assignment, or print is the answer. Do not wrap in markdown fences."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":90}},"required":["code"],"additionalProperties":false}) })
+        let mut languages = Vec::new();
+        if self.python_available() {
+            languages.push("python");
+        }
+        if executable(&self.config.node_path) {
+            languages.push("javascript");
+        }
+        if executable(&self.config.powershell_path) {
+            languages.push("powershell");
+        }
+        crate::connectors::AgentTool::execution(self, crate::connectors::ToolView {
+            name: "run_code".into(),
+            description: "Execute approved source in the workspace with your account permissions (not OS-isolated). Python accepts source OR a relative script file, arguments and stdin; project imports and the configured virtual environment are supported. No dependencies are installed. Last Python expression or locallm_result(value) returns JSON. Other languages require code. Inspect generated files with workspace tools.".into(),
+            input_schema: json!({"type":"object", "properties": {
+                "language":{"type":"string", "enum":languages, "description":"Defaults to Python when enabled; otherwise specify an offered language."},
+                "code":{"type":"string", "maxLength":32768, "description":"Source code, without markdown fences. Mutually exclusive with file."},
+                "file":{"type":"string", "maxLength":4096, "description":"Python script path relative to the authorized workspace. Mutually exclusive with code."},
+                "cwd":{"type":"string", "description":"Working directory inside the authorized workspace."},
+                "args":{"type":"array", "maxItems":128, "items":{"type":"string", "maxLength":8192}},
+                "stdin":{"type":"string", "maxLength":65536},
+                "artifacts":{"type":"array", "maxItems":16, "items":{"type":"string", "maxLength":4096}, "description":"Workspace-relative output files to show after execution. PNG/JPEG/WebP and UTF-8 text up to 2 MiB can be previewed."},
+                "timeout_seconds":{"type":"integer", "minimum":1, "maximum":90},
+                "result_schema":{"type":"object", "description":"Optional JSON Schema the structured result must satisfy. A mismatch fails the run instead of returning the value."}
+            }, "oneOf":[{"required":["code"]},{"required":["file"]}], "additionalProperties":false})
+        })
     }
     pub fn command_tool(self: std::sync::Arc<Self>) -> crate::connectors::AgentTool {
         crate::connectors::AgentTool::execution(
             self,
             crate::connectors::ToolView {
                 name: "execute_command".into(),
-                description: "Execute a shell command (CLI, build tool, test runner, git, etc.) locally in the workspace directory. Requires approval. Output is bounded; timeout is 1–300 seconds. Do not use this for calculations — call local_run_code with Python instead.".into(),
+                description: "Execute a shell command (CLI, build tool, test runner, git, etc.) locally in the workspace directory. Uses the configured shell (Bash by default on Linux). Approval follows the conversation and shell settings. Output is bounded; timeout is capped by the user setting (up to 300 seconds). Do not use this for calculations — call local_run_code with Python instead.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -224,6 +596,8 @@ impl LocalExecution {
                             "type": "string",
                             "description": "Optional sub-directory relative to workspace root"
                         },
+                        "stdin": { "type": "string", "maxLength": 65536 },
+                        "artifacts": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 4096 }, "description": "Workspace-relative output files to show after execution." },
                         "timeout_seconds": {
                             "type": "integer",
                             "minimum": 1,
@@ -246,16 +620,74 @@ impl LocalExecution {
     ) -> Result<Value, String> {
         let mut request: CodeRequest =
             serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+        if let Some(schema) = &request.result_schema {
+            Self::check_result_schema(schema)?;
+        }
+        let python = request.language == Language::Python;
+        if python && !self.config.python.enabled {
+            return Err("Python execution is disabled in Settings.".into());
+        }
+        if request.file.is_some() && (!python || !request.code.trim().is_empty()) {
+            return Err("Use either Python source or a Python file, never both.".into());
+        }
+        if let Some(file) = &request.file {
+            request.code = self.workspace.read_script(file)?;
+            if let Some(approved) = &request.approved_source {
+                use sha2::Digest;
+                if approved.code != request.code
+                    || format!("{:x}", sha2::Sha256::digest(request.code.as_bytes()))
+                        != approved.sha256
+                {
+                    return Err("The Python file changed after approval. Review and approve its current source again.".into());
+                }
+            }
+        }
+        if (!python && (!request.args.is_empty() || !request.stdin.is_empty()))
+            || request.args.len() > 128
+            || request
+                .args
+                .iter()
+                .any(|arg| arg.len() > 8192 || arg.contains('\0'))
+            || request.stdin.len() > 65536
+            || request.artifacts.len() > 16
+        {
+            return Err("Python accepts up to 128 arguments and 64 KiB of stdin. Other code languages do not accept arguments or stdin.".into());
+        }
+        let timeout = request.timeout_seconds.unwrap_or(if python {
+            self.config.python.timeout_seconds
+        } else {
+            60
+        });
+        let timeout = if python {
+            timeout.min(self.config.python.timeout_seconds)
+        } else {
+            timeout
+        };
+        let directory = self.working_directory(
+            request.cwd.as_deref(),
+            if python {
+                &self.config.python.working_directory
+            } else {
+                ""
+            },
+        )?;
         request.code = normalize_code(&request.code);
         if request.code.trim().is_empty()
             || request.code.len() > 32768
-            || !(1..=90).contains(&request.timeout_seconds)
+            || !(1..=90).contains(&timeout)
         {
             return Err("Code must contain 1–32768 bytes and timeout must be 1–90 seconds.".into());
         }
+        let python_executable = if self.config.python_venv.is_empty() {
+            self.config.python_path.clone()
+        } else {
+            venv_python(&self.config.python_venv)
+                .to_string_lossy()
+                .into_owned()
+        };
         let (program, args, wrapped_code): (&str, Vec<String>, String) = match request.language {
             Language::Python => (
-                &self.config.python_path,
+                &python_executable,
                 vec![
                     "-I".into(),
                     "-X".into(),
@@ -277,7 +709,7 @@ impl LocalExecution {
                 String::new(),
             ),
         };
-        if program.is_empty() {
+        if !executable(program) {
             return Err(
                 "Configure this language's interpreter on the Execution page first.".into(),
             );
@@ -286,7 +718,7 @@ impl LocalExecution {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         command
             .args(&arg_refs)
-            .current_dir(&self.directory)
+            .current_dir(&directory)
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -313,21 +745,35 @@ impl LocalExecution {
         command
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1");
-        let mut command = CommandWrap::from(command);
-        command.wrap(KillOnDrop);
-        #[cfg(windows)]
-        {
-            command.wrap(process_wrap::tokio::CreationFlags(
-                windows::Win32::System::Threading::CREATE_NO_WINDOW,
-            ));
-            command.wrap(process_wrap::tokio::JobObject);
+        if python {
+            command.envs(&self.config.python.environment);
+            if !self.config.python_venv.is_empty() {
+                command.env("VIRTUAL_ENV", &self.config.python_venv);
+                let inherited_path = self
+                    .config
+                    .python
+                    .environment
+                    .get("PATH")
+                    .map(std::ffi::OsString::from)
+                    .or_else(|| std::env::var_os("PATH"))
+                    .unwrap_or_default();
+                let paths = std::iter::once(
+                    venv_python(&self.config.python_venv)
+                        .parent()
+                        .unwrap_or(Path::new(&self.config.python_venv))
+                        .to_path_buf(),
+                )
+                .chain(std::env::split_paths(&inherited_path));
+                command.env(
+                    "PATH",
+                    std::env::join_paths(paths).map_err(|e| e.to_string())?,
+                );
+            }
         }
-        #[cfg(unix)]
-        {
-            command.wrap(process_wrap::tokio::ProcessGroup::leader());
+        if python {
+            memory_limit(&mut command, &self.config.python);
         }
-        let mut child = command
-            .spawn()
+        let mut child = managed_spawn(command)
             .map_err(|error| format!("Interpreter launch failed: {error}"))?;
         let mut input = child.stdin().take().ok_or("Missing process input pipe.")?;
         let output = child
@@ -340,12 +786,15 @@ impl LocalExecution {
         let started = std::time::Instant::now();
         let out_cb = on_chunk.clone();
         let err_cb = on_chunk;
-        let result = tokio::time::timeout(Duration::from_secs(request.timeout_seconds), async {
+        let result = tokio::time::timeout(Duration::from_secs(timeout), async {
             let write = async {
                 // Structured-result helpers ride in front of the approved code
                 // so plain prints stay logs and only marker lines count. For
                 // PowerShell the helper is defined in the -Command prelude.
-                let payload = if matches!(request.language, Language::Powershell) {
+                let payload = if python {
+                    json!({"code":request.code, "args":request.args, "stdin":request.stdin,
+                        "file":request.file.as_ref().map(|file| self.directory.join(file).to_string_lossy().into_owned())}).to_string()
+                } else if matches!(request.language, Language::Powershell) {
                     request.code.clone()
                 } else {
                     format!("{wrapped_code}{}", request.code)
@@ -386,8 +835,14 @@ impl LocalExecution {
         let stderr_text = String::from_utf8_lossy(&stderr).into_owned();
         let duration_ms = started.elapsed().as_millis();
         let structured = parse_structured_results(&stdout_text);
-        let legacy = json!({"provider":"local","exitCode":exit_code,"stdout":stdout_text,"stderr":stderr_text,"error":error,"isError":error.is_some() || exit_code!=Some(0),"durationMs":duration_ms});
-        Ok(finish_execution_result(legacy, structured, request.result_schema.as_ref(), duration_ms))
+        let (artifacts, artifact_errors) = self.collect_artifacts(&request.artifacts);
+        let legacy = json!({"provider":"local","cwd":directory.to_string_lossy(),"workspace":self.directory.to_string_lossy(),"interpreter":program,"exitCode":exit_code,"stdout":stdout_text,"stderr":stderr_text,"error":error,"isError":error.is_some() || exit_code!=Some(0),"durationMs":duration_ms,"artifacts":artifacts,"artifactErrors":artifact_errors});
+        Ok(finish_execution_result(
+            legacy,
+            structured,
+            request.result_schema.as_ref(),
+            duration_ms,
+        ))
     }
 
     pub async fn run_command(&self, arguments: Value) -> Result<Value, String> {
@@ -401,85 +856,81 @@ impl LocalExecution {
     ) -> Result<Value, String> {
         let request: CommandRequest =
             serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+        if !self.command_available() {
+            return Err(
+                "Shell execution is disabled or no shell is configured in Settings.".into(),
+            );
+        }
+        let timeout = request
+            .timeout_seconds
+            .unwrap_or(self.config.bash.timeout_seconds)
+            .min(self.config.bash.timeout_seconds);
         if request.command.trim().is_empty()
             || request.command.len() > 32768
-            || !(1..=300).contains(&request.timeout_seconds)
+            || !(1..=300).contains(&timeout)
+            || request.stdin.len() > 65536
+            || request.artifacts.len() > 16
         {
-            return Err("Command must contain 1–32768 bytes and timeout must be 1–300 seconds.".into());
+            return Err(
+                "Command must contain 1–32768 bytes and timeout must be 1–300 seconds.".into(),
+            );
         }
 
-        let target_dir = if let Some(sub) = &request.cwd {
-            let p = Path::new(sub);
-            if p.is_absolute() {
-                if !p.starts_with(&self.directory) {
-                    return Err("cwd must be within the workspace directory.".into());
-                }
-                p.to_path_buf()
-            } else {
-                let joined = self.directory.join(p);
-                if !joined.starts_with(&self.directory) {
-                    return Err("cwd must be within the workspace directory.".into());
-                }
-                joined
-            }
+        let target_dir =
+            self.working_directory(request.cwd.as_deref(), &self.config.bash.working_directory)?;
+        let mut cmd = tokio::process::Command::new(&self.config.bash_path);
+        let powershell = Path::new(&self.config.bash_path)
+            .file_stem()
+            .is_some_and(|s| {
+                s.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("powershell")
+                    || s == "pwsh"
+            });
+        if powershell {
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &request.command,
+            ]);
         } else {
-            self.directory.clone()
-        };
-
-        if !target_dir.is_dir() {
-            return Err("Specified working directory does not exist.".into());
+            cmd.args(["-c", &request.command]);
         }
-
-        let mut cmd = if cfg!(windows) {
-            let shell = if !self.config.powershell_path.is_empty() && Path::new(&self.config.powershell_path).is_file() {
-                &self.config.powershell_path
-            } else {
-                "powershell.exe"
-            };
-            let mut c = tokio::process::Command::new(shell);
-            c.args(["-NoProfile", "-NonInteractive", "-Command", &request.command]);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("sh");
-            c.args(["-c", &request.command]);
-            c
-        };
 
         cmd.current_dir(&target_dir)
             .env_clear()
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         for name in [
-            "SystemRoot", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT",
-            "COMSPEC", "USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA",
-            "TERM", "COLORTERM",
+            "SystemRoot",
+            "WINDIR",
+            "TEMP",
+            "TMP",
+            "PATH",
+            "PATHEXT",
+            "COMSPEC",
+            "USERPROFILE",
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TERM",
+            "COLORTERM",
         ] {
             if let Some(value) = std::env::var_os(name) {
                 cmd.env(name, value);
             }
         }
         cmd.env("PYTHONIOENCODING", "utf-8")
-           .env("PYTHONUTF8", "1");
+            .env("PYTHONUTF8", "1")
+            .envs(&self.config.bash.environment);
 
-        let mut command = CommandWrap::from(cmd);
-        command.wrap(KillOnDrop);
-        #[cfg(windows)]
-        {
-            command.wrap(process_wrap::tokio::CreationFlags(
-                windows::Win32::System::Threading::CREATE_NO_WINDOW,
-            ));
-            command.wrap(process_wrap::tokio::JobObject);
-        }
-        #[cfg(unix)]
-        {
-            command.wrap(process_wrap::tokio::ProcessGroup::leader());
-        }
-
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("Command launch failed: {error}"))?;
+        memory_limit(&mut cmd, &self.config.bash);
+        let mut child =
+            managed_spawn(cmd).map_err(|error| format!("Command launch failed: {error}"))?;
+        let mut input = child.stdin().take().ok_or("Missing process input pipe.")?;
 
         let output = child
             .stdout()
@@ -493,9 +944,19 @@ impl LocalExecution {
         let out_cb = on_chunk.clone();
         let err_cb = on_chunk;
 
-        let result = tokio::time::timeout(Duration::from_secs(request.timeout_seconds), async {
+        let result = tokio::time::timeout(Duration::from_secs(timeout), async {
+            let write = async {
+                match input.write_all(request.stdin.as_bytes()).await {
+                    Ok(()) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => (),
+                    Err(e) => return Err(e.to_string()),
+                }
+                drop(input);
+                Ok(())
+            };
             let wait = async { child.wait().await.map_err(|error| error.to_string()) };
-            let (_, _, status) = tokio::try_join!(
+            let (_, _, _, status) = tokio::try_join!(
+                write,
                 read_output(output, &mut stdout, "stdout", out_cb),
                 read_output(errors, &mut stderr, "stderr", err_cb),
                 wait
@@ -518,10 +979,15 @@ impl LocalExecution {
             }
         };
         drop(child);
+        let (artifacts, artifact_errors) = self.collect_artifacts(&request.artifacts);
         Ok(json!({
             "provider": "local",
             "command": request.command,
             "cwd": target_dir.to_string_lossy(),
+            "workspace": self.directory.to_string_lossy(),
+            "artifacts": artifacts,
+            "artifactErrors": artifact_errors,
+            "interpreter": self.config.bash_path,
             "exitCode": exit_code,
             "stdout": String::from_utf8_lossy(&stdout),
             "stderr": String::from_utf8_lossy(&stderr),
@@ -538,12 +1004,19 @@ async fn read_output(
     on_chunk: Option<ChunkCallback>,
 ) -> Result<(), String> {
     let mut buffer = [0; 4096];
+    let mut pending = Vec::new();
     loop {
         let count = stream
             .read(&mut buffer)
             .await
             .map_err(|error| error.to_string())?;
         if count == 0 {
+            if let Some(ref cb) = on_chunk {
+                let text = crate::terminal_ui::decode(&mut pending, &[], true);
+                if !text.is_empty() {
+                    cb(stream_name, &text);
+                }
+            }
             return Ok(());
         }
         let available = 65_536 - output.len();
@@ -551,8 +1024,11 @@ async fn read_output(
         if to_take > 0 {
             output.extend_from_slice(&buffer[..to_take]);
             if let Some(ref cb) = on_chunk {
-                let chunk_text = String::from_utf8_lossy(&buffer[..to_take]);
-                cb(stream_name, &chunk_text);
+                let chunk_text =
+                    crate::terminal_ui::decode(&mut pending, &buffer[..to_take], false);
+                if !chunk_text.is_empty() {
+                    cb(stream_name, &chunk_text);
+                }
             }
         }
         if count > available {
@@ -566,7 +1042,7 @@ async fn read_output(
 /// on stdout for the host fallback. math/json/datetime/decimal/fractions/
 /// statistics/re are preloaded. Never uses eval on unparsed text.
 fn python_repl_driver() -> &'static str {
-    r#"import ast, collections, datetime, decimal, fractions, itertools, json, math, random, re, statistics, sys
+    r#"import ast, collections, datetime, decimal, fractions, itertools, json, math, random, re, statistics, sys, io, os
 _emitted = {"n": 0}
 def locallm_result(value):
     _emitted["n"] += 1
@@ -582,10 +1058,17 @@ def _strip(src):
         if s.endswith("```"):
             s = s[:-3].rstrip()
     return s
-src = _strip(sys.stdin.read())
+request = json.loads(sys.stdin.read())
+src = _strip(request["code"])
+filename = request.get("file") or "<run_code>"
+sys.stdin = io.StringIO(request.get("stdin", ""))
+sys.argv = [filename] + request.get("args", [])
+sys.path.insert(0, os.path.dirname(filename) if request.get("file") else os.getcwd())
+sys.path[1:1] = [path for path in os.environ.get("PYTHONPATH", "").split(os.pathsep) if path]
 g = {
     "__name__": "__main__",
     "__builtins__": __builtins__,
+    "__file__": filename,
     "locallm_result": locallm_result,
     "math": math, "json": json, "datetime": datetime, "decimal": decimal,
     "fractions": fractions, "statistics": statistics, "re": re,
@@ -593,18 +1076,18 @@ g = {
 }
 if not src:
     raise SystemExit(0)
-tree = ast.parse(src, filename="<run_code>")
+tree = ast.parse(src, filename=filename)
 if not tree.body:
     raise SystemExit(0)
 *head, tail = tree.body
 if head:
-    exec(compile(ast.Module(body=head, type_ignores=[]), "<run_code>", "exec"), g, g)
+    exec(compile(ast.Module(body=head, type_ignores=[]), filename, "exec"), g, g)
 if isinstance(tail, ast.Expr):
-    value = eval(compile(ast.Expression(tail.value), "<run_code>", "eval"), g, g)
+    value = eval(compile(ast.Expression(tail.value), filename, "eval"), g, g)
     if _emitted["n"] == 0 and value is not None:
         locallm_result(value)
 else:
-    exec(compile(ast.Module(body=[tail], type_ignores=[]), "<run_code>", "exec"), g, g)
+    exec(compile(ast.Module(body=[tail], type_ignores=[]), filename, "exec"), g, g)
     if _emitted["n"] == 0:
         name = None
         if isinstance(tail, ast.Assign) and len(tail.targets) == 1 and isinstance(tail.targets[0], ast.Name):
@@ -691,19 +1174,27 @@ fn parse_structured_results(stdout: &str) -> StructuredOutcome {
     }
     let mut values = Vec::new();
     for line in normalized.lines() {
-        let Some(payload) = line.strip_prefix(RESULT_MARKER) else { continue };
+        let Some(payload) = line.strip_prefix(RESULT_MARKER) else {
+            continue;
+        };
         if payload.len() > MAX_RESULT_BYTES {
             return StructuredOutcome::TooLarge(payload.len());
         }
         match serde_json::from_str::<Value>(payload.trim()) {
             Ok(value) => values.push(value),
-            Err(error) => return StructuredOutcome::Malformed(format!("Structured result is not valid JSON: {error}")),
+            Err(error) => {
+                return StructuredOutcome::Malformed(format!(
+                    "Structured result is not valid JSON: {error}"
+                ))
+            }
         }
     }
     match values.len() {
         0 => StructuredOutcome::Missing,
         1 => StructuredOutcome::Value(values.into_iter().next().unwrap()),
-        count => StructuredOutcome::Malformed(format!("Expected exactly one structured result but found {count}.")),
+        count => StructuredOutcome::Malformed(format!(
+            "Expected exactly one structured result but found {count}."
+        )),
     }
 }
 
@@ -742,8 +1233,16 @@ fn finish_execution_result(
         .get("error")
         .and_then(Value::as_str)
         .is_some_and(|message| message.contains("exceeded 64 KiB"));
-    let stdout_text = legacy.get("stdout").and_then(Value::as_str).unwrap_or("").to_string();
-    let stderr_text = legacy.get("stderr").and_then(Value::as_str).unwrap_or("").to_string();
+    let stdout_text = legacy
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let stderr_text = legacy
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
 
     // Missing-result detection, serialization errors, schema mismatches, and
     // truncated streams are explicit failures — never silent success. A
@@ -755,19 +1254,25 @@ fn finish_execution_result(
             crate::tool_envelope::Status::Failure,
             Value::Null,
             "truncated",
-            Some(json!({"code": "output-truncated", "message": "An output stream exceeded 64 KiB; the structured result cannot be trusted complete.", "retryable": false})),
+            Some(
+                json!({"code": "output-truncated", "message": "An output stream exceeded 64 KiB; the structured result cannot be trusted complete.", "retryable": false}),
+            ),
         ),
         StructuredOutcome::Missing if timed_out => (
             crate::tool_envelope::Status::Failure,
             Value::Null,
             "unknown",
-            Some(json!({"code": "timeout", "message": "Execution timed out; whether the result was produced is unknown. Do not rerun side-effecting code automatically.", "retryable": false})),
+            Some(
+                json!({"code": "timeout", "message": "Execution timed out; whether the result was produced is unknown. Do not rerun side-effecting code automatically.", "retryable": false}),
+            ),
         ),
         StructuredOutcome::Missing if !exit_ok => (
             crate::tool_envelope::Status::Failure,
             Value::Null,
             "exit-nonzero",
-            Some(json!({"code": "nonzero-exit", "message": format!("Process exited with {exit_code_value}; no structured result was emitted."), "retryable": false})),
+            Some(
+                json!({"code": "nonzero-exit", "message": format!("Process exited with {exit_code_value}; no structured result was emitted."), "retryable": false}),
+            ),
         ),
         StructuredOutcome::Missing => match stdout_as_result(&stdout_text) {
             Some(value) => (crate::tool_envelope::Status::Success, value, "ok", None),
@@ -775,7 +1280,9 @@ fn finish_execution_result(
                 crate::tool_envelope::Status::Failure,
                 Value::Null,
                 "missing",
-                Some(json!({"code": "missing-result", "message": "Execution produced no result. Print the answer or end with an expression, e.g. print(2+2) or locallm_result(value).", "retryable": true})),
+                Some(
+                    json!({"code": "missing-result", "message": "Execution produced no result. Print the answer or end with an expression, e.g. print(2+2) or locallm_result(value).", "retryable": true}),
+                ),
             ),
         },
         StructuredOutcome::Malformed(message) => (
@@ -788,23 +1295,49 @@ fn finish_execution_result(
             crate::tool_envelope::Status::Failure,
             Value::Null,
             "too-large",
-            Some(json!({"code": "result-too-large", "message": format!("Structured result is {bytes} bytes, above the 64 KiB channel limit. Write large output to a workspace file and return its path instead."), "retryable": false})),
+            Some(
+                json!({"code": "result-too-large", "message": format!("Structured result is {bytes} bytes, above the 64 KiB channel limit. Write large output to a workspace file and return its path instead."), "retryable": false}),
+            ),
         ),
         StructuredOutcome::Value(value) => {
             if stream_truncated {
-                (crate::tool_envelope::Status::Failure, Value::Null, "truncated",
-                    Some(json!({"code": "output-truncated", "message": "An output stream exceeded 64 KiB; the structured result cannot be trusted complete.", "retryable": false})))
+                (
+                    crate::tool_envelope::Status::Failure,
+                    Value::Null,
+                    "truncated",
+                    Some(
+                        json!({"code": "output-truncated", "message": "An output stream exceeded 64 KiB; the structured result cannot be trusted complete.", "retryable": false}),
+                    ),
+                )
             } else if timed_out {
-                (crate::tool_envelope::Status::Failure, Value::Null, "unknown",
-                    Some(json!({"code": "timeout", "message": "Execution timed out; whether the result was produced is unknown. Do not rerun side-effecting code automatically.", "retryable": false})))
+                (
+                    crate::tool_envelope::Status::Failure,
+                    Value::Null,
+                    "unknown",
+                    Some(
+                        json!({"code": "timeout", "message": "Execution timed out; whether the result was produced is unknown. Do not rerun side-effecting code automatically.", "retryable": false}),
+                    ),
+                )
             } else if !exit_ok {
-                (crate::tool_envelope::Status::Failure, Value::Null, "exit-nonzero",
-                    Some(json!({"code": "nonzero-exit", "message": format!("Process exited with {:?}; structured result is not accepted.", legacy.get("exitCode").unwrap_or(&Value::Null)), "retryable": false})))
+                (
+                    crate::tool_envelope::Status::Failure,
+                    Value::Null,
+                    "exit-nonzero",
+                    Some(
+                        json!({"code": "nonzero-exit", "message": format!("Process exited with {:?}; structured result is not accepted.", legacy.get("exitCode").unwrap_or(&Value::Null)), "retryable": false}),
+                    ),
+                )
             } else if let Some(schema) = schema {
                 match crate::tool_envelope::validate_against_schema(&value, schema) {
                     Ok(()) => (crate::tool_envelope::Status::Success, value, "ok", None),
-                    Err(message) => (crate::tool_envelope::Status::Failure, Value::Null, "schema-mismatch",
-                        Some(json!({"code": "schema-mismatch", "message": message, "retryable": false}))),
+                    Err(message) => (
+                        crate::tool_envelope::Status::Failure,
+                        Value::Null,
+                        "schema-mismatch",
+                        Some(
+                            json!({"code": "schema-mismatch", "message": message, "retryable": false}),
+                        ),
+                    ),
                 }
             } else {
                 (crate::tool_envelope::Status::Success, value, "ok", None)
@@ -812,8 +1345,7 @@ fn finish_execution_result(
         }
     };
 
-    let truncated = stream_truncated
-        || matches!(result_status, "too-large" | "truncated");
+    let truncated = stream_truncated || matches!(result_status, "too-large" | "truncated");
     let mut envelope = crate::tool_envelope::make(
         status,
         json!({
@@ -822,7 +1354,7 @@ fn finish_execution_result(
             "result": data_result,
             "resultStatus": result_status,
         }),
-        Vec::new(),
+        legacy["artifacts"].as_array().cloned().unwrap_or_default(),
         error,
         json!({"durationMs": duration_ms, "truncated": truncated}),
     );
@@ -870,12 +1402,20 @@ pub async fn test_interpreter(path: String) -> Result<String, String> {
     }
     let lower = clean_path.to_lowercase();
     let mut cmd = tokio::process::Command::new(&clean_path);
+    cmd.kill_on_drop(true);
     if lower.contains("powershell") || lower.contains("pwsh") {
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"]);
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$PSVersionTable.PSVersion.ToString()",
+        ]);
     } else {
         cmd.arg("--version");
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         #[allow(unused_imports)]
@@ -887,12 +1427,22 @@ pub async fn test_interpreter(path: String) -> Result<String, String> {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !output.status.success() {
+                return Err(format!(
+                    "Interpreter check failed ({}): {}",
+                    output.status,
+                    stderr.chars().take(2000).collect::<String>()
+                ));
+            }
             if !stdout.is_empty() {
                 Ok(stdout)
             } else if !stderr.is_empty() {
                 Ok(stderr)
             } else {
-                Ok(format!("Executable verified (exit code {})", output.status.code().unwrap_or(0)))
+                Ok(format!(
+                    "Executable verified (exit code {})",
+                    output.status.code().unwrap_or(0)
+                ))
             }
         }
         Ok(Err(e)) => Err(format!("Failed to run executable: {e}")),
@@ -903,7 +1453,6 @@ pub async fn test_interpreter(path: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(windows)]
     #[tokio::test]
     async fn cancelling_execution_kills_spawned_descendants() {
         let temp = tempfile::tempdir().unwrap();
@@ -928,16 +1477,261 @@ mod tests {
             "Descendant survived cancellation"
         );
     }
+    #[test]
+    fn migrates_existing_settings_and_validates_user_limits() {
+        let mut config: ExecutionConfig =
+            serde_json::from_value(json!({"pythonPath":"", "nodePath":"", "powershellPath":""}))
+                .unwrap();
+        assert!(config.bash.enabled && config.python.enabled);
+        assert!(!config.bash.always_ask && !config.python.always_ask);
+        config.python.timeout_seconds = 91;
+        assert!(config.validate().is_err());
+        config.python.timeout_seconds = 60;
+        config
+            .python
+            .environment
+            .insert("BAD=NAME".into(), "value".into());
+        assert!(config.validate().is_err());
+    }
+    #[tokio::test]
+    async fn python_scripts_use_project_imports_arguments_stdin_environment_and_venv() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ExecutionConfig::default();
+        let venv = temp.path().join(".venv");
+        let status = tokio::process::Command::new(&config.python_path)
+            .args(["-m", "venv", "--without-pip"])
+            .arg(&venv)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(temp.path().join("helper.py"), "VALUE = 'héllo世界'\n").unwrap();
+        std::fs::write(temp.path().join("script.py"), "import helper, sys, os, json\nfrom pathlib import Path\nPath('result.csv').write_text('value\\n42\\n')\nlocallm_result({'value': helper.VALUE, 'args': sys.argv[1:], 'stdin': input(), 'env': os.environ['TEST_VALUE'], 'venv': sys.prefix, 'file': __file__})\n").unwrap();
+        let mut config = config;
+        config.python_venv = venv.to_string_lossy().into_owned();
+        config
+            .python
+            .environment
+            .insert("TEST_VALUE".into(), "from settings".into());
+        let execution = LocalExecution::new(config, temp.path().to_str().unwrap()).unwrap();
+        let result = execution.run(json!({"file":"script.py", "args":["with spaces", "$(literal)"], "stdin":"test input\n", "artifacts":["result.csv"]})).await.unwrap();
+        assert_eq!(result["status"], "success", "{result}");
+        assert_eq!(result["data"]["result"]["value"], "héllo世界");
+        assert_eq!(result["data"]["result"]["stdin"], "test input");
+        assert_eq!(
+            result["data"]["result"]["args"],
+            json!(["with spaces", "$(literal)"])
+        );
+        assert_eq!(result["data"]["result"]["env"], "from settings");
+        assert_eq!(
+            result["data"]["result"]["venv"],
+            venv.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("result.csv")).unwrap(),
+            "value\n42\n"
+        );
+        assert_eq!(result["artifacts"][0]["path"], "result.csv");
+        assert_eq!(result["artifacts"][0]["mimeType"], "text/plain");
+        assert_eq!(result["artifacts"][0]["sha256"].as_str().unwrap().len(), 64);
+        assert!(execution
+            .run(json!({"file":"script.py", "code":"print('ambiguous')"}))
+            .await
+            .is_err());
+        let result = execution
+            .run(json!({"code":"raise ValueError('readable failure')"}))
+            .await
+            .unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(result["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("ValueError: readable failure"));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_supports_arrays_stdin_limits_and_rejects_escaped_working_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(parent.path(), root.join("outside")).unwrap();
+        let mut config = ExecutionConfig::default();
+        config.bash.timeout_seconds = 1;
+        config
+            .bash
+            .environment
+            .insert("TEST_VALUE".into(), "héllo".into());
+        let execution = LocalExecution::new(config, root.to_str().unwrap()).unwrap();
+        let result = execution.run_command(json!({"command":"items=(a b); read -r line; printf artifact > out.txt; printf '%s:%s:%s' \"${items[1]}\" \"$line\" \"$TEST_VALUE\"", "stdin":"world\n", "cwd":"sub", "artifacts":["sub/out.txt"]})).await.unwrap();
+        assert_eq!(result["exitCode"], 0, "{result}");
+        assert_eq!(result["stdout"], "b:world:héllo");
+        assert_eq!(result["artifacts"][0]["path"], "sub/out.txt");
+        assert_eq!(result["cwd"], root.join("sub").to_string_lossy().as_ref());
+        for cwd in ["..", "sub/../..", "outside"] {
+            assert!(
+                execution
+                    .run_command(json!({"command":"pwd", "cwd":cwd}))
+                    .await
+                    .is_err(),
+                "{cwd}"
+            );
+        }
+        let result = execution
+            .run_command(json!({"command":"printf failed >&2; exit 7"}))
+            .await
+            .unwrap();
+        assert_eq!(result["exitCode"], 7);
+        assert_eq!(result["stderr"], "failed");
+        let result = execution
+            .run_command(json!({"command":"sleep 10", "timeout_seconds":300}))
+            .await
+            .unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(result["durationMs"].as_u64().unwrap() < 5000, "{result}");
+    }
+    #[tokio::test]
+    async fn disabled_tools_and_stricter_approval_are_enforced() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = ExecutionConfig::default();
+        config.python.enabled = false;
+        config.bash.enabled = false;
+        let execution = LocalExecution::new(config.clone(), temp.path().to_str().unwrap()).unwrap();
+        assert!(!execution.command_available());
+        assert!(execution
+            .run(json!({"code":"print('forbidden')"}))
+            .await
+            .is_err());
+        assert!(execution
+            .run_command(json!({"command":"echo forbidden"}))
+            .await
+            .is_err());
+        config.bash.always_ask = true;
+        config.python.always_ask = true;
+        let execution = std::sync::Arc::new(
+            LocalExecution::new(config, temp.path().to_str().unwrap()).unwrap(),
+        );
+        assert!(execution
+            .clone()
+            .command_tool()
+            .requires_approval(&json!({"command":"echo preview"})));
+        let tool = execution.tool();
+        assert!(tool.requires_approval(&json!({"code":"1+1"})));
+        assert!(!tool.requires_approval(&json!({"language":"javascript", "code":"1+1"})));
+        assert!(!tool.tool.input_schema["properties"]["language"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("python")));
+    }
+    #[test]
+    fn a_missing_interpreter_does_not_disable_other_native_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ExecutionConfig {
+            python_path: temp
+                .path()
+                .join("removed-python")
+                .to_string_lossy()
+                .into_owned(),
+            node_path: String::new(),
+            powershell_path: String::new(),
+            ..Default::default()
+        };
+        let execution = LocalExecution::new(config, temp.path().to_str().unwrap()).unwrap();
+        assert!(execution.command_available());
+        assert!(!execution.code_available());
+    }
+    #[tokio::test]
+    async fn script_approval_snapshot_contains_source_and_rejects_later_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("script.py"), "print('approved')\n").unwrap();
+        let execution = std::sync::Arc::new(
+            LocalExecution::new(ExecutionConfig::default(), temp.path().to_str().unwrap()).unwrap(),
+        );
+        let tool = execution.clone().tool();
+        let arguments = tool.prepare_arguments(json!({"file":"script.py"})).unwrap();
+        assert_eq!(arguments["approved_source"]["code"], "print('approved')\n");
+        assert!(execution.run(arguments.clone()).await.unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("approved"));
+        std::fs::write(temp.path().join("script.py"), "print('changed')\n").unwrap();
+        assert!(execution
+            .run(arguments)
+            .await
+            .unwrap_err()
+            .contains("changed after approval"));
+        assert!(tool
+            .prepare_arguments(
+                json!({"file":"script.py","approved_source":{"code":"forged","sha256":"forged"}})
+            )
+            .is_err());
+        assert!(tool
+            .prepare_arguments(json!({"code":"print('a')","file":"script.py"}))
+            .is_err());
+        assert!(tool.prepare_arguments(json!({})).is_err());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_memory_limit_is_applied_only_to_the_python_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = ExecutionConfig::default();
+        config.python.memory_limit_mib = Some(128);
+        let execution = LocalExecution::new(config, temp.path().to_str().unwrap()).unwrap();
+        let result = execution.run(json!({"code":"import resource\nlocallm_result(resource.getrlimit(resource.RLIMIT_AS)[0])"})).await.unwrap();
+        assert_eq!(result["data"]["result"], 128 * 1024 * 1024);
+        let result = execution
+            .run(json!({"code":"data = bytearray(512 * 1024 * 1024)"}))
+            .await
+            .unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(result["stderr"].as_str().unwrap().contains("MemoryError"));
+        assert_ne!(
+            rustix::process::getrlimit(rustix::process::Resource::As).current,
+            Some(128 * 1024 * 1024)
+        );
+    }
+    #[tokio::test]
+    async fn streaming_preserves_utf8_split_between_reads() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let capture = collected.clone();
+        let callback: ChunkCallback =
+            std::sync::Arc::new(move |_, text| capture.lock().unwrap().push_str(text));
+        let write = async move {
+            for byte in "héllo世界🌍".as_bytes() {
+                writer.write_all(&[*byte]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let mut bytes = Vec::new();
+        let (_, result) = tokio::join!(
+            write,
+            read_output(reader, &mut bytes, "stdout", Some(callback))
+        );
+        result.unwrap();
+        assert_eq!(*collected.lock().unwrap(), "héllo世界🌍");
+    }
     #[tokio::test]
     async fn runs_python_and_javascript_and_reports_nonzero_exit() {
         let temp = tempfile::tempdir().unwrap();
         let execution =
             LocalExecution::new(ExecutionConfig::default(), temp.path().to_str().unwrap()).unwrap();
         for (language, code) in [
-            ("python", "print('héllo'); locallm_result({'greeting': 'héllo'})"),
-            ("javascript", "console.log('héllo'); locallm_result({greeting: 'héllo'});"),
-            ("powershell", "Write-Output 'héllo'; locallm_result(@{greeting='héllo'})"),
+            (
+                "python",
+                "print('héllo'); locallm_result({'greeting': 'héllo'})",
+            ),
+            (
+                "javascript",
+                "console.log('héllo'); locallm_result({greeting: 'héllo'});",
+            ),
+            (
+                "powershell",
+                "Write-Output 'héllo'; locallm_result(@{greeting='héllo'})",
+            ),
         ] {
+            if language == "powershell" && execution.config.powershell_path.is_empty() {
+                continue; // PowerShell is an optional interpreter on Unix.
+            }
             let result = execution
                 .run(json!({"language":language,"code":code}))
                 .await
@@ -948,8 +1742,14 @@ mod tests {
                 result["stdout"].as_str().unwrap().contains("héllo"),
                 "{language}: {result}"
             );
-            assert_eq!(result["data"]["result"]["greeting"], "héllo", "{language}: {result}");
-            assert!(crate::tool_envelope::validate_envelope(&result).is_ok(), "{language}: {result}");
+            assert_eq!(
+                result["data"]["result"]["greeting"], "héllo",
+                "{language}: {result}"
+            );
+            assert!(
+                crate::tool_envelope::validate_envelope(&result).is_ok(),
+                "{language}: {result}"
+            );
         }
         let result=execution.run(json!({"language":"python","code":"import sys; print('failed', file=sys.stderr); sys.exit(7)"})).await.unwrap();
         assert_eq!(result["exitCode"], 7);
@@ -957,7 +1757,10 @@ mod tests {
         assert_eq!(result["status"], "failure");
         assert_eq!(result["error"]["code"], "nonzero-exit");
         assert!(result["stderr"].as_str().unwrap().contains("failed"));
-        assert!(crate::tool_envelope::validate_envelope(&result).is_ok(), "{result}");
+        assert!(
+            crate::tool_envelope::validate_envelope(&result).is_ok(),
+            "{result}"
+        );
     }
     #[tokio::test]
     async fn structured_results_validate_nested_none_unicode_and_schema() {
@@ -972,9 +1775,15 @@ mod tests {
         assert_eq!(result["status"], "success", "{result}");
         assert_eq!(result["data"]["result"]["nested"]["flag"], true);
         assert_eq!(result["data"]["result"]["nested"]["missing"], Value::Null);
-        assert_eq!(result["data"]["result"]["nested"]["items"][1], "héllo世界🌍");
+        assert_eq!(
+            result["data"]["result"]["nested"]["items"][1],
+            "héllo世界🌍"
+        );
         assert_eq!(result["data"]["result"]["nested"]["items"][2], Value::Null);
-        assert!(result["data"]["logs"]["stdout"].as_str().unwrap().contains("log line"));
+        assert!(result["data"]["logs"]["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("log line"));
         // A requested schema is enforced; wrong shapes fail explicitly.
         let schema = json!({"type":"object","required":["answer"],"properties":{"answer":{"type":"string"}}});
         let ok = execution
@@ -1004,7 +1813,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(printed["status"], "success", "{printed}");
-        assert_eq!(printed["data"]["result"], "just a log, no result", "{printed}");
+        assert_eq!(
+            printed["data"]["result"], "just a log, no result",
+            "{printed}"
+        );
         let missing = execution
             .run(json!({"language":"python","code":"pass"}))
             .await
@@ -1017,11 +1829,92 @@ mod tests {
             .unwrap();
         assert_eq!(nan["status"], "failure", "{nan}");
         assert_eq!(nan["exitCode"], 1);
-        assert!(crate::tool_envelope::validate_envelope(&nan).is_ok(), "{nan}");
+        assert!(
+            crate::tool_envelope::validate_envelope(&nan).is_ok(),
+            "{nan}"
+        );
+    }
+    #[tokio::test]
+    async fn result_schema_is_advertised_compiled_and_enforced() {
+        let temp = tempfile::tempdir().unwrap();
+        let execution = std::sync::Arc::new(
+            LocalExecution::new(ExecutionConfig::default(), temp.path().to_str().unwrap()).unwrap(),
+        );
+        let tool = execution.clone().tool();
+        // The model-facing schema advertises result_schema.
+        assert_eq!(
+            tool.tool.input_schema["properties"]["result_schema"]["type"],
+            "object"
+        );
+        // prepare_arguments accepts a valid schema and rejects unusable ones
+        // before any interpreter can launch.
+        tool.prepare_arguments(json!({"code":"1+1","result_schema":{"type":"number"}}))
+            .unwrap();
+        for schema in [
+            json!({"type":"nonsense"}),
+            json!({"$ref":"https://schemas.example/remote.json"}),
+            json!({"$ref":"file:///etc/passwd"}),
+        ] {
+            assert!(
+                tool.prepare_arguments(json!({"code":"1+1","result_schema":schema}))
+                    .is_err(),
+                "{schema}"
+            );
+        }
+        // run() (direct public path, e.g. catalog dispatch) rejects the same
+        // schemas before launch: the side-effect file must not exist.
+        for schema in [
+            json!({"type":"nonsense"}),
+            json!({"$ref":"https://schemas.example/remote.json"}),
+            json!("not an object"),
+        ] {
+            assert!(
+                execution
+                    .run(json!({"code":"1+1","result_schema":schema}))
+                    .await
+                    .is_err(),
+                "{schema}"
+            );
+        }
+        assert!(execution
+            .run(json!({"code":"open('sentinel.txt','w').write('x')","result_schema":{"type":"nonsense"}}))
+            .await.is_err());
+        assert!(
+            !temp.path().join("sentinel.txt").exists(),
+            "rejected schema ran a process"
+        );
+        // Public dispatch validates the advertised type too.
+        assert!(tool
+            .call(json!({"code":"1+1","result_schema":"nope"}))
+            .await
+            .is_err());
+        // Full JSON Schema enforcement on the structured result channel.
+        let schema = json!({"type":"object","required":["answer"],"properties":{"answer":{"type":"integer","minimum":2}},"additionalProperties":false});
+        let ok = execution
+            .run(json!({"code":"locallm_result({'answer': 7})","result_schema":schema}))
+            .await
+            .unwrap();
+        assert_eq!(ok["status"], "success", "{ok}");
+        assert_eq!(ok["data"]["result"]["answer"], 7);
+        for (label, code) in [
+            ("wrong type", "locallm_result({'answer': '7'})"),
+            ("below minimum", "locallm_result({'answer': 1})"),
+            ("extra key", "locallm_result({'answer': 7, 'extra': True})"),
+        ] {
+            let bad = execution
+                .run(json!({"code": code, "result_schema": schema}))
+                .await
+                .unwrap();
+            assert_eq!(bad["status"], "failure", "{label}: {bad}");
+            assert_eq!(bad["error"]["code"], "schema-mismatch", "{label}: {bad}");
+        }
     }
     #[test]
     fn structured_result_parsing_joins_wrapped_lines_and_rejects_reprs() {
-        assert!(matches!(parse_structured_results("log\n"), StructuredOutcome::Missing));
+        assert!(matches!(
+            parse_structured_results("log\n"),
+            StructuredOutcome::Missing
+        ));
         match parse_structured_results("__LOCALLM_RESULT_JSON__{\"a\":1}\n") {
             StructuredOutcome::Value(value) => assert_eq!(value["a"], 1),
             other => panic!("unexpected {other:?}"),
@@ -1108,7 +2001,10 @@ mod tests {
             .unwrap();
         assert_eq!(explicit["status"], "success", "{explicit}");
         assert_eq!(explicit["data"]["result"]["answer"], 7, "{explicit}");
-        assert!(crate::tool_envelope::validate_envelope(&expr).is_ok(), "{expr}");
+        assert!(
+            crate::tool_envelope::validate_envelope(&expr).is_ok(),
+            "{expr}"
+        );
     }
     #[tokio::test]
     async fn runs_shell_command_and_streams_output() {
@@ -1118,20 +2014,29 @@ mod tests {
         let streamed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let streamed_clone = streamed.clone();
         let cb: ChunkCallback = std::sync::Arc::new(move |stream, chunk| {
-            streamed_clone.lock().unwrap().push((stream.to_string(), chunk.to_string()));
+            streamed_clone
+                .lock()
+                .unwrap()
+                .push((stream.to_string(), chunk.to_string()));
         });
-        let cmd_str = if cfg!(windows) { "Write-Output 'test_streaming_chunk'" } else { "echo 'test_streaming_chunk'" };
+        let cmd_str = if cfg!(windows) {
+            "Write-Output 'test_streaming_chunk'"
+        } else {
+            "echo 'test_streaming_chunk'"
+        };
         let result = execution
-            .run_command_with_stream(
-                json!({"command": cmd_str}),
-                Some(cb),
-            )
+            .run_command_with_stream(json!({"command": cmd_str}), Some(cb))
             .await
             .unwrap();
         assert_eq!(result["exitCode"], 0, "{result}");
-        assert!(result["stdout"].as_str().unwrap().contains("test_streaming_chunk"));
+        assert!(result["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("test_streaming_chunk"));
         let chunks = streamed.lock().unwrap();
         assert!(!chunks.is_empty());
-        assert!(chunks.iter().any(|(s, c)| s == "stdout" && c.contains("test_streaming_chunk")));
+        assert!(chunks
+            .iter()
+            .any(|(s, c)| s == "stdout" && c.contains("test_streaming_chunk")));
     }
 }

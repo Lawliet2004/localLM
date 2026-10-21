@@ -146,6 +146,11 @@ export async function fetchPageCascade(
     }
 
     const live = await fetcher.fetch(url, fetchOpts);
+    const mime = (live.mimeType || '').split(';')[0].trim().toLowerCase();
+    if (live.success && typeof live.body === 'string' && (['application/json', 'text/csv', 'application/csv', 'text/tab-separated-values'].includes(mime) || mime.endsWith('+json'))) {
+      await record(true);
+      return { document: null, raw: live, method: 'live' };
+    }
     if (live.success && live.body && live.body.length >= 150) {
       if (isPdf(live, url)) {
         await record(true);

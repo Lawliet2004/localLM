@@ -1,10 +1,56 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::borrow::Cow;
+
+/// Display programs are data, including literal tool markup in code samples.
+/// Blank their bytes (preserving offsets) before text-call detection/parsing.
+/// Conservative recognition also covers nested Markdown/list/blockquote fences
+/// and an interrupted fence: ambiguity must never turn presentation into work.
+pub(crate) fn without_presentation_fences(text: &str) -> Cow<'_, str> {
+    let mut masked: Option<Vec<u8>> = None;
+    let mut fence: Option<(u8, usize)> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let mut closing = false;
+        if let Some((marker, count)) = fence {
+            let trimmed = line.trim_start_matches(|c: char| c.is_whitespace() || c == '>');
+            let run = trimmed.bytes().take_while(|byte| *byte == marker).count();
+            closing = run >= count && trimmed[run..].trim().is_empty();
+        } else {
+            for (index, marker) in line.bytes().enumerate() {
+                if marker != b'`' && marker != b'~' { continue; }
+                // Inspect each marker run once; long backtick lines must not
+                // turn fence recognition into quadratic work.
+                if index > 0 && line.as_bytes()[index - 1] == marker { continue; }
+                let rest = &line[index..];
+                let count = rest.bytes().take_while(|byte| *byte == marker).count();
+                if count < 3 { continue; }
+                let language = rest[count..].split_whitespace().next().unwrap_or_default();
+                if matches!(language, "openui" | "openui-lang") {
+                    fence = Some((marker, count));
+                    break;
+                }
+            }
+        }
+        if fence.is_some() {
+            let bytes = masked.get_or_insert_with(|| text.as_bytes().to_vec());
+            for byte in &mut bytes[offset..offset + line.len()] {
+                if *byte != b'\n' && *byte != b'\r' { *byte = b' '; }
+            }
+        }
+        if closing { fence = None; }
+        offset += line.len();
+    }
+    match masked {
+        Some(bytes) => Cow::Owned(String::from_utf8(bytes).expect("masked complete UTF-8 lines")),
+        None => Cow::Borrowed(text),
+    }
+}
 
 #[derive(Default)]
 pub struct ToolCalls(BTreeMap<u64, PartialCall>);
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct PartialCall {
     id: String,
     name: String,
@@ -18,13 +64,15 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 impl ToolCalls {
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
     /// Assemble one OpenAI-compatible streaming delta. Some local runtimes
     /// (AREX-family templates) interleave `content` reasoning prose with tool
     /// deltas in the same round; prose is ignored here and separated by the
     /// chat-level think filter instead.
     pub fn push(&mut self, delta: &Value) -> Result<(), String> {
-        let Some(calls) = delta.get("tool_calls") else {
+        let Some(calls) = delta.get("tool_calls").filter(|calls| !calls.is_null()) else {
             return Ok(());
         };
         for call in calls.as_array().ok_or("Invalid tool call array.")? {
@@ -35,16 +83,22 @@ impl ToolCalls {
                 return Err("The model requested more than eight tools in one round.".into());
             }
             let entry = self.0.entry(index).or_default();
-            for (target, value) in [
-                (&mut entry.id, &call["id"]),
-                (&mut entry.name, &call["function"]["name"]),
-                (&mut entry.arguments, &call["function"]["arguments"]),
-            ] {
-                if let Some(text) = value.as_str() {
-                    target.push_str(text);
-                } else if !value.is_null() {
-                    return Err("Malformed tool call fragment.".into());
+            if let Some(kind) = call.get("type").filter(|kind| !kind.is_null()) {
+                if kind != "function" {
+                    return Err("Unsupported tool call type.".into());
                 }
+            }
+            // `id` and `function.name` identify the call; `arguments` is the
+            // only field OpenAI fragments across deltas. Several
+            // OpenAI-compatible servers repeat the id and the name in EVERY
+            // delta, so appending them would produce "call_abc"+"call_abc"
+            // and "read"+"read" — a call that can no longer be resolved.
+            merge_identity(&mut entry.id, call["id"].as_str())?;
+            merge_identity(&mut entry.name, call["function"]["name"].as_str())?;
+            if let Some(text) = call["function"]["arguments"].as_str() {
+                entry.arguments.push_str(text);
+            } else if !call["function"]["arguments"].is_null() {
+                return Err("Malformed tool call fragment.".into());
             }
             if entry.id.len() > 128 || entry.name.len() > 128 || entry.arguments.len() > 65_536 {
                 return Err("Tool call exceeds its size limit.".into());
@@ -52,13 +106,26 @@ impl ToolCalls {
         }
         Ok(())
     }
-    pub fn finish(self) -> Result<Vec<ToolCall>, String> {
+    /// Validate the accumulated calls **without consuming** the accumulator.
+    ///
+    /// The finalizing path needs the validated calls and must still be able to
+    /// see that the round produced calls, so it cannot take the accumulator
+    /// apart. A malformed call is a real error here, not an empty round.
+    pub fn validated(&self) -> Result<Vec<ToolCall>, String> {
+        if self.0.len() > 8 {
+            return Err("The model requested more than eight tools in one round.".into());
+        }
         let mut ids = std::collections::HashSet::new();
-        let calls: Vec<ToolCall> = self.0
-            .into_values()
+        let calls: Vec<ToolCall> = self
+            .0
+            .values()
+            .cloned()
             .map(|call| {
                 if call.id.is_empty() || call.name.is_empty() || !ids.insert(call.id.clone()) {
                     return Err("Tool call has missing or duplicate identifiers.".into());
+                }
+                if call.id.len() > 128 || call.name.len() > 128 || call.arguments.len() > 65_536 {
+                    return Err("Tool call exceeds its size limit.".into());
                 }
                 // Truncated generations arrive as partial JSON; detect them
                 // here so the chat loop rejects unfinished arguments instead
@@ -88,6 +155,46 @@ impl ToolCalls {
         }
         Ok(calls)
     }
+    pub fn finish(self) -> Result<Vec<ToolCall>, String> {
+        self.validated()
+    }
+}
+
+/// Merge a repeated tool-call identity field.
+///
+/// The field identifies the call, so it is **replaced** rather than appended
+/// when the server repeats it — appending would corrupt the id and the name.
+/// A genuine second fragment (the server splitting the name) is still
+/// appended, and a value that conflicts with what was already seen is
+/// rejected rather than guessed at.
+fn merge_identity(target: &mut String, incoming: Option<&str>) -> Result<(), String> {
+    let Some(text) = incoming else {
+        // A missing field is not a change.
+        return Ok(());
+    };
+    if text.is_empty() {
+        // Some servers send an empty string in later deltas.
+        return Ok(());
+    }
+    if target.is_empty() {
+        target.push_str(text);
+        return Ok(());
+    }
+    if text == target {
+        // A pure repeat.
+        return Ok(());
+    }
+    if text.starts_with(target.as_str()) {
+        // The server repeated the field with more of it.
+        target.clear();
+        target.push_str(text);
+        return Ok(());
+    } else if target.starts_with(text) {
+        // A genuine fragment of a split field.
+        target.push_str(text);
+        return Ok(());
+    }
+    Err("Tool call identity changed between stream fragments.".into())
 }
 
 impl ToolCalls {
@@ -96,26 +203,34 @@ impl ToolCalls {
     pub fn from_parsed(calls: Vec<ToolCall>) -> Self {
         let mut acc = Self::default();
         for (index, call) in calls.into_iter().enumerate() {
-            acc.0.insert(index as u64, PartialCall {
-                id: call.id,
-                name: call.name,
-                arguments: call.arguments.to_string(),
-            });
+            acc.0.insert(
+                index as u64,
+                PartialCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments.to_string(),
+                },
+            );
         }
         acc
     }
 
     /// A finished OpenAI message uses the same argument checks as a streamed call.
     /// Partial or non-object arguments are rejected instead of executed.
+    #[cfg(test)]
     pub fn from_openai_message(message: &Value) -> Result<Vec<ToolCall>, String> {
-        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+        let Some(raw) = message.get("tool_calls").filter(|calls| !calls.is_null()) else {
             return Ok(Vec::new());
         };
+        let calls = raw.as_array().ok_or("Invalid tool call array.")?;
         if calls.is_empty() {
             return Ok(Vec::new());
         }
         let mut acc = Self::default();
         for (index, call) in calls.iter().enumerate() {
+            if call.get("type").is_some_and(|kind| kind != "function") {
+                return Err("Unsupported tool call type.".into());
+            }
             let arguments = match &call["function"]["arguments"] {
                 Value::String(text) => text.clone(),
                 Value::Object(_) => call["function"]["arguments"].to_string(),
@@ -142,10 +257,16 @@ impl ToolCalls {
 /// the normal permissioned dispatch instead of leaking into the answer.
 /// Returns None when any block is malformed — a partial parse is never executed.
 pub fn parse_text_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
-    let mut rest = text;
+    if text.len() > 1_048_576 {
+        return None;
+    }
+    let visible = without_presentation_fences(text);
+    let mut rest = visible.as_ref();
     let mut calls = Vec::new();
     while let Some(start) = [rest.find("<tool_call>"), rest.find("<function=")]
-        .into_iter().flatten().min()
+        .into_iter()
+        .flatten()
+        .min()
     {
         rest = &rest[start..];
         if let Some(body) = rest.strip_prefix("<tool_call>") {
@@ -158,27 +279,40 @@ pub fn parse_text_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
             } else {
                 parse_json_call(inner, calls.len())?
             };
-            if calls.iter().any(|existing: &ToolCall| existing.id == call.id) { return None; }
+            if calls
+                .iter()
+                .any(|existing: &ToolCall| existing.id == call.id)
+            {
+                return None;
+            }
             calls.push(call);
             rest = body[end + "</tool_call>".len()..].trim_start();
         } else if let Some(body) = rest.strip_prefix("<function=") {
             let name_end = body.find('>')?;
             let name = body[..name_end].trim();
-            if name.is_empty() || name.len() > 128 { return None; }
+            if name.is_empty() || name.len() > 128 {
+                return None;
+            }
             let body = &body[name_end + 1..];
-            let (args_part, tail) = match body.find("</function>") {
-                Some(end) => (&body[..end], &body[end + "</function>".len()..]),
-                None => (body, ""),
-            };
+            let end = body.find("</function>")?;
+            let (args_part, tail) = (&body[..end], &body[end + "</function>".len()..]);
             let arguments = parse_function_args(args_part.trim())?;
-            calls.push(ToolCall { id: format!("textcall_{}", calls.len()), name: name.into(), arguments });
+            calls.push(ToolCall {
+                id: format!("textcall_{}", calls.len()),
+                name: name.into(),
+                arguments,
+            });
             rest = tail.trim_start();
         } else {
             break;
         }
-        if calls.len() > 8 { return None; }
+        if calls.len() > 8 {
+            return None;
+        }
     }
-    if calls.is_empty() { return None; }
+    if calls.is_empty() {
+        return None;
+    }
     Some(calls)
 }
 
@@ -186,34 +320,50 @@ pub fn parse_text_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
 fn parse_json_call(inner: &str, index: usize) -> Option<ToolCall> {
     let parsed: Value = serde_json::from_str(inner).ok()?;
     let name = parsed["name"].as_str()?.trim();
-    if name.is_empty() || name.len() > 128 { return None; }
+    if name.is_empty() || name.len() > 128 {
+        return None;
+    }
     let arguments = match &parsed["arguments"] {
         Value::Object(_) => parsed["arguments"].clone(),
         Value::String(raw) => serde_json::from_str(raw).ok()?,
         _ => return None,
     };
-    if !arguments.is_object() { return None; }
-    let id = parsed["id"].as_str()
-        .filter(|id| !id.is_empty() && id.len() <= 128)
-        .map(String::from)
-        .unwrap_or_else(|| format!("textcall_{index}"));
-    Some(ToolCall { id, name: name.into(), arguments })
+    if !arguments.is_object() {
+        return None;
+    }
+    let id = match parsed.get("id") {
+        None => format!("textcall_{index}"),
+        Some(value) => {
+            let id = value
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 128)?;
+            id.to_string()
+        }
+    };
+    Some(ToolCall {
+        id,
+        name: name.into(),
+        arguments,
+    })
 }
 
 /// `<function=name>` followed by a bare JSON object or `<parameter=k>v</parameter>`
-/// blocks, optionally closed by `</function>`.
+/// blocks, closed by `</function>`.
 fn parse_function_block(text: &str, index: usize) -> Option<ToolCall> {
     let body = text.strip_prefix("<function=")?;
     let name_end = body.find('>')?;
     let name = body[..name_end].trim();
-    if name.is_empty() || name.len() > 128 { return None; }
+    if name.is_empty() || name.len() > 128 {
+        return None;
+    }
     let body = &body[name_end + 1..];
-    let args_part = match body.find("</function>") {
-        Some(end) => &body[..end],
-        None => body,
-    };
+    let args_part = body.trim_end().strip_suffix("</function>")?;
     let arguments = parse_function_args(args_part.trim())?;
-    Some(ToolCall { id: format!("textcall_{index}"), name: name.into(), arguments })
+    Some(ToolCall {
+        id: format!("textcall_{index}"),
+        name: name.into(),
+        arguments,
+    })
 }
 
 /// `<function>` bodies are either a bare JSON object or Qwen/AREX-style
@@ -234,12 +384,16 @@ fn parse_function_args(body: &str) -> Option<Value> {
         let inner = rest.trim_start().strip_prefix("<parameter=")?;
         let key_end = inner.find('>')?;
         let key = inner[..key_end].trim();
-        if key.is_empty() || key.len() > 128 { return None; }
+        if key.is_empty() || key.len() > 128 {
+            return None;
+        }
         let after = &inner[key_end + 1..];
         let end = after.find("</parameter>")?;
         let raw = after[..end].trim();
         let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()));
-        args.insert(key.to_string(), value);
+        if args.insert(key.to_string(), value).is_some() {
+            return None;
+        }
         rest = &after[end + "</parameter>".len()..];
     }
     Some(Value::Object(args))
@@ -249,22 +403,35 @@ fn parse_function_args(body: &str) -> Option<Value> {
 /// surrounding prose for the stored assistant message.
 pub fn strip_text_tool_calls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    let visible = without_presentation_fences(text);
     let mut rest = text;
     while !rest.is_empty() {
-        let next = [rest.find("<tool_call>"), rest.find("<function=")]
-            .into_iter().flatten().min();
-        let Some(start) = next else { out.push_str(rest); break };
+        let visible_rest = &visible[text.len() - rest.len()..];
+        let next = [visible_rest.find("<tool_call>"), visible_rest.find("<function=")]
+            .into_iter()
+            .flatten()
+            .min();
+        let Some(start) = next else {
+            out.push_str(rest);
+            break;
+        };
         out.push_str(&rest[..start]);
         let after = &rest[start..];
         rest = if let Some(body) = after.strip_prefix("<tool_call>") {
             match body.find("</tool_call>") {
                 Some(end) => &body[end + "</tool_call>".len()..],
-                None => { out.push_str(after); break }
+                None => {
+                    out.push_str(after);
+                    break;
+                }
             }
         } else if let Some(body) = after.strip_prefix("<function=") {
             match body.find("</function>") {
                 Some(end) => &body[end + "</function>".len()..],
-                None => { out.push_str(after); break }
+                None => {
+                    out.push_str(after);
+                    break;
+                }
             }
         } else {
             unreachable!()
@@ -309,6 +476,104 @@ impl ToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Several OpenAI-compatible servers repeat the call id and the tool name
+    /// in every delta. Appending them corrupts both, and the call can no
+    /// longer be resolved.
+    #[test]
+    fn repeated_call_identity_is_replaced_not_appended() {
+        let mut calls = ToolCalls::default();
+        calls
+            .push(&json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
+                "function":{"name":"read","arguments":"{\"path\":"}}]}))
+            .unwrap();
+        calls
+            .push(&json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
+                "function":{"name":"read","arguments":"\"a.txt\"}"}}]}))
+            .unwrap();
+        let finished = calls.finish().unwrap();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].id, "call_abc");
+        assert_eq!(finished[0].name, "read");
+        assert_eq!(finished[0].arguments, json!({"path":"a.txt"}));
+    }
+
+    /// A server that sends an empty identity field in a later delta must not
+    /// wipe the id it already sent.
+    #[test]
+    fn an_empty_repeated_identity_does_not_erase_the_call() {
+        let mut calls = ToolCalls::default();
+        calls
+            .push(&json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
+                "function":{"name":"read","arguments":"{}"}}]}))
+            .unwrap();
+        calls
+            .push(&json!({"tool_calls":[{"index":0,"id":"","type":"function",
+                "function":{"name":"","arguments":""}}]}))
+            .unwrap();
+        let finished = calls.finish().unwrap();
+        assert_eq!(finished[0].id, "call_abc");
+        assert_eq!(finished[0].name, "read");
+    }
+
+    /// A genuinely conflicting identity is rejected rather than guessed at.
+    #[test]
+    fn a_conflicting_call_identity_is_rejected() {
+        let mut calls = ToolCalls::default();
+        calls
+            .push(&json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
+                "function":{"name":"read","arguments":"{}"}}]}))
+            .unwrap();
+        assert!(calls
+            .push(&json!({"tool_calls":[{"index":0,"id":"call_other","type":"function",
+                "function":{"name":"read","arguments":""}}]}))
+            .is_err());
+    }
+
+    #[test]
+    fn null_tool_deltas_are_noops_and_unsupported_call_types_fail() {
+        let mut calls = ToolCalls::default();
+        calls.push(&json!({"tool_calls":null})).unwrap();
+        assert!(calls.finish().unwrap().is_empty());
+        assert!(ToolCalls::default()
+            .push(&json!({"tool_calls":[{"index":0,"type":"custom"}]}))
+            .is_err());
+        assert!(ToolCalls::from_openai_message(&json!({"tool_calls":{}})).is_err());
+        assert!(ToolCalls::from_openai_message(&json!({"tool_calls":[{"type":"custom","id":"x","function":{"name":"run","arguments":"{}"}}]})).is_err());
+    }
+
+    #[test]
+    fn text_and_structured_calls_share_count_and_size_limits() {
+        let call = ToolCall {
+            id: "a".into(),
+            name: "run".into(),
+            arguments: json!({}),
+        };
+        assert!(ToolCalls::from_parsed(vec![call.clone(); 9])
+            .finish()
+            .is_err());
+        let mut large = call;
+        large.arguments = json!({"code":"x".repeat(65_536)});
+        assert!(ToolCalls::from_parsed(vec![large]).finish().is_err());
+    }
+
+    #[test]
+    fn incomplete_or_ambiguous_text_calls_never_become_executable() {
+        for text in [
+            "<function=clock>",
+            "<function=run>{\"code\":\"x\"}",
+            "<tool_call><function=clock></tool_call>",
+            "<function=run><parameter=code>first</parameter><parameter=code>second</parameter></function>",
+            "<tool_call><function=clock>{}</function>ignored</tool_call>",
+            "<tool_call>{\"id\":\"\",\"name\":\"clock\",\"arguments\":{}}</tool_call>",
+        ] {
+            assert!(parse_text_tool_calls(text).is_none(), "accepted {text}");
+        }
+        assert!(ToolCalls::from_parsed(
+            parse_text_tool_calls("<function=clock></function>").unwrap()
+        )
+        .finish()
+        .is_ok());
+    }
     #[test]
     fn assembles_interleaved_calls_in_index_order() {
         let mut calls = ToolCalls::default();
@@ -353,7 +618,8 @@ mod tests {
         let assembled = ToolCalls::from_parsed(calls).finish().unwrap();
         assert_eq!(assembled[0].name, "search");
 
-        let legacy = parse_text_tool_calls("<function=search>{\"query\":[\"q\"]}</function>").unwrap();
+        let legacy =
+            parse_text_tool_calls("<function=search>{\"query\":[\"q\"]}</function>").unwrap();
         assert_eq!(legacy[0].name, "search");
 
         // AREX's native Qwen-style form: parameter blocks inside the wrapper.
@@ -385,6 +651,23 @@ mod tests {
     }
 
     #[test]
+    fn presentation_fences_never_become_text_tool_calls() {
+        for opener in ["```openui", "```openui-lang", "~~~~openui", "> ```openui", "- ```openui"] {
+            let code = format!("{opener}\nroot = Response([CodeBlock(\"<tool_call>{{\\\"name\\\":\\\"shell\\\",\\\"arguments\\\":{{}}}}</tool_call>\")])\n");
+            // Literal legacy markup, plus Unicode to verify offset masking.
+            let source = format!("{code}例 <function=shell>{{}}</function>\n");
+            assert!(parse_text_tool_calls(&source).is_none(), "{opener}");
+            assert_eq!(strip_text_tool_calls(&source), source.trim());
+        }
+        let visual = "```openui\nroot = Response([Text(\"<function=shell>{}</function>\")])\n```";
+        let mixed = format!("{visual}\n<tool_call>{{\"name\":\"clock\",\"arguments\":{{}}}}</tool_call>");
+        let calls = parse_text_tool_calls(&mixed).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "clock");
+        assert_eq!(strip_text_tool_calls(&mixed), visual);
+    }
+
+    #[test]
     fn text_tool_calls_parse_after_prose() {
         // The observed failure: commentary first, then the call markup.
         let calls = parse_text_tool_calls(
@@ -405,7 +688,9 @@ mod tests {
 
         // A malformed embedded block still fails the whole parse.
         assert!(parse_text_tool_calls("prose <tool_call>not json</tool_call>").is_none());
-        assert!(parse_text_tool_calls("prose <tool_call>{\"name\":\"x\",\"arguments\":{}}").is_none());
+        assert!(
+            parse_text_tool_calls("prose <tool_call>{\"name\":\"x\",\"arguments\":{}}").is_none()
+        );
     }
 
     #[test]

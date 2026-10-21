@@ -27,7 +27,10 @@ pub fn validate_todos(todos: &[Todo]) -> Result<(), String> {
             return Err("Each todo needs 1-500 characters of text.".into());
         }
         if ![PENDING, IN_PROGRESS, COMPLETED].contains(&todo.status.as_str()) {
-            return Err(format!("Unknown todo status '{}'. Use pending, in_progress, or completed.", todo.status));
+            return Err(format!(
+                "Unknown todo status '{}'. Use pending, in_progress, or completed.",
+                todo.status
+            ));
         }
     }
     Ok(())
@@ -50,12 +53,18 @@ pub fn parse_plan_steps(plan_text: &str) -> Vec<Todo> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let Some(raw) = step_text(trimmed) else { continue };
+        let Some(raw) = step_text(trimmed) else {
+            continue;
+        };
         let text = strip_md(raw);
         if text.len() < 3 || text.len() > 500 {
             continue;
         }
-        let status = if todos.is_empty() { IN_PROGRESS } else { PENDING };
+        let status = if todos.is_empty() {
+            IN_PROGRESS
+        } else {
+            PENDING
+        };
         todos.push(Todo {
             text,
             status: status.to_string(),
@@ -110,7 +119,12 @@ pub fn current_task_line(todos: &[Todo]) -> Option<String> {
         .iter()
         .enumerate()
         .find(|(_, todo)| todo.status == IN_PROGRESS)
-        .or_else(|| todos.iter().enumerate().find(|(_, todo)| todo.status == PENDING));
+        .or_else(|| {
+            todos
+                .iter()
+                .enumerate()
+                .find(|(_, todo)| todo.status == PENDING)
+        });
     let mut line = format!("Checklist progress: {done}/{total} complete.");
     match current {
         Some((index, todo)) => {
@@ -120,7 +134,9 @@ pub fn current_task_line(todos: &[Todo]) -> Option<String> {
             ));
         }
         None => {
-            line.push_str(" All tasks are complete. Summarize the answer and do not call more tools.");
+            line.push_str(
+                " All tasks are complete. Summarize the answer and do not call more tools.",
+            );
         }
     }
     Some(line)
@@ -139,8 +155,15 @@ pub fn parse_todo_write(arguments: &serde_json::Value) -> Result<Vec<Todo>, Stri
             .get("text")
             .and_then(|value| value.as_str())
             .ok_or("Each todo needs a 'text' string.")?;
-        let status = item.get("status").and_then(|value| value.as_str()).unwrap_or(PENDING);
-        todos.push(Todo { text: text.to_string(), status: status.to_string(), updated_at: now });
+        let status = item
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or(PENDING);
+        todos.push(Todo {
+            text: text.to_string(),
+            status: status.to_string(),
+            updated_at: now,
+        });
     }
     validate_todos(&todos)?;
     Ok(todos)
@@ -151,7 +174,11 @@ fn make_todo(text: &str) -> Result<Todo, String> {
     if text.trim().is_empty() || text.len() > 500 {
         return Err("Each todo needs 1-500 characters of text.".into());
     }
-    Ok(Todo { text: text.to_string(), status: PENDING.to_string(), updated_at: crate::store::now() })
+    Ok(Todo {
+        text: text.to_string(),
+        status: PENDING.to_string(),
+        updated_at: crate::store::now(),
+    })
 }
 
 /// One-line open-work summary injected into the turn context (logged).
@@ -190,17 +217,26 @@ pub fn summary_line(todos: &[Todo], goal: Option<&str>, todo_tools: &[&str]) -> 
 }
 
 #[tauri::command]
-pub fn get_todos(state: tauri::State<'_, crate::AppState>, conversation_id: String) -> Result<Vec<Todo>, String> {
+pub fn get_todos(
+    state: tauri::State<'_, crate::AppState>,
+    conversation_id: String,
+) -> Result<Vec<Todo>, String> {
     state.database()?.todos(&conversation_id)
 }
 
 #[tauri::command]
-pub fn get_goal(state: tauri::State<'_, crate::AppState>, conversation_id: String) -> Result<Option<String>, String> {
+pub fn get_goal(
+    state: tauri::State<'_, crate::AppState>,
+    conversation_id: String,
+) -> Result<Option<String>, String> {
     state.database()?.goal(&conversation_id)
 }
 
 #[tauri::command]
-pub fn clear_todos(state: tauri::State<'_, crate::AppState>, conversation_id: String) -> Result<(), String> {
+pub fn clear_todos(
+    state: tauri::State<'_, crate::AppState>,
+    conversation_id: String,
+) -> Result<(), String> {
     state.database()?.save_todos(&conversation_id, &[])
 }
 
@@ -210,23 +246,45 @@ mod tests {
     #[test]
     fn rejects_bad_todo_states_and_sizes() {
         assert!(validate_todos(&[]).is_ok());
-        assert!(validate_todos(&[Todo { text: "".into(), status: PENDING.into(), updated_at: 0 }]).is_err());
-        assert!(validate_todos(&[Todo { text: "x".into(), status: "later".into(), updated_at: 0 }]).is_err());
+        assert!(validate_todos(&[Todo {
+            text: "".into(),
+            status: PENDING.into(),
+            updated_at: 0
+        }])
+        .is_err());
+        assert!(validate_todos(&[Todo {
+            text: "x".into(),
+            status: "later".into(),
+            updated_at: 0
+        }])
+        .is_err());
         assert!(validate_objective("").is_err());
         assert!(validate_objective(&"x".repeat(4001)).is_err());
     }
     #[test]
     fn summary_mentions_goal_and_open_items_only() {
         let todos = vec![
-            Todo { text: "done thing".into(), status: COMPLETED.into(), updated_at: 0 },
-            Todo { text: "next thing".into(), status: IN_PROGRESS.into(), updated_at: 0 },
+            Todo {
+                text: "done thing".into(),
+                status: COMPLETED.into(),
+                updated_at: 0,
+            },
+            Todo {
+                text: "next thing".into(),
+                status: IN_PROGRESS.into(),
+                updated_at: 0,
+            },
         ];
         let line = summary_line(&todos, Some("ship it"), &["todo_add", "todo_update"]).unwrap();
-        assert!(line.contains("ship it") && line.contains("next thing") && !line.contains("done thing"));
+        assert!(
+            line.contains("ship it") && line.contains("next thing") && !line.contains("done thing")
+        );
         assert!(line.contains("todo_add/todo_update"));
         let write_only = summary_line(&todos, None, &["todo_write"]).unwrap();
         assert!(write_only.contains("todo_write") && !write_only.contains("todo_update"));
-        assert!(summary_line(&todos, None, &[]).unwrap().contains("no todo tools"));
+        assert!(summary_line(&todos, None, &[])
+            .unwrap()
+            .contains("no todo tools"));
         assert!(summary_line(&[], None, &["todo_write"]).is_none());
     }
     #[test]
@@ -258,17 +316,35 @@ mod tests {
     #[test]
     fn current_task_line_names_the_in_progress_item() {
         let todos = vec![
-            Todo { text: "done thing".into(), status: COMPLETED.into(), updated_at: 0 },
-            Todo { text: "open the paper".into(), status: IN_PROGRESS.into(), updated_at: 0 },
-            Todo { text: "verify".into(), status: PENDING.into(), updated_at: 0 },
+            Todo {
+                text: "done thing".into(),
+                status: COMPLETED.into(),
+                updated_at: 0,
+            },
+            Todo {
+                text: "open the paper".into(),
+                status: IN_PROGRESS.into(),
+                updated_at: 0,
+            },
+            Todo {
+                text: "verify".into(),
+                status: PENDING.into(),
+                updated_at: 0,
+            },
         ];
         let line = current_task_line(&todos).unwrap();
         assert!(line.contains("1/3 complete"));
         assert!(line.contains("index 1"));
         assert!(line.contains("open the paper"));
         assert!(line.contains("Do not skip ahead"));
-        let finished = vec![Todo { text: "done".into(), status: COMPLETED.into(), updated_at: 0 }];
-        assert!(current_task_line(&finished).unwrap().contains("All tasks are complete"));
+        let finished = vec![Todo {
+            text: "done".into(),
+            status: COMPLETED.into(),
+            updated_at: 0,
+        }];
+        assert!(current_task_line(&finished)
+            .unwrap()
+            .contains("All tasks are complete"));
         assert!(current_task_line(&[]).is_none());
     }
 }

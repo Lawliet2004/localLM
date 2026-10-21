@@ -1,107 +1,233 @@
-/* ------------------------------------------------------------------
-   LocalLM design tokens
-   Dark-first palette: deep layered neutrals, emerald brand accent.
-------------------------------------------------------------------- */
+/* Shared palette: warm paper, forest ink, and a single purposeful accent. */
+@font-face { font-family: 'IBM Plex Sans'; src: url('./assets/fonts/IBMPlexSans-Regular.ttf') format('truetype'); font-weight: 400; font-display: swap; }
+@font-face { font-family: 'IBM Plex Sans'; src: url('./assets/fonts/IBMPlexSans-Medium.ttf') format('truetype'); font-weight: 500; font-display: swap; }
+@font-face { font-family: 'IBM Plex Sans'; src: url('./assets/fonts/IBMPlexSans-SemiBold.ttf') format('truetype'); font-weight: 600 800; font-display: swap; }
+@font-face { font-family: 'IBM Plex Serif'; src: url('./assets/fonts/IBMPlexSerif-Regular.ttf') format('truetype'); font-weight: 400; font-display: swap; }
 :root {
-  color-scheme: dark;
-
-  /* Typography */
-  --font-sans: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif;
-  --font-mono: 'Cascadia Code', 'JetBrains Mono', Consolas, 'Liberation Mono', monospace;
-
-  /* Surfaces — darkest at the edges, lighter as layers rise */
-  --background: #0a0c11;
-  --sidebar: #07090d;
-  --surface: #10141c;
-  --input: #12161f;
-  --elevated: #171c27;
-  --overlay: #1c222e;
-
-  /* Text */
-  --text: #eceef4;
-  --foreground: #eceef4;
-  --secondary: #9aa2b4;
-  --muted: #676f84;
-
-  /* Lines & fills */
-  --border: #1d2330;
-  --border-strong: #2c3346;
-  --hover: #1a2029;
-  --active: #212839;
-
-  /* Brand & semantic */
-  --accent: #34d399;
-  --accent-strong: #6ee7b7;
-  --accent-subtle: #34d39914;
-  --accent-soft: #34d39921;
-  --accent-2: #818cf8;
-  --accent-3: #22d3ee;
-  --warn: #fbbf24;
-  --grad-accent: linear-gradient(135deg, var(--accent) 0%, var(--accent-3) 100%);
-  --folder: #d9a45b;
-  --focus-border: #34d399;
-
-  /* Buttons */
-  --button-bg: #f2f4f9;
-  --button-text: #11141b;
-
-  /* Feedback */
-  --error: #f87171;
-  --error-bg: #3a1518;
-  --error-subtle: #f8717114;
-
-  /* Radius scale */
+  color-scheme: light;
+  --font-sans: 'IBM Plex Sans', 'Segoe UI', sans-serif;
+  --font-mono: 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
+  --chat-font: var(--font-sans);
+  --chat-font-size: 16px;
+  --code-font-size: 13px;
+  --chat-max-width: 824px;
+  --background: #eeeee7;
+  --sidebar: #f3f3ed;
+  --surface: #fcfcf8;
+  --input: #ffffff;
+  --elevated: #ffffff;
+  --overlay: #f6f6f0;
+  --text: #26382f;
+  --foreground: #26382f;
+  --secondary: #536153;
+  --muted: #536153;
+  --border: #e1e4da;
+  --border-strong: #c9d0c4;
+  --hover: #e9ede3;
+  --active: #e0e8da;
+  --accent: #356349;
+  --accent-strong: #254e37;
+  --accent-subtle: #35634908;
+  --accent-soft: #35634914;
+  --accent-2: #356349;
+  --accent-3: #356349;
+  --warn: #8a5c15;
+  --folder: #6c8069;
+  --focus-border: #356349;
+  --grad-accent: linear-gradient(var(--accent), var(--accent));
+  --button-bg: #356349;
+  --button-text: #ffffff;
+  --error: #ad4036;
+  --error-bg: #fff0eb;
+  --error-subtle: #ad403608;
+  --rail-bg: #e8ebe2;
+  --rail-text: #5c6d5c;
   --radius-xs: 5px;
   --radius-sm: 8px;
   --radius-md: 10px;
   --radius-lg: 14px;
   --radius-xl: 20px;
   --radius-pill: 999px;
-
-  /* Elevation */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .28);
-  --shadow-md: 0 8px 28px rgba(0, 0, 0, .36);
-  --shadow-lg: 0 20px 56px rgba(0, 0, 0, .5);
-  --ring: 0 0 0 3px var(--accent-subtle);
+  --shadow-sm: 0 2px 4px #26382f05;
+  --shadow-md: 0 8px 24px #26382f0c;
+  --shadow-lg: 0 16px 48px #26382f18;
+  --ring: 0 0 0 3px var(--accent-soft);
   --ring-strong: 0 0 0 2px var(--accent);
-
-  /* Motion */
-  --dur: .16s;
+  --dur: .18s;
   --ease: cubic-bezier(.22, .68, .32, 1);
+
+  /* Activity categories: each kind of assistant work keeps one hue across
+     icons, labels and borders. Status (success/warn/error/interrupted) stays
+     a separate axis so a blue command can still show a red failure. */
+  --cat-reasoning: #6d4fa1;
+  --cat-command: #2f5ea8;
+  --cat-web: #0e7490;
+  --cat-read: #48796e;
+  --cat-edit: #8a5c15;
+  --cat-tool: #5c6b84;
+  --cat-reasoning-soft: #6d4fa114;
+  --cat-command-soft: #2f5ea812;
+  --cat-web-soft: #0e749012;
+  --cat-read-soft: #48796e14;
+  --cat-edit-soft: #8a5c1514;
+  --cat-tool-soft: #5c6b8412;
+  --cat-reasoning-border: #6d4fa13d;
+  --cat-command-border: #2f5ea83d;
+  --cat-web-border: #0e74903d;
+  --cat-read-border: #48796e3d;
+  --cat-edit-border: #8a5c153d;
+  --cat-tool-border: #5c6b843d;
+
+  /* Permission modes: safe follows the active accent, read-only uses the
+     command blue, and full access uses the warning color. */
+  --permission-safe: var(--accent);
+  --permission-safe-soft: color-mix(in srgb, var(--accent) 10%, transparent);
+  --permission-safe-border: color-mix(in srgb, var(--accent) 30%, transparent);
+  --permission-reads: var(--cat-command);
+  --permission-reads-soft: var(--cat-command-soft);
+  --permission-reads-border: var(--cat-command-border);
+  --permission-full: var(--warn);
+  --permission-full-soft: var(--cat-edit-soft);
+  --permission-full-border: var(--cat-edit-border);
+
+  /* Code surface: warm tint of the paper palette instead of a fixed dark. */
+  --code-bg: #f4f4ec;
+  --code-fg: #26382f;
+  --code-border: #e1e4da;
+  --code-header-bg: #ecede4;
+  --code-gutter: #8a9488;
+
+  /* Syntax palette tuned for the code surface in each theme. */
+  --syn-keyword: #6d4fa1;
+  --syn-string: #356349;
+  --syn-number: #8a5c15;
+  --syn-comment: #66725f;
+  --syn-function: #2f5ea8;
+  --syn-type: #0e7490;
+  --syn-attr: #9a4561;
+  --syn-meta: #5c6b84;
+  --syn-link: #2f5ea8;
+
+  /* Diff surfaces and markers. */
+  --diff-add-fg: #245d36;
+  --diff-add-bg: #3563491c;
+  --diff-del-fg: #9c3028;
+  --diff-del-bg: #ad40361a;
+  --diff-hdr-fg: #536153;
+  --diff-hdr-bg: #e9ede3;
 }
-:root[data-theme=light] {
-  color-scheme: light;
-  --background: #f5f6f3;
-  --sidebar: #eceee8;
-  --surface: #ffffff;
-  --input: #ffffff;
-  --elevated: #ffffff;
-  --overlay: #ffffff;
-  --text: #22261f;
-  --foreground: #22261f;
-  --secondary: #4e564d;
-  --muted: #707769;
-  --border: #e0e3da;
-  --border-strong: #c8cdc0;
-  --hover: #e9ece2;
-  --active: #dde1d3;
-  --accent: #2e7d52;
-  --accent-strong: #1d6a44;
-  --accent-subtle: #2e7d5212;
-  --accent-soft: #2e7d521f;
-  --accent-2: #6366f1;
-  --accent-3: #0891b2;
-  --warn: #b45309;
-  --grad-accent: linear-gradient(135deg, var(--accent) 0%, var(--accent-3) 100%);
-  --folder: #b07f2e;
-  --focus-border: #7a8d7d;
-  --button-bg: #2c4634;
-  --button-text: #ffffff;
-  --error: #9d3731;
-  --error-bg: #fae9e5;
-  --error-subtle: #9d373114;
-  --shadow-sm: 0 1px 2px rgba(30, 35, 28, .08);
-  --shadow-md: 0 8px 24px rgba(30, 35, 28, .1);
-  --shadow-lg: 0 18px 48px rgba(30, 35, 28, .16);
-  --ring: 0 0 0 3px var(--accent-subtle);
+:root[data-theme=dark] {
+  color-scheme: dark;
+  --background: #191f1c;
+  --sidebar: #202722;
+  --surface: #252d27;
+  --input: #2a332c;
+  --elevated: #303b32;
+  --overlay: #29322b;
+  --text: #e8ede2;
+  --foreground: #e8ede2;
+  --secondary: #b2bdae;
+  --muted: #a1ae9d;
+  --border: #374238;
+  --border-strong: #52604f;
+  --hover: #303c32;
+  --active: #3b4c3c;
+  --accent: #afc9a0;
+  --accent-strong: #c6dbb9;
+  --accent-subtle: #afc9a008;
+  --accent-soft: #afc9a018;
+  --accent-2: #afc9a0;
+  --accent-3: #afc9a0;
+  --warn: #dfb974;
+  --folder: #afc9a0;
+  --focus-border: #afc9a0;
+  --button-bg: #afc9a0;
+  --button-text: #202b21;
+  --error: #f2a292;
+  --error-bg: #402d28;
+  --error-subtle: #f2a2920a;
+  --rail-bg: #1c241f;
+  --rail-text: #a3b39e;
+  --shadow-sm: 0 2px 4px #00000010;
+  --shadow-md: 0 8px 24px #00000024;
+  --shadow-lg: 0 16px 48px #00000038;
+
+  --cat-reasoning: #c8aef0;
+  --cat-command: #9dbef2;
+  --cat-web: #7fc8d4;
+  --cat-read: #92b7aa;
+  --cat-edit: #dfb974;
+  --cat-tool: #a4aec0;
+  --cat-reasoning-soft: #c8aef01a;
+  --cat-command-soft: #9dbef21a;
+  --cat-web-soft: #7fc8d419;
+  --cat-read-soft: #92b7aa1a;
+  --cat-edit-soft: #dfb9741a;
+  --cat-tool-soft: #a4aec01a;
+  --cat-reasoning-border: #c8aef052;
+  --cat-command-border: #9dbef24f;
+  --cat-web-border: #7fc8d44f;
+  --cat-read-border: #92b7aa4f;
+  --cat-edit-border: #dfb9744f;
+  --cat-tool-border: #a4aec04f;
+
+  --code-bg: #1e2621;
+  --code-fg: #dfe6db;
+  --code-border: #39443b;
+  --code-header-bg: #27302a;
+  --code-gutter: #7e8a7c;
+
+  --syn-keyword: #c8aef0;
+  --syn-string: #a9d69a;
+  --syn-number: #dfb974;
+  --syn-comment: #8a9488;
+  --syn-function: #9dbef2;
+  --syn-type: #7fc8d4;
+  --syn-attr: #dba8bc;
+  --syn-meta: #a4aec0;
+  --syn-link: #9dbef2;
+
+  --diff-add-fg: #b2d99e;
+  --diff-add-bg: #b2d99e1a;
+  --diff-del-fg: #ffb7af;
+  --diff-del-bg: #f2a29219;
+  --diff-hdr-fg: #a1ae9d;
+  --diff-hdr-bg: #303c32;
+}
+/* ANSI output remains readable on each theme's tool surface. */
+:root {
+  --terminal-black: #26382f;
+  --terminal-red: #9c3028;
+  --terminal-green: #245d36;
+  --terminal-yellow: #7b4f00;
+  --terminal-blue: #204d9c;
+  --terminal-magenta: #803b7b;
+  --terminal-cyan: #22616c;
+  --terminal-white: #26382f;
+  --terminal-bright-black: #536153;
+  --terminal-bright-red: #ad4036;
+  --terminal-bright-green: #356349;
+  --terminal-bright-yellow: #8a5c15;
+  --terminal-bright-blue: #275ba6;
+  --terminal-bright-magenta: #8a377d;
+  --terminal-bright-cyan: #086c76;
+  --terminal-bright-white: #26382f;
+}
+:root[data-theme=dark] {
+  --terminal-black: #a1ae9d;
+  --terminal-red: #ff9e94;
+  --terminal-green: #b2d99e;
+  --terminal-yellow: #edcb85;
+  --terminal-blue: #a9c8ff;
+  --terminal-magenta: #e9b4df;
+  --terminal-cyan: #9bd2d3;
+  --terminal-white: #e8ede2;
+  --terminal-bright-black: #b2bdae;
+  --terminal-bright-red: #ffb7af;
+  --terminal-bright-green: #c5e8b5;
+  --terminal-bright-yellow: #f5dc9e;
+  --terminal-bright-blue: #c4d8ff;
+  --terminal-bright-magenta: #f3c8eb;
+  --terminal-bright-cyan: #b5e5e5;
+  --terminal-bright-white: #ffffff;
 }

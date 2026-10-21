@@ -11,24 +11,49 @@ export interface RuntimeConfig {
   cacheTypeV: CacheType;
   offloadKvCache: boolean;
   mmap: boolean;
+  visionEnabled: boolean;
+  offloadProjector: boolean;
   inferenceSlots: number;
 }
 
 export const defaultRuntimeConfig: RuntimeConfig = {
   contextLength: 131072, gpuLayers: -1, cpuThreads: 6, batchSize: 512,
   microBatchSize: 128, flashAttention: true, cacheTypeK: 'q8_0', cacheTypeV: 'q8_0',
-  offloadKvCache: true, mmap: true, inferenceSlots: 1,
+  offloadKvCache: true, mmap: true, inferenceSlots: 1, visionEnabled: true, offloadProjector: true,
 };
 
 export interface Conversation {
   id: string; title: string; updatedAt: number;
   providerId: string | null; modelId: string | null; providerSelectionRequired: boolean;
 }
+export type PresentationMode = 'auto' | 'text' | 'visual';
+export interface PresentationRecord {
+  messageId: string; format: 'markdown' | 'openui'; formatVersion: number;
+  libraryVersion: string; sourceText: string; uiProgram: string;
+  interactiveState: Record<string, unknown>;
+  generationStatus: 'streaming' | 'complete' | 'interrupted' | 'error';
+  diagnostic?: string | null;
+}
+export interface PresentationModes { defaultMode: PresentationMode; overrideMode: PresentationMode | null; effectiveMode: PresentationMode }
 export interface Message {
+  presentation?: PresentationRecord;
+  metrics?: ResponseMetrics | null;
   error?: string | null;
   id: string; conversationId: string; role: 'user' | 'assistant' | 'tool';
-  content: string; reasoning: string; status: 'complete' | 'streaming' | 'interrupted' | 'error'; createdAt: number;
+  content: string; reasoning: string; status: 'complete' | 'streaming' | 'interrupted' | 'error' | 'paused'; createdAt: number;
 }
+export interface InferenceRound {
+  phase?: string;
+  usage: {
+    inputTokens?: number | null; outputTokens?: number | null; cachedTokens?: number | null;
+    cacheWriteTokens?: number | null; processedPromptTokens?: number | null;
+    promptMs?: number | null; generationMs?: number | null;
+    generationTokensPerSecond?: number | null; promptTokensPerSecond?: number | null;
+  };
+  firstVisibleAnswerMs?: number | null; reasoningMs?: number | null;
+  firstTokenMs: number | null; durationMs: number; complete: boolean;
+}
+export interface ResponseMetrics { preparationMs?: number | null; toolsMs?: number | null; approvalMs?: number | null; model: string; rounds: InferenceRound[]; totalMs: number }
 export interface InstalledModel {
   id: string; filename: string; path: string; bytes: number; repo: string | null;
   revision: string | null; files: string[]; complete: boolean; received?: number;
@@ -44,25 +69,54 @@ export interface ModelMetadata {
 }
 export interface Preferences {
   runtimePath: string; modelPath: string; projectorPath?: string; temperature: number; topP: number; maxTokens: number;
+  reasoningMode?: 'auto' | 'quick' | 'think';
+  generativeUi?: boolean;
   systemPrompt: string;
 }
-export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null; gpuOffload?: { layers: number; totalLayers: number } | null }
+export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null; gpuOffload?: { layers: number; totalLayers: number } | null; projector?: { path: string; offload: boolean; fileBytes: number } | null }
 export type ToolSupport = 'unknown' | 'supported' | 'unsupported';
-export interface RemoteModel { supportsImages?: boolean; id: string; contextLength: number | null; maxOutputTokens: number | null; toolSupport: ToolSupport }
+export interface ModelControls {
+  source: 'configured' | 'provider-reported';
+  endpointFingerprint?: string | null;
+  temperature: ToolSupport; topP: ToolSupport; reasoningEffort: ToolSupport;
+  toolChoice: ToolSupport; parallelToolCalls: ToolSupport; structuredOutput: ToolSupport;
+  tokenLimitField: 'protocol-default' | 'max-tokens' | 'max-completion-tokens' | 'max-output-tokens';
+}
+export interface RemoteModel { supportsImages?: boolean; id: string; contextLength: number | null; maxOutputTokens: number | null; toolSupport: ToolSupport; controls?: ModelControls | null }
+export type ApiFormat = 'openai-chat-completions' | 'openai-responses' | 'chatgpt-subscription' | 'grok-subscription' | 'freetoken-openai' | 'claude-messages';
 export interface ProviderConnection {
-  id: string; name: string; apiFormat: 'openai-chat-completions' | 'chatgpt-subscription' | 'grok-subscription' | 'freetoken-openai'; baseUrl: string;
+  id: string; name: string; apiFormat: ApiFormat; baseUrl: string;
   verified: boolean; lastTestedAt: number | null; models: RemoteModel[]; hasApiKey: boolean;
 }
+export interface ProviderDraft {
+  id?: string | null; name: string; apiFormat: ApiFormat; baseUrl: string;
+  apiKey?: string | null; models: RemoteModel[];
+}
+export interface ProviderTestResult { verified: boolean; modelListSupported: boolean; models: string[]; message: string }
 export interface ModelSelection { providerId: string | null; modelId: string }
 export interface Bootstrap {
   conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus;
   rememberedTools: RememberedTools; providers: ProviderConnection[]; preferredModel: ModelSelection;
 }
 export interface RememberedTools { sources: string[]; tools: ToolSelection[]; accessMode?: AccessMode }
-export interface ToolApproval { id: string; kind?: 'tool' | 'ask_user'; connector: string; localServerName?: string | null; name: string; arguments: Record<string, unknown> }
+export interface McpInputField {
+  name: string; required?: boolean;
+  kind: 'text' | 'number' | 'integer' | 'boolean' | 'select' | 'multi';
+  title?: string; description?: string; default?: unknown;
+  format?: string; minLength?: number; maxLength?: number;
+  minimum?: number; maximum?: number;
+  options?: { value: string; label?: string }[];
+  minItems?: number; maxItems?: number;
+}
+export interface McpInputForm { message: string; fields: McpInputField[] }
+export interface ToolApproval { purpose?: string | null; id: string; kind?: 'tool' | 'ask_user' | 'mcp_input' | 'plan_approval'; connector: string; localServerName?: string | null; name: string; arguments: Record<string, unknown>; form?: McpInputForm | null; closed?: boolean }
 export interface AskUserApproval extends ToolApproval { kind: 'ask_user'; }
-export interface ContextUsage { inputTokens: number; responseReserve: number; contextLength: number; estimated?: boolean }
-export interface PreflightBreakdown { total: number; instructions: number; tools: number; history: number; scratchpad?: number; draft: number; responseReserve: number; contextLength: number; exact: boolean; fits: boolean; notice?: string; overflow?: string }
+export interface ContextUsage {
+  inputTokens: number; responseReserve: number; contextLength: number; estimated?: boolean;
+  cachedTokens?: number | null; cacheWriteTokens?: number | null; outputTokens?: number | null;
+  cacheHitRate?: number | null; promptMs?: number | null; generationMs?: number | null;
+}
+export interface PreflightBreakdown { presentation?: {profile:string;minimumInputTokens:number;separateRequest:boolean;estimated:boolean;contextLength:number;responseReserve:number}; offeredToolCount?: number; total: number; instructions: number; tools: number; history: number; scratchpad?: number; draft: number; responseReserve: number; contextLength: number; exact: boolean; fits: boolean; notice?: string; overflow?: string }
 export interface Preset {
   id: string;
   name: string;
@@ -99,6 +153,7 @@ export type RunState =
   | 'awaiting_approval'
   | 'executing_tools'
   | 'preparing_next_round'
+  | 'paused'
   | 'completed'
   | 'cancelled'
   | 'failed'
@@ -158,6 +213,7 @@ export interface TodoItem {
 }
 
 export interface ChatEvent {
+  presentation?: PresentationRecord;
   notice?: string;
   messageId: string;
   content: string;
@@ -191,8 +247,23 @@ export interface SkillUpdateStatus {
   id: string; installedRevision: string | null; catalogRevision: string;
   updateAvailable: boolean; intact: boolean; problem: string | null;
 }
-export interface ExecutionConfig { pythonPath: string; nodePath: string; powershellPath: string }
-export interface WebSearchConfig { provider: 'searxng' | 'google'; searxngBaseUrl: string; googleApiKey: string; googleCxId: string; searchFallbackEnabled: boolean }
+export interface ExecutionPolicy {
+  enabled: boolean; timeoutSeconds: number; workingDirectory: string;
+  environment: Record<string, string>; alwaysAsk: boolean;
+  memoryLimitMib?: number | null;
+}
+export interface WeatherConfig { enabled: boolean; location: string; temperatureUnit: 'celsius' | 'fahrenheit' }
+export interface GitReview {
+  branch: string; branches: string[]; status: string; diff: string; repository?: boolean;
+  files?: { path: string; status: string; previousPath?: string }[]; truncated?: boolean; stagedTree?: string | null;
+}
+export type GitAction = { action: 'stage' | 'unstage'; paths: string[] } | { action: 'commit'; message: string; expectedTree: string; confirmed: boolean } | { action: 'createBranch'; name: string } | { action: 'history' };
+export interface GitHistoryEntry { id: string; shortId: string; author: string; date: string; subject: string }
+export interface ExecutionConfig {
+  pythonPath: string; nodePath: string; powershellPath: string;
+  bashPath?: string; bash?: ExecutionPolicy; python?: ExecutionPolicy; pythonVenv?: string;
+}
+export interface WebSearchConfig { provider: 'searxng' | 'google'; searxngBaseUrl: string; hasGoogleApiKey?: boolean; googleApiKey?: string; clearGoogleApiKey?: boolean; googleCxId: string; searchFallbackEnabled: boolean; enabled?: boolean; mode?: 'fast' | 'normal' | 'deep' }
 export interface HardwareStatus {
   logicalCpus: number; memoryTotalBytes: number | null; memoryAvailableBytes: number | null;
   gpuStatus: string; sampledAt: number;
@@ -225,4 +296,93 @@ export interface Hit {
   role: string;
   excerpt: string;
   createdAt: number;
+}
+
+export interface AutomationConfig {
+  browserEnabled: boolean; computerEnabled: boolean; browserPackagePath: string;
+  browserExecutablePath: string; browserChannel: 'chrome' | 'msedge'; headless: boolean;
+}
+export interface LspServerConfig {
+  id: string;
+  languageId: string;
+  command: string;
+  enabled: boolean;
+  arguments: string[];
+  environment: Record<string, string>;
+  initializationOptions: unknown;
+  settings: unknown;
+  timeoutSeconds: number;
+  allowedCommands?: string[];
+}
+export interface LspConfig {
+  enabled: boolean;
+  alwaysAsk: boolean;
+  servers: LspServerConfig[];
+}
+
+export interface Hook {
+  id: string;
+  event: 'pre_tool_use' | 'post_tool_use' | 'run_finished';
+  matcher: string;
+  command: string;
+  timeoutSecs: number;
+  enabled: boolean;
+}
+
+export interface DebuggerPolicy { requestTimeoutSeconds: number; idleTimeoutSeconds: number; lifetimeSeconds: number }
+export interface ProfilerConfig { nativeExecutable: string; exportExecutable: string; exportProfile: string }
+export interface HttpCredentialView { id: string; name: string; header: string; origin: string }
+export interface DatabaseProfile {
+  id: string; name: string; engine: 'postgres' | 'mysql'; host: string; port: number;
+  database: string; username: string; tls: 'verify-full' | 'require' | 'disable';
+  scratchProfileId: string | null; dumpExecutable: string; restoreExecutable: string;
+}
+
+export interface PermissionRuleView {
+  action: 'tool' | 'command' | 'path' | 'host';
+  resource: string;
+  effect: 'allow' | 'deny' | 'ask';
+}
+
+export interface SnapshotFileView {
+  path: string;
+  sha256: string;
+  size: number;
+  deleted: boolean;
+}
+
+export interface SnapshotView {
+  id: string;
+  conversationId: string;
+  step: number;
+  createdAt: number;
+  files: SnapshotFileView[];
+  skipped: string[];
+}
+
+export interface StagedRevertView {
+  id: string;
+  conversationId: string;
+  snapshotId: string;
+  paths: string[];
+  createdAt: number;
+}
+
+export interface RevertReportView {
+  restored: string[];
+  deleted: string[];
+  overwritten: string[];
+  failed: { path: string; reason: string }[];
+}
+
+export interface PluginView {
+  name: string;
+  description: string;
+  command: string[];
+  arguments: Record<string, unknown>;
+  required: string[];
+  timeoutSeconds: number;
+  path: string;
+  status: 'ok' | 'error';
+  error?: string | null;
 }

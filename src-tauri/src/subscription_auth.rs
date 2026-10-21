@@ -1,11 +1,7 @@
 use crate::vault::Vault;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tauri_plugin_opener::OpenerExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -255,8 +251,9 @@ pub fn import_cli_session(vault: &Vault, provider: &str) -> Result<SubscriptionS
             Ok(session)
         }
         PROVIDER_GROK | "grok-subscription" => {
-            let path = grok_auth_path()
-                .ok_or_else(|| "Grok Build CLI auth file not found (~/.grok/auth.json)".to_string())?;
+            let path = grok_auth_path().ok_or_else(|| {
+                "Grok Build CLI auth file not found (~/.grok/auth.json)".to_string()
+            })?;
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
             let session = parse_grok_auth_content(&content)?;
@@ -285,9 +282,13 @@ pub fn save_manual_token(
     let session = SubscriptionSession {
         provider: canonical_provider.to_string(),
         access_token: token.trim().to_string(),
-        refresh_token: refresh_token.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        refresh_token: refresh_token
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         expires_at: None,
-        account_id: account_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        account_id: account_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         plan_type: Some("Subscription (Manual Token)".into()),
         source: "manual".into(),
         updated_at: crate::store::now(),
@@ -363,7 +364,10 @@ pub async fn refresh_subscription_token(
             );
             let response = client
                 .post("https://auth.openai.com/oauth/token")
-                .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
                 .body(body)
                 .send()
                 .await
@@ -396,7 +400,10 @@ pub async fn refresh_subscription_token(
             );
             let response = client
                 .post("https://auth.x.ai/oauth/token")
-                .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
                 .body(body)
                 .send()
                 .await
@@ -428,8 +435,11 @@ pub async fn refresh_subscription_token(
 }
 
 pub async fn get_valid_access_token(vault: &Vault, provider: &str) -> Result<String, String> {
-    let session = load_session(vault, provider)?
-        .ok_or_else(|| format!("No active subscription session found for {provider}. Sign in or sync from CLI first."))?;
+    let session = load_session(vault, provider)?.ok_or_else(|| {
+        format!(
+            "No active subscription session found for {provider}. Sign in or sync from CLI first."
+        )
+    })?;
 
     let now_sec = crate::store::now() / 1000;
     let needs_refresh = session
@@ -469,8 +479,8 @@ pub fn base64url_encode(data: &[u8]) -> String {
 }
 
 pub fn generate_pkce() -> (String, String) {
-    use aes_gcm::aead::OsRng;
     use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::aead::OsRng;
     let mut random_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut random_bytes);
     let verifier = base64url_encode(&random_bytes);
@@ -498,10 +508,7 @@ pub async fn sign_in_subscription(
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("Could not open local OAuth callback listener: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| e.to_string())?
-        .port();
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
     let (verifier, challenge) = generate_pkce();
@@ -585,7 +592,8 @@ pub async fn sign_in_subscription(
             let code = match code {
                 Some(c) => c,
                 None => {
-                    let err = extract_query_param(&target, "error").unwrap_or_else(|| "Unknown auth error".into());
+                    let err = extract_query_param(&target, "error")
+                        .unwrap_or_else(|| "Unknown auth error".into());
                     let _ = socket.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nSign-in rejected: {err}").as_bytes()).await;
                     return Err(format!("Provider sign-in was not approved: {err}"));
                 }
@@ -620,24 +628,24 @@ pub async fn sign_in_subscription(
     );
     let token_resp = client
         .post(token_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
         .body(exchange_body)
         .send()
         .await
         .map_err(|e| format!("Token exchange request failed: {e}"))?;
 
     let status = token_resp.status();
-    let body = token_resp
-        .text()
-        .await
-        .unwrap_or_default();
+    let body = token_resp.text().await.unwrap_or_default();
 
     if !status.is_success() {
         return Err(format!("Token exchange failed ({status}): {body}"));
     }
 
-    let json: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Invalid token response: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid token response: {e}"))?;
 
     let access_token = json
         .get("access_token")
@@ -662,7 +670,14 @@ pub async fn sign_in_subscription(
         refresh_token,
         expires_at,
         account_id: None,
-        plan_type: Some(format!("{} Subscription", if canonical == PROVIDER_CHATGPT { "ChatGPT" } else { "Grok" })),
+        plan_type: Some(format!(
+            "{} Subscription",
+            if canonical == PROVIDER_CHATGPT {
+                "ChatGPT"
+            } else {
+                "Grok"
+            }
+        )),
         source: "oauth".into(),
         updated_at: crate::store::now(),
     };
@@ -672,7 +687,11 @@ pub async fn sign_in_subscription(
 }
 
 fn parse_callback_request(request: &str) -> Result<String, String> {
-    let mut parts = request.lines().next().unwrap_or_default().split_whitespace();
+    let mut parts = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
     if parts.next() != Some("GET") {
         return Err("Expected GET callback.".into());
     }
@@ -699,7 +718,12 @@ mod urlencoding {
     pub fn encode(input: &str) -> String {
         let mut out = String::new();
         for byte in input.bytes() {
-            if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.' || byte == b'~' {
+            if byte.is_ascii_alphanumeric()
+                || byte == b'-'
+                || byte == b'_'
+                || byte == b'.'
+                || byte == b'~'
+            {
                 out.push(byte as char);
             } else {
                 out.push_str(&format!("%{:02X}", byte));
@@ -714,7 +738,10 @@ mod urlencoding {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'%' && i + 2 < bytes.len() {
-                if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| ())?, 16) {
+                if let Ok(val) = u8::from_str_radix(
+                    std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| ())?,
+                    16,
+                ) {
                     out.push(val);
                     i += 3;
                     continue;
@@ -727,7 +754,9 @@ mod urlencoding {
             }
             i += 1;
         }
-        String::from_utf8(out).map(std::borrow::Cow::Owned).map_err(|_| ())
+        String::from_utf8(out)
+            .map(std::borrow::Cow::Owned)
+            .map_err(|_| ())
     }
 }
 
@@ -748,7 +777,10 @@ mod tests {
         let session = parse_codex_auth_content(json).unwrap();
         assert_eq!(session.provider, PROVIDER_CHATGPT);
         assert_eq!(session.access_token, "test-access-token-123");
-        assert_eq!(session.refresh_token.as_deref(), Some("test-refresh-token-456"));
+        assert_eq!(
+            session.refresh_token.as_deref(),
+            Some("test-refresh-token-456")
+        );
         assert_eq!(session.account_id.as_deref(), Some("acct_abc123"));
         assert_eq!(session.expires_at, Some(1800000000));
         assert_eq!(session.source, "cli_sync");
@@ -777,15 +809,22 @@ mod tests {
         assert!(!verifier.is_empty());
         assert!(!challenge.is_empty());
         assert_ne!(verifier, challenge);
-        assert!(verifier.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
-        assert!(challenge.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+        assert!(verifier
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+        assert!(challenge
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
     fn query_param_extraction_works() {
         let target = "/callback?code=abc-123&state=state-456";
         assert_eq!(extract_query_param(target, "code"), Some("abc-123".into()));
-        assert_eq!(extract_query_param(target, "state"), Some("state-456".into()));
+        assert_eq!(
+            extract_query_param(target, "state"),
+            Some("state-456".into())
+        );
         assert_eq!(extract_query_param(target, "unknown"), None);
     }
 }

@@ -31,8 +31,16 @@ dist-ssr
 *.sln
 *.sw?
 .vitest
+__pycache__/
+*.py[cod]
 .commandcode
 .localqa-*.txt
 nul
 
 graphify-out/
+
+# Impeccable working captures and runtime caches
+.impeccable/review/
+.impeccable/questions/
+.impeccable/config.local.json
+.impeccable/live/

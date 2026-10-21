@@ -3,6 +3,7 @@ import { build } from 'vite';
 await build({
   configFile: false,
   logLevel: 'warn',
+  ssr: { noExternal: ['fflate'] },
   build: {
     ssr: 'scripts/web-worker.mjs',
     outDir: 'src-tauri/resources/web',

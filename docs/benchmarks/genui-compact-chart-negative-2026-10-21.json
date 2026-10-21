@@ -1,0 +1,292 @@
+{
+  "startedAtUtc": "2026-10-20T21:03:03Z",
+  "model": "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+  "modelSha256": "79dde517866cfbb5c00230b530de17910fc7fc78f8827554d0e14281ce5faf03",
+  "runtimeSha256": "3f6d3ddddc1de7a86073cb890d952cb63216055df190c2db4b11dddbe758f009",
+  "sourceSha256": {
+    "src/genui/Chart.tsx": "c9ecc041d5693cfd348428afb7e6f1343541b3cf3f0b5a1ea6a6428d20606469",
+    "src/genui/Coding.tsx": "c0c853ded4d3fdee55159c794f4f8ba5ef5fb74b26e1ee18bb57fbd90f6496dd",
+    "src/genui/DataTable.tsx": "405d4bd4789e38231d62e2c68be55b5923e0c16348516a114fc2af9c1b073ec4",
+    "src/genui/Diagram.tsx": "1b0b148e97db6fa30aa460890250d37ccecf4d505776ce04e8f6c465b41e6b72",
+    "src/genui/Education.tsx": "228f7d4cc68b9b84ffa8c9148b7317a3b8fde3cbe8f6a9fff0e53dab9ea3d3b7",
+    "src/genui/Experiences.tsx": "1290f9a1d267fd85b77f78b74a6fe505358fd26e72b60d762de07478472e1cbc",
+    "src/genui/GenUiSurface.tsx": "2b002fcca5de822e8048ec33430dc6e757bbbd450e351216fc2f9ee2f7f8f0c0",
+    "src/genui/MessageRenderer.tsx": "ff36687f1cb7cc547ca2cefccc1c0aba20b53565249e0956408da81199f84a04",
+    "src/genui/RichComponents.tsx": "91fe358713cb3945b0b5820a7b5afe774ae56345c2e74f03f40773b4b5957375",
+    "src/genui/ValidatedRenderer.test.tsx": "7e4148e5626bbc1ebb2395ac4a6a1f2e7b6094ee056f3a358f99f4f3fe7196d6",
+    "src/genui/ValidatedRenderer.tsx": "c5a74c20bc69520e34b67077374e2fc09c44e0047bdb0533388ecc19b00e2d58",
+    "src/genui/VisualAnswer.test.tsx": "80925bea850c2199ad0625a52c62636684838bc75dde42c507848ee10f571f64",
+    "src/genui/VisualAnswer.tsx": "fda26a9a6fda038af93554946d5da72b87e87c62fa2dec214d9a0167071c2b22",
+    "src/genui/VisualErrorBoundary.tsx": "cf98143c77e0a7e25eb2ea7312b1fd07c5772e19d015c3e3ab5a01b332e9783d",
+    "src/genui/VisualMarkdown.tsx": "6b55e3eb0c0a0f00e77196456a0c9565443d5b7f92f1136d38fd7c1d027c63db",
+    "src/genui/actions.test.ts": "acc0e8e97362c892e8121cf3405153b62af21398df60c7b54933acd0e6da35c3",
+    "src/genui/actions.ts": "05351e97a616cc45e80b73405945f62695965f546ffcdc603a626628974d3281",
+    "src/genui/audit-regressions.test.tsx": "e7472a5430ec256476f1440053ffbd37addb92438d12f7c7444ab1a7e40dd338",
+    "src/genui/catalog.ts": "c97d2dcdc7f07b36d7d0fc32be4e02383a0dd51c700ae5d7740c58677b7e91d8",
+    "src/genui/componentTypes.ts": "11dc9921a0f00b6ec2b60de8e6734988d9fd38d1fdedc3d202fc3cb578563011",
+    "src/genui/dataGrounding.test.ts": "cde7e9935267e37206dd50af199da5409c8e95dc8cbfb50da2441d1d03500960",
+    "src/genui/dataGrounding.ts": "be47c630800e2b699007090fff7566fa0344b72b9531d22aced8f0d527c84248",
+    "src/genui/diff.ts": "b99cc3c1e3b83f4149eac9232853ba0bb4576f9e0474250a81c02e992e413584",
+    "src/genui/experiences.test.tsx": "e0a4e1983ae0119ffaef7f9f4d524cb0acce7ec06432d3a95e82c444d45723ef",
+    "src/genui/grounding.test.ts": "c27349f8ca4b70306adcc4f5ed732eb665d6f704b3ddced617988c8f2021b5e5",
+    "src/genui/grounding.tsx": "6b9c7c34e0a284045b4f2c0fa1627f37806a08895e46c5b9c48e9a6f1fe04a76",
+    "src/genui/library.test.ts": "84acb2f22d2c3835aefc17a2a17cafdf1797da4b15bf4148c4ee582f0e00cb94",
+    "src/genui/library.tsx": "de8b2566a3a97e95660112dd5c7196b7ba4e52cdd35ad80846c20d4887cadc87",
+    "src/genui/model-output.test.tsx": "d4d604de0fca96968553bc2af65cdcbf98e61602c8026bba0d4b21b02a8ffae1",
+    "src/genui/progressive.ts": "c46254e9dcafe67ae1f68fb7dbc09afea63b9acd00794f70a8c7d55e74e54284",
+    "src/genui/render-failure.test.tsx": "4a07360e7d2f08824ef50d110ca9205105db937219545935d03cfecf8fbdb4cf",
+    "src/genui/repair.test.ts": "29c794fe3abcfb284e0f522b59c1853459ec7c027a0bff4e54c74ada003d1b1e",
+    "src/genui/repair.ts": "f330272eceebeafc748dcf803a6b76d7053233298ba61fb6a6c409142d5da368",
+    "src/genui/rich.test.tsx": "176ce99120f5bc33f6b78898873bbd791ed378860890be1e83a1079ac743bbe4",
+    "src/genui/richCatalog.ts": "b5fa7cf586ac9b6d3657afe947c6b166ca74024896687a67ede088c6fb5961d8",
+    "src/genui/simulations.ts": "684874598552014c25c40e112b6cd66eed2274f91d7141cc4d97813721d53293",
+    "src/genui/specification.test.ts": "dc24ec2386ca83bcff5d231bba891c04ad3496f8f0af16a066f204bb282c7fd8",
+    "src/genui/specification.ts": "b189cc054e27afcf9e2bdb11bade6205d074972bf31b57b54ee06c6b8bc1defa",
+    "src/genui/validation.test.ts": "2754047ca682428bc80e51f110fe5cfbfa38b3515101b19b48ff17c0ea11a7e0",
+    "src/genui/validation.ts": "00495f0646c6ba51d4bf3b0f301e35b15ca5f8adda912c8a89030d355c8f8af5"
+  },
+  "hardware": {
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+    "cpu": "AMD Ryzen 5 7535HS with Radeon Graphics",
+    "logicalCpus": 12
+  },
+  "cpuOnly": true,
+  "contextLength": 8192,
+  "maxOutputTokens": 512,
+  "repetitions": 3,
+  "cachePolicy": "disabled",
+  "loadPolicy": "Wait for observed Rust/link compiler idle before each request; before/after compiler observations recorded. Desktop background activity is not controlled; OS page cache not flushed.",
+  "cases": [
+    {
+      "name": "chart",
+      "sample": 0,
+      "failure": null,
+      "compilerWaitMs": 26938.643891000538,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "chart",
+      "authoritativeInput": "Plot these supplied sales: Jan 10, Feb 15, Mar 25. Use Chart with kind bar and exactly these points.",
+      "rawContentTokens": 880,
+      "promptTokens": 880,
+      "timeToFirstTokenMs": 2972.2140610028873,
+      "totalMs": 7787.148417002754,
+      "finishReason": "stop",
+      "source": "root = Response([Chart(title: \"Sales Data\", kind: \"bar\", points: [{label: \"Jan 10\", value: 10}, {label: \"Feb 15\", value: 20}, {label: \"Mar 25\", value: 30}]])",
+      "usage": {
+        "completion_tokens": 66,
+        "prompt_tokens": 889,
+        "total_tokens": 955,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 889,
+        "prompt_ms": 2962.673,
+        "prompt_per_token_ms": 3.3325905511811023,
+        "prompt_per_second": 300.06686529360485,
+        "predicted_n": 66,
+        "predicted_ms": 4796.498,
+        "predicted_per_token_ms": 73.79227692307691,
+        "predicted_per_second": 13.551553654353656
+      },
+      "runtimePeakRssKiB": 3841176,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([Chart(\"Sales Data\", \"bar\", [{label: \"Jan 10\", value: 10}, {label: \"Feb 15\", value: 20}, {label: \"Mar 25\", value: 30}])])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": false,
+      "transportComplete": true,
+      "requiredComponent": "Chart",
+      "requestedComponentPresent": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 20.07129699999996,
+        "htmlChars": 1766,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      }
+    },
+    {
+      "name": "chart",
+      "sample": 1,
+      "failure": null,
+      "compilerWaitMs": 12.810587999410927,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "chart",
+      "authoritativeInput": "Plot these supplied sales: Jan 10, Feb 15, Mar 25. Use Chart with kind bar and exactly these points.",
+      "rawContentTokens": 880,
+      "promptTokens": 880,
+      "timeToFirstTokenMs": 2599.384907000058,
+      "totalMs": 7324.291775999882,
+      "finishReason": "stop",
+      "source": "root = Response([Chart(title: \"Sales Data\", kind: \"bar\", points: [{label: \"Jan 10\", value: 10}, {label: \"Feb 15\", value: 20}, {label: \"Mar 25\", value: 30}]])",
+      "usage": {
+        "completion_tokens": 66,
+        "prompt_tokens": 889,
+        "total_tokens": 955,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 889,
+        "prompt_ms": 2593.934,
+        "prompt_per_token_ms": 2.9178110236220474,
+        "prompt_per_second": 342.72267528780606,
+        "predicted_n": 66,
+        "predicted_ms": 4711.615,
+        "predicted_per_token_ms": 72.48638461538461,
+        "predicted_per_second": 13.795694257701447
+      },
+      "runtimePeakRssKiB": 3844836,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([Chart(\"Sales Data\", \"bar\", [{label: \"Jan 10\", value: 10}, {label: \"Feb 15\", value: 20}, {label: \"Mar 25\", value: 30}])])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": false,
+      "transportComplete": true,
+      "requiredComponent": "Chart",
+      "requestedComponentPresent": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 5.639218999999912,
+        "htmlChars": 1766,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      }
+    },
+    {
+      "name": "chart",
+      "sample": 2,
+      "failure": null,
+      "compilerWaitMs": 11.664605997793842,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "chart",
+      "authoritativeInput": "Plot these supplied sales: Jan 10, Feb 15, Mar 25. Use Chart with kind bar and exactly these points.",
+      "rawContentTokens": 880,
+      "promptTokens": 880,
+      "timeToFirstTokenMs": 2548.7113859999226,
+      "totalMs": 7263.961055999971,
+      "finishReason": "stop",
+      "source": "root = Response([Chart(title: \"Sales Data\", kind: \"bar\", points: [{label: \"Jan 10\", value: 10}, {label: \"Feb 15\", value: 20}, {label: \"Mar 25\", value: 30}]])",
+      "usage": {
+        "completion_tokens": 66,
+        "prompt_tokens": 889,
+        "total_tokens": 955,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 889,
+        "prompt_ms": 2543.829,
+        "prompt_per_token_ms": 2.8614499437570307,
+        "prompt_per_second": 349.473176066473,
+        "predicted_n": 66,
+        "predicted_ms": 4703.094,
+        "predicted_per_token_ms": 72.35529230769231,
+        "predicted_per_second": 13.820689103811235
+      },
+      "runtimePeakRssKiB": 3845228,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([Chart(\"Sales Data\", \"bar\", [{label: \"Jan 10\", value: 10}, {label: \"Feb 15\", value: 20}, {label: \"Mar 25\", value: 30}])])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": false,
+      "transportComplete": true,
+      "requiredComponent": "Chart",
+      "requestedComponentPresent": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 7.309821000000056,
+        "htmlChars": 1766,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      }
+    }
+  ],
+  "limitations": [
+    "Isolated CPU process loaded once; first pass OS/model warmth is not controlled. cache_prompt is explicit and case order rotates.",
+    "TTFT is model transport, not first paint. Native interaction/memory are measured separately.",
+    "Actual Python process execution is fixed benchmark orchestration, not a model-selected permission-controlled harness call.",
+    "Direct program-generation experiment; production tool-free second-pass inference is separately measured in native acceptance. No remote provider or GPU inference."
+  ],
+  "loadSeconds": 3.083472501995857,
+  "finishedAtUtc": "2026-10-20T21:03:58Z",
+  "validationSourceSha256": {
+    "Chart.tsx": "c9ecc041d5693cfd348428afb7e6f1343541b3cf3f0b5a1ea6a6428d20606469",
+    "Coding.tsx": "c0c853ded4d3fdee55159c794f4f8ba5ef5fb74b26e1ee18bb57fbd90f6496dd",
+    "DataTable.tsx": "405d4bd4789e38231d62e2c68be55b5923e0c16348516a114fc2af9c1b073ec4",
+    "Diagram.tsx": "1b0b148e97db6fa30aa460890250d37ccecf4d505776ce04e8f6c465b41e6b72",
+    "Education.tsx": "228f7d4cc68b9b84ffa8c9148b7317a3b8fde3cbe8f6a9fff0e53dab9ea3d3b7",
+    "Experiences.tsx": "1290f9a1d267fd85b77f78b74a6fe505358fd26e72b60d762de07478472e1cbc",
+    "GenUiSurface.tsx": "2b002fcca5de822e8048ec33430dc6e757bbbd450e351216fc2f9ee2f7f8f0c0",
+    "MessageRenderer.tsx": "ff36687f1cb7cc547ca2cefccc1c0aba20b53565249e0956408da81199f84a04",
+    "RichComponents.tsx": "91fe358713cb3945b0b5820a7b5afe774ae56345c2e74f03f40773b4b5957375",
+    "ValidatedRenderer.test.tsx": "7e4148e5626bbc1ebb2395ac4a6a1f2e7b6094ee056f3a358f99f4f3fe7196d6",
+    "ValidatedRenderer.tsx": "c5a74c20bc69520e34b67077374e2fc09c44e0047bdb0533388ecc19b00e2d58",
+    "VisualAnswer.test.tsx": "80925bea850c2199ad0625a52c62636684838bc75dde42c507848ee10f571f64",
+    "VisualAnswer.tsx": "fda26a9a6fda038af93554946d5da72b87e87c62fa2dec214d9a0167071c2b22",
+    "VisualErrorBoundary.tsx": "cf98143c77e0a7e25eb2ea7312b1fd07c5772e19d015c3e3ab5a01b332e9783d",
+    "VisualMarkdown.tsx": "6b55e3eb0c0a0f00e77196456a0c9565443d5b7f92f1136d38fd7c1d027c63db",
+    "actions.test.ts": "acc0e8e97362c892e8121cf3405153b62af21398df60c7b54933acd0e6da35c3",
+    "actions.ts": "05351e97a616cc45e80b73405945f62695965f546ffcdc603a626628974d3281",
+    "audit-regressions.test.tsx": "e7472a5430ec256476f1440053ffbd37addb92438d12f7c7444ab1a7e40dd338",
+    "catalog.ts": "c97d2dcdc7f07b36d7d0fc32be4e02383a0dd51c700ae5d7740c58677b7e91d8",
+    "componentTypes.ts": "11dc9921a0f00b6ec2b60de8e6734988d9fd38d1fdedc3d202fc3cb578563011",
+    "dataGrounding.test.ts": "cde7e9935267e37206dd50af199da5409c8e95dc8cbfb50da2441d1d03500960",
+    "dataGrounding.ts": "be47c630800e2b699007090fff7566fa0344b72b9531d22aced8f0d527c84248",
+    "diff.ts": "b99cc3c1e3b83f4149eac9232853ba0bb4576f9e0474250a81c02e992e413584",
+    "experiences.test.tsx": "e0a4e1983ae0119ffaef7f9f4d524cb0acce7ec06432d3a95e82c444d45723ef",
+    "grounding.test.ts": "c27349f8ca4b70306adcc4f5ed732eb665d6f704b3ddced617988c8f2021b5e5",
+    "grounding.tsx": "6b9c7c34e0a284045b4f2c0fa1627f37806a08895e46c5b9c48e9a6f1fe04a76",
+    "library.test.ts": "84acb2f22d2c3835aefc17a2a17cafdf1797da4b15bf4148c4ee582f0e00cb94",
+    "library.tsx": "de8b2566a3a97e95660112dd5c7196b7ba4e52cdd35ad80846c20d4887cadc87",
+    "model-output.test.tsx": "d4d604de0fca96968553bc2af65cdcbf98e61602c8026bba0d4b21b02a8ffae1",
+    "progressive.ts": "c46254e9dcafe67ae1f68fb7dbc09afea63b9acd00794f70a8c7d55e74e54284",
+    "render-failure.test.tsx": "4a07360e7d2f08824ef50d110ca9205105db937219545935d03cfecf8fbdb4cf",
+    "repair.test.ts": "29c794fe3abcfb284e0f522b59c1853459ec7c027a0bff4e54c74ada003d1b1e",
+    "repair.ts": "f330272eceebeafc748dcf803a6b76d7053233298ba61fb6a6c409142d5da368",
+    "rich.test.tsx": "176ce99120f5bc33f6b78898873bbd791ed378860890be1e83a1079ac743bbe4",
+    "richCatalog.ts": "b5fa7cf586ac9b6d3657afe947c6b166ca74024896687a67ede088c6fb5961d8",
+    "simulations.ts": "684874598552014c25c40e112b6cd66eed2274f91d7141cc4d97813721d53293",
+    "specification.test.ts": "dc24ec2386ca83bcff5d231bba891c04ad3496f8f0af16a066f204bb282c7fd8",
+    "specification.ts": "b189cc054e27afcf9e2bdb11bade6205d074972bf31b57b54ee06c6b8bc1defa",
+    "validation.test.ts": "2754047ca682428bc80e51f110fe5cfbfa38b3515101b19b48ff17c0ea11a7e0",
+    "validation.ts": "00495f0646c6ba51d4bf3b0f301e35b15ca5f8adda912c8a89030d355c8f8af5"
+  },
+  "summary": {
+    "chart": {
+      "samples": 3,
+      "totalP50Ms": 7324.291775999882,
+      "totalP95Ms": 7787.148417002754,
+      "rawValid": 0,
+      "repairedValid": 3,
+      "grounded": 0,
+      "requestedComponentPresent": 3,
+      "serverRendered": 3,
+      "transportFailures": 0
+    }
+  }
+}

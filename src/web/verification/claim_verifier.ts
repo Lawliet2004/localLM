@@ -153,6 +153,7 @@ Output valid JSON: {"claims": [{"claim": "...", "status": "SUPPORTED|UNSUPPORTED
         userPrompt,
         temperature: 0.1,
         maxTokens: 600,
+        reasoningEffort: 'low',
       });
 
       const jsonMatch = res.text.match(/\{[\s\S]*\}/);

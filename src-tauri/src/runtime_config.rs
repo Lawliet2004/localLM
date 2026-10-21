@@ -13,6 +13,12 @@ pub struct RuntimeConfig {
     pub cache_type_v: CacheType,
     pub offload_kv_cache: bool,
     pub mmap: bool,
+    /// Keep the configured projector file but omit it from text-only launches.
+    #[serde(default = "default_enabled")]
+    pub vision_enabled: bool,
+    /// Independent of language-model GPU layers; false forces the projector onto CPU.
+    #[serde(default = "default_enabled")]
+    pub offload_projector: bool,
     /// llama.cpp `--parallel` / slot count. 1 is the 4 GB default; 2 keeps
     /// parent KV when a subagent runs and roughly doubles cache memory.
     #[serde(default = "default_inference_slots")]
@@ -21,6 +27,9 @@ pub struct RuntimeConfig {
 
 fn default_inference_slots() -> u32 {
     1
+}
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -56,6 +65,8 @@ impl Default for RuntimeConfig {
             cache_type_v: CacheType::Q8_0,
             offload_kv_cache: true,
             mmap: true,
+            vision_enabled: true,
+            offload_projector: true,
             inference_slots: 1,
         }
     }
@@ -89,10 +100,7 @@ impl RuntimeConfig {
 
     pub fn arguments(&self) -> Result<Vec<String>, String> {
         self.validate()?;
-        let mut args = vec![
-            "--ctx-size".into(),
-            self.context_length.to_string(),
-        ];
+        let mut args = vec!["--ctx-size".into(), self.context_length.to_string()];
         // -1 means automatic: llama.cpp --fit chooses how many layers fill
         // VRAM and leaves the rest in RAM. Passing --n-gpu-layers disables that.
         if self.gpu_layers >= 0 {
@@ -138,7 +146,9 @@ impl RuntimeConfig {
         let Some(blocks) = model.block_count.filter(|count| *count > 0) else {
             return 0;
         };
-        let max = i32::try_from(blocks.saturating_add(1)).unwrap_or(999).clamp(1, 999);
+        let max = i32::try_from(blocks.saturating_add(1))
+            .unwrap_or(999)
+            .clamp(1, 999);
         let Some(available) = available_gpu_bytes else {
             return 0;
         };
@@ -147,9 +157,10 @@ impl RuntimeConfig {
             return 0;
         }
         let kv = kv_cache_bytes(model, config).unwrap_or(0);
-        let gpu_full = model
-            .file_bytes
-            .saturating_add(if config.offload_kv_cache { kv } else { 0 });
+        let gpu_full =
+            model
+                .file_bytes
+                .saturating_add(if config.offload_kv_cache { kv } else { 0 });
         if gpu_full == 0 {
             return 0;
         }
@@ -182,7 +193,8 @@ fn kv_cache_bytes(model: &crate::gguf::ModelMetadata, config: &RuntimeConfig) ->
         u64::from(config.context_length)
             * blocks
             * heads_kv
-            * (cache_elem_bytes(config.cache_type_k, key) + cache_elem_bytes(config.cache_type_v, value))
+            * (cache_elem_bytes(config.cache_type_k, key)
+                + cache_elem_bytes(config.cache_type_v, value))
             * slots,
     )
 }
@@ -205,20 +217,50 @@ mod tests {
         assert!(config.validate().is_ok());
         assert_eq!(config.context_length, 32768);
         assert_eq!(config.inference_slots, 1);
-        assert!(config.arguments().unwrap().windows(2).any(|pair| pair == ["--ctx-size", "32768"]));
-        assert!(config.arguments().unwrap().windows(2).any(|pair| pair == ["--parallel", "1"]));
-        assert!(!config.arguments().unwrap().iter().any(|arg| arg == "--n-gpu-layers"));
+        assert!(config
+            .arguments()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == ["--ctx-size", "32768"]));
+        assert!(config
+            .arguments()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == ["--parallel", "1"]));
+        assert!(!config
+            .arguments()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "--n-gpu-layers"));
     }
 
     #[test]
     fn automatic_gpu_omits_n_gpu_layers_so_llama_cpp_can_fit() {
         let auto = RuntimeConfig::default();
         assert!(auto.automatic_gpu());
-        assert!(!auto.arguments().unwrap().iter().any(|arg| arg == "--n-gpu-layers"));
-        let cpu = RuntimeConfig { gpu_layers: 0, ..Default::default() };
-        assert!(cpu.arguments().unwrap().windows(2).any(|pair| pair == ["--n-gpu-layers", "0"]));
-        let split = RuntimeConfig { gpu_layers: 18, ..Default::default() };
-        assert!(split.arguments().unwrap().windows(2).any(|pair| pair == ["--n-gpu-layers", "18"]));
+        assert!(!auto
+            .arguments()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "--n-gpu-layers"));
+        let cpu = RuntimeConfig {
+            gpu_layers: 0,
+            ..Default::default()
+        };
+        assert!(cpu
+            .arguments()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == ["--n-gpu-layers", "0"]));
+        let split = RuntimeConfig {
+            gpu_layers: 18,
+            ..Default::default()
+        };
+        assert!(split
+            .arguments()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == ["--n-gpu-layers", "18"]));
     }
 
     #[test]
@@ -233,8 +275,12 @@ mod tests {
             key_length: None,
             value_length: None,
             file_bytes: 4 * 1024 * 1024 * 1024,
+            thinking_control: None,
         };
-        let config = RuntimeConfig { context_length: 8192, ..Default::default() };
+        let config = RuntimeConfig {
+            context_length: 8192,
+            ..Default::default()
+        };
         assert_eq!(RuntimeConfig::auto_gpu_layers(&model, &config, None), 0);
         assert_eq!(
             RuntimeConfig::auto_gpu_layers(&model, &config, Some(24 * 1024 * 1024 * 1024)),
@@ -260,11 +306,43 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(parsed.inference_slots, 1);
-        let two = RuntimeConfig { inference_slots: 2, ..Default::default() };
+        assert!(parsed.vision_enabled);
+        assert!(parsed.offload_projector);
+        let two = RuntimeConfig {
+            inference_slots: 2,
+            ..Default::default()
+        };
         assert!(two.validate().is_ok());
-        assert!(two.arguments().unwrap().windows(2).any(|pair| pair == ["--parallel", "2"]));
-        let three = RuntimeConfig { inference_slots: 3, ..Default::default() };
+        assert!(two
+            .arguments()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == ["--parallel", "2"]));
+        let three = RuntimeConfig {
+            inference_slots: 3,
+            ..Default::default()
+        };
         assert!(three.validate().is_err());
+    }
+
+    #[test]
+    fn projector_choices_round_trip_without_changing_language_model_placement() {
+        for (vision_enabled, offload_projector) in [(false, true), (true, false), (true, true)] {
+            let config = RuntimeConfig {
+                vision_enabled,
+                offload_projector,
+                gpu_layers: 18,
+                ..Default::default()
+            };
+            let restored: RuntimeConfig =
+                serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            assert_eq!(restored, config);
+            assert!(config
+                .arguments()
+                .unwrap()
+                .windows(2)
+                .any(|pair| pair == ["--n-gpu-layers", "18"]));
+        }
     }
 
     #[test]
@@ -291,7 +369,12 @@ mod tests {
 
     #[test]
     fn permits_large_model_contexts_within_the_harness_safety_cap() {
-        assert!(RuntimeConfig { context_length: 262144, ..Default::default() }.validate().is_ok());
+        assert!(RuntimeConfig {
+            context_length: 262144,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

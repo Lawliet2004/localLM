@@ -94,6 +94,7 @@ Rules:
         userPrompt,
         temperature: 0.1,
         maxTokens: 500,
+        reasoningEffort: 'low',
         responseSchema: {
           type: 'object',
           properties: {

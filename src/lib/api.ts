@@ -31,10 +31,24 @@ import type {
   CompactionOutcome,
   CompactionStatus,
   WebSearchConfig,
+  ProviderConnection,
+  ProviderDraft,
+  RemoteModel,
+  ProviderTestResult,
+  PermissionRuleView,
+  SnapshotView,
+  StagedRevertView,
+  RevertReportView,
+  PluginView,
 } from './types';
 
 export const nativeAvailable = isTauri();
-export interface TerminalEvent { type: 'output' | 'exit'; data?: string; code?: number }
+export interface TerminalEvent { type: 'output' | 'exit'; data?: string; code?: number; seq?: number }
+export interface EditorDocument { content: string; sha256: string }
+export type EditorMutation =
+  | { kind: 'createFile' | 'createDirectory'; path: string }
+  | { kind: 'rename'; path: string; name: string }
+  | { kind: 'delete'; path: string; directory: boolean; recursive: boolean };
 export interface LocalServerConfig {
   id: string;
   name: string;
@@ -62,18 +76,46 @@ export interface ModelDownloadInfo {
 }
 
 export const api = {
+  rejectPresentation: (conversationId:string,messageId:string,program:string) => invoke<void>('reject_presentation',{conversationId,messageId,program}),
+  getPresentationMode: (conversationId: string | null) => invoke<import('./types').PresentationModes>('get_presentation_mode', { conversationId }),
+  setPresentationMode: (conversationId: string | null, mode: import('./types').PresentationMode | null) => invoke<void>('set_presentation_mode', { conversationId, mode }),
+  getPresentations: (conversationId: string) => invoke<import('./types').PresentationRecord[]>('get_presentations', { conversationId }),
+  saveVisualState: (conversationId: string, messageId: string, visualState: Record<string, unknown>) => invoke<void>('save_visual_state', { conversationId, messageId, visualState }),
+  getDebuggerPolicy: () => invoke<import('./types').DebuggerPolicy>('get_debugger_policy'),
+  saveDebuggerPolicy: (policy: import('./types').DebuggerPolicy) => invoke<void>('save_debugger_policy', { policy }),
+  getProfilerConfig: () => invoke<import('./types').ProfilerConfig>('get_profile_config'),
+  saveProfilerConfig: (config: import('./types').ProfilerConfig) => invoke<void>('save_profile_config', { config }),
+  listHttpCredentials: () => invoke<import('./types').HttpCredentialView[]>('list_http_credentials'),
+  saveHttpCredential: (name: string, header: string, secret: string, origin: string) => invoke<import('./types').HttpCredentialView>('save_http_credential', { name, header, secret, origin }),
+  deleteHttpCredential: (id: string) => invoke<void>('delete_http_credential', { id }),
+  getReferenceOrigins: () => invoke<string[]>('get_reference_origins'),
+  saveReferenceOrigins: (origins: string[]) => invoke<void>('save_reference_origins', { origins }),
+  listDatabaseProfiles: () => invoke<import('./types').DatabaseProfile[]>('list_database_profiles'),
+  saveDatabaseProfile: (profile: import('./types').DatabaseProfile, password: string | null) => invoke<import('./types').DatabaseProfile>('save_database_profile', { profile, password }),
+  deleteDatabaseProfile: (id: string) => invoke<void>('delete_database_profile', { id }),
+  testDatabaseProfile: (id: string) => invoke<unknown>('test_database_profile', { id }),
+  getAutomationConfig: () => invoke<import('./types').AutomationConfig>('get_automation_config'),
+  saveAutomationConfig: (config: import('./types').AutomationConfig) => invoke<void>('save_automation_config', { config }),
+  installBrowserEngine: () => invoke<import('./types').AutomationConfig>('install_browser_engine'),
+  automationDiagnostics: (config: import('./types').AutomationConfig) => invoke<{ browser: { available: boolean; message: string }; computer: Record<string, unknown> }>('automation_diagnostics', { config }),
+  resetAutomation: () => invoke<void>('reset_automation'),
   workspaceIndex: () => invoke<WorkspaceIndex>('workspace_index'),
   saveProject: (project: Project) => invoke<WorkspaceIndex>('save_project', { project }),
   removeProject: (id: string) => invoke<WorkspaceIndex>('remove_project', { id }),
   saveTaskMeta: (id: string, meta: TaskMeta) => invoke<WorkspaceIndex>('save_task_meta', { id, meta }),
   workspaceInspect: (path: string, directory: boolean, root?: string) => invoke<{ entries?: {name: string; kind: string}[]; content?: string; truncated?: boolean; totalLines?: number; workspaceId?: string; root?: string }>('workspace_inspect', { path, directory, root }),
   workspaceSearch: (query: string, root?: string) => invoke<{ results: { path: string; kind: string }[]; truncated: boolean; truncation?: 'result' | 'scan' | 'depth' | null; workspaceId?: string; root?: string }>('workspace_search', { query, root }),
-  workspaceGit: (branch?: string) => invoke<{ branch: string; branches: string[]; status: string; diff: string }>('workspace_git', { branch }),
-  terminalOpen: (cols: number, rows: number) => invoke<{ id: string }>('terminal_open', { cols, rows }),
+  workspaceGit: (branch?: string, root?: string) => invoke<import('./types').GitReview>('workspace_git', { branch, root }),
+  workspaceGitAction: <T = import('./types').GitReview>(root: string, request: import('./types').GitAction) => invoke<T>('workspace_git_action', { root, request }),
+  editorRead: (root: string, path: string) => invoke<EditorDocument>('editor_read', { root, path }),
+  editorSave: (root: string, path: string, content: string, expectedSha256: string) => invoke<EditorDocument>('editor_save', { root, path, content, expectedSha256 }),
+  editorMutate: (root: string, mutation: EditorMutation) => invoke<string>('editor_mutate', { root, mutation }),
+  terminalOpen: (cols: number, rows: number, root?: string) => invoke<{ id: string }>('terminal_open', { cols, rows, root }),
   terminalAttach: (id: string, onEvent: (event: TerminalEvent) => void) => {
     const channel = new Channel<TerminalEvent>(); channel.onmessage = onEvent;
     return invoke<{ id: string; exited: boolean }>('terminal_attach', { id, channel });
   },
+  terminalAck: (id: string, seq: number) => invoke<void>('terminal_ack', { id, seq }),
   terminalInput: (id: string, data: string) => invoke<void>('terminal_input', { id, data }),
   terminalResize: (id: string, cols: number, rows: number) => invoke<void>('terminal_resize', { id, cols, rows }),
   terminalClose: (id: string) => invoke<void>('terminal_close', { id }),
@@ -85,11 +127,24 @@ export const api = {
   browserGoBack: (label: string) => invoke<void>('browser_go_back', { label }),
   browserGoForward: (label: string) => invoke<void>('browser_go_forward', { label }),
   browserUrl: (label: string) => invoke<{ url: string | null }>('browser_url', { label }),
+  listProviders: () => invoke<ProviderConnection[]>('list_providers'),
+  saveProvider: (draft: ProviderDraft) => invoke<ProviderConnection>('save_provider', { draft }),
+  deleteProvider: (id: string) => invoke<void>('delete_provider', { id }),
+  deleteProviderApiKey: (id: string) => invoke<void>('delete_provider_api_key', { id }),
+  testProvider: (id: string) => invoke<ProviderTestResult>('test_provider', { id }),
+  /** Test/list against an unsaved draft — nothing is written to the store or vault. */
+  testProviderDraft: (draft: ProviderDraft) => invoke<ProviderTestResult>('test_provider_draft', { draft }),
+  getHooks: () => invoke<import('./types').Hook[]>('get_hooks'),
+  saveHooks: (hooks: import('./types').Hook[]) => invoke<void>('save_hooks', { hooks }),
+  probeModelTools: (providerId: string, modelId: string) => invoke<{ verified: boolean; supported: boolean; detail: string; probedAt: string }>('probe_model_tools_command', { providerId, modelId }),
+  listProviderModelsDraft: (draft: ProviderDraft) => invoke<RemoteModel[]>('list_provider_models_draft', { draft }),
+  listProviderModels: (id: string) => invoke<ProviderConnection>('list_provider_models', { id }),
+  testProviderInference: (id: string, modelId: string) => invoke<ProviderTestResult>('test_provider_inference', { id, modelId }),
   readLocalConnector: (id: string) => invoke<LocalServerConfig>('read_local_connector', { id }),
   saveLocalConnector: (server: LocalServerConfig) => invoke<void>('save_local_connector', { server }),
   removeLocalConnector: (id: string) => invoke<void>('remove_local_connector', { id }),
   listInstalledRuntimes: () => invoke<{ id: string; path: string; complete: boolean; problem: string | null }[]>('list_installed_runtimes'),
-  runtimeDownloadInfo: () => invoke<{ bytes: number; requiredBytes: number; availableBytes: number; destination: string }>('runtime_download_info'),
+  runtimeDownloadInfo: () => invoke<{ bytes: number; requiredBytes: number; availableBytes: number; destination: string; supported?: boolean; platform?: string; message?: string | null }>('runtime_download_info'),
   runtimeInstallStatus: () => invoke<ModelInstallStatus>('runtime_install_status'),
   installRuntime: () => invoke<ModelInstallStatus>('install_runtime'),
   cancelRuntimeInstall: () => invoke<void>('cancel_runtime_install'),
@@ -112,17 +167,23 @@ export const api = {
   pendingDaytonaOperations: () => invoke<{ name: string; sandboxId: string | null; createdAt: number; cleanupError: string | null }[]>('pending_daytona_operations'),
   hardwareStatus: () => invoke<HardwareStatus>('hardware_status'),
   getExecutionConfig: () => invoke<ExecutionConfig>('get_execution_config'),
+  getLspConfig: () => invoke<import('./types').LspConfig>('get_lsp_config'),
+  saveLspConfig: (config: import('./types').LspConfig) => invoke<void>('save_lsp_config', { config }),
+  testLspServer: (server: string, root: string) => invoke<{ ready: boolean; message: string }>('test_lsp_server', { server, root }),
+  getWeatherConfig: () => invoke<import('./types').WeatherConfig>('get_weather_config'),
+  saveWeatherConfig: (config: import('./types').WeatherConfig) => invoke<void>('save_weather_config', { config }),
   saveExecutionConfig: (config: ExecutionConfig) => invoke<void>('save_execution_config', { config }),
   detectInterpreters: () => invoke<ExecutionConfig>('detect_interpreters'),
   testInterpreter: (path: string) => invoke<string>('test_interpreter', { path }),
   getWorkspace: () => invoke<{ path: string }>('get_workspace'),
   setWorkspace: (path: string) => invoke<void>('set_workspace', { path }),
+  setTaskWorkspace: (path: string, conversationId: string | null) => invoke<{ workspace: WorkspaceIndex; project: Project }>('set_task_workspace', { path, conversationId }),
   listSkills: () => invoke<SkillView[]>('list_skills'),
   installSkill: (id: string) => invoke<void>('install_skill', { id }),
   removeSkill: (id: string) => invoke<void>('remove_skill', { id }),
   setSkillActive: (id: string, active: boolean) => invoke<void>('set_skill_active', { id, active }),
   readSkillFile: (id: string, path: string) => invoke<string>('read_skill_file', { id, path }),
-  skillDependencies: (id: string) => invoke<SkillDependencyStatus[]>('skills_skill_dependencies', { id }),
+  skillDependencies: (id: string) => invoke<SkillDependencyStatus[]>('skill_dependencies', { id }),
   skillUpdateStatus: (id: string) => invoke<SkillUpdateStatus>('skill_update_status', { id }),
   listConnectors: () => invoke<ConnectorView[]>('list_connectors'),
   listLocalConnectors: () => invoke<ConnectorView[]>('list_local_connectors'),
@@ -142,31 +203,45 @@ export const api = {
   savePreferredModel: (selection: ModelSelection) => invoke<void>('save_preferred_model', { selection }),
   saveConversationModel: (id: string, selection: ModelSelection) => invoke<void>('save_conversation_model', { id, selection }),
   exportConversation: (id: string, path: string) => invoke<void>('export_conversation', { id, path }),
-  messages: (id: string) => invoke<Message[]>('get_messages', { id }),
+  messages: async (id: string) => {
+    const [messages, presentations] = await Promise.all([
+      invoke<Message[]>('get_messages', { id }),
+      invoke<import('./types').PresentationRecord[]>('get_presentations', { conversationId: id }).catch(() => []),
+    ]);
+    return messages.map(message => ({ ...message, presentation: presentations?.find(p => p.messageId === message.id) }));
+  },
   getRun: (id: string) => invoke<RunRecord | null>('get_run', { id }),
   getConversationRun: (conversationId: string) => invoke<RunRecord | null>('get_conversation_run', { conversationId }),
   getRunEvents: (runId: string) => invoke<RunEvent[]>('get_run_events', { runId }),
   listCapabilities: (conversationId?: string | null) => invoke<Capability[]>('list_capabilities', { conversationId }),
   setCapabilityEnabled: (id: string, enabled: boolean) => invoke<Capability[]>('set_capability_enabled', { id, enabled }),
   dumpConfig: (conversationId?: string | null) => invoke<Record<string, unknown>>('dump_config', { conversationId }),
-  contextPreflight: (conversationId: string | null, draft: string, preset: string | null, connectorIds: string[], connectorTools: ToolSelection[], planMode = false) =>
-    invoke<{ available: boolean; reason?: string; breakdown?: PreflightBreakdown }>('context_preflight', { conversationId, draft, preset, connectorIds, connectorTools, planMode }),
+  contextPreflight: (conversationId: string | null, draft: string, preset: string | null, connectorIds: string[], connectorTools: ToolSelection[], planMode = false, reasoningMode?: Preferences['reasoningMode'], presentationMode?: import('./types').PresentationMode) =>
+    invoke<{ available: boolean; reason?: string; breakdown?: PreflightBreakdown }>('context_preflight', { conversationId, draft, preset, connectorIds, connectorTools, planMode, reasoningMode, presentationMode }),
   listPresets: () => invoke<Preset[]>('list_presets'),
   getPreset: (conversationId: string) => invoke<Preset>('get_preset', { conversationId }),
   setPreset: (conversationId: string, preset: string) => invoke<Preset>('set_preset', { conversationId, preset }),
   compactConversation: (conversationId: string) => invoke<CompactionOutcome>('compact_conversation_cmd', { conversationId }),
   compactionStatus: (conversationId: string) => invoke<CompactionStatus>('compaction_status', { conversationId }),
   setCompactionAuto: (conversationId: string, enabled: boolean) => invoke<void>('set_compaction_auto', { conversationId, enabled }),
+  saveArtifactCopy: (path: string, content: string, mimeType: string) => invoke<void>('save_artifact_copy', { path, content, mimeType }),
   getArtifact: (id: string) => invoke<ArtifactRecord | null>('get_artifact', { id }),
+  previewExecutionArtifact: (root: string, path: string, sha256: string) => invoke<{ content: string; mimeType: string }>('preview_execution_artifact', { root, path, sha256 }),
   saveConfig: (config: RuntimeConfig) => invoke<void>('save_runtime_config', { config }),
   savePreferences: (preferences: Preferences) => invoke<void>('save_preferences', { preferences }),
   loadModel: () => invoke<RuntimeStatus>('load_model'),
   unloadModel: () => invoke<RuntimeStatus>('unload_model'),
+  documentIndexStatus: (root: string) => invoke<{ enabled: boolean; paths: string[]; updatedAt: number }>('document_index_status', { root }),
+  saveDocumentIndex: (root: string, enabled: boolean, paths: string[]) => invoke<{ enabled: boolean; paths: string[]; updatedAt: number }>('save_document_index', { root, enabled, paths }),
+  searchDocumentIndex: (root: string, query: string) => invoke<{ path: string; line: number; excerpt: string }[]>('search_document_index', { root, query }),
+  runLatencyDiagnostic: (task: string, mode: 'auto' | 'quick' | 'think', samples: number) => invoke<unknown>('run_latency_diagnostic', { task, mode, samples }),
+  localReasoningCapability: () => invoke<string | null>('local_reasoning_capability'),
   runtimeStatus: () => invoke<RuntimeStatus>('runtime_status'),
-  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = [], connectorTools: ToolSelection[] = [], planMode = false) => {
+  retestToolCalling: () => invoke<{ supported: boolean; message: string }>('retest_tool_calling'),
+  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = [], connectorTools: ToolSelection[] = [], planMode = false, reasoningMode?: Preferences['reasoningMode'], presentationMode?: import('./types').PresentationMode) => {
     const channel = new Channel<ChatEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools, planMode });
+    return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools, planMode, reasoningMode, presentationMode });
   },
   cancelGeneration: () => invoke<void>('cancel_generation'),
   pauseGeneration: () => invoke<void>('pause_generation'),
@@ -174,6 +249,7 @@ export const api = {
   restartGeneration: () => invoke<{ replayedWriteIds: string[]; unconditionalSuccess: boolean }>('restart_generation'),
   resolveToolApproval: (id: string, allow: boolean) => invoke<void>('resolve_tool_approval', { id, allow }),
   resolveAskUser: (id: string, choice: string | null) => invoke<void>('resolve_ask_user', { id, choice }),
+  resolveMcpInput: (id: string, action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown>) => invoke<void>('resolve_mcp_input', { requestId: id, action, content }),
   getTodos: (conversationId: string) => invoke<TodoItem[]>('get_todos', { conversationId }),
   getGoal: (conversationId: string) => invoke<string | null>('get_goal', { conversationId }),
   clearTodos: (conversationId: string) => invoke<void>('clear_todos', { conversationId }),
@@ -186,14 +262,34 @@ export const api = {
   searchSessions: (query: string, limit?: number | null) =>
     invoke<Hit[]>('search_sessions', { query, limit }),
   getWebSearchConfig: () => invoke<WebSearchConfig>('get_web_search_config'),
+  clearWebCache: () => invoke<{ cleared: boolean }>('clear_web_cache'),
+  getOfflineMode: () => invoke<boolean>('get_offline_mode'),
+  setOfflineMode: (enabled: boolean) => invoke<void>('set_offline_mode', { enabled }),
   saveWebSearchConfig: (config: WebSearchConfig) => invoke<void>('save_web_search_config', {
+    enabled: config.enabled,
+    mode: config.mode,
     provider: config.provider,
     searxngBaseUrl: config.searxngBaseUrl,
-    googleApiKey: config.googleApiKey,
+    googleApiKey: config.googleApiKey ?? '',
     googleCxId: config.googleCxId,
     searchFallbackEnabled: config.searchFallbackEnabled,
+    clearGoogleApiKey: config.clearGoogleApiKey ?? false,
   }),
-  webSearchHealth: () => invoke<Record<string, unknown>>('web_search_health'),
+  webSearchHealth: (config?: WebSearchConfig) => invoke<Record<string, unknown>>('web_search_health', { config }),
+  // The backend resolves the path inside the selected workspace before it
+  // hands it to the operating system; the renderer cannot open an arbitrary
+  // absolute path.
+  openWorkspacePath: (path: string, root?: string | null) => invoke<void>('open_workspace_path', { path, root: root ?? null }),
+  listPermissionRules: () => invoke<PermissionRuleView[]>('list_permission_rules'),
+  savePermissionRules: (rules: PermissionRuleView[]) => invoke<void>('save_permission_rules', { rules }),
+  listSnapshots: (conversationId: string) => invoke<SnapshotView[]>('list_snapshots', { conversationId }),
+  stageRevert: (conversationId: string, snapshotId: string) => invoke<StagedRevertView>('stage_revert', { conversationId, snapshotId }),
+  discardRevert: (stagedId: string) => invoke<void>('discard_revert', { stagedId }),
+  commitRevert: (stagedId: string) => invoke<RevertReportView>('commit_revert', { stagedId }),
+  captureSnapshot: (conversationId: string, step: number, paths: string[]) => invoke<SnapshotView>('capture_snapshot', { conversationId, step, paths }),
+  listPlugins: () => invoke<PluginView[]>('list_plugins'),
+  savePlugin: (plugin: PluginView) => invoke<PluginView>('save_plugin', { plugin }),
+  removePlugin: (name: string) => invoke<void>('remove_plugin', { name }),
 };
 
 export function errorMessage(error: unknown): string {

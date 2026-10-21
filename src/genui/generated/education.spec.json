@@ -1,0 +1,1686 @@
+{
+  "root": "Response",
+  "components": {
+    "FunctionPlot": {
+      "signature": "FunctionPlot(title: string, parameterId: string, family: \"linear\" | \"quadratic\" | \"exponential\", minX: number, maxX: number)",
+      "description": "Educational finite function plot driven by a Slider with the same parameterId. No expressions or code."
+    },
+    "EvidenceView": {
+      "signature": "EvidenceView(citationIds: string[])",
+      "description": "Actual host-collected evidence and claim audit. IDs must resolve; generated claims are never accepted as audit metadata."
+    },
+    "Calculator": {
+      "signature": "Calculator(id: string, title: string, operation: \"add\" | \"multiply\" | \"divide\" | \"power\", a: number, b: number)",
+      "description": "Local bounded arithmetic; never executes code."
+    },
+    "Diagram": {
+      "signature": "Diagram(title: string, nodes: {id: string, label: string, detail?: string}[], edges: {from: string, to: string, label?: string}[])",
+      "description": "Directed concept/process graph."
+    },
+    "Timeline": {
+      "signature": "Timeline(title: string, events: {date: string, title: string, detail?: string}[])",
+      "description": "Ordered dated events."
+    },
+    "Quiz": {
+      "signature": "Quiz(id: string, title: string, questions: {question: string, options: string[], answer: number, explanation: string}[])",
+      "description": "Local scored multiple-choice quiz."
+    },
+    "Flashcard": {
+      "signature": "Flashcard(id: string, front: string, back: string)",
+      "description": "Flip to reveal an answer."
+    },
+    "InteractiveExample": {
+      "signature": "InteractiveExample(id: string, kind: \"sorting\" | \"binary-search\" | \"lru\" | \"bfs\" | \"dfs\" | \"sql-join\" | \"gradient-descent\", values: number[], target?: number, capacity?: number, edges?: any[])",
+      "description": "Deterministic educational simulation, not execution."
+    },
+    "Slider": {
+      "signature": "Slider(id: string, label: string, min: number, max: number, value: number, step?: number)",
+      "description": "Local numeric control."
+    },
+    "Toggle": {
+      "signature": "Toggle(id: string, label: string, value: boolean)",
+      "description": "Local on/off control."
+    },
+    "Select": {
+      "signature": "Select(id: string, label: string, options: string[], value: string)",
+      "description": "Local choice control."
+    },
+    "Input": {
+      "signature": "Input(id: string, label: string, value: string)",
+      "description": "Local text field. Never sends hidden requests."
+    },
+    "SourceCard": {
+      "signature": "SourceCard(citationId: string, title: string, summary?: string)",
+      "description": "Reference an actual evidence ID from the answer. Never invent IDs."
+    },
+    "Heading": {
+      "signature": "Heading(text: string, level?: \"h2\" | \"h3\" | \"h4\")",
+      "description": "A section heading."
+    },
+    "Text": {
+      "signature": "Text(text: string)",
+      "description": "Plain text, no Markdown."
+    },
+    "Markdown": {
+      "signature": "Markdown(text: string)",
+      "description": "A block of Markdown text. Use for prose, explanations and formatted text inside the UI."
+    },
+    "Callout": {
+      "signature": "Callout(text: string, tone?: \"info\" | \"success\" | \"warning\" | \"error\")",
+      "description": "A highlighted note for a warning, tip, success or error the user should notice."
+    },
+    "Stat": {
+      "signature": "Stat(label: string, value: string, detail?: string)",
+      "description": "A single metric with a label and an optional detail line."
+    },
+    "Table": {
+      "signature": "Table(columns: string[], rows: (string | number)[][], id?: string)",
+      "description": "A simple data table. Use instead of a Markdown table when the data is the focus."
+    },
+    "List": {
+      "signature": "List(items: string[])",
+      "description": "A short bulleted list of plain-text items."
+    },
+    "Button": {
+      "signature": "Button(label: string, action?: {type: \"continue_conversation\", message?: string} | {type: \"open_url\", url: string}, variant?: \"primary\" | \"secondary\")",
+      "description": "A clickable button for suggested follow-ups or opening a link. Place one or a small row at the end of a UI block."
+    },
+    "Divider": {
+      "signature": "Divider()",
+      "description": "A thin horizontal rule separating sections."
+    },
+    "Section": {
+      "signature": "Section(title: string, children: (FunctionPlot | EvidenceView | Calculator | Diagram | Timeline | Quiz | Flashcard | InteractiveExample | Slider | Toggle | Select | Input | SourceCard | Heading | Text | Markdown | Callout | Stat | Table | List | Button | Divider)[])",
+      "description": "A titled panel grouping related content."
+    },
+    "Columns": {
+      "signature": "Columns(children: (FunctionPlot | EvidenceView | Calculator | Diagram | Timeline | Quiz | Flashcard | InteractiveExample | Slider | Toggle | Select | Input | SourceCard | Heading | Text | Markdown | Callout | Stat | Table | List | Button | Divider)[])",
+      "description": "Places children side by side, wrapping on narrow widths. Ideal for a row of Stat cards."
+    },
+    "Card": {
+      "signature": "Card(title: string, children: (FunctionPlot | EvidenceView | Calculator | Diagram | Timeline | Quiz | Flashcard | InteractiveExample | Slider | Toggle | Select | Input | SourceCard | Heading | Text | Markdown | Callout | Stat | Table | List | Button | Divider)[])",
+      "description": "A titled group of related content."
+    },
+    "Stack": {
+      "signature": "Stack(children: (FunctionPlot | EvidenceView | Calculator | Diagram | Timeline | Quiz | Flashcard | InteractiveExample | Slider | Toggle | Select | Input | SourceCard | Heading | Text | Markdown | Callout | Stat | Table | List | Button | Divider | Card)[])",
+      "description": "Content arranged vertically."
+    },
+    "Row": {
+      "signature": "Row(children: (FunctionPlot | EvidenceView | Calculator | Diagram | Timeline | Quiz | Flashcard | InteractiveExample | Slider | Toggle | Select | Input | SourceCard | Heading | Text | Markdown | Callout | Stat | Table | List | Button | Divider | Card)[])",
+      "description": "Content in a wrapping horizontal row."
+    },
+    "Grid": {
+      "signature": "Grid(children: (FunctionPlot | EvidenceView | Calculator | Diagram | Timeline | Quiz | Flashcard | InteractiveExample | Slider | Toggle | Select | Input | SourceCard | Heading | Text | Markdown | Callout | Stat | Table | List | Button | Divider | Card)[], columns?: number)",
+      "description": "Responsive equal-width content columns."
+    },
+    "Response": {
+      "signature": "Response(children: (FunctionPlot | EvidenceView | Calculator | Diagram | Timeline | Quiz | Flashcard | InteractiveExample | Slider | Toggle | Select | Input | SourceCard | Heading | Text | Markdown | Callout | Stat | Table | List | Button | Divider | Section | Columns | Card | Stack | Row | Grid)[])",
+      "description": "Root container of every UI block. Assign it to `root` and pass content as children."
+    }
+  },
+  "componentGroups": [
+    {
+      "name": "Visual data",
+      "components": [
+        "Diagram",
+        "Timeline",
+        "SourceCard",
+        "EvidenceView"
+      ]
+    },
+    {
+      "name": "Education",
+      "components": [
+        "FunctionPlot",
+        "Calculator",
+        "Quiz",
+        "Flashcard",
+        "InteractiveExample",
+        "Slider",
+        "Toggle",
+        "Select",
+        "Input"
+      ]
+    },
+    {
+      "name": "Content",
+      "components": [
+        "Heading",
+        "Text",
+        "Markdown",
+        "Callout"
+      ]
+    },
+    {
+      "name": "Data",
+      "components": [
+        "Stat",
+        "Table",
+        "List"
+      ]
+    },
+    {
+      "name": "Actions",
+      "components": [
+        "Button"
+      ]
+    },
+    {
+      "name": "Layout",
+      "components": [
+        "Divider",
+        "Section",
+        "Columns",
+        "Card",
+        "Stack",
+        "Row",
+        "Grid",
+        "Response"
+      ]
+    }
+  ],
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "FunctionPlot": {
+        "$ref": "#/$defs/FunctionPlot"
+      },
+      "EvidenceView": {
+        "$ref": "#/$defs/EvidenceView"
+      },
+      "Calculator": {
+        "$ref": "#/$defs/Calculator"
+      },
+      "Diagram": {
+        "$ref": "#/$defs/Diagram"
+      },
+      "Timeline": {
+        "$ref": "#/$defs/Timeline"
+      },
+      "Quiz": {
+        "$ref": "#/$defs/Quiz"
+      },
+      "Flashcard": {
+        "$ref": "#/$defs/Flashcard"
+      },
+      "InteractiveExample": {
+        "$ref": "#/$defs/InteractiveExample"
+      },
+      "Slider": {
+        "$ref": "#/$defs/Slider"
+      },
+      "Toggle": {
+        "$ref": "#/$defs/Toggle"
+      },
+      "Select": {
+        "$ref": "#/$defs/Select"
+      },
+      "Input": {
+        "$ref": "#/$defs/Input"
+      },
+      "SourceCard": {
+        "$ref": "#/$defs/SourceCard"
+      },
+      "Heading": {
+        "$ref": "#/$defs/Heading"
+      },
+      "Text": {
+        "$ref": "#/$defs/Text"
+      },
+      "Markdown": {
+        "$ref": "#/$defs/Markdown"
+      },
+      "Callout": {
+        "$ref": "#/$defs/Callout"
+      },
+      "Stat": {
+        "$ref": "#/$defs/Stat"
+      },
+      "Table": {
+        "$ref": "#/$defs/Table"
+      },
+      "List": {
+        "$ref": "#/$defs/List"
+      },
+      "Button": {
+        "$ref": "#/$defs/Button"
+      },
+      "Divider": {
+        "$ref": "#/$defs/Divider"
+      },
+      "Section": {
+        "$ref": "#/$defs/Section"
+      },
+      "Columns": {
+        "$ref": "#/$defs/Columns"
+      },
+      "Card": {
+        "$ref": "#/$defs/Card"
+      },
+      "Stack": {
+        "$ref": "#/$defs/Stack"
+      },
+      "Row": {
+        "$ref": "#/$defs/Row"
+      },
+      "Grid": {
+        "$ref": "#/$defs/Grid"
+      },
+      "Response": {
+        "$ref": "#/$defs/Response"
+      }
+    },
+    "required": [
+      "FunctionPlot",
+      "EvidenceView",
+      "Calculator",
+      "Diagram",
+      "Timeline",
+      "Quiz",
+      "Flashcard",
+      "InteractiveExample",
+      "Slider",
+      "Toggle",
+      "Select",
+      "Input",
+      "SourceCard",
+      "Heading",
+      "Text",
+      "Markdown",
+      "Callout",
+      "Stat",
+      "Table",
+      "List",
+      "Button",
+      "Divider",
+      "Section",
+      "Columns",
+      "Card",
+      "Stack",
+      "Row",
+      "Grid",
+      "Response"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "FunctionPlot": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "parameterId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "family": {
+            "type": "string",
+            "enum": [
+              "linear",
+              "quadratic",
+              "exponential"
+            ]
+          },
+          "minX": {
+            "type": "number",
+            "minimum": -10,
+            "maximum": 10
+          },
+          "maxX": {
+            "type": "number",
+            "minimum": -10,
+            "maximum": 10
+          }
+        },
+        "required": [
+          "title",
+          "parameterId",
+          "family",
+          "minX",
+          "maxX"
+        ],
+        "additionalProperties": false,
+        "description": "Educational finite function plot driven by a Slider with the same parameterId. No expressions or code."
+      },
+      "EvidenceView": {
+        "type": "object",
+        "properties": {
+          "citationIds": {
+            "minItems": 1,
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{1,64}$"
+            }
+          }
+        },
+        "required": [
+          "citationIds"
+        ],
+        "additionalProperties": false,
+        "description": "Actual host-collected evidence and claim audit. IDs must resolve; generated claims are never accepted as audit metadata."
+      },
+      "Calculator": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "add",
+              "multiply",
+              "divide",
+              "power"
+            ]
+          },
+          "a": {
+            "type": "number",
+            "minimum": -1000000000000,
+            "maximum": 1000000000000
+          },
+          "b": {
+            "type": "number",
+            "minimum": -1000000000000,
+            "maximum": 1000000000000
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "operation",
+          "a",
+          "b"
+        ],
+        "additionalProperties": false,
+        "description": "Local bounded arithmetic; never executes code."
+      },
+      "Diagram": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "nodes": {
+            "minItems": 1,
+            "maxItems": 24,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+                },
+                "label": {
+                  "type": "string",
+                  "maxLength": 240
+                },
+                "detail": {
+                  "type": "string",
+                  "maxLength": 240
+                }
+              },
+              "required": [
+                "id",
+                "label"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "edges": {
+            "maxItems": 48,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string",
+                  "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+                },
+                "to": {
+                  "type": "string",
+                  "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+                },
+                "label": {
+                  "type": "string",
+                  "maxLength": 240
+                }
+              },
+              "required": [
+                "from",
+                "to"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "title",
+          "nodes",
+          "edges"
+        ],
+        "additionalProperties": false,
+        "description": "Directed concept/process graph."
+      },
+      "Timeline": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "events": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "date": {
+                  "type": "string",
+                  "maxLength": 240
+                },
+                "title": {
+                  "type": "string",
+                  "maxLength": 240
+                },
+                "detail": {
+                  "type": "string",
+                  "maxLength": 240
+                }
+              },
+              "required": [
+                "date",
+                "title"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "title",
+          "events"
+        ],
+        "additionalProperties": false,
+        "description": "Ordered dated events."
+      },
+      "Quiz": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "questions": {
+            "minItems": 1,
+            "maxItems": 12,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "maxLength": 240
+                },
+                "options": {
+                  "minItems": 2,
+                  "maxItems": 6,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 240
+                  }
+                },
+                "answer": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 5
+                },
+                "explanation": {
+                  "type": "string",
+                  "maxLength": 240
+                }
+              },
+              "required": [
+                "question",
+                "options",
+                "answer",
+                "explanation"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "questions"
+        ],
+        "additionalProperties": false,
+        "description": "Local scored multiple-choice quiz."
+      },
+      "Flashcard": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "front": {
+            "type": "string",
+            "maxLength": 16384
+          },
+          "back": {
+            "type": "string",
+            "maxLength": 16384
+          }
+        },
+        "required": [
+          "id",
+          "front",
+          "back"
+        ],
+        "additionalProperties": false,
+        "description": "Flip to reveal an answer."
+      },
+      "InteractiveExample": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "sorting",
+              "binary-search",
+              "lru",
+              "bfs",
+              "dfs",
+              "sql-join",
+              "gradient-descent"
+            ]
+          },
+          "values": {
+            "minItems": 1,
+            "maxItems": 24,
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": -999,
+              "maximum": 999
+            }
+          },
+          "target": {
+            "type": "integer",
+            "minimum": -999,
+            "maximum": 999
+          },
+          "capacity": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8
+          },
+          "edges": {
+            "maxItems": 48,
+            "type": "array",
+            "items": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 23
+                },
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 23
+                }
+              ],
+              "items": false,
+              "minItems": 2,
+              "maxItems": 2
+            }
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "values"
+        ],
+        "additionalProperties": false,
+        "description": "Deterministic educational simulation, not execution."
+      },
+      "Slider": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "min": {
+            "type": "number",
+            "minimum": -1000000000000,
+            "maximum": 1000000000000
+          },
+          "max": {
+            "type": "number",
+            "minimum": -1000000000000,
+            "maximum": 1000000000000
+          },
+          "value": {
+            "type": "number",
+            "minimum": -1000000000000,
+            "maximum": 1000000000000
+          },
+          "step": {
+            "type": "number",
+            "minimum": 0.001,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "min",
+          "max",
+          "value"
+        ],
+        "additionalProperties": false,
+        "description": "Local numeric control."
+      },
+      "Toggle": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "value": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "value"
+        ],
+        "additionalProperties": false,
+        "description": "Local on/off control."
+      },
+      "Select": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "options": {
+            "minItems": 1,
+            "maxItems": 24,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 240
+            }
+          },
+          "value": {
+            "type": "string",
+            "maxLength": 240
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "options",
+          "value"
+        ],
+        "additionalProperties": false,
+        "description": "Local choice control."
+      },
+      "Input": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "value": {
+            "type": "string",
+            "maxLength": 2000
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "value"
+        ],
+        "additionalProperties": false,
+        "description": "Local text field. Never sends hidden requests."
+      },
+      "SourceCard": {
+        "type": "object",
+        "properties": {
+          "citationId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 240
+          }
+        },
+        "required": [
+          "citationId",
+          "title"
+        ],
+        "additionalProperties": false,
+        "description": "Reference an actual evidence ID from the answer. Never invent IDs."
+      },
+      "Heading": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "h2",
+              "h3",
+              "h4"
+            ]
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "description": "A section heading."
+      },
+      "Text": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 16384
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "description": "Plain text, no Markdown."
+      },
+      "Markdown": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 16384
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "description": "A block of Markdown text. Use for prose, explanations and formatted text inside the UI."
+      },
+      "Callout": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 16384
+          },
+          "tone": {
+            "type": "string",
+            "enum": [
+              "info",
+              "success",
+              "warning",
+              "error"
+            ]
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "description": "A highlighted note for a warning, tip, success or error the user should notice."
+      },
+      "Stat": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "value": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "detail": {
+            "type": "string",
+            "maxLength": 240
+          }
+        },
+        "required": [
+          "label",
+          "value"
+        ],
+        "additionalProperties": false,
+        "description": "A single metric with a label and an optional detail line."
+      },
+      "Table": {
+        "type": "object",
+        "properties": {
+          "columns": {
+            "minItems": 1,
+            "maxItems": 12,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 240
+            }
+          },
+          "rows": {
+            "maxItems": 100,
+            "type": "array",
+            "items": {
+              "maxItems": 12,
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 240
+                  },
+                  {
+                    "type": "number"
+                  }
+                ]
+              }
+            }
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 64
+          }
+        },
+        "required": [
+          "columns",
+          "rows"
+        ],
+        "additionalProperties": false,
+        "description": "A simple data table. Use instead of a Markdown table when the data is the focus."
+      },
+      "List": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 16384
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false,
+        "description": "A short bulleted list of plain-text items."
+      },
+      "Button": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240
+          },
+          "action": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "continue_conversation"
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4000
+                  }
+                },
+                "required": [
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "open_url"
+                  },
+                  "url": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "format": "uri"
+                  }
+                },
+                "required": [
+                  "type",
+                  "url"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "variant": {
+            "type": "string",
+            "enum": [
+              "primary",
+              "secondary"
+            ]
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "additionalProperties": false,
+        "description": "A clickable button for suggested follow-ups or opening a link. Place one or a small row at the end of a UI block."
+      },
+      "Divider": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "description": "A thin horizontal rule separating sections."
+      },
+      "Section": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "children": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FunctionPlot"
+                },
+                {
+                  "$ref": "#/$defs/EvidenceView"
+                },
+                {
+                  "$ref": "#/$defs/Calculator"
+                },
+                {
+                  "$ref": "#/$defs/Diagram"
+                },
+                {
+                  "$ref": "#/$defs/Timeline"
+                },
+                {
+                  "$ref": "#/$defs/Quiz"
+                },
+                {
+                  "$ref": "#/$defs/Flashcard"
+                },
+                {
+                  "$ref": "#/$defs/InteractiveExample"
+                },
+                {
+                  "$ref": "#/$defs/Slider"
+                },
+                {
+                  "$ref": "#/$defs/Toggle"
+                },
+                {
+                  "$ref": "#/$defs/Select"
+                },
+                {
+                  "$ref": "#/$defs/Input"
+                },
+                {
+                  "$ref": "#/$defs/SourceCard"
+                },
+                {
+                  "$ref": "#/$defs/Heading"
+                },
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "$ref": "#/$defs/Markdown"
+                },
+                {
+                  "$ref": "#/$defs/Callout"
+                },
+                {
+                  "$ref": "#/$defs/Stat"
+                },
+                {
+                  "$ref": "#/$defs/Table"
+                },
+                {
+                  "$ref": "#/$defs/List"
+                },
+                {
+                  "$ref": "#/$defs/Button"
+                },
+                {
+                  "$ref": "#/$defs/Divider"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "title",
+          "children"
+        ],
+        "additionalProperties": false,
+        "description": "A titled panel grouping related content."
+      },
+      "Columns": {
+        "type": "object",
+        "properties": {
+          "children": {
+            "maxItems": 12,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FunctionPlot"
+                },
+                {
+                  "$ref": "#/$defs/EvidenceView"
+                },
+                {
+                  "$ref": "#/$defs/Calculator"
+                },
+                {
+                  "$ref": "#/$defs/Diagram"
+                },
+                {
+                  "$ref": "#/$defs/Timeline"
+                },
+                {
+                  "$ref": "#/$defs/Quiz"
+                },
+                {
+                  "$ref": "#/$defs/Flashcard"
+                },
+                {
+                  "$ref": "#/$defs/InteractiveExample"
+                },
+                {
+                  "$ref": "#/$defs/Slider"
+                },
+                {
+                  "$ref": "#/$defs/Toggle"
+                },
+                {
+                  "$ref": "#/$defs/Select"
+                },
+                {
+                  "$ref": "#/$defs/Input"
+                },
+                {
+                  "$ref": "#/$defs/SourceCard"
+                },
+                {
+                  "$ref": "#/$defs/Heading"
+                },
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "$ref": "#/$defs/Markdown"
+                },
+                {
+                  "$ref": "#/$defs/Callout"
+                },
+                {
+                  "$ref": "#/$defs/Stat"
+                },
+                {
+                  "$ref": "#/$defs/Table"
+                },
+                {
+                  "$ref": "#/$defs/List"
+                },
+                {
+                  "$ref": "#/$defs/Button"
+                },
+                {
+                  "$ref": "#/$defs/Divider"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "children"
+        ],
+        "additionalProperties": false,
+        "description": "Places children side by side, wrapping on narrow widths. Ideal for a row of Stat cards."
+      },
+      "Card": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "children": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FunctionPlot"
+                },
+                {
+                  "$ref": "#/$defs/EvidenceView"
+                },
+                {
+                  "$ref": "#/$defs/Calculator"
+                },
+                {
+                  "$ref": "#/$defs/Diagram"
+                },
+                {
+                  "$ref": "#/$defs/Timeline"
+                },
+                {
+                  "$ref": "#/$defs/Quiz"
+                },
+                {
+                  "$ref": "#/$defs/Flashcard"
+                },
+                {
+                  "$ref": "#/$defs/InteractiveExample"
+                },
+                {
+                  "$ref": "#/$defs/Slider"
+                },
+                {
+                  "$ref": "#/$defs/Toggle"
+                },
+                {
+                  "$ref": "#/$defs/Select"
+                },
+                {
+                  "$ref": "#/$defs/Input"
+                },
+                {
+                  "$ref": "#/$defs/SourceCard"
+                },
+                {
+                  "$ref": "#/$defs/Heading"
+                },
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "$ref": "#/$defs/Markdown"
+                },
+                {
+                  "$ref": "#/$defs/Callout"
+                },
+                {
+                  "$ref": "#/$defs/Stat"
+                },
+                {
+                  "$ref": "#/$defs/Table"
+                },
+                {
+                  "$ref": "#/$defs/List"
+                },
+                {
+                  "$ref": "#/$defs/Button"
+                },
+                {
+                  "$ref": "#/$defs/Divider"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "title",
+          "children"
+        ],
+        "additionalProperties": false,
+        "description": "A titled group of related content."
+      },
+      "Stack": {
+        "type": "object",
+        "properties": {
+          "children": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/FunctionPlot"
+                    },
+                    {
+                      "$ref": "#/$defs/EvidenceView"
+                    },
+                    {
+                      "$ref": "#/$defs/Calculator"
+                    },
+                    {
+                      "$ref": "#/$defs/Diagram"
+                    },
+                    {
+                      "$ref": "#/$defs/Timeline"
+                    },
+                    {
+                      "$ref": "#/$defs/Quiz"
+                    },
+                    {
+                      "$ref": "#/$defs/Flashcard"
+                    },
+                    {
+                      "$ref": "#/$defs/InteractiveExample"
+                    },
+                    {
+                      "$ref": "#/$defs/Slider"
+                    },
+                    {
+                      "$ref": "#/$defs/Toggle"
+                    },
+                    {
+                      "$ref": "#/$defs/Select"
+                    },
+                    {
+                      "$ref": "#/$defs/Input"
+                    },
+                    {
+                      "$ref": "#/$defs/SourceCard"
+                    },
+                    {
+                      "$ref": "#/$defs/Heading"
+                    },
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "$ref": "#/$defs/Markdown"
+                    },
+                    {
+                      "$ref": "#/$defs/Callout"
+                    },
+                    {
+                      "$ref": "#/$defs/Stat"
+                    },
+                    {
+                      "$ref": "#/$defs/Table"
+                    },
+                    {
+                      "$ref": "#/$defs/List"
+                    },
+                    {
+                      "$ref": "#/$defs/Button"
+                    },
+                    {
+                      "$ref": "#/$defs/Divider"
+                    }
+                  ]
+                },
+                {
+                  "$ref": "#/$defs/Card"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "children"
+        ],
+        "additionalProperties": false,
+        "description": "Content arranged vertically."
+      },
+      "Row": {
+        "type": "object",
+        "properties": {
+          "children": {
+            "maxItems": 12,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/FunctionPlot"
+                    },
+                    {
+                      "$ref": "#/$defs/EvidenceView"
+                    },
+                    {
+                      "$ref": "#/$defs/Calculator"
+                    },
+                    {
+                      "$ref": "#/$defs/Diagram"
+                    },
+                    {
+                      "$ref": "#/$defs/Timeline"
+                    },
+                    {
+                      "$ref": "#/$defs/Quiz"
+                    },
+                    {
+                      "$ref": "#/$defs/Flashcard"
+                    },
+                    {
+                      "$ref": "#/$defs/InteractiveExample"
+                    },
+                    {
+                      "$ref": "#/$defs/Slider"
+                    },
+                    {
+                      "$ref": "#/$defs/Toggle"
+                    },
+                    {
+                      "$ref": "#/$defs/Select"
+                    },
+                    {
+                      "$ref": "#/$defs/Input"
+                    },
+                    {
+                      "$ref": "#/$defs/SourceCard"
+                    },
+                    {
+                      "$ref": "#/$defs/Heading"
+                    },
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "$ref": "#/$defs/Markdown"
+                    },
+                    {
+                      "$ref": "#/$defs/Callout"
+                    },
+                    {
+                      "$ref": "#/$defs/Stat"
+                    },
+                    {
+                      "$ref": "#/$defs/Table"
+                    },
+                    {
+                      "$ref": "#/$defs/List"
+                    },
+                    {
+                      "$ref": "#/$defs/Button"
+                    },
+                    {
+                      "$ref": "#/$defs/Divider"
+                    }
+                  ]
+                },
+                {
+                  "$ref": "#/$defs/Card"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "children"
+        ],
+        "additionalProperties": false,
+        "description": "Content in a wrapping horizontal row."
+      },
+      "Grid": {
+        "type": "object",
+        "properties": {
+          "children": {
+            "maxItems": 12,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/FunctionPlot"
+                    },
+                    {
+                      "$ref": "#/$defs/EvidenceView"
+                    },
+                    {
+                      "$ref": "#/$defs/Calculator"
+                    },
+                    {
+                      "$ref": "#/$defs/Diagram"
+                    },
+                    {
+                      "$ref": "#/$defs/Timeline"
+                    },
+                    {
+                      "$ref": "#/$defs/Quiz"
+                    },
+                    {
+                      "$ref": "#/$defs/Flashcard"
+                    },
+                    {
+                      "$ref": "#/$defs/InteractiveExample"
+                    },
+                    {
+                      "$ref": "#/$defs/Slider"
+                    },
+                    {
+                      "$ref": "#/$defs/Toggle"
+                    },
+                    {
+                      "$ref": "#/$defs/Select"
+                    },
+                    {
+                      "$ref": "#/$defs/Input"
+                    },
+                    {
+                      "$ref": "#/$defs/SourceCard"
+                    },
+                    {
+                      "$ref": "#/$defs/Heading"
+                    },
+                    {
+                      "$ref": "#/$defs/Text"
+                    },
+                    {
+                      "$ref": "#/$defs/Markdown"
+                    },
+                    {
+                      "$ref": "#/$defs/Callout"
+                    },
+                    {
+                      "$ref": "#/$defs/Stat"
+                    },
+                    {
+                      "$ref": "#/$defs/Table"
+                    },
+                    {
+                      "$ref": "#/$defs/List"
+                    },
+                    {
+                      "$ref": "#/$defs/Button"
+                    },
+                    {
+                      "$ref": "#/$defs/Divider"
+                    }
+                  ]
+                },
+                {
+                  "$ref": "#/$defs/Card"
+                }
+              ]
+            }
+          },
+          "columns": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4
+          }
+        },
+        "required": [
+          "children"
+        ],
+        "additionalProperties": false,
+        "description": "Responsive equal-width content columns."
+      },
+      "Response": {
+        "type": "object",
+        "properties": {
+          "children": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FunctionPlot"
+                },
+                {
+                  "$ref": "#/$defs/EvidenceView"
+                },
+                {
+                  "$ref": "#/$defs/Calculator"
+                },
+                {
+                  "$ref": "#/$defs/Diagram"
+                },
+                {
+                  "$ref": "#/$defs/Timeline"
+                },
+                {
+                  "$ref": "#/$defs/Quiz"
+                },
+                {
+                  "$ref": "#/$defs/Flashcard"
+                },
+                {
+                  "$ref": "#/$defs/InteractiveExample"
+                },
+                {
+                  "$ref": "#/$defs/Slider"
+                },
+                {
+                  "$ref": "#/$defs/Toggle"
+                },
+                {
+                  "$ref": "#/$defs/Select"
+                },
+                {
+                  "$ref": "#/$defs/Input"
+                },
+                {
+                  "$ref": "#/$defs/SourceCard"
+                },
+                {
+                  "$ref": "#/$defs/Heading"
+                },
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "$ref": "#/$defs/Markdown"
+                },
+                {
+                  "$ref": "#/$defs/Callout"
+                },
+                {
+                  "$ref": "#/$defs/Stat"
+                },
+                {
+                  "$ref": "#/$defs/Table"
+                },
+                {
+                  "$ref": "#/$defs/List"
+                },
+                {
+                  "$ref": "#/$defs/Button"
+                },
+                {
+                  "$ref": "#/$defs/Divider"
+                },
+                {
+                  "$ref": "#/$defs/Section"
+                },
+                {
+                  "$ref": "#/$defs/Columns"
+                },
+                {
+                  "$ref": "#/$defs/Card"
+                },
+                {
+                  "$ref": "#/$defs/Stack"
+                },
+                {
+                  "$ref": "#/$defs/Row"
+                },
+                {
+                  "$ref": "#/$defs/Grid"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "children"
+        ],
+        "additionalProperties": false,
+        "description": "Root container of every UI block. Assign it to `root` and pass content as children."
+      }
+    }
+  }
+}

@@ -1,9 +1,11 @@
-import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Chat } from './Chat';
 import type { Message, ProviderConnection } from '../lib/types';
 
 const apiMocks = vi.hoisted(() => ({
+  getPresentationMode: vi.fn(async () => ({defaultMode:'auto',overrideMode:null,effectiveMode:'auto'})),
+  setPresentationMode: vi.fn(async () => {}),
   getArtifact: vi.fn(),
   contextPreflight: vi.fn(),
   compactConversation: vi.fn(),
@@ -15,6 +17,8 @@ vi.mock('../lib/api', () => ({
   api: {
     listInstalledModels: async () => [],
     compactionStatus: async () => ({ auto: true, keepLast: 10, checkpoint: null }),
+    getPresentationMode: apiMocks.getPresentationMode,
+    setPresentationMode: apiMocks.setPresentationMode,
     getArtifact: apiMocks.getArtifact,
     contextPreflight: apiMocks.contextPreflight,
     compactConversation: apiMocks.compactConversation,
@@ -23,6 +27,8 @@ vi.mock('../lib/api', () => ({
 }));
 
 afterEach(() => {
+  apiMocks.setPresentationMode.mockReset();
+  apiMocks.setPresentationMode.mockResolvedValue(undefined);
   apiMocks.getTodos.mockReset();
   apiMocks.getTodos.mockResolvedValue([]);
   apiMocks.contextPreflight.mockReset();
@@ -32,14 +38,102 @@ afterEach(() => {
 });
 
 const props = { generating: false, ready: true, loading: false, onSend: vi.fn(), onCancel: vi.fn(), onConfigure: vi.fn() };
+describe('audit regressions', () => {
+  it.each([false, true])('has no response-mode selector (existing conversation: %s)', async existing => {
+    const send = vi.fn();
+    const { container } = render(<Chat {...props} onSend={send} conversationKey={existing ? 'owned' : 'new'} messages={existing ? [{id:'m',conversationId:'owned',role:'assistant',content:'Ready',reasoning:'',status:'complete',createdAt:1}] : []} draft="Question" />);
+    await act(async () => {});
+    expect(screen.queryByRole('combobox', { name: 'Response mode' })).not.toBeInTheDocument();
+    expect(container.querySelector('.presentation-mode')).toBeNull();
+    expect(screen.queryByRole('option', { name: /Default \(auto\)/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(send).toHaveBeenCalledWith('Question');
+    expect(apiMocks.setPresentationMode).not.toHaveBeenCalled();
+  });
+
+  it('counts the composed attachment payload, refreshes on model change, and ignores stale preflight responses', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveOld!: (value: unknown) => void;
+      apiMocks.contextPreflight.mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve; }))
+        .mockResolvedValue({ available: false });
+      const attachments = { new: [{ id: 'a', name: 'large.txt', size: 6, content: 'secret attachment text' }] };
+      const { rerender } = render(<Chat {...props} messages={[]} draft="Read this" attachmentDrafts={attachments} modelIdentity="first" />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(apiMocks.contextPreflight.mock.calls[apiMocks.contextPreflight.mock.calls.length - 1]?.[1]).toContain('secret attachment text');
+      rerender(<Chat {...props} messages={[]} draft="Read this" attachmentDrafts={attachments} modelIdentity="second" />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(apiMocks.contextPreflight).toHaveBeenCalledTimes(2);
+      await act(async () => { resolveOld({ available: true, breakdown: { overflow: 'Stale overflow' } }); });
+      expect(screen.queryByText('Stale overflow')).not.toBeInTheDocument();
+    } finally { vi.useRealTimers(); }
+  });
+  it('dismisses the model picker with Escape and outside pointer and restores keyboard focus', () => {
+    render(<Chat {...props} messages={[]} providers={[]} onSelectModel={vi.fn()} />);
+    const trigger = screen.getByRole('button', { name: 'Local model' });
+    fireEvent.click(trigger);
+    expect(screen.getByRole('button', { name: 'Close model picker' })).toHaveFocus();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'Select model' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    fireEvent.click(trigger);
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole('dialog', { name: 'Select model' })).not.toBeInTheDocument();
+  });
+  it('shows only Stop while generating and clicking it cancels once', () => {
+    const onCancel = vi.fn();
+    render(<Chat {...props} onCancel={onCancel} messages={[]} generating />);
+    expect(screen.queryByRole('button', { name: 'Pause response' })).not.toBeInTheDocument();
+    const stops = screen.getAllByRole('button', { name: 'Stop response' });
+    expect(stops).toHaveLength(1);
+    fireEvent.click(stops[0]);
+    expect(onCancel).toHaveBeenCalledOnce();
+  });
+});
+describe('home composer surface', () => {
+  it('keeps a screen-reader heading but renders no visible welcome text or suggestions', () => {
+    const { container } = render(<Chat {...props} messages={[]} projectName="My project" />);
+    expect(screen.getByRole('heading', { name: 'New conversation' })).toBeInTheDocument();
+    expect(container.querySelector('.home-starters')).toBeNull();
+    expect(screen.queryByText('Suggestions')).not.toBeInTheDocument();
+    expect(screen.queryByText('What would you like to work on?')).not.toBeInTheDocument();
+  });
+  it('shows the project name in the context tray on home and opens model settings from it', () => {
+    const onConfigure = vi.fn();
+    render(<Chat {...props} onConfigure={onConfigure} messages={[]} projectName="My project" />);
+    expect(screen.getByText('My project')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Model settings' }));
+    expect(onConfigure).toHaveBeenCalledOnce();
+  });
+});
 describe('chat action reporting and submission', () => {
-  it('pause and resume call the generation controls while a response is running', () => {
-    const onPause = vi.fn();
+  it.each([
+    { motion: 'reduced', systemReduced: false, expected: 'instant' },
+    { motion: 'system', systemReduced: true, expected: 'instant' },
+    { motion: 'system', systemReduced: false, expected: 'smooth' },
+  ])('jumps to the latest message with $expected scrolling for $motion / OS reduced $systemReduced', async ({ motion, systemReduced, expected }) => {
+    const previousMotion = document.documentElement.dataset.motion;
+    const previousMatchMedia = window.matchMedia;
+    document.documentElement.dataset.motion = motion;
+    window.matchMedia = vi.fn(() => ({ matches: systemReduced })) as unknown as typeof window.matchMedia;
+    try {
+      const { container } = render(<Chat {...props} messages={[]} />);
+      const scroller = container.querySelector('.chat-scroll') as HTMLDivElement;
+      Object.defineProperties(scroller, { scrollHeight: { value: 1000 }, clientHeight: { value: 200 }, scrollTop: { value: 0, writable: true } });
+      scroller.scrollTo = vi.fn();
+      fireEvent.scroll(scroller);
+      fireEvent.click(await screen.findByRole('button', { name: 'Jump to latest message' }));
+      expect(scroller.scrollTo).toHaveBeenCalledWith({ top: 1000, behavior: expected });
+    } finally {
+      window.matchMedia = previousMatchMedia;
+      if (previousMotion === undefined) delete document.documentElement.dataset.motion;
+      else document.documentElement.dataset.motion = previousMotion;
+    }
+  });
+
+  it('resume calls the generation control after a paused run', () => {
     const onResume = vi.fn();
-    const { rerender } = render(<Chat {...props} messages={[]} generating onPause={onPause} onResume={onResume} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Pause response' }));
-    expect(onPause).toHaveBeenCalledOnce();
-    rerender(<Chat {...props} messages={[]} generating={false} paused onPause={onPause} onResume={onResume} />);
+    render(<Chat {...props} messages={[]} generating={false} paused onResume={onResume} />);
     fireEvent.click(screen.getByRole('button', { name: 'Resume response' }));
     expect(onResume).toHaveBeenCalledOnce();
   });
@@ -61,20 +155,6 @@ describe('chat action reporting and submission', () => {
     fireEvent.click(screen.getByRole('button', { name: /Plan\s*1 of 2/i }));
     expect(screen.queryByRole('list')).not.toBeInTheDocument();
   });
-  it('toggles plan mode from the composer', () => {
-    const onPlanModeChange = vi.fn();
-    const { rerender } = render(<Chat {...props} messages={[]} planMode={false} onPlanModeChange={onPlanModeChange} />);
-    const toggle = screen.getByRole('button', { name: 'Plan mode' });
-    expect(toggle).toHaveAttribute('aria-pressed', 'false');
-    expect(toggle).not.toHaveTextContent('Plan');
-    fireEvent.click(toggle);
-    expect(onPlanModeChange).toHaveBeenCalledWith(true);
-    rerender(<Chat {...props} messages={[]} planMode onPlanModeChange={onPlanModeChange} />);
-    const active = screen.getByRole('button', { name: 'Plan mode' });
-    expect(active).toHaveAttribute('aria-pressed', 'true');
-    expect(active).toHaveTextContent('Plan');
-    expect(screen.getByLabelText('Message')).toHaveAttribute('placeholder', 'Describe the task to plan…');
-  });
   it('shows unavailable tools as a notice without blocking ordinary chat', () => {
     render(<Chat {...props} messages={[]} draft="Hello" chatNotice="Unavailable for this reply: parallel-web, deepwiki." />);
     expect(screen.getByRole('status')).toHaveTextContent('parallel-web, deepwiki');
@@ -86,8 +166,8 @@ describe('chat action reporting and submission', () => {
     const assistant: Message = {...user,id:'a',role:'assistant',content:'Updated the styles.'};
     const tool: Message = {...user,id:'t',role:'tool',content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'styles.css'}},result:{diff:'--- a/styles.css\n+++ b/styles.css\n@@ -1 +1 @@\n-old\n+new'}})};
     render(<Chat {...props} messages={[user,assistant,tool]} />);
-    expect(screen.getByText('Edited styles.css')).toBeVisible();
-    expect(screen.getByText('Review')).toBeVisible();
+    expect(screen.getByText('Edited 1 file')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'View changes' })).toBeVisible();
   });
   it('shows send failures before the first message is saved', () => {
     render(<Chat {...props} messages={[]} chatError="Connector parallel-web is not connected." />);
@@ -112,10 +192,9 @@ describe('chat action reporting and submission', () => {
     await screen.findByRole('button', { name: /Remove pasted\.png/ });
     expect(onSend).not.toHaveBeenCalled();
   });
-   it('attaches file contents, removes chips, and keeps tools inside the composer', async () => {
+  it('attaches file contents and removes chips', async () => {
     const onSend = vi.fn(async (_content: string) => {});
-    render(<Chat {...props} messages={[]} onSend={onSend} composerTools={<button type="button">Choose tools</button>} />);
-    expect(screen.getByRole('button', { name: 'Choose tools' }).closest('form')).toHaveClass('composer');
+    render(<Chat {...props} messages={[]} onSend={onSend} />);
     fireEvent.change(screen.getByLabelText('Attach files'), { target: { files: [new File(['hello from disk'], 'note.txt')] } });
     await screen.findByRole('button', { name: 'Remove note.txt' });
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
@@ -140,6 +219,7 @@ describe('chat action reporting and submission', () => {
     const message: Message = { id:'tool', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'local-stable-id',localServerName:'Research server',name:'lookup',arguments:{query:'example'},authorization:'user approval decision'},result:{isError:false}}) };
     const { rerender } = render(<Chat {...props} messages={[message]} />);
     expect(screen.getByText('Research server · lookup')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('1 tool used'));
     fireEvent.click(screen.getByText('Research server · lookup'));
     expect(screen.getByText('local-stable-id')).toBeVisible();
     expect(screen.getByText('Authorization: user approval decision')).toBeVisible();
@@ -160,14 +240,15 @@ describe('chat action reporting and submission', () => {
     expect(screen.getByText('fusion yield')).toBeInTheDocument();
     expect(screen.getByText('1 result')).toBeInTheDocument();
     fireEvent.click(screen.getByText('fusion yield'));
-    expect(screen.getByRole('link', { name: 'NIF' })).toHaveAttribute('href', 'https://example.com/nif');
+    expect(within(screen.getByTestId('command-run-card')).getByRole('link', { name: 'NIF' })).toHaveAttribute('href', 'https://example.com/nif');
   });
   it('shows a reviewable unified diff for workspace edits', () => {
     const message: Message = { id:'edit', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'note.txt'},decision:'allowed'},result:{replacements:1,diff:'--- a/note.txt\n+++ b/note.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n'}}) };
     render(<Chat {...props} messages={[message]} />);
-    fireEvent.click(screen.getByText('note.txt'));
+    fireEvent.click(screen.getByText('1 tool used'));
+    fireEvent.click(screen.getAllByText('note.txt')[0]);
     expect(screen.getByText('Diff')).toBeVisible();
-    expect(screen.getByText(/--- a\/note\.txt/, { exact: false })).toBeVisible();
+    expect(screen.getAllByText(/--- a\/note\.txt/, { exact: false })[0]).toBeVisible();
   });
   it('retries the failed prompt as a new send without changing the draft', async () => {
     const onSend = vi.fn(async (_content: string) => {});
@@ -231,6 +312,19 @@ it('shows measured context usage in the context popover', () => {
     await act(async () => reject(new Error('Rejected')));
     expect(input).toHaveValue('Next draft');
   });
+});
+
+it('renders an openui block from an assistant message and sends follow-up actions', async () => {
+  const onSend = vi.fn(async (_content: string) => {});
+  const messages: Message[] = [
+    { id: 'u', conversationId: 'c', role: 'user', content: 'Show stats', reasoning: '', status: 'complete', createdAt: 1 },
+    { id: 'a', conversationId: 'c', role: 'assistant', status: 'complete', reasoning: '', createdAt: 2,
+      content: 'Here are your stats:\n\n```openui-lang\nroot = Response([s, b])\ns = Stat("Downloaded", "2.07 GB")\nb = Button("Show details")\n```\n' },
+  ];
+  render(<Chat {...props} messages={messages} onSend={onSend} />);
+  expect(await screen.findByText('Downloaded')).toBeInTheDocument();
+  fireEvent.click(await screen.findByRole('button', { name: 'Show details' }));
+  expect(onSend).toHaveBeenCalledWith('Show details');
 });
 
 it('shows a saved generation error next to the partial response', () => {
@@ -341,6 +435,51 @@ it('opens model popover and triggers onSelectModel for local and remote models',
   expect(onSelectModel).toHaveBeenCalledWith({ providerId: null, modelId: '' });
 });
 
+it('disables unconfigured or uncredentialed provider models in the picker', async () => {
+  const onSelectModel = vi.fn(async () => {});
+  const providers: ProviderConnection[] = [
+    {
+      id: 'prov-openai',
+      name: 'OpenAI',
+      baseUrl: 'https://api.openai.com/v1',
+      apiFormat: 'openai-chat-completions',
+      hasApiKey: true,
+      verified: true,
+      lastTestedAt: 0,
+      models: [
+        { id: 'configured', contextLength: 128000, maxOutputTokens: 4096, toolSupport: 'supported' },
+        { id: 'unconfigured', contextLength: null, maxOutputTokens: null, toolSupport: 'unknown' },
+      ],
+    },
+    {
+      id: 'prov-nokey',
+      name: 'NoKey',
+      baseUrl: 'https://api.example.com',
+      apiFormat: 'claude-messages',
+      hasApiKey: false,
+      verified: true,
+      lastTestedAt: 0,
+      models: [{ id: 'keyless', contextLength: 8192, maxOutputTokens: null, toolSupport: 'unknown' }],
+    },
+  ];
+
+  render(<Chat {...props} messages={[]} providers={providers} onSelectModel={onSelectModel} modelLabel="Local · llama.cpp" />);
+  fireEvent.click(screen.getByRole('button', { name: /Local · llama\.cpp/ }));
+
+  const unconfigured = screen.getByRole('button', { name: /unconfigured/ });
+  expect(unconfigured).toBeDisabled();
+  expect(unconfigured.getAttribute('title')).toContain('context capacity');
+  const keyless = screen.getByRole('button', { name: /keyless/ });
+  expect(keyless).toBeDisabled();
+  expect(keyless.getAttribute('title')).toContain('API key');
+  fireEvent.click(unconfigured);
+  fireEvent.click(keyless);
+  expect(onSelectModel).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole('button', { name: /^configured/ }));
+  expect(onSelectModel).toHaveBeenCalledWith({ providerId: 'prov-openai', modelId: 'configured' });
+});
+
 it('displays scoped chat error and allows dismissing it', () => {
   const onDismissError = vi.fn();
   const message: Message = { id: 'user-1', conversationId: 'chat', role: 'user', content: 'Hello', reasoning: '', status: 'complete', createdAt: 0 };
@@ -376,7 +515,7 @@ it('renders reasoning block with thinking indicator while streaming and thought 
 
   const { rerender } = render(<Chat {...props} messages={[streamingMsg]} generating={true} />);
 
-  expect(screen.getByText(/Thinking \(/)).toBeInTheDocument();
+  expect(screen.getByText('Reasoning')).toBeInTheDocument();
   expect(screen.getByText('Analyzing query parameters...')).toBeInTheDocument();
 
   const completedMsg: Message = {
@@ -385,7 +524,7 @@ it('renders reasoning block with thinking indicator while streaming and thought 
   };
 
   rerender(<Chat {...props} messages={[completedMsg]} generating={false} />);
-  expect(screen.getByText(/Thought/)).toBeInTheDocument();
+  expect(screen.getByText('Reasoning')).toBeInTheDocument();
 });
 
 it('renders copy button on markdown code blocks', async () => {
@@ -413,3 +552,29 @@ it('renders copy button on markdown code blocks', async () => {
 });
 
 
+
+it('opens an assistant code block in the canvas and closes it', async () => {
+  const messages: Message[] = [
+    { id: 'u', conversationId: 'c', role: 'user', content: 'Show code', reasoning: '', status: 'complete', createdAt: 1 },
+    { id: 'a', conversationId: 'c', role: 'assistant', status: 'complete', reasoning: '', createdAt: 2,
+      content: 'Here you go:\n\n```python\nprint(1)\n```' },
+  ];
+  render(<Chat {...props} messages={messages} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Open in canvas' }));
+  const panel = await screen.findByRole('complementary', { name: 'Canvas: python snippet' });
+  expect(within(panel).getByText('print(1)')).toBeInTheDocument();
+  fireEvent.click(within(panel).getByRole('button', { name: 'Close canvas' }));
+  expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
+});
+
+it('closes the canvas when the conversation changes', async () => {
+  const messages: Message[] = [
+    { id: 'u', conversationId: 'c1', role: 'user', content: 'Show code', reasoning: '', status: 'complete', createdAt: 1 },
+    { id: 'a', conversationId: 'c1', role: 'assistant', status: 'complete', reasoning: '', createdAt: 2, content: '```python\nprint(1)\n```' },
+  ];
+  const view = render(<Chat {...props} conversationKey="c1" messages={messages} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Open in canvas' }));
+  expect(await screen.findByRole('complementary', { name: /Canvas:/ })).toBeInTheDocument();
+  view.rerender(<Chat {...props} conversationKey="c2" messages={[]} />);
+  expect(screen.queryByRole('complementary', { name: /Canvas:/ })).not.toBeInTheDocument();
+});

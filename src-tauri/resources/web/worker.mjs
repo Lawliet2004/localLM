@@ -1,12 +1,11 @@
+import { createRequire } from "module";
 import { DatabaseSync } from "node:sqlite";
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP } from "node:net";
 import http from "node:http";
 import https from "node:https";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
-import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 //#region src/web/types.ts
 function emptySearchMeta() {
@@ -40,29 +39,12 @@ var DEFAULT_CONFIG = {
 	extractEvidenceWithModel: false,
 	enabled: true,
 	mode: "normal",
+	planning: "auto",
 	profile: "standard",
 	searxngBaseUrl: "http://127.0.0.1:8080",
 	searxngTimeoutMs: 15e3,
-	searxngEngines: [
-		"google cse",
-		"yep",
-		"duckduckgo",
-		"google news",
-		"reuters",
-		"wikipedia",
-		"wikinews",
-		"stackoverflow",
-		"github",
-		"arxiv",
-		"openstreetmap"
-	],
-	searxngDisabledEngines: [
-		"google",
-		"bing",
-		"yandex",
-		"brave",
-		"qwant"
-	],
+	searxngEngines: [],
+	searxngDisabledEngines: [],
 	searchProvider: "searxng",
 	googleApiKey: "",
 	googleCxId: "",
@@ -71,9 +53,9 @@ var DEFAULT_CONFIG = {
 		googleDailyLimit: 90
 	},
 	queries: {
-		fast: 2,
-		normal: 4,
-		deep: 6
+		fast: 1,
+		normal: 2,
+		deep: 4
 	},
 	maxConcurrentQueries: 4,
 	searchRetries: 1,
@@ -81,9 +63,9 @@ var DEFAULT_CONFIG = {
 	enablePagination: true,
 	resultsPerQuery: 10,
 	fetch: {
-		fastPages: 4,
-		normalPages: 8,
-		deepPages: 20,
+		fastPages: 3,
+		normalPages: 6,
+		deepPages: 10,
 		timeoutSeconds: 10,
 		deepTimeoutSeconds: 20,
 		maxBytes: 5242880,
@@ -152,12 +134,34 @@ var DEFAULT_CONFIG = {
 /**
 * Creates configuration adjusted for the low_memory profile.
 */
+/**
+* Environment overrides, applied last so a deployment can pin the SearXNG
+* endpoint and engine catalogue without touching app settings (the app always
+* injects a base URL, so env has to win to be useful):
+* SEARXNG_BASE_URL, SEARXNG_TIMEOUT_MS, SEARXNG_ENGINES (csv),
+* SEARXNG_DISABLED_ENGINES (csv), AGC_WEB_PROFILE (=low_memory).
+*/
+function envOverrides() {
+	const env = globalThis.process?.env;
+	if (!env) return {};
+	const out = {};
+	const list = (value) => value?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
+	if (env.SEARXNG_BASE_URL?.trim()) out.searxngBaseUrl = env.SEARXNG_BASE_URL.trim();
+	const timeout = Number(env.SEARXNG_TIMEOUT_MS);
+	if (Number.isFinite(timeout) && timeout >= 1e3 && timeout <= 12e4) out.searxngTimeoutMs = Math.floor(timeout);
+	const engines = list(env.SEARXNG_ENGINES);
+	if (engines.length) out.searxngEngines = engines;
+	const disabled = list(env.SEARXNG_DISABLED_ENGINES);
+	if (disabled.length) out.searxngDisabledEngines = disabled;
+	if (env.AGC_WEB_PROFILE === "low_memory") out.profile = "low_memory";
+	return out;
+}
 function createConfig(overrides) {
-	const envProfile = typeof globalThis.process !== "undefined" && globalThis.process?.env?.AGC_WEB_PROFILE === "low_memory" ? "low_memory" : void 0;
+	const env = envOverrides();
 	const base = {
 		...DEFAULT_CONFIG,
-		...envProfile ? { profile: "low_memory" } : {},
-		...overrides
+		...overrides,
+		...env
 	};
 	for (const key of [
 		"queries",
@@ -179,7 +183,7 @@ function createConfig(overrides) {
 		maxConcurrentQueries: Math.min(base.maxConcurrentQueries, 2),
 		fetch: {
 			...base.fetch,
-			fastPages: 3,
+			fastPages: 2,
 			normalPages: 4,
 			deepPages: 8,
 			globalConcurrency: 4,
@@ -357,6 +361,337 @@ function fuseSearchResults(queryResults) {
 	return deduplicateSearchResults(allResults);
 }
 //#endregion
+//#region node_modules/fflate/esm/index.mjs
+var require = createRequire("/");
+var _a;
+try {
+	_a = require("worker_threads"), _a.Worker, _a.isMarkedAsUntransferable;
+} catch (e) {}
+var u8 = Uint8Array;
+var u16 = Uint16Array;
+var i32 = Int32Array;
+var fleb = new u8([
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+	1,
+	1,
+	1,
+	1,
+	2,
+	2,
+	2,
+	2,
+	3,
+	3,
+	3,
+	3,
+	4,
+	4,
+	4,
+	4,
+	5,
+	5,
+	5,
+	5,
+	0,
+	0,
+	0,
+	0
+]);
+var fdeb = new u8([
+	0,
+	0,
+	0,
+	0,
+	1,
+	1,
+	2,
+	2,
+	3,
+	3,
+	4,
+	4,
+	5,
+	5,
+	6,
+	6,
+	7,
+	7,
+	8,
+	8,
+	9,
+	9,
+	10,
+	10,
+	11,
+	11,
+	12,
+	12,
+	13,
+	13,
+	0,
+	0
+]);
+var clim = new u8([
+	16,
+	17,
+	18,
+	0,
+	8,
+	7,
+	9,
+	6,
+	10,
+	5,
+	11,
+	4,
+	12,
+	3,
+	13,
+	2,
+	14,
+	1,
+	15
+]);
+var freb = function(eb, start) {
+	var b = new u16(31);
+	for (var i = 0; i < 31; ++i) b[i] = start += 1 << eb[i - 1];
+	var r = new i32(b[30]);
+	for (var i = 1; i < 30; ++i) for (var j = b[i]; j < b[i + 1]; ++j) r[j] = j - b[i] << 5 | i;
+	return {
+		b,
+		r
+	};
+};
+var _a = freb(fleb, 2);
+var fl = _a.b;
+var revfl = _a.r;
+fl[28] = 258, revfl[258] = 28;
+var _b = freb(fdeb, 0);
+var fd = _b.b;
+_b.r;
+var rev = new u16(32768);
+for (var i = 0; i < 32768; ++i) {
+	var x = (i & 43690) >> 1 | (i & 21845) << 1;
+	x = (x & 52428) >> 2 | (x & 13107) << 2;
+	x = (x & 61680) >> 4 | (x & 3855) << 4;
+	rev[i] = ((x & 65280) >> 8 | (x & 255) << 8) >> 1;
+}
+var hMap = (function(cd, mb, r) {
+	var s = cd.length;
+	var i = 0;
+	var l = new u16(mb);
+	for (; i < s; ++i) if (cd[i]) ++l[cd[i] - 1];
+	var le = new u16(mb);
+	for (i = 1; i < mb; ++i) le[i] = le[i - 1] + l[i - 1] << 1;
+	var co;
+	if (r) {
+		co = new u16(1 << mb);
+		var rvb = 15 - mb;
+		for (i = 0; i < s; ++i) if (cd[i]) {
+			var sv = i << 4 | cd[i];
+			var r_1 = mb - cd[i];
+			var v = le[cd[i] - 1]++ << r_1;
+			for (var m = v | (1 << r_1) - 1; v <= m; ++v) co[rev[v] >> rvb] = sv;
+		}
+	} else {
+		co = new u16(s);
+		for (i = 0; i < s; ++i) if (cd[i]) co[i] = rev[le[cd[i] - 1]++] >> 15 - cd[i];
+	}
+	return co;
+});
+var flt = new u8(288);
+for (var i = 0; i < 144; ++i) flt[i] = 8;
+for (var i = 144; i < 256; ++i) flt[i] = 9;
+for (var i = 256; i < 280; ++i) flt[i] = 7;
+for (var i = 280; i < 288; ++i) flt[i] = 8;
+var fdt = new u8(32);
+for (var i = 0; i < 32; ++i) fdt[i] = 5;
+var flrm = /*#__PURE__*/ hMap(flt, 9, 1);
+var fdrm = /*#__PURE__*/ hMap(fdt, 5, 1);
+var max = function(a) {
+	var m = a[0];
+	for (var i = 1; i < a.length; ++i) if (a[i] > m) m = a[i];
+	return m;
+};
+var bits = function(d, p, m) {
+	var o = p / 8 | 0;
+	return (d[o] | d[o + 1] << 8) >> (p & 7) & m;
+};
+var bits16 = function(d, p) {
+	var o = p / 8 | 0;
+	return (d[o] | d[o + 1] << 8 | d[o + 2] << 16) >> (p & 7);
+};
+var shft = function(p) {
+	return (p + 7) / 8 | 0;
+};
+var slc = function(v, s, e) {
+	if (s == null || s < 0) s = 0;
+	if (e == null || e > v.length) e = v.length;
+	return new u8(v.subarray(s, e));
+};
+var ec = [
+	"unexpected EOF",
+	"invalid block type",
+	"invalid length/literal",
+	"invalid distance",
+	"stream finished",
+	"no stream handler",
+	,
+	"no callback",
+	"invalid UTF-8 data",
+	"extra field too long",
+	"date not in range 1980-2099",
+	"filename too long",
+	"stream finishing",
+	"invalid zip data"
+];
+var err = function(ind, msg, nt) {
+	var e = new Error(msg || ec[ind]);
+	e.code = ind;
+	if (Error.captureStackTrace) Error.captureStackTrace(e, err);
+	if (!nt) throw e;
+	return e;
+};
+var inflt = function(dat, st, buf, dict) {
+	var sl = dat.length, dl = dict ? dict.length : 0;
+	if (!sl || st.f && !st.l) return buf || new u8(0);
+	var noBuf = !buf;
+	var resize = noBuf || st.i != 2;
+	var noSt = st.i;
+	if (noBuf) buf = new u8(sl * 3);
+	var cbuf = function(l) {
+		var bl = buf.length;
+		if (l > bl) {
+			var nbuf = new u8(Math.max(bl * 2, l));
+			nbuf.set(buf);
+			buf = nbuf;
+		}
+	};
+	var final = st.f || 0, pos = st.p || 0, bt = st.b || 0, lm = st.l, dm = st.d, lbt = st.m, dbt = st.n;
+	var tbts = sl * 8;
+	do {
+		if (!lm) {
+			final = bits(dat, pos, 1);
+			var type = bits(dat, pos + 1, 3);
+			pos += 3;
+			if (!type) {
+				var s = shft(pos) + 4, l = dat[s - 4] | dat[s - 3] << 8, t = s + l;
+				if (t > sl) {
+					if (noSt) err(0);
+					break;
+				}
+				if (resize) cbuf(bt + l);
+				buf.set(dat.subarray(s, t), bt);
+				st.b = bt += l, st.p = pos = t * 8, st.f = final;
+				continue;
+			} else if (type == 1) lm = flrm, dm = fdrm, lbt = 9, dbt = 5;
+			else if (type == 2) {
+				var hLit = bits(dat, pos, 31) + 257, hcLen = bits(dat, pos + 10, 15) + 4;
+				var tl = hLit + bits(dat, pos + 5, 31) + 1;
+				pos += 14;
+				var ldt = new u8(tl);
+				var clt = new u8(19);
+				for (var i = 0; i < hcLen; ++i) clt[clim[i]] = bits(dat, pos + i * 3, 7);
+				pos += hcLen * 3;
+				var clb = max(clt), clbmsk = (1 << clb) - 1;
+				var clm = hMap(clt, clb, 1);
+				for (var i = 0; i < tl;) {
+					var r = clm[bits(dat, pos, clbmsk)];
+					pos += r & 15;
+					var s = r >> 4;
+					if (s < 16) ldt[i++] = s;
+					else {
+						var c = 0, n = 0;
+						if (s == 16) n = 3 + bits(dat, pos, 3), pos += 2, c = ldt[i - 1];
+						else if (s == 17) n = 3 + bits(dat, pos, 7), pos += 3;
+						else if (s == 18) n = 11 + bits(dat, pos, 127), pos += 7;
+						while (n--) ldt[i++] = c;
+					}
+				}
+				var lt = ldt.subarray(0, hLit), dt = ldt.subarray(hLit);
+				lbt = max(lt);
+				dbt = max(dt);
+				lm = hMap(lt, lbt, 1);
+				dm = hMap(dt, dbt, 1);
+			} else err(1);
+			if (pos > tbts) {
+				if (noSt) err(0);
+				break;
+			}
+		}
+		if (resize) cbuf(bt + 131072);
+		var lms = (1 << lbt) - 1, dms = (1 << dbt) - 1;
+		var lpos = pos;
+		for (;; lpos = pos) {
+			var c = lm[bits16(dat, pos) & lms], sym = c >> 4;
+			pos += c & 15;
+			if (pos > tbts) {
+				if (noSt) err(0);
+				break;
+			}
+			if (!c) err(2);
+			if (sym < 256) buf[bt++] = sym;
+			else if (sym == 256) {
+				lpos = pos, lm = null;
+				break;
+			} else {
+				var add = sym - 254;
+				if (sym > 264) {
+					var i = sym - 257, b = fleb[i];
+					add = bits(dat, pos, (1 << b) - 1) + fl[i];
+					pos += b;
+				}
+				var d = dm[bits16(dat, pos) & dms], dsym = d >> 4;
+				if (!d) err(3);
+				pos += d & 15;
+				var dt = fd[dsym];
+				if (dsym > 3) {
+					var b = fdeb[dsym];
+					dt += bits16(dat, pos) & (1 << b) - 1, pos += b;
+				}
+				if (pos > tbts) {
+					if (noSt) err(0);
+					break;
+				}
+				if (resize) cbuf(bt + 131072);
+				var end = bt + add;
+				if (bt < dt) {
+					var shift = dl - dt, dend = Math.min(dt, end);
+					if (shift + bt < 0) err(3);
+					for (; bt < dend; ++bt) buf[bt] = dict[shift + bt];
+				}
+				for (; bt < end; ++bt) buf[bt] = buf[bt - dt];
+			}
+		}
+		st.l = lm, st.p = lpos, st.b = bt, st.f = final;
+		if (lm) final = 1, st.m = lbt, st.d = dm, st.n = dbt;
+	} while (!final);
+	return bt != buf.length && noBuf ? slc(buf, 0, bt) : buf.subarray(0, bt);
+};
+var et = /*#__PURE__*/ new u8(0);
+var zls = function(d, dict) {
+	if ((d[0] & 15) != 8 || d[0] >> 4 > 7 || (d[0] << 8 | d[1]) % 31) err(6, "invalid zlib data");
+	if ((d[1] >> 5 & 1) == +!dict) err(6, "invalid zlib data: " + (d[1] & 32 ? "need" : "unexpected") + " dictionary");
+	return (d[1] >> 3 & 4) + 2;
+};
+function inflateSync(data, opts) {
+	return inflt(data, { i: 2 }, opts && opts.out, opts && opts.dictionary);
+}
+function unzlibSync(data, opts) {
+	return inflt(data.subarray(zls(data, opts && opts.dictionary), -4), { i: 2 }, opts && opts.out, opts && opts.dictionary);
+}
+var td = typeof TextDecoder != "undefined" && /*#__PURE__*/ new TextDecoder();
+try {
+	td.decode(et, { stream: true });
+} catch (e) {}
+//#endregion
 //#region src/web/chunking/tokenizer.ts
 var ApproximateTokenCounter = class {
 	count(text) {
@@ -475,6 +810,16 @@ function chunkDocument(doc, options = {}) {
 }
 //#endregion
 //#region src/web/documents/document_store.ts
+/**
+* Document Store: full stored document text with stable evidence references.
+*
+* The worker keeps full documents outside model context (SQLite `research`
+* rows) and serves bounded passages with stable `docId:passage` references.
+* Open/find tools read from this store — never only from previously
+* compressed evidence — so facts excluded from the initial summary stay
+* recoverable. PDF text carries page references. Missing text is
+* `no_extractable_text`; it is not labeled OCR-required.
+*/
 var MAX_PASSAGE_CHARS = 2e3;
 var MAX_PASSAGES = 5;
 var DocumentStore = class {
@@ -576,45 +921,388 @@ var DocumentStore = class {
 		};
 	}
 };
-/** Minimal PDF text extraction: uncompresses stream objects and pulls text
-*  spans with approximate page attribution. No OCR dependency is bundled, so
-*  scanned PDFs (no extractable text) fail explicitly with `ocr-required`. */
+var PDF_BYTE_LIMIT = 8e6;
+var PDF_INFLATE_LIMIT = 2e6;
+var PdfLimitExceeded = class extends Error {
+	constructor() {
+		super("PDF inflate limit exceeded");
+		this.name = "PdfLimitExceeded";
+	}
+};
+/** Local PDF text extraction.
+*  Bytes are parsed in-process. `title` is ignored so a remote URL is never
+*  fetched or parsed, and external PDF resources are not loaded.
+*  `needsOcr` stays false: little or missing text is not labeled OCR-required. */
 function extractPdfText(bytes, title = "") {
-	const raw = new TextDecoder("latin1").decode(bytes);
-	const pages = [];
-	const pageBodies = raw.split(/\/Type\s*\/Page[^s]/g).slice(1);
-	const pageTexts = (pageBodies.length > 0 ? pageBodies : [raw]).map((body) => {
-		const spans = [];
-		const streamRe = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-		let match;
-		while ((match = streamRe.exec(body)) !== null) {
-			body.slice(Math.max(0, match.index - 500), match.index);
-			const texts = [...match[1].matchAll(/\((?:\\.|[^()\\])*\)\s*Tj|<(?:[0-9a-fA-F\s]+)>\s*Tj/g)].map((m) => decodePdfSpan(m[0]));
-			if (texts.length) spans.push(texts.join(" "));
-		}
-		if (spans.length === 0) {
-			const texts = [...body.matchAll(/\((?:\\.|[^()\\])*\)\s*Tj|<(?:[0-9a-fA-F\s]+)>\s*Tj/g)].map((m) => decodePdfSpan(m[0]));
-			if (texts.length) spans.push(texts.join(" "));
-		}
-		return spans.join("\n").trim();
-	});
-	for (const text of pageTexts) pages.push(text);
-	const text = pageTexts.join("\n").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+	if (bytes.length > PDF_BYTE_LIMIT) return pdfResult("limit_exceeded");
+	const raw = bytesToLatin1(bytes);
+	if (/\/Encrypt\s*(?:\d+\s+\d+\s+R|<<)/.test(raw)) return pdfResult("password_required");
+	if (!looksLikePdf(raw)) return pdfResult("invalid_document");
+	try {
+		const budget = { used: 0 };
+		const pages = pageBodies(raw).map((body) => normalizePdfText(pageText(body, budget)));
+		const text = normalizePdfText(pages.join("\n"));
+		return {
+			pages,
+			text,
+			needsOcr: false,
+			status: text.length > 0 ? "text_extracted" : "no_extractable_text"
+		};
+	} catch (error) {
+		if (error instanceof PdfLimitExceeded) return pdfResult("limit_exceeded");
+		throw error;
+	}
+}
+function pdfResult(status) {
 	return {
-		pages,
-		text,
-		needsOcr: text.length < 50
+		pages: [],
+		text: "",
+		needsOcr: false,
+		status
 	};
 }
-function decodePdfSpan(span) {
-	if (span.startsWith("(")) return span.slice(1, span.lastIndexOf(")")).replace(/\\n/g, "\n").replace(/\\r/g, "\r").replace(/\\t/g, "	").replace(/\\\(/g, "(").replace(/\\\)/g, ")").replace(/\\\\/g, "\\");
-	const hex = span.slice(1, span.indexOf(">")).replace(/\s+/g, "");
+function looksLikePdf(raw) {
+	const hasPage = /\/Type\s*\/Page(?!s)/.test(raw);
+	const hasTextOp = /(?:^|[^A-Za-z])(?:Tj|TJ)(?![A-Za-z])/.test(raw);
+	if (hasPage || hasTextOp) return true;
+	if (!raw.includes("%PDF")) return false;
+	return /\b\d+\s+\d+\s+obj\b/.test(raw) || /(?:^|[^A-Za-z])stream(?![A-Za-z])/.test(raw);
+}
+function normalizePdfText(text) {
+	return text.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+function pageBodies(raw) {
+	const ranges = streamRanges(raw);
+	const markers = [];
+	const re = /\/Type\s*\/Page(?!s)/g;
+	let match;
+	while ((match = re.exec(raw)) !== null) if (!indexInRanges(ranges, match.index)) markers.push(match.index);
+	if (markers.length === 0) return [raw];
+	return markers.map((marker, index) => {
+		const objAt = raw.lastIndexOf("obj", marker);
+		const start = objAt >= 0 && marker - objAt < 4e3 && !indexInRanges(ranges, objAt) && (index === 0 || objAt > markers[index - 1]) ? objAt : marker;
+		return raw.slice(start, markers[index + 1] ?? raw.length);
+	});
+}
+function pageText(body, budget) {
+	const spans = [];
+	let sawStream = false;
+	let from = 0;
+	while (from < body.length) {
+		const at = findKeyword(body, "stream", from);
+		if (at < 0) break;
+		const dataAt = streamDataOffset(body, at);
+		if (dataAt < 0) {
+			from = at + 1;
+			continue;
+		}
+		const end = findKeyword(body, "endstream", dataAt);
+		if (end < 0) break;
+		sawStream = true;
+		const rawPayload = body.slice(dataAt, end);
+		const trimmed = trimOneEol(rawPayload);
+		const dict = dictionaryBefore(body, at);
+		let decoded = trimmed;
+		if (/\/FlateDecode\b/.test(dict) && !/\/Subtype\s*\/Image\b/.test(dict)) {
+			const inflated = inflatePdfStream(trimmed) ?? (trimmed === rawPayload ? null : inflatePdfStream(rawPayload));
+			if (inflated === "limit") throw new PdfLimitExceeded();
+			if (typeof inflated !== "string") {
+				from = end + 9;
+				continue;
+			}
+			budget.used += inflated.length;
+			if (budget.used > PDF_INFLATE_LIMIT) throw new PdfLimitExceeded();
+			decoded = inflated;
+		}
+		const texts = collectSpans(decoded);
+		if (texts.length) spans.push(texts.join(lineGap(decoded)));
+		from = end + 9;
+	}
+	if (!sawStream) {
+		const texts = collectSpans(body);
+		if (texts.length) spans.push(texts.join(lineGap(body)));
+	}
+	return spans.join("\n").trim();
+}
+function dictionaryBefore(body, streamAt) {
+	const window = body.slice(Math.max(0, streamAt - 16e3), streamAt);
+	let cut = 0;
+	for (const marker of [
+		"endstream",
+		"endobj",
+		"obj"
+	]) {
+		const at = window.lastIndexOf(marker);
+		if (at > cut) cut = at;
+	}
+	return window.slice(cut);
+}
+function streamRanges(raw) {
+	const ranges = [];
+	let from = 0;
+	while (from < raw.length) {
+		const at = findKeyword(raw, "stream", from);
+		if (at < 0) break;
+		const dataAt = streamDataOffset(raw, at);
+		if (dataAt < 0) {
+			from = at + 1;
+			continue;
+		}
+		const end = findKeyword(raw, "endstream", dataAt);
+		if (end < 0) break;
+		ranges.push([dataAt, end]);
+		from = end + 9;
+	}
+	return ranges;
+}
+function streamDataOffset(body, streamAt) {
+	const dataAt = streamAt + 6;
+	if (body.startsWith("\r\n", dataAt)) return dataAt + 2;
+	if (body[dataAt] === "\n" || body[dataAt] === "\r") return dataAt + 1;
+	return -1;
+}
+function trimOneEol(payload) {
+	if (payload.endsWith("\r\n")) return payload.slice(0, -2);
+	if (payload.endsWith("\n") || payload.endsWith("\r")) return payload.slice(0, -1);
+	return payload;
+}
+function findKeyword(body, word, from) {
+	let at = from;
+	while (at < body.length) {
+		const found = body.indexOf(word, at);
+		if (found < 0) return -1;
+		const prev = found === 0 ? " " : body[found - 1];
+		const nextIndex = found + word.length;
+		const next = body[nextIndex] ?? "";
+		const followedByEndobj = word === "endstream" && body.startsWith("endobj", nextIndex);
+		if (isDelimiter(prev) && (next === "" || isDelimiter(next) || followedByEndobj)) return found;
+		at = found + 1;
+	}
+	return -1;
+}
+function isDelimiter(ch) {
+	return ch === "" || /[^A-Za-z0-9]/.test(ch);
+}
+function indexInRanges(ranges, index) {
+	return ranges.some(([start, end]) => index >= start && index < end);
+}
+function lineGap(body) {
+	return /[-\d.]+\s+[-\d.]+\s+Td/.test(body) ? "\n" : " ";
+}
+function collectSpans(body) {
+	const spans = [];
+	let i = 0;
+	while (i < body.length) {
+		const ch = body[i];
+		if (ch === "(") {
+			const parsed = readLiteral(body, i);
+			if (parsed.end <= i) {
+				i++;
+				continue;
+			}
+			i = parsed.end;
+			if (showsText(body, i)) spans.push(parsed.text);
+			continue;
+		}
+		if (ch === "<" && body[i + 1] !== "<") {
+			const parsed = readHex(body, i);
+			if (!parsed || parsed.end <= i) {
+				i++;
+				continue;
+			}
+			i = parsed.end;
+			if (showsText(body, i)) spans.push(parsed.text);
+			continue;
+		}
+		if (ch === "[") {
+			const parsed = readTextArray(body, i);
+			if (parsed && parsed.end > i) {
+				if (parsed.text) spans.push(parsed.text);
+				i = parsed.end;
+				continue;
+			}
+		}
+		i++;
+	}
+	return spans.filter((span) => span.length > 0);
+}
+function showsText(body, index) {
+	const match = /^[ \t\r\n]*([A-Za-z'"]+)/.exec(body.slice(index));
+	return match != null && (match[1] === "Tj" || match[1] === "'" || match[1] === "\"");
+}
+function readTextArray(body, start) {
+	let i = start + 1;
+	let text = "";
+	while (i < body.length) {
+		const ch = body[i];
+		if (ch === "(") {
+			const parsed = readLiteral(body, i);
+			if (parsed.end <= i) return null;
+			text += parsed.text;
+			i = parsed.end;
+			continue;
+		}
+		if (ch === "<" && body[i + 1] !== "<") {
+			const parsed = readHex(body, i);
+			if (parsed && parsed.end > i) {
+				text += parsed.text;
+				i = parsed.end;
+				continue;
+			}
+		}
+		if (ch === "]") {
+			const match = /^[ \t\r\n]*(TJ)/.exec(body.slice(i + 1));
+			if (!match) return null;
+			return {
+				text,
+				end: i + 1 + match[0].length
+			};
+		}
+		i++;
+	}
+	return null;
+}
+function readLiteral(body, start) {
+	let i = start + 1;
+	let depth = 1;
+	let raw = "";
+	while (i < body.length && depth > 0) {
+		const ch = body[i];
+		if (ch === "\\") {
+			raw += ch;
+			if (i + 1 < body.length) raw += body[++i];
+			i++;
+			continue;
+		}
+		if (ch === "(") depth++;
+		if (ch === ")") {
+			depth--;
+			if (depth === 0) break;
+		}
+		raw += ch;
+		i++;
+	}
+	return {
+		text: unescapeLiteral(raw),
+		end: Math.min(body.length, i + 1)
+	};
+}
+function readHex(body, start) {
+	if (body[start + 1] === "<") return null;
+	let hex = "";
+	let i = start + 1;
+	while (i < body.length) {
+		const ch = body[i];
+		if (ch === ">") return {
+			text: decodeHexString(hex),
+			end: i + 1
+		};
+		if (/[0-9a-fA-F]/.test(ch)) hex += ch;
+		else if (!/\s/.test(ch)) return null;
+		i++;
+	}
+	return null;
+}
+function unescapeLiteral(body) {
 	let out = "";
-	for (let i = 0; i + 3 < hex.length; i += 4) {
-		const code = parseInt(hex.slice(i, i + 4), 16);
-		if (Number.isFinite(code) && code > 0) out += String.fromCharCode(code);
+	for (let i = 0; i < body.length; i++) {
+		const ch = body[i];
+		if (ch !== "\\") {
+			out += ch;
+			continue;
+		}
+		const next = body[++i];
+		if (next == null) break;
+		if (next === "n") out += "\n";
+		else if (next === "r") out += "\r";
+		else if (next === "t") out += "	";
+		else if (next === "b") out += "\b";
+		else if (next === "f") out += "\f";
+		else if (next === "(" || next === ")" || next === "\\") out += next;
+		else if (next === "\n") continue;
+		else if (next === "\r") {
+			if (body[i + 1] === "\n") i++;
+		} else if (next >= "0" && next <= "7") {
+			let oct = next;
+			for (let k = 0; k < 2; k++) {
+				const digit = body[i + 1];
+				if (digit >= "0" && digit <= "7") {
+					oct += digit;
+					i++;
+				} else break;
+			}
+			out += String.fromCharCode(Number.parseInt(oct, 8) & 255);
+		} else out += next;
+	}
+	return decodeUtf16Bytes(out);
+}
+function decodeUtf16Bytes(text) {
+	if (text.length < 2 || text.charCodeAt(0) !== 254 || text.charCodeAt(1) !== 255) return text;
+	let out = "";
+	for (let i = 2; i + 1 < text.length; i += 2) {
+		const code = text.charCodeAt(i) << 8 | text.charCodeAt(i + 1) & 255;
+		if (code > 0) out += String.fromCharCode(code);
 	}
 	return out;
+}
+function decodeHexString(hex) {
+	if (hex.length % 2 === 1) hex += "0";
+	if (!hex) return "";
+	const bytes = new Uint8Array(hex.length / 2);
+	for (let i = 0; i < bytes.length; i++) {
+		const value = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+		if (!Number.isFinite(value)) return "";
+		bytes[i] = value;
+	}
+	if (bytes.length >= 2 && bytes[0] === 254 && bytes[1] === 255) return utf16be(bytes.subarray(2));
+	if (bytes.length >= 2 && bytes.length % 2 === 0 && mostlyUtf16Be(bytes)) return utf16be(bytes);
+	return bytesToLatin1(bytes);
+}
+function utf16be(bytes) {
+	let out = "";
+	for (let i = 0; i + 1 < bytes.length; i += 2) {
+		const code = bytes[i] << 8 | bytes[i + 1];
+		if (code > 0) out += String.fromCharCode(code);
+	}
+	return out;
+}
+function mostlyUtf16Be(bytes) {
+	let zeros = 0;
+	const pairs = bytes.length / 2;
+	for (let i = 0; i < bytes.length; i += 2) if (bytes[i] === 0) zeros++;
+	return zeros * 2 >= pairs;
+}
+function inflatePdfStream(latin1) {
+	if (!latin1) return null;
+	const bytes = latin1ToBytes(latin1);
+	const zlibbed = tryInflate(bytes, "zlib");
+	if (zlibbed === "limit") return "limit";
+	if (zlibbed) return bytesToLatin1(zlibbed);
+	const raw = tryInflate(bytes, "raw");
+	if (raw === "limit") return "limit";
+	if (raw) return bytesToLatin1(raw);
+	return null;
+}
+function tryInflate(bytes, mode) {
+	try {
+		const out = /* @__PURE__ */ new Uint8Array(2000001);
+		const inflated = mode === "zlib" ? unzlibSync(bytes, { out }) : inflateSync(bytes, { out });
+		if (inflated.length > PDF_INFLATE_LIMIT) return "limit";
+		return inflated;
+	} catch {
+		return null;
+	}
+}
+function bytesToLatin1(bytes) {
+	let out = "";
+	const chunk = 8192;
+	for (let i = 0; i < bytes.length; i += chunk) out += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+	return out;
+}
+function latin1ToBytes(latin1) {
+	const bytes = new Uint8Array(latin1.length);
+	for (let i = 0; i < latin1.length; i++) bytes[i] = latin1.charCodeAt(i) & 255;
+	return bytes;
 }
 //#endregion
 //#region src/web/router/request_normalizer.ts
@@ -917,9 +1605,14 @@ var QueryPlanner = class {
 	constructor(llmProvider) {
 		this.llmProvider = llmProvider;
 	}
-	async planQueries(question, freshness = "any", maxQueries = 4, currentDate) {
+	/**
+	* `strategy` decides who plans. `rules`/`auto`-on-small-modes keep planning
+	* free; `model` (or `auto` on a deep turn) spends one bounded LLM call and
+	* still falls back to deterministic planning when the model fails.
+	*/
+	async planQueries(question, freshness = "any", maxQueries = 4, currentDate, strategy = "model") {
 		maxQueries = Math.max(1, Math.min(4, Math.floor(maxQueries) || 1));
-		if (!this.llmProvider) return planQueriesDeterministically(question, freshness, maxQueries);
+		if (strategy === "rules" || !this.llmProvider) return planQueriesDeterministically(question, freshness, maxQueries);
 		const curDate = currentDate || (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
 		const systemPrompt = `You are a web-search query planner.
 Your ONLY job is to produce search queries required to answer the user's question.
@@ -944,6 +1637,7 @@ Return valid JSON: {"queries": [{"query": "...", "purpose": "...", "freshness": 
 				userPrompt,
 				temperature: .1,
 				maxTokens: 400,
+				reasoningEffort: "low",
 				responseSchema: {
 					...QUERY_PLAN_SCHEMA,
 					properties: { queries: {
@@ -1173,14 +1867,6 @@ function normalizeSearxMeta(data) {
 	if (Array.isArray(data?.suggestions)) meta.suggestions = data.suggestions.filter((s) => typeof s === "string" && s.trim().length > 0).slice(0, 8);
 	return meta;
 }
-/** Engines that require credentials or are unreliable without them stay off in the default configuration. */
-var KEYFREE_CREDENTIAL_ENGINES = [
-	"google",
-	"bing",
-	"yandex",
-	"brave",
-	"qwant"
-];
 var resultMeta = /* @__PURE__ */ new WeakMap();
 /** Meta attached to a `search()` return value so concurrent queries cannot clobber each other. */
 function metaForResults(results) {
@@ -1188,7 +1874,17 @@ function metaForResults(results) {
 }
 function parseSearxngBaseUrls(baseUrl) {
 	const urls = baseUrl.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
-	return urls.length > 0 ? urls : ["http://127.0.0.1:8080"];
+	return [...new Set((urls.length ? urls : ["http://127.0.0.1:8080"]).map((value) => {
+		let url;
+		try {
+			url = new URL(value);
+		} catch {
+			throw new Error("SearXNG base URL must be an absolute HTTP or HTTPS URL.");
+		}
+		if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error("SearXNG base URL must use HTTP or HTTPS without credentials, a query, or a fragment.");
+		url.pathname = url.pathname.replace(/\/+$/, "").replace(/\/search$/, "") + "/";
+		return url.href.replace(/\/$/, "");
+	}))];
 }
 /** Instant answers and infoboxes become evidence documents for small local models. */
 function documentsFromSearchMeta(meta, retrievedAt = (/* @__PURE__ */ new Date()).toISOString()) {
@@ -1244,58 +1940,83 @@ function hostnameOf(url) {
 		return "searxng";
 	}
 }
-var SearXNGProvider = class {
+var SearXNGError = class extends Error {
+	diagnostics;
+	retryable;
+	constructor(message, diagnostics, retryable = true) {
+		super(message);
+		this.diagnostics = diagnostics;
+		this.retryable = retryable;
+		this.name = "SearXNGError";
+	}
+};
+function engineFailures(data) {
+	const failures = {};
+	if (data.engines && !Array.isArray(data.engines) && typeof data.engines === "object") {
+		for (const [name, info] of Object.entries(data.engines)) if (info?.error || info?.timed_out) failures[name] = String(info.error || "timeout");
+	}
+	for (const entry of Array.isArray(data.unresponsive_engines) ? data.unresponsive_engines : []) if (Array.isArray(entry) && typeof entry[0] === "string") failures[entry[0]] = String(entry[1] || "unresponsive");
+	else if (typeof entry === "string") failures[entry] = "unresponsive";
+	return failures;
+}
+var SearXNGProvider = class SearXNGProvider {
 	baseUrl;
 	timeoutMs;
 	engines;
 	disabledEngines;
-	retryAfter = 0;
+	retryAfter = /* @__PURE__ */ new Map();
 	lastDiagnostics = null;
-	/** Instant answers / infoboxes / corrections / suggestions from the last successful search. */
+	/** Metadata from the last completed search; per-query metadata travels with results. */
 	lastMeta = null;
-	constructor(baseUrl = "http://127.0.0.1:8080", timeoutMs = 8e3, engines = [
-		"google cse",
-		"yep",
-		"duckduckgo",
-		"google news",
-		"reuters",
-		"wikipedia",
-		"wikinews",
-		"stackoverflow",
-		"github",
-		"arxiv",
-		"openstreetmap"
-	], disabledEngines = [...KEYFREE_CREDENTIAL_ENGINES]) {
+	constructor(baseUrl = "http://127.0.0.1:8080", timeoutMs = 15e3, engines = [], disabledEngines = []) {
 		this.baseUrl = baseUrl;
 		this.timeoutMs = timeoutMs;
 		this.engines = engines;
 		this.disabledEngines = disabledEngines;
 	}
-	/** Verify which configured engines answer instead of assuming they work. */
+	/** Probe the real JSON search API, including upstream engine failures. */
+	async checkHealth() {
+		try {
+			const hits = await this.search({
+				query: "SearXNG",
+				maxResults: 1
+			});
+			const degraded = Object.keys(this.lastDiagnostics?.engines || {}).length > 0;
+			const hasEvidence = hits.length || this.lastMeta?.answers.length || this.lastMeta?.infoboxes.length;
+			return {
+				search: degraded ? "degraded" : hasEvidence ? "healthy" : "empty",
+				...!hasEvidence ? { searchError: "SearXNG JSON API responded, but the probe returned no results. Check the enabled engines." } : {},
+				searxngDiagnostics: this.lastDiagnostics ?? void 0
+			};
+		} catch (error) {
+			return {
+				search: this.lastDiagnostics?.httpStatus ? "error" : "unreachable",
+				searchError: error instanceof Error ? error.message : String(error),
+				searxngDiagnostics: this.lastDiagnostics ?? void 0
+			};
+		}
+	}
+	/** HTTP 200 alone does not establish that an engine actually answered. */
 	async checkEngineHealth() {
 		const working = [];
 		const failing = {};
-		await Promise.all(this.engines.map(async (engine) => {
-			try {
-				const url = new URL("/search", parseSearxngBaseUrls(this.baseUrl)[0]);
-				url.searchParams.set("q", "health check");
-				url.searchParams.set("format", "json");
-				url.searchParams.set("engines", engine);
-				const controller = new AbortController();
-				const timer = setTimeout(() => controller.abort(), Math.min(this.timeoutMs, 5e3));
+		const queue = [...this.engines];
+		await Promise.all(Array.from({ length: Math.min(4, queue.length) }, async () => {
+			while (queue.length) {
+				const engine = queue.shift();
 				try {
-					const res = await fetch(url.toString(), {
-						headers: { Accept: "application/json" },
-						signal: controller.signal,
-						redirect: "error"
+					const probe = new SearXNGProvider(this.baseUrl, this.timeoutMs, [engine]);
+					const hits = await probe.search({
+						query: "SearXNG",
+						maxResults: 1
 					});
-					if (!res.ok) failing[engine] = `HTTP ${res.status}`;
-					else working.push(engine);
-				} finally {
-					clearTimeout(timer);
+					const reason = probe.lastDiagnostics?.engines?.[engine];
+					if (reason) failing[engine] = reason;
+					else if (hits.length || probe.lastMeta?.answers.length || probe.lastMeta?.infoboxes.length) working.push(engine);
+					else failing[engine] = "No results returned for the probe";
+				} catch (error) {
+					failing[engine] = error instanceof Error ? error.message : String(error);
 				}
-			} catch (err) {
-				failing[engine] = err?.name === "AbortError" ? "timeout" : String(err?.message || err);
 			}
 		}));
 		return {
@@ -1304,101 +2025,111 @@ var SearXNGProvider = class {
 		};
 	}
 	async search(request) {
-		if (Date.now() < this.retryAfter) throw new Error("SearXNG Retry-After cooldown active");
-		const bases = parseSearxngBaseUrls(this.baseUrl);
+		this.lastMeta = null;
+		this.lastDiagnostics = null;
+		if (typeof request.query !== "string" || !request.query.trim()) throw new SearXNGError("SearXNG requires a nonempty search query.", {}, false);
+		let bases;
+		try {
+			bases = parseSearxngBaseUrls(this.baseUrl);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.lastDiagnostics = { error: message };
+			throw new SearXNGError(message, this.lastDiagnostics, false);
+		}
 		const deadline = Date.now() + this.timeoutMs;
 		let lastError;
-		let cooldownUntil = 0;
-		for (let i = 0; i < bases.length; i++) {
+		const available = bases.filter((base) => (this.retryAfter.get(base) || 0) <= Date.now());
+		if (!available.length) {
+			this.lastDiagnostics = { error: "SearXNG Retry-After cooldown active for all configured instances." };
+			throw new SearXNGError(this.lastDiagnostics.error, this.lastDiagnostics, false);
+		}
+		for (let i = 0; i < available.length; i++) {
 			const remaining = deadline - Date.now();
 			if (remaining <= 0) break;
 			try {
-				return await this.searchAgainst(bases[i], request, remaining);
-			} catch (err) {
-				lastError = err;
-				if (typeof err?.cooldownUntil === "number") cooldownUntil = Math.max(cooldownUntil, err.cooldownUntil);
-				if (bases.length === 1) {
-					if (cooldownUntil) this.retryAfter = cooldownUntil;
-					throw err;
-				}
+				const outcome = await this.searchAgainst(available[i], request, remaining / (available.length - i));
+				this.lastDiagnostics = outcome.diagnostics;
+				this.lastMeta = outcome.meta;
+				resultMeta.set(outcome.results, outcome.meta);
+				return outcome.results;
+			} catch (error) {
+				lastError = error;
+				this.lastDiagnostics = lastError.diagnostics;
 			}
 		}
-		if (cooldownUntil) this.retryAfter = cooldownUntil;
-		throw lastError instanceof Error ? lastError : /* @__PURE__ */ new Error("SearXNG request failed");
+		throw lastError || new SearXNGError("SearXNG request timed out.", { error: "timeout" });
 	}
 	async searchAgainst(baseUrl, request, timeoutMs) {
 		const page = Math.max(1, Math.min(5, Math.floor(request.page ?? 1) || 1));
-		const url = new URL("/search", baseUrl);
-		url.searchParams.set("q", request.query);
+		const diagnostics = {
+			baseUrl,
+			page
+		};
+		const url = new URL(`${baseUrl}/search`);
+		url.searchParams.set("q", request.query.trim());
 		url.searchParams.set("format", "json");
 		url.searchParams.set("pageno", String(page));
-		if (this.engines.length > 0) url.searchParams.set("engines", this.engines.join(","));
-		if (this.disabledEngines.length > 0) url.searchParams.set("disabled_engines", this.disabledEngines.join(","));
+		const enabled = this.engines.filter((engine) => !this.disabledEngines.includes(engine));
+		if (this.engines.length && !enabled.length) throw new SearXNGError("All requested SearXNG engines are disabled.", diagnostics, false);
+		if (enabled.length) url.searchParams.set("engines", enabled.join(","));
+		if (this.disabledEngines.length) url.searchParams.set("disabled_engines", this.disabledEngines.join(","));
 		if (request.language) url.searchParams.set("language", request.language);
 		if (request.category) url.searchParams.set("categories", request.category);
-		if (request.freshness && request.freshness !== "any" && request.freshness !== "realtime") url.searchParams.set("time_range", request.freshness === "week" ? "month" : request.freshness);
+		if (request.freshness && request.freshness !== "any") url.searchParams.set("time_range", request.freshness === "week" ? "month" : request.freshness === "realtime" ? "day" : request.freshness);
 		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), Math.max(50, timeoutMs));
+		const timer = setTimeout(() => controller.abort(), Math.max(1, Math.floor(timeoutMs)));
 		try {
 			const res = await fetch(url.toString(), {
 				headers: { Accept: "application/json" },
 				signal: controller.signal,
 				redirect: "error"
 			});
+			diagnostics.httpStatus = res.status;
 			if (!res.ok) {
-				this.lastDiagnostics = {
-					httpStatus: res.status,
-					page,
-					error: `HTTP ${res.status}`
-				};
-				const error = /* @__PURE__ */ new Error(`SearXNG returned HTTP ${res.status}: ${res.statusText}`);
+				let message = `SearXNG returned HTTP ${res.status}.`;
+				if (res.status === 403) message += " Enable json under search.formats in SearXNG settings.yml and check access restrictions.";
 				if (res.status === 429 || res.status === 503) {
-					const value = res.headers.get("Retry-After") || "";
-					const parsed = /^\d+$/.test(value) ? Date.now() + Number(value) * 1e3 : Date.parse(value);
-					error.cooldownUntil = Math.max(Date.now() + 3e4, Number.isFinite(parsed) ? parsed : 0);
+					const value = res.headers.get("Retry-After")?.trim();
+					const parsed = value && /^\d+$/.test(value) ? Date.now() + Number(value) * 1e3 : Date.parse(value || "");
+					this.retryAfter.set(baseUrl, Number.isFinite(parsed) ? Math.max(Date.now(), parsed) : Date.now() + 3e4);
+					message += " Retry-After cooldown applied to this instance.";
 				}
-				throw error;
+				throw new SearXNGError(message, diagnostics, res.status >= 500 && res.status !== 503);
 			}
-			const data = await res.json();
-			clearTimeout(timer);
-			const engines = data?.engines && typeof data.engines === "object" ? data.engines : void 0;
-			const unresponsive = Array.isArray(data?.unresponsive_engines) ? data.unresponsive_engines.map((e) => String(e)) : [];
-			const engineFailures = {};
-			if (engines) {
-				for (const [name, info] of Object.entries(engines)) if (info && typeof info === "object" && ("error" in info || typeof info.timed_out !== "undefined" && info.timed_out)) engineFailures[name] = String(info.error || "engine failed");
+			let data;
+			try {
+				data = await res.json();
+			} catch (error) {
+				if (controller.signal.aborted) throw error;
+				throw new SearXNGError("SearXNG did not return valid JSON. Enable json under search.formats in settings.yml and check the base URL.", diagnostics, false);
 			}
-			this.lastDiagnostics = {
-				httpStatus: res.status,
-				engines: engineFailures,
-				unresponsiveEngines: unresponsive,
-				page
-			};
+			if (!data || !Array.isArray(data.results) || data.error) throw new SearXNGError(`SearXNG returned an invalid search response${data?.error ? `: ${String(data.error).slice(0, 300)}` : ": missing results array"}.`, diagnostics, false);
+			diagnostics.engines = engineFailures(data);
+			diagnostics.unresponsiveEngines = Object.keys(diagnostics.engines);
 			const meta = normalizeSearxMeta(data);
-			this.lastMeta = this.lastMeta ? mergeSearchMeta(this.lastMeta, meta) : meta;
-			if (!data || !Array.isArray(data.results)) {
-				const empty = [];
-				resultMeta.set(empty, meta);
-				return empty;
-			}
-			const limit = request.maxResults ?? 10;
+			const limit = Math.max(1, Math.min(50, Math.floor(request.maxResults ?? 10) || 10));
 			const results = [];
-			for (let i = 0; i < Math.min(data.results.length, limit); i++) results.push(normalizeRawSearchResult(data.results[i], request.query, i + 1, page));
-			resultMeta.set(results, meta);
-			return results;
-		} catch (err) {
-			clearTimeout(timer);
-			if (err.name === "AbortError") {
-				this.lastDiagnostics = {
-					page,
-					error: "timeout"
-				};
-				throw new Error(`SearXNG request timed out after ${this.timeoutMs}ms`);
+			for (let i = 0; i < data.results.length && results.length < limit; i++) {
+				const raw = data.results[i];
+				if (!raw || typeof raw !== "object" || !usableMetaUrl(raw.url)) continue;
+				results.push(normalizeRawSearchResult(raw, request.query, i + 1, page));
 			}
-			if (!this.lastDiagnostics) this.lastDiagnostics = {
-				page,
-				error: String(err?.message || err)
+			if (!results.length && !meta.answers.length && !meta.infoboxes.length && diagnostics.unresponsiveEngines.length) throw new SearXNGError(`SearXNG returned no usable results; engine failures: ${Object.entries(diagnostics.engines).map(([name, reason]) => `${name}: ${reason}`).join("; ")}`, diagnostics);
+			return {
+				results,
+				meta,
+				diagnostics
 			};
-			throw err;
+		} catch (error) {
+			if (controller.signal.aborted) throw new SearXNGError(`SearXNG request timed out after ${this.timeoutMs}ms (instance budget ${Math.floor(timeoutMs)}ms).`, {
+				...diagnostics,
+				error: "timeout"
+			});
+			const failure = error instanceof SearXNGError ? error : new SearXNGError(`Could not reach SearXNG at ${baseUrl}: ${error instanceof Error ? error.message : String(error)}`, diagnostics);
+			failure.diagnostics.error = failure.message;
+			throw failure;
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 };
@@ -1422,11 +2153,13 @@ var SearchService = class {
 				query: query.query,
 				freshness: query.freshness,
 				maxResults,
-				page: query.page
+				page: query.page,
+				language: query.language,
+				category: query.category
 			});
 		} catch (err) {
 			lastError = String(err?.message || err);
-			if (/retry-after/i.test(lastError)) break;
+			if (err?.retryable === false || /retry-after/i.test(lastError)) break;
 			if (attempt < this.retries) await new Promise((r) => setTimeout(r, this.retryDelayMs));
 		}
 		throw new Error(lastError || "search failed");
@@ -2167,6 +2900,20 @@ async function fetchPageCascade(url, fetcher, options = {}) {
 			}
 		}
 		const live = await fetcher.fetch(url, fetchOpts);
+		const mime = (live.mimeType || "").split(";")[0].trim().toLowerCase();
+		if (live.success && typeof live.body === "string" && ([
+			"application/json",
+			"text/csv",
+			"application/csv",
+			"text/tab-separated-values"
+		].includes(mime) || mime.endsWith("+json"))) {
+			await record(true);
+			return {
+				document: null,
+				raw: live,
+				method: "live"
+			};
+		}
 		if (live.success && live.body && live.body.length >= 150) {
 			if (isPdf(live, url)) {
 				await record(true);
@@ -2861,6 +3608,7 @@ Rules:
 				userPrompt,
 				temperature: .1,
 				maxTokens: 500,
+				reasoningEffort: "low",
 				responseSchema: {
 					type: "object",
 					properties: { facts: {
@@ -3166,19 +3914,18 @@ var ClaimVerifier = class {
 			}
 			let status = "UNSUPPORTED";
 			let sources = [];
+			const passage = matchingEvidence?.claim ?? "";
+			const grounded = (matchingEvidence ? excerptContains(claim, passage) : false) && bestNumbersMatch && !quantitiesConflict(claim, passage) && !addsCurrentWording(claim, passage);
+			const assessment = !matchingEvidence ? "unresolved" : matchingEvidence.status === "conflicting" ? "conflicting" : grounded ? "exact_excerpt" : bestScore >= .4 ? "lexical_match" : "unresolved";
 			if (matchingEvidence) {
-				if (matchingEvidence.status === "conflicting") {
+				if (matchingEvidence.status === "conflicting" || assessment === "conflicting") {
 					status = "CONFLICTING";
 					sources = matchingEvidence.supportingSources;
 					conflictingCount++;
-				} else if (bestNumbersMatch && bestScore >= .6) {
+				} else if (grounded) {
 					status = "SUPPORTED";
 					sources = matchingEvidence.supportingSources;
 					supportedCount++;
-				} else if (bestNumbersMatch && bestScore >= .4) {
-					status = "PARTIALLY_SUPPORTED";
-					sources = matchingEvidence.supportingSources;
-					unsupportedCount++;
 				} else {
 					status = "UNSUPPORTED";
 					unsupportedCount++;
@@ -3190,7 +3937,8 @@ var ClaimVerifier = class {
 			verifiedClaims.push({
 				claim,
 				status,
-				sources
+				sources,
+				assessment
 			});
 		}
 		return {
@@ -3227,7 +3975,8 @@ Output valid JSON: {"claims": [{"claim": "...", "status": "SUPPORTED|UNSUPPORTED
 				systemPrompt,
 				userPrompt,
 				temperature: .1,
-				maxTokens: 600
+				maxTokens: 600,
+				reasoningEffort: "low"
 			})).text.match(/\{[\s\S]*\}/);
 			if (jsonMatch) {
 				const parsed = JSON.parse(jsonMatch[0]);
@@ -3253,7 +4002,8 @@ Output valid JSON: {"claims": [{"claim": "...", "status": "SUPPORTED|UNSUPPORTED
 							return {
 								claim: item.claim,
 								status: st,
-								sources: Array.isArray(item.sources) ? item.sources : []
+								sources: Array.isArray(item.sources) ? item.sources : [],
+								assessment: "model_assessed"
 							};
 						}),
 						allSupported: unsup === 0 && conf === 0,
@@ -3267,6 +4017,82 @@ Output valid JSON: {"claims": [{"claim": "...", "status": "SUPPORTED|UNSUPPORTED
 		return this.verifyClaimsDeterministic(claims, evidence);
 	}
 };
+function normalizeText(value) {
+	return value.toLowerCase().replace(/[^\w\s.%$€]/g, " ").replace(/(?<!\d)\.(?!\d)/g, " ").replace(/\s+/g, " ").trim();
+}
+var TRAILING_UNIT = /^(?:[kmbt]|kilometers?|km|miles?|mi|dollars?|usd|cents?|euros?|gb|mb|kb|tb|percent|watts?)(?!\w)/;
+var CURRENT_MARKERS = [
+	"as of now",
+	"right now",
+	"currently",
+	"nowadays",
+	"presently",
+	"current",
+	"today",
+	"latest"
+];
+/** The quoted text has to occur in the passage. Overlap is not enough. */
+function excerptContains(quote, passage) {
+	const quoted = normalizeText(quote);
+	const source = normalizeText(passage);
+	if (!quoted) return false;
+	let from = 0;
+	while (from < source.length) {
+		const at = source.indexOf(quoted, from);
+		if (at < 0) return false;
+		const end = at + quoted.length;
+		const startsToken = at === 0 || source[at - 1] === " ";
+		const endsToken = end === source.length || source[end] === " ";
+		if (startsToken && endsToken && !TRAILING_UNIT.test(source.slice(end).trimStart())) return true;
+		from = at + 1;
+	}
+	return false;
+}
+function canonicalUnit(symbol, raw) {
+	if (symbol === "$" || /^(?:dollars?|usd)$/i.test(raw)) return "dollar";
+	if (symbol === "€" || /^euros?$/i.test(raw)) return "euro";
+	if (raw === "%" || /^percent$/i.test(raw)) return "percent";
+	if (/^(?:kilometers?|km)$/i.test(raw)) return "km";
+	if (/^(?:miles?|mi)$/i.test(raw)) return "mile";
+	if (/^cents?$/i.test(raw)) return "cent";
+	if (/^watts?$/i.test(raw)) return "watt";
+	if (/^(?:gb|mb|kb|tb)$/i.test(raw)) return raw.toLowerCase();
+	return null;
+}
+function extractQuantities(text) {
+	const found = [];
+	for (const match of text.matchAll(/(?<sym>[$€])?\s*\b(?<num>\d+(?:\.\d+)?)(?<suf>[kmbt])?\b(?:\s*(?<unit>kilometers?|km|miles?|mi|dollars?|usd|cents?|euros?|gb|mb|kb|tb|percent|%|watts?)(?!\w))?/gi)) {
+		const num = match.groups?.num;
+		if (!num) continue;
+		const suffix = (match.groups?.suf ?? "").toLowerCase();
+		found.push({
+			value: `${num}${suffix}`.toLowerCase(),
+			unit: canonicalUnit(match.groups?.sym ?? "", match.groups?.unit ?? "")
+		});
+	}
+	return found;
+}
+/** Same magnitude with a different or dropped unit is not the same quantity. */
+function quantitiesConflict(claim, passage) {
+	const passageQuantities = extractQuantities(passage);
+	for (const quantity of extractQuantities(claim)) {
+		const sameValue = passageQuantities.filter((item) => item.value === quantity.value);
+		if (quantity.unit) {
+			if (!sameValue.some((item) => item.unit === quantity.unit)) return true;
+		} else if (sameValue.length > 0 && sameValue.every((item) => item.unit)) return true;
+	}
+	return false;
+}
+function hasMarker(text, marker) {
+	const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(`(?:^|\\s)${escaped}(?=\\s|$)`).test(text);
+}
+/** "Currently" / "latest" in the claim is not supported by an older passage that lacks it. */
+function addsCurrentWording(claim, passage) {
+	const claimed = normalizeText(claim);
+	const source = normalizeText(passage);
+	return CURRENT_MARKERS.some((marker) => hasMarker(claimed, marker) && !hasMarker(source, marker));
+}
 //#endregion
 //#region src/web/verification/claim_extractor.ts
 /**
@@ -3478,6 +4304,58 @@ function classifyRequirements(state, evidence) {
 }
 //#endregion
 //#region src/web/verticals/weather/weather_provider.ts
+var weatherTemperature = (celsius, unit) => unit === "fahrenheit" ? celsius * 9 / 5 + 32 : celsius;
+function validateWeatherRequest(location, forecastDays = 3) {
+	if (typeof location !== "string" || !location.trim() || location.length > 200) throw new Error("Weather requires an explicit location of 1–200 characters.");
+	if (typeof forecastDays !== "number" || !Number.isInteger(forecastDays) || forecastDays < 1 || forecastDays > 7) throw new Error("forecastDays must be an integer from 1 to 7.");
+	return {
+		location: location.trim(),
+		forecastDays
+	};
+}
+function record(value, label) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Weather response has invalid ${label}.`);
+	return value;
+}
+function text(value, label) {
+	if (typeof value !== "string" || !value.trim() || value.length > 500) throw new Error(`Weather response has missing ${label}.`);
+	return value.trim();
+}
+function measurement(value, label, min = -Infinity, max = Infinity) {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) throw new Error(`Weather response has missing or invalid ${label}.`);
+	return value;
+}
+async function requestJson(url, label) {
+	const res = await fetch(url, {
+		signal: AbortSignal.timeout(8e3),
+		redirect: "error"
+	});
+	if (!res.ok) throw new Error(`${label} unavailable (HTTP ${res.status}).`);
+	const reader = res.body?.getReader();
+	if (!reader) throw new Error(`${label} returned an empty response.`);
+	const chunks = [];
+	let size = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			size += value.byteLength;
+			if (size > 1048576) throw new Error(`${label} response exceeds 1 MiB.`);
+			chunks.push(value);
+		}
+	} finally {
+		await reader.cancel();
+	}
+	const bytes = new Uint8Array(size);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	const data = record(JSON.parse(new TextDecoder().decode(bytes)), label);
+	if (data.error === true) throw new Error(`${label} unavailable: ${typeof data.reason === "string" ? data.reason.slice(0, 300) : "provider error"}.`);
+	return data;
+}
 var WeatherProvider = class {
 	extractLocation(query) {
 		const location = (query.match(/(?:weather(?:\s+report)?|temperature|forecast)(?:\s+(?:in|for|at))\s+([^?!]+)/i) || query.match(/(?:in|for|at)\s+([^?!]+)/i) || query.match(/^([^?!]+)\s+weather/i))?.[1].replace(/\b(today|tomorrow|now|tonight|this week|current)\b/gi, "").replace(/[.]+$/, "").trim();
@@ -3485,51 +4363,107 @@ var WeatherProvider = class {
 		return location;
 	}
 	async geocode(name) {
-		const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=5&language=en&format=json`;
-		const res = await fetch(url, { signal: AbortSignal.timeout(8e3) });
-		if (!res.ok) throw new Error(`Geocoding unavailable (HTTP ${res.status})`);
-		const first = (await res.json()).results?.[0];
-		if (!first || !Number.isFinite(first.latitude) || !Number.isFinite(first.longitude)) throw new Error(`Could not resolve location: ${name}`);
+		const parts = name.split(",").map((part) => part.trim());
+		if (parts.some((part) => !part) || parts.length > 3) throw new Error(`Could not resolve all location qualifiers: ${name}. Try City, country or City, state.`);
+		const data = await requestJson(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(parts[0])}&count=10&language=en&format=json`, "Geocoding");
+		if (!Array.isArray(data.results) || !data.results.length) throw new Error(`Could not resolve location: ${name}. Try City, country or City, state.`);
+		const resolved = data.results.map((value) => record(value, "location"));
+		const normalizeName = (value) => value.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase("en");
+		const exact = resolved.filter((candidate) => typeof candidate.name === "string" && normalizeName(candidate.name) === normalizeName(parts[0]));
+		const candidates = (exact.length ? exact : resolved).filter((candidate) => parts.slice(1).every((part) => [
+			candidate.country,
+			candidate.country_code,
+			candidate.admin1,
+			candidate.admin2
+		].some((value) => typeof value === "string" && value.toLocaleLowerCase("en") === part.toLocaleLowerCase("en"))));
+		if (!candidates.length) throw new Error(`Could not resolve all location qualifiers: ${name}. Try City, country or City, state.`);
+		const distinct = new Map(candidates.map((candidate) => [`${candidate.name}|${candidate.admin1}|${candidate.country}`, candidate]));
+		if (distinct.size > 1) throw new Error(`Ambiguous location. Specify a city and region or country: ${[...distinct.values()].slice(0, 5).map((candidate) => [
+			candidate.name,
+			candidate.admin1,
+			candidate.country
+		].filter(Boolean).join(", ")).join("; ")}.`);
+		const first = candidates[0];
 		return {
-			name: String(first.name).normalize("NFD").replace(/[\u0300-\u036f]/g, ""),
-			region: first.admin1,
-			country: first.country,
-			lat: first.latitude,
-			lon: first.longitude
+			name: text(first.name, "location name"),
+			region: typeof first.admin1 === "string" ? first.admin1 : void 0,
+			country: typeof first.country === "string" ? first.country : void 0,
+			lat: measurement(first.latitude, "latitude", -90, 90),
+			lon: measurement(first.longitude, "longitude", -180, 180)
 		};
 	}
 	async execute(query) {
-		const coords = await this.geocode(this.extractLocation(query));
-		const sourceUrl = `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=3`;
-		const res = await fetch(sourceUrl, { signal: AbortSignal.timeout(8e3) });
-		if (!res.ok) throw new Error(`Weather unavailable (HTTP ${res.status})`);
-		const data = await res.json();
-		const cur = data.current;
-		if (!cur || ![
-			cur.temperature_2m,
-			cur.apparent_temperature,
-			cur.relative_humidity_2m,
-			cur.wind_speed_10m
-		].every(Number.isFinite)) throw new Error("Weather response has missing measurements");
-		const daily = data.daily || {};
+		return this.executeLocation(this.extractLocation(query));
+	}
+	async executeLocation(location, forecastDays = 3, temperatureUnit = "celsius") {
+		const request = validateWeatherRequest(location, forecastDays);
+		if (temperatureUnit !== "celsius" && temperatureUnit !== "fahrenheit") throw new Error("Temperature unit must be celsius or fahrenheit.");
+		const coords = await this.geocode(request.location);
+		const sourceUrl = `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,weather_code,precipitation&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,wind_speed_10m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&temperature_unit=celsius&wind_speed_unit=kmh&timezone=auto&forecast_days=${request.forecastDays}`;
+		const data = await requestJson(sourceUrl, "Weather");
+		const cur = record(data.current, "current conditions");
+		const observedAt = text(cur.time, "current timestamp");
+		if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(observedAt) || !Number.isFinite(Date.parse(observedAt))) throw new Error("Weather response has invalid current timestamp.");
+		const timezone = text(data.timezone, "timezone");
+		try {
+			new Intl.DateTimeFormat("en", { timeZone: timezone });
+		} catch {
+			throw new Error("Weather response has invalid timezone.");
+		}
+		const daily = record(data.daily, "daily forecast");
+		if (!Array.isArray(daily.time) || !daily.time.length) throw new Error("Weather response has missing forecast dates.");
+		const min = daily.temperature_2m_min, max = daily.temperature_2m_max, rain = daily.precipitation_probability_max;
+		if (![
+			min,
+			max,
+			rain
+		].every(Array.isArray)) throw new Error("Weather response has missing forecast measurements.");
 		const forecast = [];
-		for (let i = 0; i < Math.min(daily.time?.length || 0, 3); i++) {
-			const values = [
-				daily.temperature_2m_min?.[i],
-				daily.temperature_2m_max?.[i],
-				daily.precipitation_probability_max?.[i]
-			];
-			if (values.every(Number.isFinite)) forecast.push({
-				date: daily.time[i],
-				minC: values[0],
-				maxC: values[1],
-				precipitationProbabilityPercent: values[2]
+		for (let i = 0; i < Math.min(daily.time.length, request.forecastDays); i++) {
+			const date = text(daily.time[i], "forecast date");
+			if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date))) throw new Error("Weather response has invalid forecast date.");
+			const minC = measurement(min[i], "minimum temperature");
+			const maxC = measurement(max[i], "maximum temperature", minC);
+			forecast.push({
+				date,
+				minC,
+				maxC,
+				precipitationProbabilityPercent: measurement(rain[i], "rain probability", 0, 100)
 			});
+		}
+		const hourly = [];
+		if (data.hourly) {
+			const hours = record(data.hourly, "hourly forecast");
+			if (!Array.isArray(hours.time)) throw new Error("Weather response has missing hourly times.");
+			for (let i = 0; i < hours.time.length && hourly.length < 48; i++) {
+				const time = text(hours.time[i], "hourly timestamp");
+				if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(time)) throw new Error("Weather response has invalid hourly time.");
+				if (time < observedAt.slice(0, 13) + ":00") continue;
+				const at = (key, min = -Infinity, max = Infinity) => measurement(hours[key]?.[i], key, min, max);
+				hourly.push({
+					time,
+					temperatureC: at("temperature_2m"),
+					apparentTemperatureC: at("apparent_temperature"),
+					humidityPercent: at("relative_humidity_2m", 0, 100),
+					precipitationProbabilityPercent: at("precipitation_probability", 0, 100),
+					windKph: at("wind_speed_10m", 0),
+					weatherCode: at("weather_code", 0, 99)
+				});
+			}
 		}
 		return {
 			sourceUrl,
-			observedAt: cur.time,
-			timezone: data.timezone,
+			observedAt,
+			timezone,
+			fetchedAt: (/* @__PURE__ */ new Date()).toISOString(),
+			temperatureUnit,
+			hourly,
+			units: {
+				temperature: "°C",
+				windSpeed: "km/h",
+				humidity: "%",
+				precipitationProbability: "%"
+			},
 			location: {
 				name: coords.name,
 				region: coords.region,
@@ -3538,23 +4472,84 @@ var WeatherProvider = class {
 				longitude: coords.lon
 			},
 			current: {
-				temperatureC: cur.temperature_2m,
-				apparentTemperatureC: cur.apparent_temperature,
-				humidityPercent: cur.relative_humidity_2m,
-				windKph: cur.wind_speed_10m
+				temperatureC: measurement(cur.temperature_2m, "temperature"),
+				apparentTemperatureC: measurement(cur.apparent_temperature, "apparent temperature"),
+				humidityPercent: measurement(cur.relative_humidity_2m, "humidity", 0, 100),
+				windKph: measurement(cur.wind_speed_10m, "wind speed", 0),
+				weatherCode: cur.weather_code === void 0 ? void 0 : measurement(cur.weather_code, "conditions", 0, 99),
+				precipitationMm: cur.precipitation === void 0 ? void 0 : measurement(cur.precipitation, "precipitation", 0)
 			},
 			forecast
 		};
 	}
 	formatReportAsEvidence(report) {
 		const loc = report.location, cur = report.current;
+		const unit = report.temperatureUnit === "fahrenheit" ? "°F" : "°C";
+		const temp = (value) => `${weatherTemperature(value, report.temperatureUnit).toFixed(1)}${unit}`;
 		return `Location: ${[
 			loc.name,
 			loc.region,
 			loc.country
-		].filter(Boolean).join(", ")}\nAs of ${report.observedAt} (${report.timezone}), Open-Meteo model data.\nCurrent Temperature: ${cur.temperatureC}°C (Feels like ${cur.apparentTemperatureC}°C)\nHumidity: ${cur.humidityPercent}%\nWind Speed: ${cur.windKph} km/h\n` + report.forecast.map((f) => `${f.date}: High ${f.maxC}°C, Low ${f.minC}°C, Rain probability ${f.precipitationProbabilityPercent}%`).join("\n");
+		].filter(Boolean).join(", ")}\nAs of ${report.observedAt} (${report.timezone}), Open-Meteo model data.\nCurrent Temperature: ${temp(cur.temperatureC)} (Feels like ${temp(cur.apparentTemperatureC)})\nHumidity: ${cur.humidityPercent}%\nWind Speed: ${cur.windKph} km/h\n` + report.forecast.map((f) => `${f.date}: High ${temp(f.maxC)}, Low ${temp(f.minC)}, Rain probability ${f.precipitationProbabilityPercent}%`).join("\n");
 	}
 };
+//#endregion
+//#region src/web/extraction/structured_content.ts
+/** Parse public structured documents without treating their contents as HTML. */
+function extractStructuredContent(body, mime) {
+	const source = body.replace(/^\uFEFF/, "");
+	if (source.length > 5242880) throw new Error("Structured document exceeds 5 MiB.");
+	if (mime === "application/json" || mime.endsWith("+json")) {
+		const value = JSON.parse(source);
+		const text = JSON.stringify(value, null, 2);
+		if (text.length > 10485760) throw new Error("Expanded JSON exceeds 10 MiB.");
+		return {
+			text,
+			extractionMethod: "structured_json",
+			rows: Array.isArray(value) ? value.length : void 0
+		};
+	}
+	const delimiter = mime === "text/tab-separated-values" ? "	" : ",";
+	const rows = [];
+	let row = [], cell = "", quoted = false, afterQuote = false;
+	function field() {
+		row.push(cell);
+		cell = "";
+		afterQuote = false;
+		if (row.length > 256) throw new Error("Delimited document exceeds 256 columns.");
+	}
+	function line() {
+		field();
+		rows.push(row);
+		row = [];
+		if (rows.length > 1e4) throw new Error("Delimited document exceeds 10000 rows. Request a smaller file.");
+	}
+	for (let index = 0; index < source.length; index++) {
+		const char = source[index];
+		if (quoted) {
+			if (char === "\"" && source[index + 1] === "\"") {
+				cell += "\"";
+				index++;
+			} else if (char === "\"") {
+				quoted = false;
+				afterQuote = true;
+			} else cell += char;
+		} else if (char === delimiter) field();
+		else if (char === "\n" || char === "\r") {
+			if (char === "\r" && source[index + 1] === "\n") index++;
+			line();
+		} else if (char === "\"" && !cell && !afterQuote) quoted = true;
+		else if (afterQuote || char === "\"") throw new Error("Malformed delimited document: unexpected text around a quoted field.");
+		else cell += char;
+	}
+	if (quoted) throw new Error("Malformed delimited document: unterminated quoted field.");
+	if (cell || row.length || afterQuote) line();
+	return {
+		text: rows.map((cells, index) => `Row ${index + 1}: ${JSON.stringify(cells)}`).join("\n"),
+		extractionMethod: delimiter === "	" ? "structured_tsv" : "structured_csv",
+		rows: rows.length
+	};
+}
 //#endregion
 //#region src/web/verticals/currency/currency_provider.ts
 var CurrencyProvider = class {
@@ -3966,6 +4961,27 @@ var WebSearchEngine = class {
 	answerGenerator;
 	claimVerifier;
 	logger;
+	onProgress;
+	/** Concurrent calls for one URL share a single fetch cascade. */
+	inflightFetches = /* @__PURE__ */ new Map();
+	progress(stage, message, extra) {
+		try {
+			this.onProgress?.({
+				stage,
+				message,
+				...extra
+			});
+		} catch {}
+	}
+	fetchCascade(url, options) {
+		const pending = this.inflightFetches.get(url);
+		if (pending) return pending;
+		const promise = fetchPageCascade(url, this.fetcher, options).finally(() => {
+			if (this.inflightFetches.get(url) === promise) this.inflightFetches.delete(url);
+		});
+		this.inflightFetches.set(url, promise);
+		return promise;
+	}
 	constructor(deps = {}) {
 		this.config = createConfig(deps.config);
 		if (this.config.searchProvider === "google" && this.config.googleApiKey && this.config.googleCxId) {
@@ -3993,6 +5009,7 @@ var WebSearchEngine = class {
 		this.answerGenerator = new AnswerGenerator(this.llmProvider);
 		this.claimVerifier = new ClaimVerifier(this.config.verification.enabled ? this.llmProvider : void 0);
 		this.logger = new PipelineLogger(false);
+		this.onProgress = deps.onProgress;
 	}
 	/**
 	* Quota guard for the Google free tier: at most googleDailyLimit fallback
@@ -4011,21 +5028,11 @@ var WebSearchEngine = class {
 	* Health Check: Validates status of dependencies without charging any paid APIs.
 	*/
 	async getHealthStatus() {
-		let searchStatus = "ready";
-		try {
-			if (this.searchProvider instanceof SearXNGProvider) {
-				const res = await fetch(new URL("/", this.config.searxngBaseUrl).toString(), {
-					method: "HEAD",
-					signal: AbortSignal.timeout(5e3),
-					redirect: "error"
-				});
-				searchStatus = res.ok ? "healthy" : `http_${res.status}`;
-			}
-		} catch {
-			searchStatus = "unreachable";
-		}
 		return {
-			search: searchStatus,
+			...this.config.searchProvider === "google" && (!this.config.googleApiKey || !this.config.googleCxId) ? {
+				search: "not_configured",
+				searchError: "Configure a Google API key and Custom Search Engine ID."
+			} : this.searchProvider instanceof SearXNGProvider ? await this.searchProvider.checkHealth() : { search: "ready" },
 			database: this.config.cache.enabled ? "configured" : "disabled",
 			embeddingModel: this.config.retrieval.embeddings ? this.embeddingProvider.constructor.name : "disabled",
 			reranker: this.config.reranking.enabled ? this.reranker.constructor.name : "disabled",
@@ -4035,8 +5042,8 @@ var WebSearchEngine = class {
 	}
 	/**
 	* Fetch + extract one URL with full SSRF/redirect/fetch limits: HTML keeps
-	* headings, links, and table structure; PDFs keep page references; scanned
-	* PDFs report ocrRequired explicitly. Browser rendering fallback is
+	* headings, links, and table structure; PDFs keep page references. Missing
+	* text is not labeled OCR-required. Browser rendering fallback is
 	* intentionally NOT bundled: JS-dependent pages surface as snippet-only
 	* evidence with an explicit limitation (see docs).
 	*/
@@ -4055,12 +5062,18 @@ var WebSearchEngine = class {
 			retryDelayMs: this.config.searchRetryDelayMs
 		};
 		const result = await new SearchService(this.searchProvider, options).executeSearches(planned, 10);
-		if (result.results.length || !this.fallbackProvider) return result;
+		if (result.results.length || result.meta.answers.length || result.meta.infoboxes.length || !this.fallbackProvider) return result;
 		if (this.fallbackProvider instanceof GoogleSearchProvider && !await this.claimGoogleQuota(planned.length)) return result;
-		return new SearchService(this.fallbackProvider, options).executeSearches(planned, 10);
+		const fallback = await new SearchService(this.fallbackProvider, options).executeSearches(planned, 10);
+		return {
+			...fallback,
+			failureCount: result.failureCount + fallback.failureCount,
+			failures: [...result.failures, ...fallback.failures],
+			meta: mergeSearchMeta(result.meta, fallback.meta)
+		};
 	}
 	async fetchUrl(rawUrl) {
-		const outcome = await fetchPageCascade(rawUrl, this.fetcher, {
+		const outcome = await this.fetchCascade(rawUrl, {
 			timeoutSeconds: this.config.fetch.timeoutSeconds,
 			maxBytes: this.config.fetch.maxBytes,
 			userAgent: this.config.fetch.userAgent,
@@ -4070,10 +5083,42 @@ var WebSearchEngine = class {
 		});
 		const res = outcome.raw;
 		const mime = (res?.mimeType || "").split(";")[0].trim().toLowerCase();
+		if (res?.success && typeof res.body === "string" && ([
+			"application/json",
+			"text/csv",
+			"application/csv",
+			"text/tab-separated-values"
+		].includes(mime) || mime.endsWith("+json"))) {
+			const structured = extractStructuredContent(res.body, mime);
+			const url = res.finalUrl || rawUrl;
+			return {
+				id: `data-${Date.now()}`,
+				url,
+				domain: new URL(url).hostname,
+				title: new URL(url).pathname.split("/").pop() || "Structured document",
+				text: structured.text,
+				retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
+				searchResultIds: [],
+				metadata: {
+					extractionMethod: structured.extractionMethod,
+					rowCount: structured.rows
+				}
+			};
+		}
 		if (res?.success && res.body && (mime === "application/pdf" || /\.pdf(\?|#|$)/i.test(res.finalUrl || rawUrl))) {
 			const latin1 = res.body || "";
-			const pdf = extractPdfText(Uint8Array.from(latin1, (ch) => ch.charCodeAt(0) & 255), rawUrl);
-			if (pdf.needsOcr) throw new Error("OCR required: this PDF has no extractable text (scanned document). No OCR engine is bundled; install an OCR tool or supply the text directly.");
+			const pdf = extractPdfText(Uint8Array.from(latin1, (ch) => ch.charCodeAt(0) & 255));
+			switch (pdf.status) {
+				case "text_extracted": break;
+				case "no_extractable_text": throw new Error("This PDF has no extractable text.");
+				case "password_required": throw new Error("This PDF is password-protected and cannot be extracted locally.");
+				case "invalid_document": throw new Error("The response is not a valid PDF.");
+				case "limit_exceeded": throw new Error("PDF exceeds the local extraction size limit.");
+				default: {
+					const unexpected = pdf.status;
+					throw new Error(`PDF extraction failed (${String(unexpected)}).`);
+				}
+			}
 			return {
 				id: `pdf-${Date.now()}`,
 				url: res.finalUrl || rawUrl,
@@ -4119,7 +5164,7 @@ var WebSearchEngine = class {
 				method: "cache"
 			};
 		}
-		const outcome = await fetchPageCascade(candidate.url, this.fetcher, {
+		const outcome = await this.fetchCascade(candidate.url, {
 			timeoutSeconds: this.config.fetch.timeoutSeconds,
 			maxBytes: this.config.fetch.maxBytes,
 			userAgent: this.config.fetch.userAgent,
@@ -4208,7 +5253,19 @@ var WebSearchEngine = class {
 		trace.startTimer("route");
 		const route = routeRequest(normalizedReq.normalizedQuery);
 		trace.endTimer("route");
+		if (options.freshness && options.freshness !== "any" && options.freshness !== route.freshness) {
+			const order = [
+				"realtime",
+				"day",
+				"week",
+				"month",
+				"year",
+				"any"
+			];
+			if (order.indexOf(options.freshness) < order.indexOf(route.freshness)) route.freshness = options.freshness;
+		}
 		this.logger.log("route_selected", { route });
+		this.progress("route", route.requiresWebSearch ? `Web research (${route.vertical.toLowerCase()})` : route.requiresExternalData ? `${route.vertical.charAt(0)}${route.vertical.slice(1).toLowerCase()} lookup` : "Direct answer");
 		const sourceManager = new SourceManager();
 		if (!route.requiresExternalData) {
 			const defaultStats = {
@@ -4330,7 +5387,13 @@ var WebSearchEngine = class {
 		const totalQueryBudget = maxQueries;
 		const retryReserve = this.config.verification.enabled ? Math.min(this.config.verification.maxResearchRetries, Math.max(0, maxQueries - 1)) : 0;
 		maxQueries -= retryReserve;
-		const plannedQueries = await this.queryPlanner.planQueries(question, route.freshness, maxQueries, curDate);
+		const planningStrategy = this.config.planning === "model" ? "model" : this.config.planning === "rules" ? "rules" : mode === "deep" ? "model" : "rules";
+		const plannedQueries = await this.queryPlanner.planQueries(question, route.freshness, maxQueries, curDate, planningStrategy);
+		if (options.language || options.category) for (const q of plannedQueries) {
+			if (options.language) q.language = options.language;
+			if (options.category) q.category = options.category;
+		}
+		this.progress("search", `Searching ${plannedQueries.length} ${plannedQueries.length === 1 ? "query" : "queries"}…`);
 		trace.endTimer("planning");
 		trace.update({ queriesGenerated: plannedQueries.length });
 		this.logger.log("queries_generated", { plannedQueries });
@@ -4373,22 +5436,43 @@ var WebSearchEngine = class {
 				fallbackUsed: false,
 				fallbackReason: ""
 			});
-			if (searchOutcome.results.length === 0 && this.fallbackProvider) {
+			if (searchOutcome.results.length === 0 && !searchOutcome.meta.answers.length && !searchOutcome.meta.infoboxes.length && this.fallbackProvider) {
 				const fallbackName = this.fallbackProvider instanceof GoogleSearchProvider ? "google" : "searxng";
 				let reason = "";
 				if (fallbackName === "google" && !await this.claimGoogleQuota(plannedQueries.length)) reason = "google daily quota exhausted";
 				else {
-					const fbOutcome = await new SearchService(this.fallbackProvider).executeSearches(plannedQueries, this.config.resultsPerQuery);
+					const fbOutcome = await new SearchService(this.fallbackProvider, {
+						maxConcurrentQueries: this.config.maxConcurrentQueries,
+						retries: this.config.searchRetries,
+						retryDelayMs: this.config.searchRetryDelayMs
+					}).executeSearches(plannedQueries, this.config.resultsPerQuery);
+					const failures = [...searchOutcome.failures || [], ...fbOutcome.failures];
+					const meta = mergeSearchMeta(searchOutcome.meta, fbOutcome.meta);
 					if (fbOutcome.results.length > 0) {
-						searchOutcome = fbOutcome;
+						searchOutcome = {
+							...fbOutcome,
+							failures,
+							failureCount: failures.length,
+							meta
+						};
 						reason = `primary ${primaryName} empty; fell back to ${fallbackName}`;
 						if (this.config.cache.enabled) await this.searchCache.set(fallbackName, cacheKey, fbOutcome.results, route.freshness, this.config.cache.searchTtlSeconds.default);
-					} else reason = `primary ${primaryName} and fallback ${fallbackName} both empty`;
+					} else {
+						searchOutcome = {
+							...searchOutcome,
+							failures,
+							failureCount: failures.length,
+							meta
+						};
+						reason = `primary ${primaryName} and fallback ${fallbackName} both empty`;
+					}
 				}
 				trace.update({
-					providerUsed: fallbackName,
+					providerUsed: searchOutcome.results.length ? fallbackName : primaryName,
 					fallbackUsed: searchOutcome.results.length > 0,
-					fallbackReason: reason
+					fallbackReason: reason,
+					queryFailures: searchOutcome.failures,
+					searchFailureCount: searchOutcome.failureCount
 				});
 				this.logger.log("search_fallback", {
 					primary: primaryName,
@@ -4406,6 +5490,7 @@ var WebSearchEngine = class {
 			raw: searchOutcome.rawCount,
 			unique: searchOutcome.results.length
 		});
+		this.progress("search", `Search returned ${searchOutcome.results.length} unique ${searchOutcome.results.length === 1 ? "result" : "results"}`);
 		if (this.config.enablePagination && searchOutcome.results.length === 0 && searchOutcome.failureCount === 0) {
 			const paged = new SearchService(this.searchProvider, {
 				maxConcurrentQueries: this.config.maxConcurrentQueries,
@@ -4415,17 +5500,17 @@ var WebSearchEngine = class {
 			const pagedPages = [];
 			let pagedRaw = 0;
 			const remaining = Math.max(0, totalQueryBudget - plannedQueries.length);
-			for (const q of plannedQueries.slice(0, Math.max(1, remaining))) {
+			for (const q of plannedQueries.slice(0, remaining)) {
+				plannedQueries.push({
+					...q,
+					page: 2,
+					purpose: `${q.purpose} (page 2)`
+				});
 				const extra = await paged.fetchAdditionalPage(q, 2, this.config.resultsPerQuery);
 				if (extra.results.length > 0) {
 					pagedResults.push(...extra.results);
 					pagedRaw += extra.results.length;
 					pagedPages.push(2);
-					plannedQueries.push({
-						...q,
-						page: 2,
-						purpose: `${q.purpose} (page 2)`
-					});
 					if (extra.meta) searchOutcome.meta = mergeSearchMeta(searchOutcome.meta, extra.meta);
 				}
 			}
@@ -4456,13 +5541,17 @@ var WebSearchEngine = class {
 				const extra = await new SearchService(this.searchProvider, { retries: 0 }).executeSearches([{
 					query: suggestion,
 					purpose: "SearXNG related-search suggestion",
-					freshness: route.freshness
+					freshness: route.freshness,
+					language: options.language,
+					category: options.category
 				}], this.config.resultsPerQuery);
 				if (extra.results.length > 0) {
 					plannedQueries.push({
 						query: suggestion,
 						purpose: "SearXNG related-search suggestion",
-						freshness: route.freshness
+						freshness: route.freshness,
+						language: options.language,
+						category: options.category
 					});
 					const fused = fuseSearchResults([{
 						query: "primary",
@@ -4515,8 +5604,19 @@ var WebSearchEngine = class {
 		let extractedTokens = documents.reduce((sum, d) => sum + defaultTokenCounter.count(d.text), 0);
 		let waybackRecoveries = 0;
 		const domainsChronicSkipped = [];
+		if (pagesToFetch.length > 0) this.progress("fetch", `Reading ${pagesToFetch.length} ${pagesToFetch.length === 1 ? "page" : "pages"}…`, {
+			done: 0,
+			total: pagesToFetch.length
+		});
+		let fetchedCount = 0;
 		const fetchPromises = pagesToFetch.map(async (candidate, index) => {
-			return this.retrieveCandidate(candidate, index + documents.length, route.freshness);
+			const outcome = await this.retrieveCandidate(candidate, index + documents.length, route.freshness);
+			fetchedCount += 1;
+			this.progress("fetch", `Reading pages ${fetchedCount}/${pagesToFetch.length}`, {
+				done: fetchedCount,
+				total: pagesToFetch.length
+			});
+			return outcome;
 		});
 		const settledDocs = await Promise.allSettled(fetchPromises);
 		for (const res of settledDocs) if (res.status === "fulfilled" && res.value.doc) {
@@ -4600,6 +5700,7 @@ var WebSearchEngine = class {
 		const finalClaims = detectEvidenceConflicts(deduplicateFacts(extractedFacts));
 		trace.endTimer("evidence");
 		trace.update({ evidenceClaims: finalClaims.length });
+		this.progress("evidence", `Extracted ${finalClaims.length} evidence ${finalClaims.length === 1 ? "claim" : "claims"}`);
 		trace.startTimer("context_builder");
 		let { allocation: budgetAllocation, context: groundedContext } = await buildModelBudgetedContext(question, sourceManager.getAllSources(), finalClaims, this.config.context, curDate, this.llmProvider?.countTokens?.bind(this.llmProvider));
 		trace.endTimer("context_builder");
@@ -4608,6 +5709,7 @@ var WebSearchEngine = class {
 			finalPromptTokens: budgetAllocation.tokenStats.finalPromptTokens
 		});
 		trace.startTimer("generation");
+		this.progress("answer", "Composing grounded answer…");
 		let answerOutcome = await this.answerGenerator.generateAnswer(groundedContext, sourceManager.getAllSources(), budgetAllocation.claims, question);
 		trace.endTimer("generation");
 		trace.startTimer("verification");
@@ -4639,6 +5741,8 @@ var WebSearchEngine = class {
 				}
 			}
 			if (!retryEval.shouldRetry || !retryEval.targetedQuery) break;
+			if (options.language) retryEval.targetedQuery.language = options.language;
+			if (options.category) retryEval.targetedQuery.category = options.category;
 			retryCount++;
 			trace.startTimer(`retry_${retryCount}`);
 			this.logger.log("retry_search_initiated", {
@@ -4779,6 +5883,39 @@ var LocalOpenAICompatibleProvider = class {
 	timeoutMs;
 	apiKey;
 	maxInputTokens;
+	/** Cached /props probe: which reasoning kwarg the chat template honors. */
+	reasoningControl;
+	/**
+	* llama.cpp exposes the loaded model's chat template at `/props`. Probe it
+	* once (2s budget, cached) — models that never mention reasoning controls
+	* simply keep their default sampling.
+	*/
+	probeReasoningControls() {
+		this.reasoningControl ??= (async () => {
+			try {
+				const res = await fetch(new URL("/props", this.baseUrl), {
+					headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+					signal: AbortSignal.timeout(2e3),
+					redirect: "error"
+				});
+				if (!res.ok) return {
+					enableThinking: false,
+					reasoningEffort: false
+				};
+				const template = String((await res.json())?.chat_template ?? "");
+				return {
+					enableThinking: template.includes("enable_thinking"),
+					reasoningEffort: template.includes("reasoning_effort")
+				};
+			} catch {
+				return {
+					enableThinking: false,
+					reasoningEffort: false
+				};
+			}
+		})();
+		return this.reasoningControl;
+	}
 	constructor(options = {}) {
 		this.baseUrl = options.baseUrl ?? "http://127.0.0.1:8080/v1";
 		this.modelName = options.modelName ?? "local-model";
@@ -4839,6 +5976,11 @@ var LocalOpenAICompatibleProvider = class {
 			}
 		};
 		if (request.stopSequences && request.stopSequences.length > 0) body.stop = request.stopSequences;
+		if (request.reasoningEffort === "low") {
+			const caps = await this.probeReasoningControls();
+			if (caps.reasoningEffort) body.chat_template_kwargs = { reasoning_effort: "low" };
+			else if (caps.enableThinking) body.chat_template_kwargs = { enable_thinking: false };
+		}
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 		const headers = { "Content-Type": "application/json" };
@@ -4876,8 +6018,16 @@ var SqliteStorage = class {
 		this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS cache (
         namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
-        expires_at INTEGER NOT NULL, PRIMARY KEY(namespace,key));
+        expires_at INTEGER NOT NULL, byte_size INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(namespace,key));
       CREATE TABLE IF NOT EXISTS research (id TEXT PRIMARY KEY, session TEXT NOT NULL, created_at INTEGER NOT NULL);`);
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			if (!this.db.prepare("PRAGMA table_info(cache)").all().some((column) => column.name === "byte_size")) this.db.exec("ALTER TABLE cache ADD COLUMN byte_size INTEGER NOT NULL DEFAULT 0; UPDATE cache SET byte_size=length(CAST(value AS BLOB))");
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
 		this.db.prepare("DELETE FROM cache WHERE expires_at <= ?").run(Date.now());
 	}
 	async get(table, key) {
@@ -4885,7 +6035,26 @@ var SqliteStorage = class {
 		return row ? JSON.parse(row.value) : null;
 	}
 	async set(table, key, value, ttl = 86400) {
-		this.db.prepare("INSERT OR REPLACE INTO cache VALUES(?,?,?,?)").run(table, key, JSON.stringify(value), Date.now() + ttl * 1e3);
+		const serialized = JSON.stringify(value);
+		if (Buffer.byteLength(serialized) > 10485760) return;
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			this.db.prepare("INSERT OR REPLACE INTO cache(namespace,key,value,expires_at,byte_size) VALUES(?,?,?,?,?)").run(table, key, serialized, Date.now() + ttl * 1e3, Buffer.byteLength(serialized));
+			this.db.prepare("DELETE FROM cache WHERE expires_at <= ?").run(Date.now());
+			if (table.startsWith("weather-")) this.db.prepare("DELETE FROM cache WHERE namespace=? AND rowid NOT IN (SELECT rowid FROM cache WHERE namespace=? ORDER BY expires_at DESC,rowid DESC LIMIT 64)").run(table, table);
+			this.db.exec("DELETE FROM cache WHERE rowid NOT IN (SELECT rowid FROM cache ORDER BY expires_at DESC,rowid DESC LIMIT 2000)");
+			let size = this.db.prepare("SELECT COALESCE(SUM(byte_size),0) AS bytes FROM cache").get().bytes;
+			while (size > 67108864) {
+				const oldest = this.db.prepare("SELECT rowid,byte_size AS bytes FROM cache ORDER BY expires_at,rowid LIMIT 1").get();
+				if (!oldest) break;
+				this.db.prepare("DELETE FROM cache WHERE rowid=?").run(oldest.rowid);
+				size -= oldest.bytes;
+			}
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
 	}
 	async delete(table, key) {
 		this.db.prepare("DELETE FROM cache WHERE namespace=? AND key=?").run(table, key);
@@ -5180,10 +6349,13 @@ var PinnedPageFetcher = class {
 					"text/html",
 					"text/plain",
 					"text/markdown",
+					"text/csv",
+					"application/csv",
+					"text/tab-separated-values",
 					"application/xhtml+xml",
 					"application/json",
 					"application/pdf"
-				].includes(mime)) throw new Error(`Unsupported MIME ${mime}`);
+				].includes(mime) && !/^application\/[\w.+-]+\+json$/.test(mime)) throw new Error(`Unsupported MIME ${mime}`);
 				const body = mime === "application/pdf" ? res.body.toString("latin1") : res.body.toString("utf8");
 				return {
 					url: raw,
@@ -5210,18 +6382,15 @@ var PinnedPageFetcher = class {
 //#endregion
 //#region scripts/web-render.mjs
 /**
-* Last-resort headless render for the research fetch cascade.
+* Last-resort render for pages a static fetch cannot read.
 *
-* Pages behind bot-wall interstitials or heavy client-side rendering return a
-* shell that static extraction cannot read. Instead of bundling Playwright (an
-* extra browser download and container-weight dependency), we reuse the Edge
-* installation that WebView2 already requires on Windows: `msedge --headless`
-* renders the page and dumps the post-script DOM.
+* The document and every later hop are retrieved with the pinned HTTP transport.
+* Headless Edge, when it launches, gets an isolated non-persistent context and
+* the bytes we already fetched. It is not navigated at the target URL.
 *
-* The renderer re-checks the SSRF guard itself: the browser resolves DNS on
-* its own, so the pinned-address check from web-transport must run before
-* spawn. Rendered output is untrusted page text; it flows through the same
-* extraction and sanitization path as a normal fetch.
+* Routing is application policy, not an OS sandbox. Anything the route handler
+* does not explicitly fulfill is aborted. If Edge cannot be launched, the
+* result is null — there is no unrestricted browser fallback.
 */
 var EDGE_CANDIDATES = [
 	process.env.LOCALLM_EDGE_PATH,
@@ -5229,89 +6398,527 @@ var EDGE_CANDIDATES = [
 	"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
 	process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "Microsoft\\Edge\\Application\\msedge.exe") : void 0
 ].filter(Boolean);
+var REDIRECT_STATUSES = /* @__PURE__ */ new Set([
+	301,
+	302,
+	303,
+	307,
+	308
+]);
+var HOP_HEADERS = /* @__PURE__ */ new Set([
+	"connection",
+	"keep-alive",
+	"proxy-connection",
+	"transfer-encoding",
+	"upgrade",
+	"content-encoding",
+	"content-length",
+	"content-disposition",
+	"location",
+	"set-cookie",
+	"set-cookie2",
+	"proxy-authenticate",
+	"proxy-authorization"
+]);
+/**
+* Isolation flags for browser.newContext. Not a persistent profile and not an
+* OS sandbox: a dead proxy makes a request that escapes routing fail closed.
+*/
+var ISOLATED_CONTEXT_OPTIONS = Object.freeze({
+	serviceWorkers: "block",
+	acceptDownloads: false,
+	proxy: { server: "http://127.0.0.1:1" }
+});
 function findEdgeBinary(candidates = EDGE_CANDIDATES, exists = existsSync) {
 	return candidates.find((path) => exists(path)) || null;
 }
+function stripHost(host) {
+	return String(host || "").trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+}
+function rawHostname(input) {
+	const scheme = String(input || "").trim().match(/^[a-z][a-z0-9+.-]*:(.*)$/i);
+	if (!scheme) return "";
+	let rest = scheme[1];
+	if (!rest.startsWith("//")) return "";
+	rest = rest.slice(2);
+	const cut = rest.search(/[/?#]/);
+	const authority = cut === -1 ? rest : rest.slice(0, cut);
+	const at = authority.lastIndexOf("@");
+	const hostport = at === -1 ? authority : authority.slice(at + 1);
+	if (hostport.startsWith("[")) {
+		const end = hostport.indexOf("]");
+		return end === -1 ? hostport : hostport.slice(1, end);
+	}
+	const colon = hostport.lastIndexOf(":");
+	if (colon !== -1 && hostport.indexOf(":") === colon) return hostport.slice(0, colon);
+	return hostport;
+}
+function isIpv4Mapped(host) {
+	const clean = stripHost(host);
+	return clean.startsWith("::ffff:") || /^(?:0+:){5}ffff:/i.test(clean);
+}
+function isInternalHost(host) {
+	return /^(localhost|metadata|instance-data)$|\.(local|internal|localhost|corp|home|lan)$/i.test(host);
+}
+/** Canonical dotted IPv4 only: four decimal octets, no leading zeros. */
+function isCanonicalDottedIpv4(host) {
+	return /^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(host);
+}
+function isDottedOrNumericIp(host) {
+	return /^(?:\d+|0x[0-9a-f]+)(?:\.(?:\d+|0x[0-9a-f]+)){0,3}$/i.test(host);
+}
 /**
-* Render `url` in headless Edge and return the serialized DOM.
-* @returns {Promise<{html: string, finalUrl: string} | null>} null when Edge is
-* unavailable, the render times out, or the page yields no usable markup.
+* Reject decimal, hex, octal, short, and IPv4-mapped spellings before any
+* socket exists. Canonical dotted IPv4 is left for the public-address check.
 */
-async function renderPage(url, { timeoutMs = 2e4, maxBytes = 5242880, virtualTimeBudgetMs = 8e3, edgePath } = {}) {
+function alternateIpReason(rawUrl) {
 	let parsed;
 	try {
-		parsed = new URL(url);
+		parsed = new URL(rawUrl);
 	} catch {
-		return null;
+		return "invalid url";
 	}
+	if (parsed.username || parsed.password) return "credentials blocked";
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "protocol blocked";
+	const raw = stripHost(rawHostname(rawUrl));
+	const canonical = stripHost(parsed.hostname);
+	if (!canonical) return "empty host";
+	if (isIpv4Mapped(raw) || isIpv4Mapped(canonical)) return "IPv4-mapped IPv6 blocked";
+	if (raw && isDottedOrNumericIp(raw) && !isCanonicalDottedIpv4(raw)) return "alternate IP form blocked";
+	if (raw && isIP(canonical) && raw !== canonical) return "alternate IP form blocked";
+	return null;
+}
+/** Static block. Null means the URL may proceed to a fresh lookup. No DNS. */
+function gateUrl(rawUrl) {
+	const reason = alternateIpReason(rawUrl);
+	if (reason) return reason;
+	let parsed;
 	try {
-		await addressesFor(parsed);
+		parsed = new URL(rawUrl);
 	} catch {
-		return null;
+		return "invalid url";
 	}
-	const binary = edgePath || findEdgeBinary();
-	if (!binary) return null;
-	const profile = mkdtempSync(join(tmpdir(), "locallm-render-"));
+	const host = stripHost(parsed.hostname);
+	if (isInternalHost(host)) return "internal host blocked";
+	if (isIP(host) && !isPublicAddress(host)) return "Non-public address blocked";
+	return null;
+}
+function headerValue(headers, name) {
+	if (!headers) return void 0;
+	const wanted = name.toLowerCase();
+	for (const [key, value] of Object.entries(headers)) if (key.toLowerCase() === wanted) return Array.isArray(value) ? value[0] : value;
+}
+function asBuffer(body) {
+	if (body == null) return Buffer.alloc(0);
+	if (Buffer.isBuffer(body)) return body;
+	if (typeof body === "string") return Buffer.from(body);
+	if (body instanceof Uint8Array) return Buffer.from(body);
+	return Buffer.from(String(body));
+}
+function addressBlockReason(address) {
+	const clean = stripHost(address);
+	if (isIpv4Mapped(clean)) return "IPv4-mapped IPv6 blocked";
+	if (!isIP(clean) || !isPublicAddress(clean)) return "Non-public address blocked";
+	return null;
+}
+async function resolvePublic(hostname, lookup, deadlineMs) {
+	let timer;
+	const pending = Promise.resolve().then(() => lookup(hostname));
+	pending.catch(() => {});
 	try {
-		const html = await dumpDom(binary, url, profile, {
-			timeoutMs,
-			maxBytes,
-			virtualTimeBudgetMs
-		});
-		return html && html.length >= 150 ? {
-			html,
-			finalUrl: url
-		} : null;
-	} catch {
+		const addresses = await Promise.race([pending, new Promise((_, reject) => {
+			timer = setTimeout(() => reject(/* @__PURE__ */ new Error("DNS timeout")), Math.min(4e3, Math.max(1, deadlineMs)));
+		})]);
+		if (!Array.isArray(addresses) || addresses.length === 0) return "DNS failed";
+		for (const entry of addresses) {
+			const reason = addressBlockReason(typeof entry === "string" ? entry : entry?.address);
+			if (reason) return reason;
+		}
 		return null;
+	} catch {
+		return "DNS failed";
 	} finally {
-		rmSync(profile, {
-			recursive: true,
-			force: true
-		});
+		clearTimeout(timer);
 	}
 }
-function dumpDom(binary, url, profile, { timeoutMs, maxBytes, virtualTimeBudgetMs }) {
-	return new Promise((resolve, reject) => {
-		const child = spawn(binary, [
-			"--headless=new",
+function browserCapabilityReason(request) {
+	const type = String(request?.resourceType || "").toLowerCase();
+	if (request?.isWebSocket || type === "websocket") return "websocket blocked";
+	if (request?.isDownload || type === "download") return "download blocked";
+	if (request?.isPopup) return "popup blocked";
+	if (request?.isServiceWorker || type === "serviceworker" || type === "service_worker") return "service worker blocked";
+	return null;
+}
+function htmlMime(headers) {
+	const mime = String(headerValue(headers, "content-type") || "").split(";")[0].trim().toLowerCase();
+	if (!mime) return "text/html";
+	if (mime === "text/html" || mime === "application/xhtml+xml") return mime;
+	return null;
+}
+function sanitizeHeaders(headers) {
+	const out = {};
+	for (const [key, value] of Object.entries(headers || {})) {
+		if (HOP_HEADERS.has(key.toLowerCase())) continue;
+		if (value == null) continue;
+		out[key] = Array.isArray(value) ? value.join(", ") : String(value);
+	}
+	return out;
+}
+function escapeAttr(value) {
+	return String(value).replace(/[&"'<>]/g, (ch) => `&#${ch.charCodeAt(0)};`);
+}
+function withBase(html, finalUrl) {
+	const tag = `<base href="${escapeAttr(finalUrl)}">`;
+	if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, (match) => `${match}${tag}`);
+	if (/<html[^>]*>/i.test(html)) return html.replace(/<html[^>]*>/i, (match) => `${match}<head>${tag}</head>`);
+	return `<!doctype html><html><head>${tag}</head><body>${html}</body></html>`;
+}
+/**
+* One render's HTTP policy. Lookup results are not cached: every hop calls
+* `lookup` again, so a name that flips to a private address is blocked.
+*/
+function createMediationSession({ get = pinnedGet, lookup = defaultLookup, maxBytes = 5242880, timeoutMs = 2e4, maxRedirects = 5, maxRequests = 32, maxConcurrency = 4, now = Date.now } = {}) {
+	if (!Number.isFinite(maxBytes) || maxBytes < 1) throw new Error("maxBytes must be positive");
+	if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new Error("timeoutMs must be positive");
+	if (!Number.isInteger(maxRedirects) || maxRedirects < 0) throw new Error("maxRedirects must be a non-negative integer");
+	if (!Number.isInteger(maxRequests) || maxRequests < 1) throw new Error("maxRequests must be a positive integer");
+	if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1) throw new Error("maxConcurrency must be a positive integer");
+	const started = now();
+	let bytes = 0;
+	let requests = 0;
+	let inFlight = 0;
+	function remainingMs() {
+		return timeoutMs - (now() - started);
+	}
+	function reserve() {
+		if (remainingMs() <= 0) return "time limit";
+		if (requests >= maxRequests) return "request limit";
+		if (inFlight >= maxConcurrency) return "concurrency limit";
+		requests += 1;
+		inFlight += 1;
+		return null;
+	}
+	async function classify(target) {
+		const textual = typeof target === "string" ? target : target?.href;
+		if (!textual) return {
+			allow: false,
+			reason: "invalid url"
+		};
+		const literal = gateUrl(textual);
+		if (literal) return {
+			allow: false,
+			reason: literal
+		};
+		let parsed;
+		try {
+			parsed = new URL(textual);
+		} catch {
+			return {
+				allow: false,
+				reason: "invalid url"
+			};
+		}
+		const host = stripHost(parsed.hostname);
+		if (!isIP(host)) {
+			const reason = await resolvePublic(host, lookup, remainingMs());
+			if (reason) return {
+				allow: false,
+				reason,
+				url: parsed
+			};
+		}
+		return {
+			allow: true,
+			url: parsed
+		};
+	}
+	async function exchange(rawUrl) {
+		let current = String(rawUrl);
+		for (let hop = 0; hop <= maxRedirects; hop++) {
+			const limited = reserve();
+			if (limited) return {
+				ok: false,
+				error: limited,
+				finalUrl: safeHref(current)
+			};
+			let redirectTo = null;
+			try {
+				const decision = await classify(current);
+				if (!decision.allow) return {
+					ok: false,
+					error: decision.reason,
+					finalUrl: decision.url?.href || safeHref(current)
+				};
+				const parsed = decision.url;
+				let response;
+				try {
+					response = await get(parsed, {
+						maxBytes: Math.max(1, maxBytes - bytes),
+						timeoutSeconds: Math.max(1, Math.ceil(remainingMs() / 1e3))
+					});
+				} catch (error) {
+					return {
+						ok: false,
+						error: error?.message || "fetch failed",
+						finalUrl: parsed.href
+					};
+				}
+				if (remainingMs() <= 0) return {
+					ok: false,
+					error: "time limit",
+					finalUrl: parsed.href
+				};
+				const body = asBuffer(response?.body);
+				bytes += body.length;
+				if (bytes > maxBytes) return {
+					ok: false,
+					error: "byte limit",
+					finalUrl: parsed.href
+				};
+				if (REDIRECT_STATUSES.has(Number(response?.status))) {
+					const location = headerValue(response.headers, "location");
+					if (!location || !String(location).trim()) return {
+						ok: false,
+						error: "Redirect missing Location",
+						finalUrl: parsed.href
+					};
+					const next = nextHop(String(location).trim(), parsed);
+					if (next.error) return {
+						ok: false,
+						error: next.error,
+						finalUrl: parsed.href
+					};
+					redirectTo = next.href;
+				} else return {
+					ok: true,
+					finalUrl: parsed.href,
+					origin: parsed.origin,
+					status: Number(response?.status) || 0,
+					headers: response?.headers || {},
+					body
+				};
+			} finally {
+				inFlight -= 1;
+			}
+			current = redirectTo;
+		}
+		return {
+			ok: false,
+			error: "Redirect limit exceeded",
+			finalUrl: safeHref(current)
+		};
+	}
+	async function mediate(request) {
+		const capability = browserCapabilityReason(request);
+		if (capability) return {
+			action: "abort",
+			reason: capability
+		};
+		const outcome = await exchange(request.url);
+		if (!outcome.ok) return {
+			action: "abort",
+			reason: outcome.error,
+			finalUrl: outcome.finalUrl
+		};
+		if (/attachment/i.test(String(headerValue(outcome.headers, "content-disposition") || ""))) return {
+			action: "abort",
+			reason: "download blocked",
+			finalUrl: outcome.finalUrl
+		};
+		const mime = htmlMime(outcome.headers) || String(headerValue(outcome.headers, "content-type") || "application/octet-stream").split(";")[0].trim();
+		return {
+			action: "fulfill",
+			reason: "mediated",
+			finalUrl: outcome.finalUrl,
+			origin: outcome.origin,
+			fulfillment: {
+				status: outcome.status || 200,
+				headers: sanitizeHeaders(outcome.headers),
+				body: outcome.body,
+				contentType: mime || "application/octet-stream"
+			}
+		};
+	}
+	async function handleRoute(route, mainPage) {
+		const described = describeRequest(route.request(), mainPage);
+		let decision;
+		try {
+			decision = await mediate(described);
+		} catch (error) {
+			decision = {
+				action: "abort",
+				reason: error?.message || "mediation failed"
+			};
+		}
+		try {
+			if (decision.action === "fulfill") await route.fulfill(decision.fulfillment);
+			else await route.abort("blockedbyclient");
+		} catch {
+			try {
+				await route.abort("blockedbyclient");
+			} catch {}
+		}
+		return decision;
+	}
+	return {
+		exchange,
+		mediate,
+		handleRoute,
+		remainingMs
+	};
+}
+function safeHref(value) {
+	try {
+		return new URL(value).href;
+	} catch {
+		return String(value);
+	}
+}
+function nextHop(location, base) {
+	const absolute = /^[a-z][a-z0-9+.-]*:/i.test(location) ? location : location.startsWith("//") ? `${base.protocol}${location}` : null;
+	if (absolute) {
+		const reason = alternateIpReason(absolute);
+		if (reason) return { error: reason };
+	}
+	try {
+		return { href: new URL(location, base).href };
+	} catch {
+		return { error: "invalid url" };
+	}
+}
+function describeRequest(request, mainPage) {
+	const resourceType = typeof request.resourceType === "function" ? request.resourceType() : request.resourceType;
+	const url = typeof request.url === "function" ? request.url() : request.url;
+	let isPopup = Boolean(request.isPopup);
+	try {
+		const page = request.frame?.()?.page?.();
+		if (page && mainPage && page !== mainPage) isPopup = true;
+	} catch {}
+	const disposition = typeof request.headers === "function" ? request.headers()["content-disposition"] : request.headers?.["content-disposition"];
+	return {
+		url,
+		resourceType,
+		isPopup,
+		isWebSocket: request.isWebSocket || String(resourceType).toLowerCase() === "websocket",
+		isDownload: Boolean(request.isDownload) || /attachment/i.test(String(disposition || "")),
+		isServiceWorker: Boolean(request.isServiceWorker)
+	};
+}
+function defaultLookup(hostname) {
+	return lookup(hostname, { all: true });
+}
+async function defaultLaunchBrowser({ executablePath, timeoutMs }) {
+	const { chromium } = await import("playwright");
+	return chromium.launch({
+		executablePath,
+		headless: true,
+		timeout: Math.min(timeoutMs || 2e4, 2e4),
+		args: [
 			"--disable-gpu",
 			"--disable-extensions",
 			"--no-first-run",
 			"--no-default-browser-check",
 			"--disable-background-networking",
 			"--disable-sync",
+			"--disable-component-update",
 			"--mute-audio",
-			`--user-data-dir=${profile}`,
-			`--virtual-time-budget=${virtualTimeBudgetMs}`,
-			"--dump-dom",
-			url
-		], {
-			stdio: [
-				"ignore",
-				"pipe",
-				"ignore"
-			],
-			windowsHide: true
-		});
-		let size = 0;
-		let overflow = false;
-		const parts = [];
-		child.stdout.on("data", (chunk) => {
-			size += chunk.length;
-			if (size > maxBytes) {
-				overflow = true;
-				child.kill();
-			} else parts.push(chunk);
-		});
-		const timer = setTimeout(() => child.kill(), timeoutMs);
-		child.on("error", reject);
-		child.on("close", () => {
-			clearTimeout(timer);
-			if (overflow) reject(/* @__PURE__ */ new Error("Rendered DOM exceeds byte limit"));
-			else resolve(Buffer.concat(parts).toString("utf8"));
-		});
+			"--disable-features=Translate,BackForwardCache,MediaRouter,DialMediaRouteProvider"
+		]
 	});
+}
+async function closeQuiet(resource) {
+	try {
+		await resource?.close?.();
+	} catch {}
+}
+async function renderIsolated(browser, session, mediated, virtualTimeBudgetMs) {
+	const context = await browser.newContext({
+		...ISOLATED_CONTEXT_OPTIONS,
+		proxy: { ...ISOLATED_CONTEXT_OPTIONS.proxy }
+	});
+	try {
+		const page = await context.newPage();
+		page.on?.("popup", (popup) => {
+			popup?.close?.()?.catch?.(() => {});
+		});
+		page.on?.("download", (download) => {
+			download?.cancel?.()?.catch?.(() => {});
+		});
+		context.on?.("page", (extra) => {
+			if (extra !== page) extra?.close?.()?.catch?.(() => {});
+		});
+		await context.route?.("**/*", (route) => session.handleRoute(route, page));
+		if (context.routeWebSocket) await context.routeWebSocket("**/*", (socket) => {
+			socket.close();
+		});
+		const timeout = Math.max(1, session.remainingMs());
+		await page.setContent(withBase(mediated.body.toString("utf8"), mediated.finalUrl), {
+			waitUntil: "domcontentloaded",
+			timeout
+		});
+		if (page.waitForLoadState) await page.waitForLoadState("networkidle", { timeout: virtualTimeBudgetMs }).catch(() => {});
+		return page.content();
+	} finally {
+		await closeQuiet(context);
+	}
+}
+function isRenderableDocument(mediated) {
+	return mediated.ok && mediated.status === 200 && mediated.body?.length > 0 && htmlMime(mediated.headers) && !/attachment/i.test(String(headerValue(mediated.headers, "content-disposition") || ""));
+}
+/**
+* Render `url` and return the serialized DOM plus the post-redirect URL.
+* @returns {Promise<{html: string, finalUrl: string, origin: string} | null>}
+*/
+async function renderPage(url, { timeoutMs = 2e4, maxBytes = 5242880, virtualTimeBudgetMs = 8e3, maxRedirects = 5, maxRequests = 32, maxConcurrency = 4, edgePath, exists = existsSync, lookup = defaultLookup, get = pinnedGet, launchBrowser = defaultLaunchBrowser, now = Date.now } = {}) {
+	let parsed;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return null;
+	}
+	if (gateUrl(String(url)) || gateUrl(parsed.href)) return null;
+	const binary = edgePath || findEdgeBinary(void 0, exists);
+	if (!binary || !exists(binary)) return null;
+	const session = createMediationSession({
+		get,
+		lookup,
+		maxBytes,
+		timeoutMs,
+		maxRedirects,
+		maxRequests,
+		maxConcurrency,
+		now
+	});
+	let mediated;
+	try {
+		mediated = await session.exchange(String(url));
+	} catch {
+		return null;
+	}
+	if (!isRenderableDocument(mediated)) return null;
+	let browser;
+	try {
+		browser = await launchBrowser({
+			executablePath: binary,
+			timeoutMs
+		});
+	} catch (error) {
+		error instanceof Error && error.message;
+		return null;
+	}
+	try {
+		const html = await renderIsolated(browser, session, mediated, virtualTimeBudgetMs);
+		if (!html || html.length < 150) return null;
+		return {
+			html,
+			finalUrl: mediated.finalUrl,
+			origin: mediated.origin
+		};
+	} catch {
+		return null;
+	} finally {
+		await closeQuiet(browser);
+	}
 }
 //#endregion
 //#region scripts/web-worker.mjs
@@ -5327,6 +6934,32 @@ function shapeDocument(doc) {
 		text: (doc.text || "").slice(0, 8e3),
 		headings: (doc.headings || []).slice(0, 30),
 		links: (doc.links || []).slice(0, 20)
+	};
+}
+/** Persist a fetched document into a research session so open/find can
+* revisit it later. Sessions are sqlite rows keyed by id; unknown ids start a
+* new minimal session whose only content is this document. */
+function stashDocument(storage, sessionId, doc) {
+	if (typeof sessionId !== "string" || !sessionId) throw new Error("store needs a sessionId");
+	if (!doc || typeof doc.id !== "string" || typeof doc.url !== "string") throw new Error("store needs a fetched document");
+	let session;
+	try {
+		session = storage.load(sessionId);
+	} catch {
+		session = {
+			id: sessionId,
+			documents: []
+		};
+	}
+	const documents = Array.isArray(session.documents) ? session.documents : [];
+	if (!documents.some((d) => d.id === doc.id)) documents.push(doc);
+	session.documents = documents;
+	storage.save(session);
+	return {
+		sessionId,
+		documentId: doc.id,
+		url: doc.url,
+		title: doc.title
 	};
 }
 function loadDocumentStore(storage, sessionId) {
@@ -5348,12 +6981,57 @@ for await (const chunk of process.stdin) {
 	if (input.length > 64e3) throw new Error("Research input too large");
 }
 var storage;
-try {
-	const request = JSON.parse(input);
+async function runRequest(request) {
+	if (request.action === "weather") {
+		validateWeatherRequest(request.location, request.forecastDays);
+		if (request.temperatureUnit !== void 0 && !["celsius", "fahrenheit"].includes(request.temperatureUnit)) throw new Error("Temperature unit must be celsius or fahrenheit.");
+		const provider = new WeatherProvider();
+		const cache = request.weatherCachePath ? new SqliteStorage(request.weatherCachePath) : null;
+		try {
+			const key = JSON.stringify([
+				String(request.location || "").trim().toLocaleLowerCase("en"),
+				request.forecastDays ?? 3,
+				request.temperatureUnit ?? "celsius"
+			]);
+			const cached = await cache?.get("weather-v2", key);
+			if (cached) return {
+				...cached,
+				cached: true
+			};
+			const report = await provider.executeLocation(request.location, request.forecastDays, request.temperatureUnit);
+			const result = {
+				...report,
+				cached: false,
+				evidence: provider.formatReportAsEvidence(report)
+			};
+			await cache?.set("weather-v2", key, result, 600);
+			return result;
+		} finally {
+			cache?.close();
+		}
+	}
 	storage = new SqliteStorage(request.databasePath || ":memory:");
+	if (request.action === "clear-cache") {
+		await storage.clear();
+		if (request.weatherCachePath) {
+			const weatherCache = new SqliteStorage(request.weatherCachePath);
+			try {
+				await weatherCache.clear();
+			} finally {
+				weatherCache.close();
+			}
+		}
+		return { cleared: true };
+	}
+	const emitProgress = (progress) => {
+		try {
+			process.stderr.write(`\x1e${JSON.stringify(progress)}\n`);
+		} catch {}
+	};
 	const engine = new WebSearchEngine({
 		config: request.config,
 		storage,
+		onProgress: emitProgress,
 		fetcher: new PinnedPageFetcher(request.config?.fetch?.globalConcurrency, request.config?.fetch?.perDomainConcurrency),
 		jsRender: request.config?.fetch?.jsRenderFallback ? (url) => renderPage(url, {
 			timeoutMs: request.config.fetch.jsRenderTimeoutMs || 2e4,
@@ -5398,8 +7076,20 @@ try {
 			};
 		}
 	} else if (request.action === "search") result = await engine.searchQueries(request.query);
-	else if (request.action === "fetch-url") result = shapeDocument(await engine.fetchUrl(request.url));
-	else if (request.action === "fetch-urls") {
+	else if (request.action === "store" || request.action === "fetch-url") {
+		if (request.action === "store") result = stashDocument(storage, request.sessionId, request.document);
+		else {
+			const doc = await engine.fetchUrl(request.url);
+			if (typeof request.sessionId === "string" && request.sessionId) {
+				stashDocument(storage, request.sessionId, doc);
+				result = {
+					...shapeDocument(doc),
+					sessionId: request.sessionId,
+					documentId: doc.id
+				};
+			} else result = shapeDocument(doc);
+		}
+	} else if (request.action === "fetch-urls") {
 		const urls = (Array.isArray(request.urls) ? request.urls : []).slice(0, 4);
 		result = { pages: await Promise.all(urls.map(async (url) => {
 			try {
@@ -5423,7 +7113,12 @@ try {
 		})).filter((item) => item.claim.trim().length > 0);
 		result = new ClaimVerifier().verifyClaimsDeterministic(claims, evidence);
 	} else {
-		const session = await engine.research(request.question, { mode: request.mode });
+		const session = await engine.research(request.question, {
+			mode: request.mode,
+			freshness: request.freshness,
+			language: request.language,
+			category: request.category
+		});
 		storage.save(session);
 		result = request.full ? session : {
 			id: session.id,
@@ -5445,6 +7140,10 @@ try {
 		};
 		if (request.trace) process.stderr.write(formatDiagnosticReport(session) + "\n");
 	}
+	return result;
+}
+try {
+	const result = await runRequest(JSON.parse(input));
 	process.stdout.write(JSON.stringify(result));
 } catch (error) {
 	process.stderr.write(String(error.message || error) + "\n");

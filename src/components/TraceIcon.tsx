@@ -61,10 +61,10 @@ interface ToolLikeArgs {
  */
 export function toolKindOf(name: string, args: ToolLikeArgs = {}, result: ToolLikeArgs = {}): TraceKind {
   if (/web_search|web_open|web_find|web_fetch/.test(name)) return 'web';
-  if (/edit|create_file|write_to_file|replace/.test(name) || typeof result.diff === 'string') return 'edit';
-  if (name === 'manage_task') return 'task';
+  if (/edit|create_file|write_file|append_file|write_to_file|replace/.test(name) || typeof result.diff === 'string') return 'edit';
+  if (name === 'manage_task' || name === 'plan_submit') return 'task';
   const hasPath = Boolean(args.path ?? args.AbsolutePath ?? args.TargetFile ?? args.file);
-  const isSearchName = /search|grep|find|list_files|locate/.test(name);
+  const isSearchName = /search|grep|find|list_files|list_tree|locate/.test(name);
   if (/read_file|view_file|open_file|cat/.test(name) || (hasPath && !isSearchName)) return 'read';
   if (/list_dir|browse_dir/.test(name)) return 'folder';
   if (isSearchName) return 'search';

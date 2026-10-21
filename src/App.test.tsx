@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   saveRememberedTools: vi.fn(), saveConversationTools: vi.fn(), conversationTools: vi.fn(),
   setWorkspace: vi.fn(), workspaceIndex: vi.fn(), removeProject: vi.fn(), confirm: vi.fn(),
   saveTaskMeta: vi.fn(), deleteConversation: vi.fn(),
+  getPreset: vi.fn(), setPreset: vi.fn(),
 }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: mocks.save, open: vi.fn(), confirm: mocks.confirm }));
 vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) => e instanceof Error ? e.message : String(e), api: {
@@ -17,6 +18,7 @@ vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) 
   saveRememberedTools: mocks.saveRememberedTools, saveConversationTools: mocks.saveConversationTools, conversationTools: mocks.conversationTools,
   setWorkspace: mocks.setWorkspace, workspaceIndex: mocks.workspaceIndex, removeProject: mocks.removeProject,
   saveTaskMeta: mocks.saveTaskMeta, deleteConversation: mocks.deleteConversation,
+  getPreset: mocks.getPreset, setPreset: mocks.setPreset,
   listConnectors: async () => [{ id: 'example', description: 'Example service', url: '', authType: 'apiKey', connected: true, hasCredential: true, tools: [{ name: 'kept_tool', description: 'Kept for new chats', inputSchema: {} }] }],
   listSkills: async () => [], getWorkspace: async () => ({ path: 'C:/workspace' }), hasDaytonaKey: async () => false,
   messages: async () => [{ id: 'message', conversationId: 'chat', role: 'user', content: 'Export this message', reasoning: '', status: 'complete', createdAt: 0 }],
@@ -26,6 +28,7 @@ const baseBootstrap = { conversations: [{ id: 'chat', title: 'Saved chat', updat
   providers: [], preferredModel: { providerId: null, modelId: '' } };
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.removeItem('locallm-appearance');
   mocks.confirm.mockResolvedValue(true);
   mocks.workspaceIndex.mockResolvedValue({ projects: [], tasks: {} });
   mocks.setWorkspace.mockResolvedValue(undefined);
@@ -39,12 +42,51 @@ beforeEach(() => {
   mocks.saveRememberedTools.mockResolvedValue(undefined);
   mocks.saveConversationTools.mockResolvedValue(undefined);
   mocks.exportConversation.mockResolvedValue(undefined);
+  mocks.getPreset.mockResolvedValue({ id: 'standard' });
+  mocks.setPreset.mockResolvedValue(undefined);
 });
 async function openChat() {
   render(<App />);
   await userEvent.click(await screen.findByRole('button', { name: 'Saved chat' }));
   await screen.findByText('Export this message');
 }
+describe('brand home navigation', () => {
+  it('returns from a saved conversation to home without requiring a project', async () => {
+    await openChat();
+    const home = screen.getByRole('button', { name: 'localLM home' });
+    expect(home).not.toHaveAttribute('aria-expanded');
+    expect(home.querySelector('.lucide-chevron-down')).toBeNull();
+    await userEvent.click(home);
+    expect(screen.queryByText('Export this message')).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Message' })).toBeVisible();
+    expect(screen.queryByText('Add a project folder first, then start a chat.')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Saved chat' }));
+    expect(await screen.findByText('Export this message')).toBeInTheDocument();
+  });
+});
+describe('workspace panel chrome', () => {
+  it('shares the full canvas height with chat and shows one set of panel actions', async () => {
+    await openChat();
+    const message = screen.getByRole('textbox', { name: 'Message' });
+    const conversation = message.closest('.workspace-conversation')!;
+    const header = conversation.querySelector('.workspace-header')!;
+    expect(header).not.toBeNull();
+    await userEvent.type(message, 'Keep my draft');
+    await userEvent.click(screen.getByRole('button', { name: 'Toggle workspace panel' }));
+    const panel = screen.getByRole('complementary', { name: 'Workspace inspector' });
+    expect(conversation.parentElement).toHaveClass('workspace-split');
+    expect(panel.parentElement?.parentElement).toBe(conversation.parentElement);
+    expect(screen.queryByRole('button', { name: 'Review changes' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Expand panel' })).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: 'Toggle terminal' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Open terminal in panel' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Toggle workspace panel' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Close inspector' }));
+    expect(screen.getByRole('button', { name: 'Toggle workspace panel' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Review changes' })).not.toBeInTheDocument();
+    expect(message).toHaveValue('Keep my draft');
+  });
+});
 describe('desktop conversation export', () => {
   it('saves to the chosen native path and reports completion', async () => {
     mocks.save.mockResolvedValue('C:/exports/chat.json');
@@ -78,7 +120,7 @@ describe('conversation permission modes', () => {
     expect(mode).toHaveValue('ask');
     await userEvent.selectOptions(mode, 'fullAccess');
     expect(mode).toHaveValue('fullAccess');
-    expect(screen.getByText('Selected tools run without prompts, including code and external changes.')).toBeInTheDocument();
+    expect(screen.getByText('Selected tools run automatically unless their settings require approval.')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
     expect(mode).toHaveValue('fullAccess');
     await userEvent.selectOptions(mode, 'autoApprove');
@@ -105,13 +147,26 @@ describe('conversation permission modes', () => {
 });
 
 describe('remembered tool selection', () => {
+  it.each([['code', /^Code \(PTC\)/], ['minimal', /^Minimal/], ['creator', /^Creator/]] as const)('saves the advanced %s profile for a conversation and restores it after remount', async (id, name) => {
+    const first = render(<App />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Saved chat' }));
+    await screen.findByText('Export this message');
+    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await userEvent.click(await screen.findByRole('radio', { name }));
+    expect(mocks.setPreset).toHaveBeenCalledExactlyOnceWith('chat', id);
+    first.unmount();
+    mocks.getPreset.mockResolvedValue({ id });
+    await openChat();
+    await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    expect(await screen.findByRole('radio', { name })).toBeChecked();
+  });
   it('restores non-workspace remembered selections for an unscoped new chat at startup', async () => {
     mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: ['__workspace'], tools: [{ connectorId: 'example', toolName: 'kept_tool' }] } });
     render(<App />);
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
     const workspace = await screen.findByRole('checkbox', { name: 'Workspace files' });
     await waitFor(() => expect(workspace).not.toBeChecked());
-    expect(screen.getByText('Tools · 1 selected')).toBeInTheDocument();
+    expect(screen.getByText('Tools · 1 connector tool')).toBeInTheDocument();
     expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
   });
   it('saves a change in a fresh chat immediately as the remembered selection', async () => {
@@ -121,7 +176,7 @@ describe('remembered tool selection', () => {
     await waitFor(() => expect(workspace).toBeEnabled());
     await userEvent.click(workspace);
     await waitFor(() => expect(mocks.saveRememberedTools).toHaveBeenCalledWith({ sources: ['__workspace'], tools: [], accessMode: 'ask' }));
-    expect(screen.getByText('Tools · 5 selected')).toBeInTheDocument();
+    expect(screen.getByText('Tools · 1 source')).toBeInTheDocument();
     // No conversation exists before the first message, so nothing is written per conversation.
     expect(mocks.saveConversationTools).not.toHaveBeenCalled();
   });
@@ -134,16 +189,17 @@ describe('remembered tool selection', () => {
     await userEvent.click(workspace);
     expect(await screen.findByRole('alert')).toHaveTextContent('Your tool selection was not saved: The disk is full.');
     expect(workspace).not.toBeChecked();
-    expect(screen.getByText('Tools · Off')).toBeInTheDocument();
+    expect(screen.getByText('Tools · No sources selected')).toBeInTheDocument();
   });
   it('a new conversation inherits the remembered selection without writing it again', async () => {
     mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, rememberedTools: { sources: [], tools: [{ connectorId: 'example', toolName: 'kept_tool' }] } });
     render(<App />);
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
-    await screen.findByText('Tools · 1 selected');
+    await screen.findByText('Tools · 1 connector tool');
+    await userEvent.click(screen.getByRole('button', { name: 'Conversations' }));
     await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
-    expect(await screen.findByText('Tools · 1 selected')).toBeInTheDocument();
+    expect(await screen.findByText('Tools · 1 connector tool')).toBeInTheDocument();
     expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
   });
   it('leaves workspace-only tools off for an unscoped new conversation', async () => {
@@ -154,6 +210,7 @@ describe('remembered tool selection', () => {
     expect(await screen.findByRole('checkbox', { name: 'Workspace files' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'Local code' })).not.toBeChecked();
 
+    await userEvent.click(screen.getByRole('button', { name: 'Conversations' }));
     await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
     expect(await screen.findByRole('checkbox', { name: 'Workspace files' })).not.toBeChecked();
@@ -169,30 +226,36 @@ describe('remembered tool selection', () => {
     mocks.conversationTools.mockResolvedValue({ sources: ['__workspace'], tools: [], accessMode: 'ask' });
     render(<App />);
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
-    await screen.findByText('Tools · 1 selected');
+    await screen.findByText('Tools · 1 connector tool');
+    await userEvent.click(screen.getByRole('button', { name: 'Conversations' }));
     await userEvent.click(screen.getByRole('button', { name: 'Saved chat' }));
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
     const workspace = await screen.findByRole('checkbox', { name: 'Workspace files' });
     await waitFor(() => expect(workspace).toBeChecked());
-    expect(screen.getByText('Tools · 5 selected')).toBeInTheDocument();
+    expect(screen.getByText('Tools · 1 source')).toBeInTheDocument();
     expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
-    // Opening another chat never changes the future-chat default.
+    // Opening another chat never changes the future-chat default; a scoped
+    // new chat turns workspace files and execution on automatically.
+    await userEvent.click(screen.getByRole('button', { name: 'Conversations' }));
     await userEvent.click(screen.getByRole('button', { name: /New conversation/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
-    expect(await screen.findByText('Tools · 1 selected')).toBeInTheDocument();
+    expect(await screen.findByText('Tools · 2 sources · 1 connector tool')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Workspace files' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Local code' })).toBeChecked();
     expect(mocks.saveRememberedTools).not.toHaveBeenCalled();
   });
   it('changing tools in a saved conversation updates it and the remembered selection', async () => {
     mocks.conversationTools.mockResolvedValue({ sources: ['__workspace'], tools: [], accessMode: 'ask' });
     render(<App />);
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Conversations' }));
     await userEvent.click(await screen.findByRole('button', { name: 'Saved chat' }));
     await userEvent.click(screen.getByRole('button', { name: 'Tools' }));
-    await screen.findByText('Tools · 5 selected');
+    await screen.findByText('Tools · 1 source');
     await userEvent.click(screen.getByRole('checkbox', { name: 'Workspace files' }));
     await waitFor(() => expect(mocks.saveConversationTools).toHaveBeenCalledWith('chat', { sources: [], tools: [], accessMode: 'ask' }));
     expect(mocks.saveRememberedTools).toHaveBeenCalledWith({ sources: [], tools: [], accessMode: 'ask' });
-    expect(screen.getByText('Tools · Off')).toBeInTheDocument();
+    expect(screen.getByText('Tools · No sources selected')).toBeInTheDocument();
   });
 });
 
@@ -248,4 +311,124 @@ describe('project folders and scoping', () => {
     );
     await waitFor(() => expect(mocks.removeProject).toHaveBeenCalledWith('proj-1'));
   });
+});
+
+describe('reference-style settings', () => {
+  it('filters settings by purpose and returns to the saved draft', async () => {
+    render(<App />);
+    const message = await screen.findByRole('textbox', { name: 'Message' });
+    await userEvent.clear(message);
+    await userEvent.type(message, 'Review the project structure');
+    await userEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    expect(screen.getByRole('heading', { name: 'General' })).toBeVisible();
+    const search = screen.getByRole('searchbox', { name: 'Search settings' });
+    await userEvent.type(search, 'gpu');
+    expect(screen.getByRole('button', { name: 'Settings: Models & runtime' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Settings: General' })).not.toBeInTheDocument();
+    await userEvent.clear(search);
+    await userEvent.type(search, 'unmatched-setting');
+    expect(screen.getByRole('status')).toHaveTextContent('No settings found');
+    await userEvent.click(screen.getByRole('button', { name: 'Clear settings search' }));
+    expect(screen.getByRole('button', { name: 'Settings: General' })).toHaveAttribute('aria-current', 'page');
+    await userEvent.click(screen.getByRole('button', { name: 'Close settings' }));
+    expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('Review the project structure');
+  });
+
+  it('saves permission changes through General and shares the state with chat', async () => {
+    render(<App />);
+    await screen.findByRole('button', { name: 'Saved chat' });
+    await userEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    await userEvent.click(screen.getByRole('radio', { name: 'Full access' }));
+    await waitFor(() => expect(mocks.saveRememberedTools).toHaveBeenLastCalledWith({ sources: [], tools: [], accessMode: 'fullAccess' }));
+    expect(screen.getByText(/Enabled tools run automatically unless their settings require approval/)).toBeVisible();
+    await userEvent.click(screen.getByRole('button', { name: 'Close settings' }));
+    expect(screen.getByRole('combobox', { name: 'Permission mode' })).toHaveValue('fullAccess');
+  });
+
+  it('keeps the previous permission mode when a General settings save fails', async () => {
+    mocks.saveRememberedTools.mockRejectedValue(new Error('Could not write settings.'));
+    render(<App />);
+    await screen.findByRole('button', { name: 'Saved chat' });
+    await userEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    await userEvent.click(screen.getByRole('radio', { name: 'Full access' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Your tool selection was not saved: Could not write settings.');
+    expect(screen.getByRole('radio', { name: 'Ask for approval' })).toBeChecked();
+  });
+
+  it('persists appearance changes and restores the chosen theme on mount', async () => {
+    localStorage.setItem('locallm-theme', 'light');
+    const app = render(<App />);
+    await userEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Settings: Appearance' }));
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Theme' }), 'dark');
+    expect(document.documentElement).toHaveAttribute('data-theme', 'dark');
+    expect(localStorage.getItem('locallm-theme')).toBe('dark');
+    app.unmount();
+    render(<App />);
+    await userEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Settings: Appearance' }));
+    expect(screen.getByRole('combobox', { name: 'Theme' })).toHaveValue('dark');
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Theme' }), 'light');
+  });
+
+  it('finds Appearance by its controls and applies preferences to the saved conversation', async () => {
+    await openChat();
+    await userEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    expect(screen.queryByRole('combobox', { name: 'Theme' })).not.toBeInTheDocument();
+    await userEvent.type(screen.getByRole('searchbox', { name: 'Search settings' }), 'font');
+    await userEvent.click(screen.getByRole('button', { name: 'Settings: Appearance' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Ocean accent' }));
+    await userEvent.selectOptions(screen.getByLabelText('Conversation font'), 'serif');
+    await userEvent.selectOptions(screen.getByLabelText('Code size'), '16');
+    await userEvent.selectOptions(screen.getByLabelText('Interface density'), 'compact');
+    await userEvent.selectOptions(screen.getByLabelText('Conversation width'), 'wide');
+    await userEvent.selectOptions(screen.getByLabelText('Animations'), 'reduced');
+    expect(document.documentElement).toHaveAttribute('data-accent', 'blue');
+    expect(document.documentElement).toHaveAttribute('data-density', 'compact');
+    expect(document.documentElement).toHaveAttribute('data-chat-width', 'wide');
+    expect(document.documentElement).toHaveAttribute('data-motion', 'reduced');
+    expect(document.documentElement.style.getPropertyValue('--code-font-size')).toBe('16px');
+    await userEvent.click(screen.getByRole('button', { name: 'Close settings' }));
+    expect(await screen.findByText('Export this message')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Settings: Appearance' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Reset appearance' }));
+    expect(screen.getByRole('button', { name: 'Reset appearance' })).toBeDisabled();
+    expect(document.documentElement).toHaveAttribute('data-accent', 'forest');
+  });
+});
+
+describe('settings as a floating modal', () => {
+  it('opens as a dialog over the chat and closes via the close button', async () => {
+    render(<App />);
+    await screen.findByRole('textbox', { name: 'Message' });
+    await userEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    expect(await screen.findByRole('dialog', { name: 'Settings' })).toBeInTheDocument();
+    // The chat surface stays mounted underneath the modal.
+    expect(screen.getByRole('textbox', { name: 'Message' })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Close settings' }));
+    expect(screen.queryByRole('dialog', { name: 'Settings' })).not.toBeInTheDocument();
+  });
+  it('closes on Escape and returns focus to the conversation', async () => {
+    render(<App />);
+    await screen.findByRole('textbox', { name: 'Message' });
+    await userEvent.click(screen.getByRole('button', { name: 'Open settings' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Settings' });
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(dialog).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Message' })).toBeInTheDocument();
+  });
+});
+
+it('restores focus to the opener when the settings modal closes', async () => {
+  render(<App />);
+  await screen.findByRole('textbox', { name: 'Message' });
+  const trigger = screen.getByRole('button', { name: 'Open settings' });
+  trigger.focus();
+  await userEvent.click(trigger);
+  const dialog = await screen.findByRole('dialog', { name: 'Settings' });
+  expect(dialog.contains(document.activeElement)).toBe(true);
+  fireEvent.keyDown(dialog, { key: 'Escape' });
+  expect(dialog).not.toBeInTheDocument();
+  expect(trigger).toHaveFocus();
 });

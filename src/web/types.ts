@@ -202,6 +202,9 @@ export interface PlannedQuery {
   freshness: FreshnessWindow;
   /** SearXNG result page; follow-up pagination only, defaults to 1. */
   page?: number;
+  /** Optional per-call SearXNG language/category overrides. */
+  language?: string;
+  category?: string;
 }
 
 export interface QueryPlan {
@@ -318,6 +321,12 @@ export interface GenerationRequest {
   maxTokens?: number;
   stopSequences?: string[];
   responseSchema?: Record<string, unknown>;
+  /**
+   * 'low' asks the backend to suppress or shrink reasoning traces for
+   * mechanical calls (planning, evidence extraction, claim checks). Providers
+   * only honor it after probing the model's chat template — never assumed.
+   */
+  reasoningEffort?: 'low' | 'default';
 }
 
 export interface GenerationResponse {

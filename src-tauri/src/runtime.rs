@@ -17,6 +17,15 @@ pub struct RuntimeStatus {
     pub model_path: Option<String>,
     pub loaded_config: Option<RuntimeConfig>,
     pub gpu_offload: Option<GpuOffload>,
+    pub projector: Option<ProjectorStatus>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectorStatus {
+    pub path: String,
+    /// GPU offload is allowed; a CPU-only runtime may still fall back to CPU.
+    pub offload: bool,
+    pub file_bytes: u64,
 }
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +67,7 @@ impl Default for RuntimeStatus {
             model_path: None,
             loaded_config: None,
             gpu_offload: None,
+            projector: None,
         }
     }
 }
@@ -91,6 +101,7 @@ impl Runtime {
             match child.try_wait() {
                 Ok(Some(code)) => {
                     self.child = None;
+                    self.supports_images = false;
                     self.status = RuntimeStatus {
                         phase: "error".into(),
                         message: format!(
@@ -100,6 +111,7 @@ impl Runtime {
                         model_path: None,
                         loaded_config: None,
                         gpu_offload: None,
+                        projector: None,
                     };
                 }
                 Err(error) => {
@@ -146,17 +158,19 @@ impl Runtime {
         // A vision projector is optional: text-only models load exactly as
         // before, while multimodal GGUFs load vision support when a valid
         // projector file is configured.
-        let projector = if preferences.projector_path.trim().is_empty() {
-            None
-        } else {
-            let path = std::fs::canonicalize(preferences.projector_path.trim())
-                .map_err(|_| "Select an existing mmproj projector file in Models, or clear it for text-only chat.")?;
-            validate_projector(&path)?;
-            Some(path)
-        };
+        let projector = configured_projector(preferences, config)?;
         let flags = inspect_runtime(&executable).await?;
-        let launch = resolve_launch_config(config, &model, flags.fit).await?;
-        let model_bytes = std::fs::metadata(&model).map(|metadata| metadata.len()).unwrap_or(0);
+        // Validate requested projector controls before stopping a working model.
+        let projector_args = projector_arguments(config, projector.as_deref(), &flags)?;
+        let projector_bytes = projector
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let launch = resolve_launch_config(config, &model, flags.fit, projector_bytes).await?;
+        let model_bytes = std::fs::metadata(&model)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         let attempts = startup_attempts(model_bytes);
         self.stop().await?;
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -170,28 +184,22 @@ impl Runtime {
             .await
             .map_err(|error| format!("Cannot create runtime log: {error}"))?;
         let mut command = runtime_command(&executable);
-        command
-            .args(launch.arguments()?)
-            .arg("--model")
-            .arg(&model);
-        if let Some(projector) = &projector {
-            command.arg("--mmproj").arg(projector);
-        } else if flags.no_mmproj {
-            // Newer llama-server may auto-discover an mmproj beside the GGUF.
-            command.arg("--no-mmproj");
-        }
+        command.args(launch.arguments()?).arg("--model").arg(&model);
+        command.args(projector_args);
         command.args([
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--jinja",
-                "--no-webui",
-                "--log-verbosity",
-                "4",
-            ]);
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--jinja",
+            "--no-webui",
+            "--log-verbosity",
+            "4",
+        ]);
         if flags.fit {
-            command.arg("--fit").arg(if config.automatic_gpu() { "on" } else { "off" });
+            command
+                .arg("--fit")
+                .arg(if config.automatic_gpu() { "on" } else { "off" });
         }
         command
             .env("LLAMA_API_KEY", &self.api_key)
@@ -239,6 +247,7 @@ impl Runtime {
             model_path: Some(preferences.model_path.clone()),
             loaded_config: None,
             gpu_offload: None,
+            projector: None,
         };
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -264,9 +273,18 @@ impl Runtime {
                             self.supports_images = projector.is_some();
                             self.status.loaded_config = Some(config.clone());
                             self.status.gpu_offload = read_offload(&self.log_path);
+                            self.status.projector = projector.as_ref().map(|_| ProjectorStatus {
+                                path: preferences.projector_path.clone(),
+                                offload: config.offload_projector,
+                                file_bytes: projector_bytes,
+                            });
                             self.status.phase = "ready".into();
                             self.status.message = if projector.is_some() {
-                                "Model ready · vision enabled".into()
+                                if config.offload_projector {
+                                    "Model ready · vision enabled (GPU preferred)".into()
+                                } else {
+                                    "Model ready · vision enabled (CPU)".into()
+                                }
                             } else {
                                 "Model ready".into()
                             };
@@ -286,9 +304,29 @@ impl Runtime {
 
 fn runtime_command(executable: &Path) -> Command {
     let mut command = Command::new(executable);
+    #[cfg(target_os = "linux")]
+    {
+        let parent = rustix::process::getpid();
+        // Dev restarts and crashes can bypass Drop and Tauri's Exit handler.
+        // Release GPU memory even when the app is forcibly terminated.
+        // SAFETY: this hook only makes async-signal-safe system calls between
+        // fork and exec; it does not allocate or acquire locks.
+        unsafe {
+            command.pre_exec(move || {
+                rustix::process::set_parent_process_death_signal(Some(
+                    rustix::process::Signal::KILL,
+                ))?;
+                // The parent might have exited before the signal was armed.
+                if rustix::process::getppid() != Some(parent) {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                Ok(())
+            });
+        }
+    }
     // Inherited llama options could expose tools or change the selected model.
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("LLAMA_") {
+        if key.to_string_lossy().starts_with("LLAMA_") || key == "MTMD_BACKEND_DEVICE" {
             command.env_remove(key);
         }
     }
@@ -299,6 +337,69 @@ struct RuntimeFlags {
     no_agent: bool,
     fit: bool,
     no_mmproj: bool,
+    mmproj: bool,
+    mmproj_offload: bool,
+    no_mmproj_offload: bool,
+}
+
+impl RuntimeFlags {
+    fn from_help(help: &str) -> Self {
+        // Match whole flags: --no-mmproj-offload must not imply --no-mmproj.
+        let has = |flag| {
+            help.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                .any(|word| word == flag)
+        };
+        Self {
+            no_agent: has("--no-agent"),
+            fit: has("--fit"),
+            no_mmproj: has("--no-mmproj"),
+            mmproj: has("--mmproj"),
+            mmproj_offload: has("--mmproj-offload"),
+            no_mmproj_offload: has("--no-mmproj-offload"),
+        }
+    }
+}
+
+fn configured_projector(
+    preferences: &Preferences,
+    config: &RuntimeConfig,
+) -> Result<Option<PathBuf>, String> {
+    if !config.vision_enabled || preferences.projector_path.trim().is_empty() {
+        return Ok(None);
+    }
+    let path = std::fs::canonicalize(preferences.projector_path.trim())
+        .map_err(|_| "Select an existing mmproj projector file in Model files, or disable Load vision projector in Runtime for text-only chat.")?;
+    validate_projector(&path)?;
+    Ok(Some(path))
+}
+
+fn projector_arguments(
+    config: &RuntimeConfig,
+    projector: Option<&Path>,
+    flags: &RuntimeFlags,
+) -> Result<Vec<std::ffi::OsString>, String> {
+    let mut args = Vec::new();
+    if let Some(path) = projector {
+        if !flags.mmproj {
+            return Err("This llama-server does not support vision projectors. Select a newer compatible runtime in Model files.".into());
+        }
+        args.push("--mmproj".into());
+        args.push(path.as_os_str().to_owned());
+        if !config.offload_projector {
+            if !flags.no_mmproj_offload {
+                return Err("This llama-server cannot force the vision projector onto CPU. Update the runtime or choose GPU preferred in Runtime.".into());
+            }
+            args.push("--no-mmproj-offload".into());
+        } else if flags.mmproj_offload {
+            args.push("--mmproj-offload".into());
+        }
+    } else if flags.no_mmproj {
+        // Explicitly prevent auto-discovery, even if an mmproj lives beside the model.
+        args.push("--no-mmproj".into());
+    } else if !config.vision_enabled && flags.mmproj {
+        return Err("This llama-server cannot explicitly disable projector auto-loading. Update the runtime before using text-only projector mode.".into());
+    }
+    Ok(args)
 }
 
 async fn inspect_runtime(executable: &Path) -> Result<RuntimeFlags, String> {
@@ -318,22 +419,28 @@ async fn inspect_runtime(executable: &Path) -> Result<RuntimeFlags, String> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok(RuntimeFlags {
-        no_agent: help.contains("--no-agent"),
-        fit: help.contains("--fit"),
-        no_mmproj: help.contains("--no-mmproj"),
-    })
+    Ok(RuntimeFlags::from_help(&help))
 }
 
 async fn resolve_launch_config(
     config: &RuntimeConfig,
     model: &Path,
     fit_supported: bool,
+    projector_bytes: u64,
 ) -> Result<RuntimeConfig, String> {
     if !config.automatic_gpu() || fit_supported {
         return Ok(config.clone());
     }
-    let available = crate::hardware::hardware_status().await.free_vram_bytes();
+    let available = crate::hardware::hardware_status()
+        .await
+        .free_vram_bytes()
+        .map(|bytes| {
+            bytes.saturating_sub(if config.vision_enabled && config.offload_projector {
+                projector_bytes
+            } else {
+                0
+            })
+        });
     let mut launch = config.clone();
     launch.gpu_layers = crate::gguf::model_metadata(model)
         .ok()
@@ -357,10 +464,15 @@ fn startup_attempts(model_bytes: u64) -> u32 {
 
 fn validate_model_context(path: &Path, config: &RuntimeConfig) -> Result<(), String> {
     if let Ok(metadata) = crate::gguf::model_metadata(path) {
-        if metadata.context_length.is_some_and(|max| config.context_length > max) {
+        if metadata
+            .context_length
+            .is_some_and(|max| config.context_length > max)
+        {
             return Err(format!("This model supports at most {} context tokens. Adjust Context window in Runtime before loading.", metadata.context_length.unwrap()));
         }
-        if metadata.block_count.is_some_and(|blocks| config.gpu_layers > 0 && config.gpu_layers as u32 > blocks.saturating_add(1)) {
+        if metadata.block_count.is_some_and(|blocks| {
+            config.gpu_layers > 0 && config.gpu_layers as u32 > blocks.saturating_add(1)
+        }) {
             return Err("GPU layer selection exceeds the model's layer count. Choose Automatic or reduce the manual count in Runtime.".into());
         }
     }
@@ -375,6 +487,9 @@ fn validate_model(path: &Path) -> Result<(), String> {
     if magic != *b"GGUF" {
         return Err("The selected file is not a GGUF model.".into());
     }
+    crate::gguf::model_metadata(path).map_err(|error| {
+        format!("The GGUF metadata is incomplete, corrupt, or incompatible: {error}")
+    })?;
     Ok(())
 }
 
@@ -396,14 +511,266 @@ fn validate_projector(path: &Path) -> Result<(), String> {
         .unwrap_or_default()
         .to_lowercase();
     if !name.ends_with(".gguf") || !name.contains("mmproj") {
-        return Err("The projector must be an mmproj GGUF file (for example mmproj-model-f16.gguf).".into());
+        return Err(
+            "The projector must be an mmproj GGUF file (for example mmproj-model-f16.gguf).".into(),
+        );
     }
-    validate_model(path).map_err(|_| "The projector file is incomplete or is not a GGUF model.".to_string())
+    validate_model(path)
+        .map_err(|_| "The projector file is incomplete or is not a GGUF model.".to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    // Minimal metadata-only GGUF fixture. The mock server below tests launch
+    // and projector flags, not tensor inference (live inference is separate).
+    fn metadata_fixture() -> Vec<u8> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes
+    }
+    #[test]
+    fn model_validation_rejects_truncated_metadata_and_unknown_gguf_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("model.gguf");
+        std::fs::write(&path, b"GGUF").unwrap();
+        assert!(super::validate_model(&path)
+            .unwrap_err()
+            .contains("metadata"));
+        let mut bytes = metadata_fixture();
+        bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(super::validate_model(&path).is_err());
+    }
+
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn parent_death_fixture() {
+        let Some(pid_file) = std::env::var_os("LOCALLM_TEST_PARENT_DEATH_PID") else {
+            return;
+        };
+        let mut child = runtime_command(Path::new("/bin/sleep"))
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        std::fs::write(pid_file, child.id().unwrap().to_string()).unwrap();
+        let _ = child.wait().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runtime_exits_when_parent_is_forcibly_killed() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("runtime.pid");
+        let mut parent = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::tests::parent_death_fixture",
+                "--nocapture",
+            ])
+            .env("LOCALLM_TEST_PARENT_DEATH_PID", &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.parse::<u32>() {
+                        break pid;
+                    }
+                }
+                assert!(
+                    parent.try_wait().unwrap().is_none(),
+                    "Parent fixture exited before starting the runtime"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        parent.kill().await.unwrap();
+        parent.wait().await.unwrap();
+        let exited = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // A reparented zombie has exited and released its GPU memory.
+                let running = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(") ")
+                            .map(|(_, fields)| !fields.starts_with('Z'))
+                    })
+                    .unwrap_or(false);
+                if !running {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if exited.is_err() {
+            // Keep a failing regression from leaving its own orphan behind.
+            if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+        assert!(
+            exited.is_ok(),
+            "Runtime survived its parent and would retain GPU memory"
+        );
+    }
+
+    #[test]
+    fn projector_controls_emit_independent_launch_flags_and_reject_unsupported_modes() {
+        let flags = RuntimeFlags::from_help(
+            "--mmproj FILE --no-mmproj --mmproj-offload --no-mmproj-offload --fit --no-agent",
+        );
+        let config = RuntimeConfig::default();
+        let path = Path::new("mmproj-model-F16.gguf");
+        let gpu = projector_arguments(&config, Some(path), &flags).unwrap();
+        assert_eq!(
+            gpu,
+            ["--mmproj", "mmproj-model-F16.gguf", "--mmproj-offload"].map(std::ffi::OsString::from)
+        );
+        let cpu = RuntimeConfig {
+            offload_projector: false,
+            ..config.clone()
+        };
+        assert!(projector_arguments(&cpu, Some(path), &flags)
+            .unwrap()
+            .contains(&"--no-mmproj-offload".into()));
+        let off = RuntimeConfig {
+            vision_enabled: false,
+            ..config.clone()
+        };
+        assert_eq!(
+            projector_arguments(&off, None, &flags).unwrap(),
+            vec![std::ffi::OsString::from("--no-mmproj")]
+        );
+        let old = RuntimeFlags::from_help("--mmproj FILE --mmproj-offload");
+        assert!(projector_arguments(&cpu, Some(path), &old)
+            .unwrap_err()
+            .contains("CPU"));
+        assert!(projector_arguments(&off, None, &old)
+            .unwrap_err()
+            .contains("auto-loading"));
+        assert!(!RuntimeFlags::from_help("--no-mmproj-offload").no_mmproj);
+        assert!(!RuntimeFlags::from_help("--fit-target").fit);
+        assert!(!RuntimeFlags::from_help("--mmproj-offload").mmproj);
+    }
+
+    #[test]
+    fn disabled_vision_does_not_require_or_clear_the_saved_projector_file() {
+        let preferences = Preferences {
+            projector_path: "missing/mmproj-model-F16.gguf".into(),
+            ..Default::default()
+        };
+        let disabled = RuntimeConfig {
+            vision_enabled: false,
+            ..Default::default()
+        };
+        assert!(configured_projector(&preferences, &disabled)
+            .unwrap()
+            .is_none());
+        assert!(!preferences.projector_path.is_empty());
+        assert!(configured_projector(&preferences, &RuntimeConfig::default()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reloads_projector_modes_and_updates_image_capability() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("llama-server");
+        // Exercise the real subprocess/health/reload path without model weights
+        // or a GPU. This fixture implements only startup and authenticated health.
+        std::fs::write(&executable, r#"#!/usr/bin/env python3
+import http.server,json,os,pathlib,sys
+if '--help' in sys.argv:
+    print('--mmproj FILE --no-mmproj --mmproj-offload --no-mmproj-offload --fit --no-agent')
+    sys.exit(0)
+pathlib.Path(__file__).with_suffix('.args.json').write_text(json.dumps(sys.argv[1:]))
+port=int(sys.argv[sys.argv.index('--port')+1])
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/health' and self.headers.get('Authorization') != 'Bearer '+os.environ['LLAMA_API_KEY']:
+            self.send_error(401)
+            return
+        self.send_response(200)
+        self.send_header('Content-Type','application/json')
+        self.end_headers()
+        self.wfile.write(b'{"data":[]}')
+    def log_message(self,*args): pass
+http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let model = directory.path().join("model.gguf");
+        let projector = directory.path().join("mmproj-model-F16.gguf");
+        std::fs::write(&model, metadata_fixture()).unwrap();
+        std::fs::write(&projector, metadata_fixture()).unwrap();
+        let mut preferences = Preferences {
+            runtime_path: executable.to_string_lossy().into_owned(),
+            model_path: model.to_string_lossy().into_owned(),
+            projector_path: projector.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let mut runtime = Runtime::new(directory.path().join("runtime.log"));
+        for (vision_enabled, offload_projector) in
+            [(false, true), (true, false), (true, true), (false, false)]
+        {
+            let config = RuntimeConfig {
+                vision_enabled,
+                offload_projector,
+                ..Default::default()
+            };
+            let status = runtime.load(&preferences, &config).await.unwrap();
+            assert_eq!(status.phase, "ready");
+            assert_eq!(runtime.supports_images, vision_enabled);
+            assert_eq!(status.projector.is_some(), vision_enabled);
+            assert_eq!(status.loaded_config, Some(config));
+            let args: Vec<String> = serde_json::from_slice(
+                &std::fs::read(executable.with_extension("args.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(args.iter().any(|arg| arg == "--mmproj"), vision_enabled);
+            assert_eq!(args.iter().any(|arg| arg == "--no-mmproj"), !vision_enabled);
+            assert_eq!(
+                args.iter().any(|arg| arg == "--no-mmproj-offload"),
+                vision_enabled && !offload_projector
+            );
+            if let Some(loaded) = status.projector {
+                assert_eq!(loaded.offload, offload_projector);
+                assert_eq!(loaded.file_bytes, metadata_fixture().len() as u64);
+            }
+        }
+        // Disabling a configured but subsequently missing projector must still
+        // allow the base language model to start.
+        preferences.projector_path = directory
+            .path()
+            .join("mmproj-missing.gguf")
+            .to_string_lossy()
+            .into_owned();
+        assert!(runtime
+            .load(
+                &preferences,
+                &RuntimeConfig {
+                    vision_enabled: false,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_ok());
+        runtime.stop().await.unwrap();
+        assert!(!runtime.supports_images);
+        assert!(runtime.status.projector.is_none());
+    }
+
     #[test]
     fn large_ggufs_get_a_longer_startup_window() {
         assert_eq!(startup_attempts(2 * 1024 * 1024 * 1024), 360);
@@ -415,7 +782,9 @@ mod tests {
     #[ignore = "requires a cached upstream Windows CUDA runtime installation"]
     async fn recognizes_current_runtime_flags() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let current = inspect_runtime(&root.join(".local/runtime/llama-server.exe")).await.unwrap();
+        let current = inspect_runtime(&root.join(".local/runtime/llama-server.exe"))
+            .await
+            .unwrap();
         assert!(current.no_agent);
         assert!(current.fit);
     }
@@ -466,10 +835,10 @@ mod tests {
     fn projector_must_be_a_regular_mmproj_gguf_file() {
         let directory = tempfile::tempdir().unwrap();
         let valid = directory.path().join("mmproj-model-f16.gguf");
-        std::fs::write(&valid, b"GGUF").unwrap();
+        std::fs::write(&valid, metadata_fixture()).unwrap();
         assert!(validate_projector(&valid).is_ok());
         let wrong_name = directory.path().join("model.gguf");
-        std::fs::write(&wrong_name, b"GGUF").unwrap();
+        std::fs::write(&wrong_name, metadata_fixture()).unwrap();
         let error = validate_projector(&wrong_name).unwrap_err();
         assert!(error.contains("mmproj"), "{error}");
         let truncated = directory.path().join("mmproj-truncated.gguf");

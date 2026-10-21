@@ -1,0 +1,1013 @@
+{
+  "startedAtUtc": "2026-10-20T20:45:48Z",
+  "model": "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+  "modelSha256": "79dde517866cfbb5c00230b530de17910fc7fc78f8827554d0e14281ce5faf03",
+  "runtimeSha256": "3f6d3ddddc1de7a86073cb890d952cb63216055df190c2db4b11dddbe758f009",
+  "sourceSha256": {
+    "src/genui/Chart.tsx": "3fafcb73485e9937c52596470829787a9dc8072ae2d24a046e42ff5d07c778b2",
+    "src/genui/Coding.tsx": "c0c853ded4d3fdee55159c794f4f8ba5ef5fb74b26e1ee18bb57fbd90f6496dd",
+    "src/genui/DataTable.tsx": "405d4bd4789e38231d62e2c68be55b5923e0c16348516a114fc2af9c1b073ec4",
+    "src/genui/Diagram.tsx": "1b0b148e97db6fa30aa460890250d37ccecf4d505776ce04e8f6c465b41e6b72",
+    "src/genui/Education.tsx": "228f7d4cc68b9b84ffa8c9148b7317a3b8fde3cbe8f6a9fff0e53dab9ea3d3b7",
+    "src/genui/Experiences.tsx": "c0d76db59b5b9271d225a566262faec9910cfabc6a5f97e5e59768dab593ed6a",
+    "src/genui/GenUiSurface.tsx": "2b002fcca5de822e8048ec33430dc6e757bbbd450e351216fc2f9ee2f7f8f0c0",
+    "src/genui/MessageRenderer.tsx": "ff36687f1cb7cc547ca2cefccc1c0aba20b53565249e0956408da81199f84a04",
+    "src/genui/RichComponents.tsx": "91fe358713cb3945b0b5820a7b5afe774ae56345c2e74f03f40773b4b5957375",
+    "src/genui/ValidatedRenderer.test.tsx": "7e4148e5626bbc1ebb2395ac4a6a1f2e7b6094ee056f3a358f99f4f3fe7196d6",
+    "src/genui/ValidatedRenderer.tsx": "c5a74c20bc69520e34b67077374e2fc09c44e0047bdb0533388ecc19b00e2d58",
+    "src/genui/VisualAnswer.test.tsx": "80925bea850c2199ad0625a52c62636684838bc75dde42c507848ee10f571f64",
+    "src/genui/VisualAnswer.tsx": "6558f503f2d765b462ee4da88d199500420cb52002c8826ed1b518e8723ec868",
+    "src/genui/VisualErrorBoundary.tsx": "cf98143c77e0a7e25eb2ea7312b1fd07c5772e19d015c3e3ab5a01b332e9783d",
+    "src/genui/VisualMarkdown.tsx": "6b55e3eb0c0a0f00e77196456a0c9565443d5b7f92f1136d38fd7c1d027c63db",
+    "src/genui/actions.test.ts": "acc0e8e97362c892e8121cf3405153b62af21398df60c7b54933acd0e6da35c3",
+    "src/genui/actions.ts": "05351e97a616cc45e80b73405945f62695965f546ffcdc603a626628974d3281",
+    "src/genui/audit-regressions.test.tsx": "e7472a5430ec256476f1440053ffbd37addb92438d12f7c7444ab1a7e40dd338",
+    "src/genui/catalog.ts": "c97d2dcdc7f07b36d7d0fc32be4e02383a0dd51c700ae5d7740c58677b7e91d8",
+    "src/genui/componentTypes.ts": "11dc9921a0f00b6ec2b60de8e6734988d9fd38d1fdedc3d202fc3cb578563011",
+    "src/genui/dataGrounding.test.ts": "4e2feb9c2bafabfec18be9e25587d0a38dcfbcba4111d39f6cdf9b5d9153764b",
+    "src/genui/dataGrounding.ts": "1952807d9fb9beca5787849f700a05c2753e9093a426273d2ef846c67a49c58c",
+    "src/genui/diff.ts": "b99cc3c1e3b83f4149eac9232853ba0bb4576f9e0474250a81c02e992e413584",
+    "src/genui/experiences.test.tsx": "eb4b84c54774b02f9c8105a410baab6b487e13c9ef7ebac2aa74a4953f2e214c",
+    "src/genui/grounding.test.ts": "c27349f8ca4b70306adcc4f5ed732eb665d6f704b3ddced617988c8f2021b5e5",
+    "src/genui/grounding.tsx": "6b9c7c34e0a284045b4f2c0fa1627f37806a08895e46c5b9c48e9a6f1fe04a76",
+    "src/genui/library.test.ts": "84acb2f22d2c3835aefc17a2a17cafdf1797da4b15bf4148c4ee582f0e00cb94",
+    "src/genui/library.tsx": "de8b2566a3a97e95660112dd5c7196b7ba4e52cdd35ad80846c20d4887cadc87",
+    "src/genui/model-output.test.tsx": "d4d604de0fca96968553bc2af65cdcbf98e61602c8026bba0d4b21b02a8ffae1",
+    "src/genui/progressive.ts": "c46254e9dcafe67ae1f68fb7dbc09afea63b9acd00794f70a8c7d55e74e54284",
+    "src/genui/render-failure.test.tsx": "4a07360e7d2f08824ef50d110ca9205105db937219545935d03cfecf8fbdb4cf",
+    "src/genui/repair.test.ts": "29c794fe3abcfb284e0f522b59c1853459ec7c027a0bff4e54c74ada003d1b1e",
+    "src/genui/repair.ts": "f330272eceebeafc748dcf803a6b76d7053233298ba61fb6a6c409142d5da368",
+    "src/genui/rich.test.tsx": "176ce99120f5bc33f6b78898873bbd791ed378860890be1e83a1079ac743bbe4",
+    "src/genui/richCatalog.ts": "b5fa7cf586ac9b6d3657afe947c6b166ca74024896687a67ede088c6fb5961d8",
+    "src/genui/simulations.ts": "684874598552014c25c40e112b6cd66eed2274f91d7141cc4d97813721d53293",
+    "src/genui/specification.test.ts": "30392cb711e294eb5d5df9e276f6c07b3442533550e944b174decb25cd30df93",
+    "src/genui/specification.ts": "ca8e0a780a09e12b22af0c13d9f9f44c659edfbf1bc9037de5968c1ae7598c28",
+    "src/genui/validation.test.ts": "2754047ca682428bc80e51f110fe5cfbfa38b3515101b19b48ff17c0ea11a7e0",
+    "src/genui/validation.ts": "00495f0646c6ba51d4bf3b0f301e35b15ca5f8adda912c8a89030d355c8f8af5"
+  },
+  "hardware": {
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+    "cpu": "AMD Ryzen 5 7535HS with Radeon Graphics",
+    "logicalCpus": 12
+  },
+  "cpuOnly": true,
+  "contextLength": 8192,
+  "maxOutputTokens": 512,
+  "repetitions": 3,
+  "cachePolicy": "disabled",
+  "loadPolicy": "Wait for observed Rust/link compiler idle before each request; before/after compiler observations recorded. Desktop background activity is not controlled; OS page cache not flushed.",
+  "cases": [
+    {
+      "name": "markdown",
+      "sample": 0,
+      "failure": null,
+      "compilerWaitMs": 25064.855862001423,
+      "compilersBefore": [],
+      "compilersAfter": [
+        "rustc"
+      ],
+      "actualProcess": null,
+      "profile": null,
+      "authoritativeInput": "Explain DNS in two simple sentences.",
+      "rawContentTokens": 7,
+      "promptTokens": 7,
+      "timeToFirstTokenMs": 752.8621380006371,
+      "totalMs": 4949.1960759987705,
+      "finishReason": "stop",
+      "source": "DNS is like a phonebook for the internet, translating human-readable website names (like google.com) into the specific numerical addresses computers need to find them. It acts as a global address book that directs your browser to the correct server.",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 16,
+        "prompt_ms": 742.714,
+        "prompt_per_token_ms": 46.419625,
+        "prompt_per_second": 21.542612634203742,
+        "predicted_n": 50,
+        "predicted_ms": 4181.745,
+        "predicted_per_token_ms": 85.34173469387756,
+        "predicted_per_second": 11.717596362284166
+      },
+      "runtimePeakRssKiB": 3348216
+    },
+    {
+      "name": "core",
+      "sample": 0,
+      "failure": null,
+      "compilerWaitMs": 32882.811169998604,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "core",
+      "authoritativeInput": "Show the TCP handshake. Facts: client sends SYN to server; server sends SYN-ACK to client; client sends ACK to server. Use Diagram with only these facts.",
+      "rawContentTokens": 1438,
+      "promptTokens": 1438,
+      "timeToFirstTokenMs": 4925.525327998912,
+      "totalMs": 17472.5680119991,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response(\n  [\n    Heading(text: \"TCP Handshake Simulation\", level: \"h2\"),\n    Text(text: \"Simulating the TCP 3-way handshake process.\"),\n    Divider(),\n    Section(title: \"TCP Handshake Simulation\", children: [\n    Text(text: \"Client sends SYN to Server.\"),\n    Text(text: \"Server sends SYN-ACK to Client.\"),\n    Text(text: \"Client sends ACK to Server.\")\n  ])\n)\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1447,
+        "prompt_ms": 4898.315,
+        "prompt_per_token_ms": 3.38515203870076,
+        "prompt_per_second": 295.4077065276529,
+        "predicted_n": 115,
+        "predicted_ms": 12522.944,
+        "predicted_per_token_ms": 109.85038596491228,
+        "predicted_per_second": 9.103290727803302
+      },
+      "runtimePeakRssKiB": 3348216,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "repairApplied": false,
+      "renderProgram": "root = Response(\n  [\n    Heading(text: \"TCP Handshake Simulation\", level: \"h2\"),\n    Text(text: \"Simulating the TCP 3-way handshake process.\"),\n    Divider(),\n    Section(title: \"TCP Handshake Simulation\", children: [\n    Text(text: \"Client sends SYN to Server.\"),\n    Text(text: \"Server sends SYN-ACK to Client.\"),\n    Text(text: \"Client sends ACK to Server.\")\n  ])\n)\n",
+      "validation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "grounding": null,
+      "transportComplete": true,
+      "requiredComponent": "Diagram",
+      "requestedComponentPresent": false
+    },
+    {
+      "name": "data",
+      "sample": 0,
+      "failure": null,
+      "compilerWaitMs": 11.111833999166265,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "data",
+      "authoritativeInput": "Plot these supplied sales: Jan 10, Feb 15, Mar 25. Use Chart with kind bar and exactly these points.",
+      "rawContentTokens": 1795,
+      "promptTokens": 1795,
+      "timeToFirstTokenMs": 5385.347243001888,
+      "totalMs": 10182.598488001531,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response(\n  Chart(title: \"Sales Performance\", kind: \"bar\", points: [{label: \"Jan\", value: 10}, {label: \"Feb\", value: 15}, {label: \"Mar\", value: 25}])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1804,
+        "prompt_ms": 5329.293,
+        "prompt_per_token_ms": 2.95415354767184,
+        "prompt_per_second": 338.5064397847895,
+        "predicted_n": 64,
+        "predicted_ms": 4780.874,
+        "predicted_per_token_ms": 75.88688888888889,
+        "predicted_per_second": 13.177506874266086
+      },
+      "runtimePeakRssKiB": 3349592,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "repairApplied": false,
+      "renderProgram": "root = Response(\n  Chart(title: \"Sales Performance\", kind: \"bar\", points: [{label: \"Jan\", value: 10}, {label: \"Feb\", value: 15}, {label: \"Mar\", value: 25}])\n",
+      "validation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "grounding": null,
+      "transportComplete": true,
+      "requiredComponent": "Chart",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "education",
+      "sample": 0,
+      "failure": null,
+      "compilerWaitMs": 11.08167699931073,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "education",
+      "authoritativeInput": "Teach binary search interactively using InteractiveExample with id search, kind binary-search, values [2,4,6,8,10], target 8.",
+      "rawContentTokens": 2093,
+      "promptTokens": 2093,
+      "timeToFirstTokenMs": 6000.631695002085,
+      "totalMs": 10063.296029999037,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  InteractiveExample(id: \"search\", kind: \"binary-search\", values: [2, 4, 6, 8, 10], target: 8)\n])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 2102,
+        "prompt_ms": 5930.3,
+        "prompt_per_token_ms": 2.8212654614652712,
+        "prompt_per_second": 354.45087095087933,
+        "predicted_n": 53,
+        "predicted_ms": 4035.119,
+        "predicted_per_token_ms": 77.59844230769231,
+        "predicted_per_second": 12.886856620585414
+      },
+      "runtimePeakRssKiB": 3443388,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  InteractiveExample(\"search\", \"binary-search\", [2, 4, 6, 8, 10], 8)\n])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 20.05772100000013,
+        "htmlChars": 997,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      },
+      "requiredComponent": "InteractiveExample",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "quiz",
+      "sample": 0,
+      "failure": null,
+      "compilerWaitMs": 11.047471998608671,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "education",
+      "authoritativeInput": "Make one SQL joins Quiz with id joins. Question: Which join preserves unmatched left rows? Options Inner, Left. Correct zero-based index 1. Explanation: LEFT JOIN preserves every left row.",
+      "rawContentTokens": 2099,
+      "promptTokens": 2099,
+      "timeToFirstTokenMs": 5923.56048199872,
+      "totalMs": 10978.883027000848,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  Quiz(id: \"joins\", title: \"SQL joins\", questions: [\n  {question: \"Which join preserves unmatched left rows?\", options: [\"Inner\", \"Left\"], answer: 1, explanation: \"LEFT JOIN keeps all left rows.\"}]])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 2108,
+        "prompt_ms": 5914.637,
+        "prompt_per_token_ms": 2.805805028462998,
+        "prompt_per_second": 356.4039517556192,
+        "predicted_n": 67,
+        "predicted_ms": 5041.887,
+        "predicted_per_token_ms": 76.39222727272727,
+        "predicted_per_second": 13.09033701072634
+      },
+      "runtimePeakRssKiB": 3443388,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  Quiz(\"joins\", \"SQL joins\", [\n  {question: \"Which join preserves unmatched left rows?\", options: [\"Inner\", \"Left\"], answer: 1, explanation: \"LEFT JOIN keeps all left rows.\"}])])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 7.318688000000066,
+        "htmlChars": 490,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      },
+      "requiredComponent": "Quiz",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "actual-process-result",
+      "sample": 0,
+      "failure": null,
+      "compilerWaitMs": 11.244814999372466,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": {
+        "command": [
+          "/usr/bin/python3",
+          "-c",
+          "print(1+1)"
+        ],
+        "exitCode": 0,
+        "stdout": "2\n",
+        "durationMs": 14.809069001785247
+      },
+      "profile": "coding",
+      "authoritativeInput": "Present the supplied code and actual stdout verbatim using FilePreview for example.py and Text for stdout. Path: example.py. Code: print(1+1). Actual stdout: 2\n",
+      "rawContentTokens": 1689,
+      "promptTokens": 1689,
+      "timeToFirstTokenMs": 4947.376513002382,
+      "totalMs": 8634.81867000155,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  FilePreview(path: \"example.py\", code: \"print(1+1)\", language: \"python\"),\n  Text(\"Observed stdout: 2\")\n])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1697,
+        "prompt_ms": 4884.071,
+        "prompt_per_token_ms": 2.878061873895109,
+        "prompt_per_second": 347.45604640063584,
+        "predicted_n": 50,
+        "predicted_ms": 3665.645,
+        "predicted_per_token_ms": 74.80908163265306,
+        "predicted_per_second": 13.367360996495842
+      },
+      "runtimePeakRssKiB": 3464788,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "The UI program is incomplete or has missing references."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  FilePreview(\"example.py\", \"print(1+1)\", \"python\"),\n  Text(\"Observed stdout: 2\")\n])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 15.47440400000005,
+        "htmlChars": 1373,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      },
+      "requiredComponent": "FilePreview",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "core",
+      "sample": 1,
+      "failure": null,
+      "compilerWaitMs": 10.481153000000631,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "core",
+      "authoritativeInput": "Show the TCP handshake. Facts: client sends SYN to server; server sends SYN-ACK to client; client sends ACK to server. Use Diagram with only these facts.",
+      "rawContentTokens": 1438,
+      "promptTokens": 1438,
+      "timeToFirstTokenMs": 4283.944055001484,
+      "totalMs": 12871.963052002684,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response(\n  [\n    Heading(text: \"TCP Handshake Simulation\", level: \"h2\"),\n    Text(text: \"Simulating the TCP 3-way handshake process.\"),\n    Divider(),\n    Section(title: \"TCP Handshake Simulation\", children: [\n    Text(text: \"Client sends SYN to Server.\"),\n    Text(text: \"Server sends SYN-ACK to Client.\"),\n    Text(text: \"Client sends ACK to Server.\")\n  ])\n)\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1447,
+        "prompt_ms": 4226.572,
+        "prompt_per_token_ms": 2.9209205252246027,
+        "prompt_per_second": 342.3578256800073,
+        "predicted_n": 115,
+        "predicted_ms": 8570.971,
+        "predicted_per_token_ms": 75.18395614035087,
+        "predicted_per_second": 13.300710036237435
+      },
+      "runtimePeakRssKiB": 3554420,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "repairApplied": false,
+      "renderProgram": "root = Response(\n  [\n    Heading(text: \"TCP Handshake Simulation\", level: \"h2\"),\n    Text(text: \"Simulating the TCP 3-way handshake process.\"),\n    Divider(),\n    Section(title: \"TCP Handshake Simulation\", children: [\n    Text(text: \"Client sends SYN to Server.\"),\n    Text(text: \"Server sends SYN-ACK to Client.\"),\n    Text(text: \"Client sends ACK to Server.\")\n  ])\n)\n",
+      "validation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "grounding": null,
+      "transportComplete": true,
+      "requiredComponent": "Diagram",
+      "requestedComponentPresent": false
+    },
+    {
+      "name": "data",
+      "sample": 1,
+      "failure": null,
+      "compilerWaitMs": 14.896984997903928,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "data",
+      "authoritativeInput": "Plot these supplied sales: Jan 10, Feb 15, Mar 25. Use Chart with kind bar and exactly these points.",
+      "rawContentTokens": 1795,
+      "promptTokens": 1795,
+      "timeToFirstTokenMs": 5408.294034998107,
+      "totalMs": 10144.19490599903,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response(\n  Chart(title: \"Sales Performance\", kind: \"bar\", points: [{label: \"Jan\", value: 10}, {label: \"Feb\", value: 15}, {label: \"Mar\", value: 25}])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1804,
+        "prompt_ms": 5324.248,
+        "prompt_per_token_ms": 2.9513569844789354,
+        "prompt_per_second": 338.8271921217795,
+        "predicted_n": 64,
+        "predicted_ms": 4722.457,
+        "predicted_per_token_ms": 74.95963492063493,
+        "predicted_per_second": 13.340513211660793
+      },
+      "runtimePeakRssKiB": 3639152,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "repairApplied": false,
+      "renderProgram": "root = Response(\n  Chart(title: \"Sales Performance\", kind: \"bar\", points: [{label: \"Jan\", value: 10}, {label: \"Feb\", value: 15}, {label: \"Mar\", value: 25}])\n",
+      "validation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "grounding": null,
+      "transportComplete": true,
+      "requiredComponent": "Chart",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "education",
+      "sample": 1,
+      "failure": null,
+      "compilerWaitMs": 10.696600002120249,
+      "compilersBefore": [],
+      "compilersAfter": [
+        "rustc"
+      ],
+      "actualProcess": null,
+      "profile": "education",
+      "authoritativeInput": "Teach binary search interactively using InteractiveExample with id search, kind binary-search, values [2,4,6,8,10], target 8.",
+      "rawContentTokens": 2093,
+      "promptTokens": 2093,
+      "timeToFirstTokenMs": 5999.788273999002,
+      "totalMs": 10525.198070001352,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  InteractiveExample(id: \"search\", kind: \"binary-search\", values: [2, 4, 6, 8, 10], target: 8)\n])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 2102,
+        "prompt_ms": 5948.101,
+        "prompt_per_token_ms": 2.8297340627973355,
+        "prompt_per_second": 353.3900987895128,
+        "predicted_n": 53,
+        "predicted_ms": 4508.429,
+        "predicted_per_token_ms": 86.7005576923077,
+        "predicted_per_second": 11.533951183438843
+      },
+      "runtimePeakRssKiB": 3639220,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  InteractiveExample(\"search\", \"binary-search\", [2, 4, 6, 8, 10], 8)\n])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 4.192579000000023,
+        "htmlChars": 997,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      },
+      "requiredComponent": "InteractiveExample",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "quiz",
+      "sample": 1,
+      "failure": null,
+      "compilerWaitMs": 39850.25148600107,
+      "compilersBefore": [],
+      "compilersAfter": [
+        "rustc"
+      ],
+      "actualProcess": null,
+      "profile": "education",
+      "authoritativeInput": "Make one SQL joins Quiz with id joins. Question: Which join preserves unmatched left rows? Options Inner, Left. Correct zero-based index 1. Explanation: LEFT JOIN preserves every left row.",
+      "rawContentTokens": 2099,
+      "promptTokens": 2099,
+      "timeToFirstTokenMs": 6613.413776998641,
+      "totalMs": 12195.755672000814,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  Quiz(id: \"joins\", title: \"SQL joins\", questions: [\n  {question: \"Which join preserves unmatched left rows?\", options: [\"Inner\", \"Left\"], answer: 1, explanation: \"LEFT JOIN keeps all left rows.\"}]])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 2108,
+        "prompt_ms": 6594.237,
+        "prompt_per_token_ms": 3.128195920303605,
+        "prompt_per_second": 319.67307210826664,
+        "predicted_n": 67,
+        "predicted_ms": 5566.733,
+        "predicted_per_token_ms": 84.3444393939394,
+        "predicted_per_second": 11.856146145324375
+      },
+      "runtimePeakRssKiB": 3639220,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  Quiz(\"joins\", \"SQL joins\", [\n  {question: \"Which join preserves unmatched left rows?\", options: [\"Inner\", \"Left\"], answer: 1, explanation: \"LEFT JOIN keeps all left rows.\"}])])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 4.095896999999923,
+        "htmlChars": 490,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      },
+      "requiredComponent": "Quiz",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "actual-process-result",
+      "sample": 1,
+      "failure": null,
+      "compilerWaitMs": 28624.249221000355,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": {
+        "command": [
+          "/usr/bin/python3",
+          "-c",
+          "print(1+1)"
+        ],
+        "exitCode": 0,
+        "stdout": "2\n",
+        "durationMs": 15.689940999436658
+      },
+      "profile": "coding",
+      "authoritativeInput": "Present the supplied code and actual stdout verbatim using FilePreview for example.py and Text for stdout. Path: example.py. Code: print(1+1). Actual stdout: 2\n",
+      "rawContentTokens": 1689,
+      "promptTokens": 1689,
+      "timeToFirstTokenMs": 5226.839860999462,
+      "totalMs": 8944.606369001121,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  FilePreview(path: \"example.py\", code: \"print(1+1)\", language: \"python\"),\n  Text(\"Observed stdout: 2\")\n])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1697,
+        "prompt_ms": 4937.386,
+        "prompt_per_token_ms": 2.9094790807307014,
+        "prompt_per_second": 343.70413818162075,
+        "predicted_n": 50,
+        "predicted_ms": 3703.174,
+        "predicted_per_token_ms": 75.57497959183674,
+        "predicted_per_second": 13.23189242525466
+      },
+      "runtimePeakRssKiB": 3639220,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "The UI program is incomplete or has missing references."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  FilePreview(\"example.py\", \"print(1+1)\", \"python\"),\n  Text(\"Observed stdout: 2\")\n])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 4.92527199999995,
+        "htmlChars": 1373,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      },
+      "requiredComponent": "FilePreview",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "markdown",
+      "sample": 1,
+      "failure": null,
+      "compilerWaitMs": 11.048925000068266,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": null,
+      "authoritativeInput": "Explain DNS in two simple sentences.",
+      "rawContentTokens": 7,
+      "promptTokens": 7,
+      "timeToFirstTokenMs": 695.9910539990233,
+      "totalMs": 4149.248355999589,
+      "finishReason": "stop",
+      "source": "DNS is like a phonebook for the internet, translating human-readable website names (like google.com) into the specific numerical addresses computers need to find them. It acts as a global address book that directs your browser to the correct server.",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 16,
+        "prompt_ms": 517.966,
+        "prompt_per_token_ms": 32.372875,
+        "prompt_per_second": 30.89005842082299,
+        "predicted_n": 50,
+        "predicted_ms": 3438.83,
+        "predicted_per_token_ms": 70.18020408163265,
+        "predicted_per_second": 14.249032374383148
+      },
+      "runtimePeakRssKiB": 3639220
+    },
+    {
+      "name": "data",
+      "sample": 2,
+      "failure": null,
+      "compilerWaitMs": 12.538204002339626,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "data",
+      "authoritativeInput": "Plot these supplied sales: Jan 10, Feb 15, Mar 25. Use Chart with kind bar and exactly these points.",
+      "rawContentTokens": 1795,
+      "promptTokens": 1795,
+      "timeToFirstTokenMs": 5698.195025001041,
+      "totalMs": 10483.197712001129,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response(\n  Chart(title: \"Sales Performance\", kind: \"bar\", points: [{label: \"Jan\", value: 10}, {label: \"Feb\", value: 15}, {label: \"Mar\", value: 25}])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1804,
+        "prompt_ms": 5457.251,
+        "prompt_per_token_ms": 3.0250837028824833,
+        "prompt_per_second": 330.56936541859625,
+        "predicted_n": 64,
+        "predicted_ms": 4769.994,
+        "predicted_per_token_ms": 75.71419047619047,
+        "predicted_per_second": 13.207563783099099
+      },
+      "runtimePeakRssKiB": 3639220,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "repairApplied": false,
+      "renderProgram": "root = Response(\n  Chart(title: \"Sales Performance\", kind: \"bar\", points: [{label: \"Jan\", value: 10}, {label: \"Feb\", value: 15}, {label: \"Mar\", value: 25}])\n",
+      "validation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "grounding": null,
+      "transportComplete": true,
+      "requiredComponent": "Chart",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "education",
+      "sample": 2,
+      "failure": null,
+      "compilerWaitMs": 10.877772001549602,
+      "compilersBefore": [],
+      "compilersAfter": [
+        "rustc"
+      ],
+      "actualProcess": null,
+      "profile": "education",
+      "authoritativeInput": "Teach binary search interactively using InteractiveExample with id search, kind binary-search, values [2,4,6,8,10], target 8.",
+      "rawContentTokens": 2093,
+      "promptTokens": 2093,
+      "timeToFirstTokenMs": 6268.388388001767,
+      "totalMs": 10708.453792998625,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  InteractiveExample(id: \"search\", kind: \"binary-search\", values: [2, 4, 6, 8, 10], target: 8)\n])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 2102,
+        "prompt_ms": 6213.677,
+        "prompt_per_token_ms": 2.956078496669838,
+        "prompt_per_second": 338.28601003882244,
+        "predicted_n": 53,
+        "predicted_ms": 4426.367,
+        "predicted_per_token_ms": 85.12244230769231,
+        "predicted_per_second": 11.747783227192865
+      },
+      "runtimePeakRssKiB": 3639220,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  InteractiveExample(\"search\", \"binary-search\", [2, 4, 6, 8, 10], 8)\n])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 3.6932879999999386,
+        "htmlChars": 997,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      },
+      "requiredComponent": "InteractiveExample",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "quiz",
+      "sample": 2,
+      "failure": null,
+      "compilerWaitMs": 27388.83177200114,
+      "compilersBefore": [
+        "rustc"
+      ],
+      "compilersAfter": [
+        "rustc"
+      ],
+      "actualProcess": null,
+      "profile": "education",
+      "authoritativeInput": "Make one SQL joins Quiz with id joins. Question: Which join preserves unmatched left rows? Options Inner, Left. Correct zero-based index 1. Explanation: LEFT JOIN preserves every left row.",
+      "rawContentTokens": 2099,
+      "promptTokens": 2099,
+      "timeToFirstTokenMs": 6707.987631001743,
+      "totalMs": 12290.049417002592,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  Quiz(id: \"joins\", title: \"SQL joins\", questions: [\n  {question: \"Which join preserves unmatched left rows?\", options: [\"Inner\", \"Left\"], answer: 1, explanation: \"LEFT JOIN keeps all left rows.\"}]])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 2108,
+        "prompt_ms": 6692.331,
+        "prompt_per_token_ms": 3.174730075901328,
+        "prompt_per_second": 314.9874087220133,
+        "predicted_n": 67,
+        "predicted_ms": 5565.837,
+        "predicted_per_token_ms": 84.33086363636365,
+        "predicted_per_second": 11.858054772354993
+      },
+      "runtimePeakRssKiB": 3639220,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  Quiz(\"joins\", \"SQL joins\", [\n  {question: \"Which join preserves unmatched left rows?\", options: [\"Inner\", \"Left\"], answer: 1, explanation: \"LEFT JOIN keeps all left rows.\"}])])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 3.2715029999999388,
+        "htmlChars": 490,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      },
+      "requiredComponent": "Quiz",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "actual-process-result",
+      "sample": 2,
+      "failure": null,
+      "compilerWaitMs": 28816.235956001037,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": {
+        "command": [
+          "/usr/bin/python3",
+          "-c",
+          "print(1+1)"
+        ],
+        "exitCode": 0,
+        "stdout": "2\n",
+        "durationMs": 19.24174200030393
+      },
+      "profile": "coding",
+      "authoritativeInput": "Present the supplied code and actual stdout verbatim using FilePreview for example.py and Text for stdout. Path: example.py. Code: print(1+1). Actual stdout: 2\n",
+      "rawContentTokens": 1689,
+      "promptTokens": 1689,
+      "timeToFirstTokenMs": 5454.862571001286,
+      "totalMs": 9155.032290000236,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  FilePreview(path: \"example.py\", code: \"print(1+1)\", language: \"python\"),\n  Text(\"Observed stdout: 2\")\n])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1697,
+        "prompt_ms": 5074.476,
+        "prompt_per_token_ms": 2.9902628167354153,
+        "prompt_per_second": 334.41876560259624,
+        "predicted_n": 50,
+        "predicted_ms": 3685.356,
+        "predicted_per_token_ms": 75.21134693877552,
+        "predicted_per_second": 13.295866125280703
+      },
+      "runtimePeakRssKiB": 3639220,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "The UI program is incomplete or has missing references."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  FilePreview(\"example.py\", \"print(1+1)\", \"python\"),\n  Text(\"Observed stdout: 2\")\n])",
+      "validation": {
+        "valid": true
+      },
+      "grounding": true,
+      "transportComplete": true,
+      "serverRender": {
+        "success": true,
+        "durationMs": 4.992449000000079,
+        "htmlChars": 1373,
+        "method": "React server render; CSS ignored; not native paint/interaction"
+      },
+      "requiredComponent": "FilePreview",
+      "requestedComponentPresent": true
+    },
+    {
+      "name": "markdown",
+      "sample": 2,
+      "failure": null,
+      "compilerWaitMs": 11.361945998942247,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": null,
+      "authoritativeInput": "Explain DNS in two simple sentences.",
+      "rawContentTokens": 7,
+      "promptTokens": 7,
+      "timeToFirstTokenMs": 552.803534999839,
+      "totalMs": 3868.6828179997974,
+      "finishReason": "stop",
+      "source": "DNS is like a phonebook for the internet, translating human-readable website names (like google.com) into the specific numerical addresses computers need to find them. It acts as a global address book that directs your browser to the correct server.",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 16,
+        "prompt_ms": 516.091,
+        "prompt_per_token_ms": 32.2556875,
+        "prompt_per_second": 31.00228448083768,
+        "predicted_n": 50,
+        "predicted_ms": 3302.552,
+        "predicted_per_token_ms": 67.39902040816327,
+        "predicted_per_second": 14.837010893393957
+      },
+      "runtimePeakRssKiB": 3639220
+    },
+    {
+      "name": "core",
+      "sample": 2,
+      "failure": null,
+      "compilerWaitMs": 11.407822999899508,
+      "compilersBefore": [],
+      "compilersAfter": [],
+      "actualProcess": null,
+      "profile": "core",
+      "authoritativeInput": "Show the TCP handshake. Facts: client sends SYN to server; server sends SYN-ACK to client; client sends ACK to server. Use Diagram with only these facts.",
+      "rawContentTokens": 1438,
+      "promptTokens": 1438,
+      "timeToFirstTokenMs": 4445.131262000359,
+      "totalMs": 13073.696283998288,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response(\n  [\n    Heading(text: \"TCP Handshake Simulation\", level: \"h2\"),\n    Text(text: \"Simulating the TCP 3-way handshake process.\"),\n    Divider(),\n    Section(title: \"TCP Handshake Simulation\", children: [\n    Text(text: \"Client sends SYN to Server.\"),\n    Text(text: \"Server sends SYN-ACK to Client.\"),\n    Text(text: \"Client sends ACK to Server.\")\n  ])\n)\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1447,
+        "prompt_ms": 4205.286,
+        "prompt_per_token_ms": 2.9062100898410503,
+        "prompt_per_second": 344.0907467411253,
+        "predicted_n": 115,
+        "predicted_ms": 8612.983,
+        "predicted_per_token_ms": 75.55248245614035,
+        "predicted_per_second": 13.235832463619166
+      },
+      "runtimePeakRssKiB": 3639220,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "repairApplied": false,
+      "renderProgram": "root = Response(\n  [\n    Heading(text: \"TCP Handshake Simulation\", level: \"h2\"),\n    Text(text: \"Simulating the TCP 3-way handshake process.\"),\n    Divider(),\n    Section(title: \"TCP Handshake Simulation\", children: [\n    Text(text: \"Client sends SYN to Server.\"),\n    Text(text: \"Server sends SYN-ACK to Client.\"),\n    Text(text: \"Client sends ACK to Server.\")\n  ])\n)\n",
+      "validation": {
+        "valid": false,
+        "diagnostic": "UI syntax has unmatched delimiters."
+      },
+      "grounding": null,
+      "transportComplete": true,
+      "requiredComponent": "Diagram",
+      "requestedComponentPresent": false
+    }
+  ],
+  "limitations": [
+    "Isolated CPU process loaded once; first pass OS/model warmth is not controlled. cache_prompt is explicit and case order rotates.",
+    "TTFT is model transport, not first paint. Native interaction/memory are measured separately.",
+    "Actual Python process execution is fixed benchmark orchestration, not a model-selected permission-controlled harness call.",
+    "Direct program-generation experiment; production tool-free second-pass inference is separately measured in native acceptance. No remote provider or GPU inference."
+  ],
+  "loadSeconds": 6.329842808001558,
+  "finishedAtUtc": "2026-10-20T20:52:02Z",
+  "validationSourceSha256": {
+    "Chart.tsx": "c9ecc041d5693cfd348428afb7e6f1343541b3cf3f0b5a1ea6a6428d20606469",
+    "Coding.tsx": "c0c853ded4d3fdee55159c794f4f8ba5ef5fb74b26e1ee18bb57fbd90f6496dd",
+    "DataTable.tsx": "405d4bd4789e38231d62e2c68be55b5923e0c16348516a114fc2af9c1b073ec4",
+    "Diagram.tsx": "1b0b148e97db6fa30aa460890250d37ccecf4d505776ce04e8f6c465b41e6b72",
+    "Education.tsx": "228f7d4cc68b9b84ffa8c9148b7317a3b8fde3cbe8f6a9fff0e53dab9ea3d3b7",
+    "Experiences.tsx": "1290f9a1d267fd85b77f78b74a6fe505358fd26e72b60d762de07478472e1cbc",
+    "GenUiSurface.tsx": "2b002fcca5de822e8048ec33430dc6e757bbbd450e351216fc2f9ee2f7f8f0c0",
+    "MessageRenderer.tsx": "ff36687f1cb7cc547ca2cefccc1c0aba20b53565249e0956408da81199f84a04",
+    "RichComponents.tsx": "91fe358713cb3945b0b5820a7b5afe774ae56345c2e74f03f40773b4b5957375",
+    "ValidatedRenderer.test.tsx": "7e4148e5626bbc1ebb2395ac4a6a1f2e7b6094ee056f3a358f99f4f3fe7196d6",
+    "ValidatedRenderer.tsx": "c5a74c20bc69520e34b67077374e2fc09c44e0047bdb0533388ecc19b00e2d58",
+    "VisualAnswer.test.tsx": "80925bea850c2199ad0625a52c62636684838bc75dde42c507848ee10f571f64",
+    "VisualAnswer.tsx": "6558f503f2d765b462ee4da88d199500420cb52002c8826ed1b518e8723ec868",
+    "VisualErrorBoundary.tsx": "cf98143c77e0a7e25eb2ea7312b1fd07c5772e19d015c3e3ab5a01b332e9783d",
+    "VisualMarkdown.tsx": "6b55e3eb0c0a0f00e77196456a0c9565443d5b7f92f1136d38fd7c1d027c63db",
+    "actions.test.ts": "acc0e8e97362c892e8121cf3405153b62af21398df60c7b54933acd0e6da35c3",
+    "actions.ts": "05351e97a616cc45e80b73405945f62695965f546ffcdc603a626628974d3281",
+    "audit-regressions.test.tsx": "e7472a5430ec256476f1440053ffbd37addb92438d12f7c7444ab1a7e40dd338",
+    "catalog.ts": "c97d2dcdc7f07b36d7d0fc32be4e02383a0dd51c700ae5d7740c58677b7e91d8",
+    "componentTypes.ts": "11dc9921a0f00b6ec2b60de8e6734988d9fd38d1fdedc3d202fc3cb578563011",
+    "dataGrounding.test.ts": "cde7e9935267e37206dd50af199da5409c8e95dc8cbfb50da2441d1d03500960",
+    "dataGrounding.ts": "be47c630800e2b699007090fff7566fa0344b72b9531d22aced8f0d527c84248",
+    "diff.ts": "b99cc3c1e3b83f4149eac9232853ba0bb4576f9e0474250a81c02e992e413584",
+    "experiences.test.tsx": "e0a4e1983ae0119ffaef7f9f4d524cb0acce7ec06432d3a95e82c444d45723ef",
+    "grounding.test.ts": "c27349f8ca4b70306adcc4f5ed732eb665d6f704b3ddced617988c8f2021b5e5",
+    "grounding.tsx": "6b9c7c34e0a284045b4f2c0fa1627f37806a08895e46c5b9c48e9a6f1fe04a76",
+    "library.test.ts": "84acb2f22d2c3835aefc17a2a17cafdf1797da4b15bf4148c4ee582f0e00cb94",
+    "library.tsx": "de8b2566a3a97e95660112dd5c7196b7ba4e52cdd35ad80846c20d4887cadc87",
+    "model-output.test.tsx": "d4d604de0fca96968553bc2af65cdcbf98e61602c8026bba0d4b21b02a8ffae1",
+    "progressive.ts": "c46254e9dcafe67ae1f68fb7dbc09afea63b9acd00794f70a8c7d55e74e54284",
+    "render-failure.test.tsx": "4a07360e7d2f08824ef50d110ca9205105db937219545935d03cfecf8fbdb4cf",
+    "repair.test.ts": "29c794fe3abcfb284e0f522b59c1853459ec7c027a0bff4e54c74ada003d1b1e",
+    "repair.ts": "f330272eceebeafc748dcf803a6b76d7053233298ba61fb6a6c409142d5da368",
+    "rich.test.tsx": "176ce99120f5bc33f6b78898873bbd791ed378860890be1e83a1079ac743bbe4",
+    "richCatalog.ts": "b5fa7cf586ac9b6d3657afe947c6b166ca74024896687a67ede088c6fb5961d8",
+    "simulations.ts": "684874598552014c25c40e112b6cd66eed2274f91d7141cc4d97813721d53293",
+    "specification.test.ts": "30392cb711e294eb5d5df9e276f6c07b3442533550e944b174decb25cd30df93",
+    "specification.ts": "ca8e0a780a09e12b22af0c13d9f9f44c659edfbf1bc9037de5968c1ae7598c28",
+    "validation.test.ts": "2754047ca682428bc80e51f110fe5cfbfa38b3515101b19b48ff17c0ea11a7e0",
+    "validation.ts": "00495f0646c6ba51d4bf3b0f301e35b15ca5f8adda912c8a89030d355c8f8af5"
+  },
+  "summary": {
+    "markdown": {
+      "samples": 3,
+      "totalP50Ms": 4149.248355999589,
+      "totalP95Ms": 4949.1960759987705,
+      "rawValid": null,
+      "repairedValid": null,
+      "grounded": 0,
+      "requestedComponentPresent": null,
+      "serverRendered": 0,
+      "transportFailures": 0
+    },
+    "core": {
+      "samples": 3,
+      "totalP50Ms": 13073.696283998288,
+      "totalP95Ms": 17472.5680119991,
+      "rawValid": 0,
+      "repairedValid": 0,
+      "grounded": 0,
+      "requestedComponentPresent": 0,
+      "serverRendered": 0,
+      "transportFailures": 0
+    },
+    "data": {
+      "samples": 3,
+      "totalP50Ms": 10182.598488001531,
+      "totalP95Ms": 10483.197712001129,
+      "rawValid": 0,
+      "repairedValid": 0,
+      "grounded": 0,
+      "requestedComponentPresent": 3,
+      "serverRendered": 0,
+      "transportFailures": 0
+    },
+    "education": {
+      "samples": 3,
+      "totalP50Ms": 10525.198070001352,
+      "totalP95Ms": 10708.453792998625,
+      "rawValid": 0,
+      "repairedValid": 3,
+      "grounded": 3,
+      "requestedComponentPresent": 3,
+      "serverRendered": 3,
+      "transportFailures": 0
+    },
+    "quiz": {
+      "samples": 3,
+      "totalP50Ms": 12195.755672000814,
+      "totalP95Ms": 12290.049417002592,
+      "rawValid": 0,
+      "repairedValid": 3,
+      "grounded": 3,
+      "requestedComponentPresent": 3,
+      "serverRendered": 3,
+      "transportFailures": 0
+    },
+    "actual-process-result": {
+      "samples": 3,
+      "totalP50Ms": 8944.606369001121,
+      "totalP95Ms": 9155.032290000236,
+      "rawValid": 0,
+      "repairedValid": 3,
+      "grounded": 3,
+      "requestedComponentPresent": 3,
+      "serverRendered": 3,
+      "transportFailures": 0
+    }
+  }
+}

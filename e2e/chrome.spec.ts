@@ -13,10 +13,10 @@ test('reference-style chrome opens workspace tabs and keeps them usable', async 
   await page.getByRole('button', { name: 'Toggle sidebar', exact: true }).click();
   await page.screenshot({ path: 'test-results/reference-chrome.png' });
   await page.getByRole('button', { name: 'Review Ctrl+Shift+G' }).click();
-  await expect(page.getByText('Choose a workspace to review its changes.')).toBeVisible();
+  await expect(page.getByText('Open the desktop application to review local Git changes.')).toBeVisible();
   // The + menu launches additional workspace tabs.
   await page.locator('.workspace-add summary').click();
-  await page.getByRole('button', { name: 'Files Ctrl+P' }).click();
+  await page.getByRole('button', { name: 'Editor Ctrl+P' }).click();
   await expect(page.getByText('Choose a workspace folder to browse files.')).toBeVisible();
   await page.keyboard.press('Control+t');
   await expect(page.getByRole('heading', { name: 'Open a website' })).toBeVisible();

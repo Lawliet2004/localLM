@@ -1,0 +1,16 @@
+.automation-settings { min-width: 0; }
+.automation-settings .automation-notice { margin: 0 0 24px; padding: 12px 14px; background: var(--hover); border-radius: 8px; }
+.automation-settings > p, .automation-settings .automation-help, .automation-diagnostics p { color: var(--secondary); line-height: 1.65; font-size: 12px; }
+.automation-settings .preference-copy label { display: block; margin: 0; font-weight: 500; }
+.automation-settings .execution-path { display: flex; gap: 8px; min-width: 0; }
+.automation-settings .execution-path input { min-width: 0; flex: 1; }
+.automation-settings .execution-path button { flex-shrink: 0; }
+.automation-settings .automation-actions { padding-top: 4px; }
+.automation-settings .error-banner { overflow-wrap: anywhere; }
+.automation-diagnostics { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
+.automation-diagnostics summary { cursor: pointer; font-size: 13px; }
+.automation-diagnostics pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+@media (max-width: 480px) {
+  .automation-settings .execution-path { flex-wrap: wrap; }
+  .automation-settings .execution-path input { flex-basis: 100%; }
+}

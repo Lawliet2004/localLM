@@ -1,0 +1,114 @@
+{
+  "interaction": {
+    "samples": 20,
+    "p50Ms": 43.96325499692466,
+    "p95Ms": 49.882521998370066,
+    "method": "AT-SPI action to observed accessible step label; includes AT-SPI traversal/polling, not browser paint",
+    "processPeaks": {
+      "850022": {
+        "name": "locallm",
+        "peakRssKiB": 241244
+      },
+      "850054": {
+        "name": "WebKitNetworkPr",
+        "peakRssKiB": 50868
+      },
+      "850059": {
+        "name": "WebKitWebProces",
+        "peakRssKiB": 248300
+      }
+    }
+  },
+  "provenance": {
+    "startedAt": "2026-10-20T21:58:11.705Z",
+    "sourceSha256": "967a2fecaab847bd08c4380b74f41880bfef1d97f998ab0de73713e1881f6e49",
+    "binarySha256": "6b6c15018c8206b8f42006cbaef48258a38f4a3e1d8343e3bd17b9dc629d2bac",
+    "sourceSnapshot": true,
+    "platform": "linux",
+    "arch": "x64",
+    "node": "v22.22.1",
+    "scenario": "native deterministic controls plus optional selected local model",
+    "modelConfigured": true
+  },
+  "nativeRenderer": true,
+  "quizScoring": true,
+  "binarySearchStep": true,
+  "sqliteState": true,
+  "restartRestoration": true,
+  "authoritativeAnswerUnchanged": true,
+  "browserUsed": false,
+  "fixture": "Manually authored deterministic component fixture; model benchmarks are separate.",
+  "nativeBoundedExperiences": true,
+  "expectedMalformedFallback": true,
+  "expectedInterruptedFallback": true,
+  "actualNativeInference": {
+    "timeToFirstAccessibleVisualMs": 21890,
+    "timeToFirstPersistedAuthoritativeAnswerMs": 5824,
+    "visualTimingMethod": "AT-SPI chart selector observation; not first paint",
+    "processPeaks": {
+      "850801": {
+        "parent": 850783,
+        "name": "WebKitWebProces",
+        "peakRssKiB": 236884
+      },
+      "850956": {
+        "parent": 850783,
+        "name": "llama-server",
+        "peakRssKiB": 3089304
+      },
+      "850797": {
+        "parent": 850783,
+        "name": "WebKitNetworkPr",
+        "peakRssKiB": 50184
+      },
+      "850783": {
+        "parent": 849823,
+        "name": "locallm",
+        "peakRssKiB": 244012
+      }
+    },
+    "config": {
+      "contextLength": 8192,
+      "cpuThreads": 6,
+      "gpuLayers": 0,
+      "maxTokens": 1024,
+      "modelSizeBytes": 3219532192
+    },
+    "status": "complete",
+    "programChars": 47,
+    "sourceChars": 398,
+    "model": "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+    "cpuOnly": true,
+    "reasoningMode": "quick"
+  },
+  "scenarioFailures": [],
+  "actualModelChartRendered": true,
+  "overall": "failed",
+  "failure": "Actual tool-assisted presentation did not finish",
+  "separateRestoreRun": {
+    "historicalResultsFile": "acceptance.json",
+    "rerun": {
+      "actualModelChartRestoredAfterRestart": true,
+      "firstTurnComposer": true
+    },
+    "provenance": {
+      "startedAt": "2026-10-20T22:03:34.301Z",
+      "sourceSha256": "967a2fecaab847bd08c4380b74f41880bfef1d97f998ab0de73713e1881f6e49",
+      "binarySha256": "6b6c15018c8206b8f42006cbaef48258a38f4a3e1d8343e3bd17b9dc629d2bac",
+      "sourceSnapshot": true,
+      "platform": "linux",
+      "arch": "x64",
+      "node": "v22.22.1",
+      "scenario": "native deterministic controls plus optional selected local model",
+      "modelConfigured": false
+    }
+  },
+  "toolFailureObserved": {
+    "runtimeHttpStatus": 500,
+    "diagnostic": "NotImplemented: map: filter-mapping not implemented",
+    "stage": "runtime prompt processing before any tool result",
+    "evidence": "native-tool-runtime-error.png",
+    "harnessOutcome": "Timed out waiting for a completed presentation; nonzero exit"
+  },
+  "scope": "Frozen source snapshot containing final generative UI changes and coherent surrounding backend; not certification of concurrent unrelated working-tree edits."
+}

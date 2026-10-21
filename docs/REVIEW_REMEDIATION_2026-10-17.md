@@ -1,0 +1,60 @@
+# LocalLM review remediation — 17 October 2026
+
+The actionable implementation scope is complete. Existing uncommitted work was preserved; nothing was reverted or committed. This checklist covers the critique, the SWE-2 Max research review and the later requested additions. A checked item means implemented and checked within the explicit evidence boundaries below, not that every external account, platform or microphone was exercised.
+
+Sources: [critique](../.impeccable/critique/2026-10-17T07-23-15Z__src-components-chat-tsx.md), [research review](../.impeccable/review/swe2-max-research-2026-10-17.md). The independent acceptance inventory is [REVIEW_COMPLETION_AUDIT.md](REVIEW_COMPLETION_AUDIT.md).
+
+## Requirement checklist
+
+- [x] Persistent, backward-compatible Auto / Quick / Think default plus per-response selection. Capability-aware controls stay separate from maximum answer tokens. Unknown controls remain unavailable/default rather than receiving guessed fields.
+- [x] Ordinary local requests use verified template controls, including runtime fallback templates absent from GGUF metadata. Installed b11669/Gemma `/props`, `/apply-template`, bounded inference and real desktop Quick send were checked.
+- [x] Conservative OpenAI Chat Completions effort mapping and Claude adaptive mapping; local-only fields are removed, known reasoning requests use the correct output budget/sampling contract, and unknown/pro/private subscription protocols retain defaults. Payload/adapter/HTTP protocol regressions pass; authenticated remote inference is not claimed.
+- [x] Quick removes optional orchestration/memory and unrelated auxiliary web schemas while preserving selected sources/connectors, primary search/weather, requested recall/research and plan controls. Catalog selection occurs before freezing and stays stable across rounds. All tool-count layers use 64; the composer reports/checks the assembled count including implicit tools.
+- [x] Fabricated 8-second, word-count and adjacent-event durations are removed. Native monotonic measurements distinguish first model token, first visible answer, initial preparation, observed reasoning, tool/approval time and total. Missing data remains unavailable. Phase persistence/fork/display regressions pass.
+- [x] One answer-first renderer serves journal replay and message-only history. Reasoning remains one collapsed disclosure across completion; completed work is collapsed and approvals/failures remain visible. Separate Stop remains reachable alongside Pause, including preparation/pause-pending states.
+- [x] Markdown uses one themed code toolbar/pre frame, readable tables and contextual copy actions. Stored citation IDs resolve to safe source links without modifying code blocks or inventing metadata.
+- [x] Typed web, command, file/excerpt, diff, weather and generated-file presentation reuses existing contracts. Raw results/parameters remain optional details. Explicit failure/denial/interruption takes precedence over Exit 0. Approval purpose uses actual in-progress checklist text when present.
+- [x] Deduplicated answer-level sources preserve supplied titles/domains/dates/snippets/IDs. Web cards share HTTP(S) validation and deduplication. Additional metadata loads from conversation-owned stored artifacts; missing metadata is handled honestly.
+- [x] Shared artifact viewer supports text/code, Markdown, images and CSV/TSV Preview/Source, metadata, copy/save/open/close, distinct accessible actions and disclosure beyond 16 files. HTML remains literal source. Native preview is workspace/hash-bound; Open uses an expanded dialog and Save uses an atomic native file copy.
+- [x] Settings use six groups, nested language/weather preferences and searchable navigation. Duplicate model Generation/Diagnostics tab routes were removed; measured-response diagnostics are optional, with no repeated default metric ribbon.
+- [x] Ctrl+Shift+P/File → Commands extends the existing shortcuts with searchable, keyboard-operable actions, visible selection and Escape/focus restoration. Local/API, reasoning, tool and image capability boundaries remain discoverable in a compact disclosure.
+- [x] In-app local latency checks and the standalone matrix support bounded simple/coding/evidence fixtures, tools on/off and requested cold/prime/warm caches. Median/p95, strict correctness and incomplete-stream failures remain separate; reports load/save. No generated code or real external tool is executed by the diagnostic.
+- [x] Project-document retrieval is explicitly opt-in, scoped through the existing project/workspace boundary, default-off and bounded to 16 × 32 KiB UTF-8 documents. Current-file reads handle edits/deletes without a stale corpus; disabling/removing the project forgets selection. Untrusted excerpts carry project:path:line markers. Native UI opt-in/search/change/delete/disable tests pass offline.
+- [x] Voice starts only by explicit action after its speech-service data-path explanation, inserts into the draft, and handles unavailable/error/cancel states. Submission/conversation changes abort and detach callbacks so late transcripts cannot cross drafts. Real microphone transcription is not claimed.
+- [x] Image preview uses a keyboard button and native dialog semantics. Result/trajectory filters use valid pressed-state controls. Conversation-search failures preserve the query, differ from no results and offer retry, with concise polite status/count announcements.
+- [x] Trace/code/ANSI colors use theme tokens. Desktop/narrow light/dark, all five accents, reduced motion, keyboard workflows and actual 200% Chrome tab zoom pass the bounded checks. Latest does not overlap composer controls; diagnostics scroll horizontally only inside their labelled table region.
+- [x] Indexed event joins and per-turn partitioning replace repeated journal scans; polling retains its cursor across generation transitions and stops when idle. Completed Markdown is not reparsed during streaming. Structural regressions and a paired long-journal algorithm benchmark pass without claiming an inference/UI-wide speedup.
+- [x] Existing project/history/draft/model/provider/editor/terminal/Git/permission/connector/skill/cache paths remain covered by frontend/native regressions and the 30-case browser workflow suite. Build, strict Clippy, diff checks, native UI acceptance and final evidence cleanup are recorded below.
+
+## Current verification
+
+| Check | Result / evidence |
+| --- | --- |
+| Production build and TypeScript | Passed; [build log](../.impeccable/review/verification/build.log). Existing main-chunk size warning remains. |
+| Frontend/web-engine tests | **529 passed, 1 skipped**; [final log](../.impeccable/review/verification/frontend-tests.log). |
+| Native library tests | **449 passed, 5 opt-in tests ignored**, plus the final conservative Claude alias boundary regression passed; [native log](../.impeccable/review/verification/native-tests.log). |
+| Strict Clippy, all targets | Passed with `-D warnings`; [log](../.impeccable/review/verification/clippy.log). |
+| Browser workflows | **30/30 passed**, including Stop/Pause, query retry, palette, sources, artifacts, voice lifecycle and prior workspace/editor/automation flows; [log](../.impeccable/review/verification/browser-workflows.log). Transport fixtures establish UI behavior, not native IPC. |
+| Final visual confirmation | **8 scenarios / 30 captures**; [confirmation](../.impeccable/review/review-round-2/CONFIRMATION.md). No page/container overflow, page errors, reduced-motion animations or sampled text-contrast failures. Five accents and ANSI palette were checked in both themes. |
+| Actual 200% browser zoom | Passed in a disposable Chromium profile through `chrome.tabs.setZoom/getZoom`; CSS zoom stayed 1. [Evidence](../.impeccable/review/browser-zoom-acceptance.json). |
+| Native artifact Open/Save | Real WebKit viewer and GTK dialog; saved CSV **30 bytes**, byte-identical SHA-256 `d92c1875dc1454f7a885180afb5edac3f53168b8e52e76e6a87ed4a55a13cab9`; [acceptance](../.impeccable/review/verification/native-acceptance.json). |
+| Real native local send | Installed Gemma/b11669, isolated app data, CPU/2 threads: Quick answered **4**, no reasoning text, verified runtime-template capability and persisted first-visible-answer metrics. [Acceptance](../.impeccable/review/verification/native-runtime-acceptance.json). These samples do not establish a speedup. |
+| In-app native diagnostic | **6 real streams / 4 measured fixtures / 4 correct** on the loaded model; [report](../.impeccable/review/verification/native-in-app-diagnostic.json). Prime streams are excluded from measured case counts. |
+| Native project documents | Explicit enable, search, changed/deleted files and disable/delete selection passed without network use; [acceptance](../.impeccable/review/verification/native-document-acceptance.json). |
+| Standalone latency matrix | Quick and Auto/Think reports retain correctness failures alongside timings; [method](RESPONSE_LATENCY_BENCHMARK.md), [Quick report](../.impeccable/review/response-diagnostic-quick-cpu/measurements.json). Two measured research/tools-on cases missed citations and correctly failed quality checks. |
+| Long-journal algorithm | Paired alternating trials preserve identical assignments; 1,000-turn/5,000-event median 12.34 ms → 0.244 ms; 2,000/10,000 47.85 ms → 0.361 ms. Small-case p95 was noisy; this is not an inference or whole-UI speedup claim. [Evidence](../.impeccable/review/activity-performance.json). |
+| Mechanical detector | [Result](../.impeccable/review/verification/design-detector.json): two unchanged baseline warnings on existing Markdown blockquote / attachment-error side borders; no reported findings in added components. One detector pass was run after implementation. |
+
+## Measurement and platform limits
+
+First streamed token starts at model request dispatch and includes reasoning/tool tokens. First visible answer starts at native send and ends at the first nonempty answer chunk, before UI rendering. Preparation is the initial send-to-first-dispatch interval. Observed reasoning spans first/last received reasoning chunks; it does not invent unobservable internal model time. Tool time excludes permission-dialog wait and can include interactive tool waits. The phases do not partition total time: prompt processing, network and round bookkeeping also contribute.
+
+The native ordinary-response sample has null tool/approval timings because no tool or approval ran. Nonzero phase fields are covered by monotonic source boundaries, persistence/fork and UI regressions; this is not a live forced-approval timing measurement.
+
+No authenticated external provider inference was performed: the two installed subscription entries were unverified placeholders. Known API mappings have payload/adapter and owned HTTP protocol tests; arbitrary remote model/provider compatibility is not promised. No real microphone audio was recorded; browser speech lifecycle tests use a mock service, and unsupported native webviews report unavailable. Linux native behavior was checked; Windows/macOS native behavior was not exercised here.
+
+Project retrieval stores file selection, not a separate document corpus. Excerpts already placed in saved model/conversation context remain with that history after disabling retrieval. API selections receive those excerpts. HTML artifacts are never executed; interactive HTML execution remains outside this implementation.
+
+Owned local model servers, browser profiles and isolated app/display/bus sessions were stopped. Existing user app/Vite sessions and all pre-existing worktree changes were preserved. Generated fixture data and reports remain under `.local/qa/` and `.impeccable/review/` for review. [Source/evidence manifest](../.impeccable/review/verification/manifest.json).
+
+The current native binary also builds successfully. Restart the already-running desktop application to load its backend changes; the existing user session was deliberately left intact.

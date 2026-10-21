@@ -1,8 +1,8 @@
-use crate::runtime_config::RuntimeConfig;
 use crate::providers::{ModelSelection, ProviderConnection, RemoteModel};
+use crate::runtime_config::RuntimeConfig;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, String>;
 const LOCAL_TOOL_CALLING_SUPPORT_KEY: &str = "local_tool_calling_support";
@@ -44,6 +44,7 @@ pub struct Conversation {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
+    pub metrics: Option<crate::inference::ResponseMetrics>,
     pub error: Option<String>,
     pub id: String,
     pub conversation_id: String,
@@ -52,6 +53,15 @@ pub struct Message {
     pub reasoning: String,
     pub status: String,
     pub created_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningMode {
+    #[default]
+    Auto,
+    Quick,
+    Think,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -65,11 +75,17 @@ pub struct Preferences {
     pub top_p: f64,
     pub max_tokens: u32,
     pub system_prompt: String,
+    #[serde(default)]
+    pub reasoning_mode: ReasoningMode,
+    /// Teach the model to emit `openui` fenced blocks that the chat renders
+    /// as structured UI. Frozen into the system prompt when enabled.
+    #[serde(default)]
+    pub generative_ui: bool,
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self { runtime_path: String::new(), model_path: String::new(), projector_path: String::new(), temperature: 1.0,
-            top_p: 0.95, max_tokens: 2048, system_prompt: "You are a helpful local assistant. Be clear and accurate. If you do not know something, say so.".into() }
+            top_p: 0.95, max_tokens: 2048, reasoning_mode: ReasoningMode::Auto, generative_ui: false, system_prompt: "You are a helpful local assistant. Be clear and accurate. If you do not know something, say so.".into() }
     }
 }
 impl Preferences {
@@ -85,19 +101,29 @@ impl Preferences {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_generation_controls()?;
+        if !(1..=32768).contains(&self.max_tokens) {
+            return Err("Maximum response length must be between 1 and 32768 tokens.".into());
+        }
+        Ok(())
+    }
+
+    /// Shared controls also apply to API requests, whose output budget is
+    /// selected from remote model metadata rather than local runtime settings.
+    pub fn validate_generation_controls(&self) -> Result<()> {
         if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
             return Err("Temperature must be between 0 and 2.".into());
         }
         if !self.top_p.is_finite() || !(0.01..=1.0).contains(&self.top_p) {
             return Err("Top-p must be between 0.01 and 1.".into());
         }
-        if !(1..=32768).contains(&self.max_tokens) {
-            return Err("Maximum response length must be between 1 and 32768 tokens.".into());
-        }
         if self.system_prompt.len() > 32768 {
             return Err("System prompt is too long.".into());
         }
-        if self.runtime_path.len() > 32768 || self.model_path.len() > 32768 || self.projector_path.len() > 32768 {
+        if self.runtime_path.len() > 32768
+            || self.model_path.len() > 32768
+            || self.projector_path.len() > 32768
+        {
             return Err("File path is too long.".into());
         }
         Ok(())
@@ -105,7 +131,14 @@ impl Preferences {
 }
 
 pub struct Store {
-    connection: Connection,
+    pub(crate) connection: Connection,
+    /// Directory that holds the database file. Private snapshot blobs live in
+    /// `<data dir>/snapshots`, next to the database and never in a workspace.
+    data_dir: PathBuf,
+    /// Keeps the scratch directory of an in-memory store alive for as long as
+    /// the store exists. It is only held, never read.
+    #[allow(dead_code)]
+    scratch: Option<tempfile::TempDir>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -143,14 +176,18 @@ fn validate_tool_selection(
             return Err("Duplicate tool source.".into());
         }
         count += match source.as_str() {
-            "__workspace" => 5,
+            "__workspace" => crate::workspace::TOOL_COUNT,
             "__execution" => 1,
             "__daytona" => 1,
+            "__browser" => crate::automation::BROWSER_TOOL_COUNT,
+            "__computer" => crate::automation::COMPUTER_TOOL_COUNT,
             _ => return Err("Unknown local tool source.".into()),
         };
     }
-    if count > 32 {
-        return Err("At most 32 tools can be selected.".into());
+    if count > crate::tool_discovery::MAX_CATALOG {
+        return Err(
+            "At most4096 tools can be selected; tool discovery keeps each request bounded.".into(),
+        );
     }
     let mut seen = std::collections::HashSet::new();
     for tool in tools {
@@ -183,12 +220,45 @@ impl RememberedTools {
 const REMEMBERED_TOOLS_KEY: &str = "remembered_tools";
 const PREFERRED_MODEL_KEY: &str = "preferred_model";
 impl Store {
+    /// Open the live database.
+    ///
+    /// This constructor performs **schema setup only**. It never runs crash
+    /// recovery, because recovery is a startup action, not a connection
+    /// action: recovery marks every `streaming` message as interrupted and
+    /// every live run as cancelled, and running it on a second connection
+    /// would flip the audit row of a tool that is executing *right now* out of
+    /// `'streaming'`. That defeats the `OLD.status!='streaming'` guard on the
+    /// `native_tool_round_edit` trigger, which then deletes the native
+    /// provider context anchored on that row mid-turn.
+    ///
+    /// The authoritative connection is recovered exactly once at startup via
+    /// [`Store::recover_interrupted`]. Every other connection to the same
+    /// file is safe to open at any time.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::initialize(Connection::open(path).map_err(db_error)?)
+        let data_dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::initialize(Connection::open(path).map_err(db_error)?, data_dir, None)
     }
     #[cfg(test)]
     pub(crate) fn open_memory() -> Result<Self> {
-        Self::initialize(Connection::open_in_memory().map_err(db_error)?)
+        // An in-memory database still owns a private directory so private
+        // sidecar storage (snapshot blobs) has a home that is cleaned up with
+        // the store.
+        let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let data_dir = scratch.path().to_path_buf();
+        Self::initialize(
+            Connection::open_in_memory().map_err(db_error)?,
+            data_dir,
+            Some(scratch),
+        )
+    }
+    /// Directory that holds the database file. Private snapshot blobs are
+    /// stored in `<data dir>/snapshots`.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
     /// Test-only insert with an explicit timestamp; production writes always
     /// stamp `now()`.
@@ -202,6 +272,7 @@ impl Store {
         created_at: i64,
     ) -> Result<Message> {
         let message = Message {
+            metrics: None,
             error: None,
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: conversation_id.into(),
@@ -219,7 +290,34 @@ impl Store {
             .map_err(db_error)?;
         Ok(message)
     }
-    fn initialize(connection: Connection) -> Result<Self> {
+    /// The schema version this build expects.
+    ///
+    /// The version lives in SQLite's `PRAGMA user_version`, so the store can
+    /// tell which additive steps have already run and can refuse to open a
+    /// database written by a **newer** build instead of corrupting it.
+    const SCHEMA_VERSION: u32 = 1;
+
+    /// The schema version recorded in the database.
+    fn schema_version(connection: &Connection) -> Result<u32> {
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(db_error)?;
+        Ok(version.max(0) as u32)
+    }
+
+    /// Record the schema version after every additive step has succeeded.
+    fn set_schema_version(connection: &Connection, version: u32) -> Result<()> {
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {version}"))
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    fn initialize(
+        connection: Connection,
+        data_dir: PathBuf,
+        scratch: Option<tempfile::TempDir>,
+    ) -> Result<Self> {
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(db_error)?;
@@ -229,6 +327,37 @@ impl Store {
                 role TEXT NOT NULL CHECK(role IN ('user','assistant','tool')), content TEXT NOT NULL, reasoning TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL CHECK(status IN ('complete','streaming','interrupted','error')), created_at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id,created_at);
+            CREATE TABLE IF NOT EXISTS model_message_contents(
+                message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                content_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS native_tool_rounds(
+                message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                content_json TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS native_tool_round_edit AFTER UPDATE OF content ON messages
+            WHEN OLD.content!=NEW.content AND OLD.status!='streaming' BEGIN
+                DELETE FROM native_tool_rounds WHERE message_id=NEW.id;
+            END;
+            CREATE TABLE IF NOT EXISTS message_inference(
+                message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                metrics_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS conversation_model_history(
+                conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+                through_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                checkpoint_id TEXT,
+                messages_json TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS invalidate_model_history_on_message_update
+                AFTER UPDATE OF content,reasoning,status ON messages BEGIN
+                DELETE FROM conversation_model_history WHERE conversation_id=NEW.conversation_id;
+                DELETE FROM model_message_contents WHERE message_id=NEW.id AND OLD.content!=NEW.content;
+            END;
+            CREATE TRIGGER IF NOT EXISTS invalidate_model_history_on_message_delete
+                AFTER DELETE ON messages BEGIN
+                DELETE FROM conversation_model_history WHERE conversation_id=OLD.conversation_id;
+            END;
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS conversation_tools(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, name TEXT NOT NULL, api_format TEXT NOT NULL, base_url TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, last_tested_at INTEGER, models TEXT NOT NULL DEFAULT '[]');
@@ -277,9 +406,49 @@ impl Store {
                 PRIMARY KEY (conversation_id, idx));
             CREATE TABLE IF NOT EXISTS goals(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
                 objective TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS findings(
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                file TEXT NOT NULL,
+                line INTEGER,
+                summary TEXT NOT NULL,
+                failure_scenario TEXT NOT NULL,
+                category TEXT,
+                state TEXT NOT NULL,
+                note TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS findings_conversation ON findings(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS tasks(
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                detail TEXT,
+                owner TEXT,
+                state TEXT NOT NULL,
+                note TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_dependencies(
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                PRIMARY KEY(task_id, depends_on)
+            );
+            CREATE INDEX IF NOT EXISTS tasks_conversation ON tasks(conversation_id, created_at);
             CREATE TABLE IF NOT EXISTS memory_facts(id TEXT PRIMARY KEY, scope TEXT NOT NULL, fact TEXT NOT NULL,
                 origin TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS memory_facts_scope ON memory_facts(scope, updated_at);
+            CREATE TABLE IF NOT EXISTS taste_signals(
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                tool TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                arguments TEXT NOT NULL,
+                result TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS taste_signals_conversation ON taste_signals(conversation_id, created_at);
             CREATE TABLE IF NOT EXISTS compaction(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
                 cutoff INTEGER NOT NULL, artifact_id TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS conversation_prompt_freeze (
@@ -325,11 +494,40 @@ impl Store {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS research_tasks_conversation ON research_tasks(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS snapshots(
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                step INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS snapshots_conversation ON snapshots(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS snapshot_files(
+                snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                deleted INTEGER NOT NULL,
+                PRIMARY KEY (snapshot_id, path)
+            );
+            CREATE TABLE IF NOT EXISTS staged_reverts(
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS staged_reverts_conversation ON staged_reverts(conversation_id);
             CREATE INDEX IF NOT EXISTS session_events_conv_seq ON session_events(conversation_id, seq);
             CREATE INDEX IF NOT EXISTS session_events_run ON session_events(run_id);
-            CREATE INDEX IF NOT EXISTS session_events_type ON session_events(event_type);
-            UPDATE messages SET status='interrupted' WHERE status='streaming';
-            UPDATE runs SET status='cancelled' WHERE status IN ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round');").map_err(db_error)?;
+            CREATE INDEX IF NOT EXISTS session_events_type ON session_events(event_type);").map_err(db_error)?;
+        // A database written by a newer build must not be opened here: the
+        // older schema would silently drop columns the newer build relies on.
+        let version = Self::schema_version(&connection)?;
+        if version > Self::SCHEMA_VERSION {
+            return Err(format!(
+                "This conversation database was written by a newer version of LocalLM (schema {version}, this build supports {}). Update the app, or start with a fresh data directory.",
+                Self::SCHEMA_VERSION
+            ));
+        }
         let has_error: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='error')",
@@ -356,15 +554,47 @@ impl Store {
                 .map_err(db_error)?;
             if !exists {
                 connection
-                    .execute(&format!("ALTER TABLE conversations ADD COLUMN {column} {definition}"), [])
+                    .execute(
+                        &format!("ALTER TABLE conversations ADD COLUMN {column} {definition}"),
+                        [],
+                    )
                     .map_err(db_error)?;
             }
         }
-        let store = Self { connection };
+        crate::presentation::initialize(&connection)?;
+        // Every additive step above has succeeded; record the version so the
+        // next open knows what has already run.
+        Self::set_schema_version(&connection, Self::SCHEMA_VERSION)?;
+        let store = Self {
+            connection,
+            data_dir,
+            scratch,
+        };
         store.seed_remembered_tools()?;
         store.seed_subscription_providers()?;
         Self::migrate_historical_to_session_events(&store.connection)?;
         Ok(store)
+    }
+    /// One-shot crash recovery. Call this **once**, at startup, on the
+    /// authoritative connection.
+    ///
+    /// It marks every message still flagged `streaming` as interrupted and
+    /// every run still in a live state as cancelled — the state a crash
+    /// leaves behind. It must not run on any later connection: a tool that is
+    /// executing right now has a `streaming` audit row, and flipping it to
+    /// `interrupted` defeats the `OLD.status!='streaming'` guard on the
+    /// `native_tool_round_edit` trigger, which then deletes the native
+    /// provider context anchored on that row.
+    pub fn recover_interrupted(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "UPDATE messages SET status='interrupted' WHERE status='streaming';
+                 UPDATE runs SET status='cancelled' WHERE status IN
+                   ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round');",
+            )
+            .map_err(db_error)?;
+        crate::presentation_store::recover_interrupted(&self.connection)?;
+        Ok(())
     }
     /// One-time migration: without a saved preference, seed the remembered
     /// selection from the most recently updated conversation that stored one,
@@ -378,11 +608,14 @@ impl Store {
                 [REMEMBERED_TOOLS_KEY],
                 |row| row.get(0),
             )
-            .optional().map_err(db_error)?;
+            .optional()
+            .map_err(db_error)?;
         if let Some(text) = &existing {
             let value: serde_json::Value = serde_json::from_str(text)
                 .map_err(|_| "Saved remembered tool selection is invalid.")?;
-            if value.get("accessMode").is_some() { return Ok(()); }
+            if value.get("accessMode").is_some() {
+                return Ok(());
+            }
         }
         let saved: Option<String> = self
             .connection
@@ -398,9 +631,11 @@ impl Store {
             let mut remembered: RememberedTools = serde_json::from_str(&existing)
                 .map_err(|_| "Saved remembered tool selection is invalid.")?;
             // Upgrade pre-permission defaults without replacing the saved tools.
-            remembered.access_mode = saved.as_deref()
+            remembered.access_mode = saved
+                .as_deref()
                 .and_then(|text| serde_json::from_str::<ConversationTools>(text).ok())
-                .map(|tools| tools.access_mode).unwrap_or_default();
+                .map(|tools| tools.access_mode)
+                .unwrap_or_default();
             self.save_remembered_tools(&remembered)?;
         } else if let Some(text) = saved {
             if let Ok(settings) = serde_json::from_str::<ConversationTools>(&text) {
@@ -508,15 +743,15 @@ impl Store {
             .optional()
             .map_err(db_error)
     }
-    pub fn active_run(&self, conversation_id: &str) -> Result<Option<crate::agent_run::RunRecord>> {
+    pub fn latest_run(&self, conversation_id: &str) -> Result<Option<crate::agent_run::RunRecord>> {
         // Subagent child runs (checkpoint='subagent') never hijack the
         // user-visible active run, even while still executing.
-        self.connection
+        let mut latest = self.connection
             .query_row(
                 "SELECT id, conversation_id, status, model_provider, model_id, checkpoint, error, created_at, updated_at
-                 FROM runs WHERE conversation_id=?1 AND status NOT IN ('completed', 'cancelled', 'failed', 'outcome_unknown')
+                 FROM runs WHERE conversation_id=?1
                  AND (checkpoint IS NULL OR checkpoint != 'subagent')
-                 ORDER BY created_at DESC LIMIT 1",
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 [conversation_id],
                 |row| {
                     let status_str: String = row.get(2)?;
@@ -536,7 +771,21 @@ impl Store {
                 },
             )
             .optional()
-            .map_err(db_error)
+            .map_err(db_error)?;
+        // Older builds represented a settled pause as preparing_next_round.
+        // Only expose Resume when its durable task checkpoint still exists.
+        if let Some(run) = latest.as_mut() {
+            if run.status == crate::agent_run::RunState::PreparingNextRound
+                && run.error.as_deref() == Some(crate::agent_run::pause_notice(false))
+                && self
+                    .recoverable_research_tasks(conversation_id)?
+                    .iter()
+                    .any(|task| task.status == crate::research_tasks::TaskStatus::Paused)
+            {
+                run.status = crate::agent_run::RunState::Paused;
+            }
+        }
+        Ok(latest)
     }
     pub fn append_run_event(&self, event: &crate::agent_run::RunEvent) -> Result<()> {
         let seq = if event.seq > 0 {
@@ -595,7 +844,8 @@ impl Store {
                 })
             })
             .map_err(db_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)
     }
     pub fn save_artifact(&self, artifact: &crate::artifacts::ArtifactRecord) -> Result<()> {
         self.connection
@@ -616,9 +866,76 @@ impl Store {
                 ],
             )
             .map_err(db_error)?;
+        // Artifacts hold the **full** tool output, so an unbounded table grows
+        // the database for the lifetime of the conversation. Evict the oldest
+        // rows of this conversation once its share passes the budget.
+        self.evict_artifacts_over_budget(&artifact.conversation_id)?;
         Ok(())
     }
-        // ---- Harness extensions (presets, subagents, plans, memory) ----
+    /// Total artifact bytes a single conversation may keep.
+    const ARTIFACT_BUDGET_BYTES: i64 = 256 * 1024 * 1024;
+
+    /// Drop the oldest artifacts of a conversation until it fits its budget.
+    ///
+    /// The newest artifact is never evicted: it is the one the model was just
+    /// told to read back.
+    fn evict_artifacts_over_budget(&self, conversation_id: &str) -> Result<()> {
+        let total: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM artifacts WHERE conversation_id=?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if total <= Self::ARTIFACT_BUDGET_BYTES {
+            return Ok(());
+        }
+        // Evict the oldest artifacts until the conversation fits its budget.
+        // The newest artifact is never evicted: it is the one the model was
+        // just told to read back.
+        let newest: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM artifacts WHERE conversation_id=?1
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        loop {
+            let total: i64 = self
+                .connection
+                .query_row(
+                    "SELECT COALESCE(SUM(size_bytes),0) FROM artifacts WHERE conversation_id=?1",
+                    [conversation_id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if total <= Self::ARTIFACT_BUDGET_BYTES {
+                break;
+            }
+            let removed = self
+                .connection
+                .execute(
+                    "DELETE FROM artifacts WHERE id = (
+                         SELECT id FROM artifacts
+                         WHERE conversation_id=?1 AND id IS NOT ?2
+                         ORDER BY created_at ASC, rowid ASC LIMIT 1
+                     )",
+                    params![conversation_id, newest],
+                )
+                .map_err(db_error)?;
+            if removed == 0 {
+                // Only the newest artifact is left, and it alone is over the
+                // budget. Keep it: the transcript must stay readable.
+                break;
+            }
+        }
+        Ok(())
+    }
+    // ---- Harness extensions (presets, subagents, plans, memory) ----
     pub fn conversation_preset(&self, id: &str) -> Result<String> {
         let preset: Option<String> = self
             .connection
@@ -720,31 +1037,6 @@ impl Store {
         }
         Ok(())
     }
-    pub fn subagent_run(&self, id: &str) -> Result<Option<crate::subagents::SubagentRun>> {
-        self.connection
-            .query_row(
-                "SELECT id, conversation_id, parent_run_id, child_run_id, depth, status, label, prompt, error, created_at, updated_at
-                 FROM subagent_runs WHERE id=?1",
-                [id],
-                |row| {
-                    Ok(crate::subagents::SubagentRun {
-                        id: row.get(0)?,
-                        conversation_id: row.get(1)?,
-                        parent_run_id: row.get(2)?,
-                        child_run_id: row.get(3)?,
-                        depth: row.get(4)?,
-                        status: row.get(5)?,
-                        label: row.get(6)?,
-                        prompt: row.get(7)?,
-                        error: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(db_error)
-    }
     pub fn subagent_runs_for_conversation(
         &self,
         conversation_id: &str,
@@ -795,17 +1087,28 @@ impl Store {
     }
     pub fn save_todos(&self, conversation_id: &str, todos: &[crate::plans::Todo]) -> Result<()> {
         crate::plans::validate_todos(todos)?;
-        self.connection
-            .execute("DELETE FROM todos WHERE conversation_id=?1", [conversation_id])
+        // The replace is atomic: a failure part-way through the insert would
+        // otherwise leave the conversation with a half-written checklist.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_error)?;
+        transaction
+            .execute(
+                "DELETE FROM todos WHERE conversation_id=?1",
+                [conversation_id],
+            )
             .map_err(db_error)?;
         for (index, todo) in todos.iter().enumerate() {
-            self.connection
+            transaction
                 .execute(
                     "INSERT INTO todos(conversation_id, idx, text, status, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![conversation_id, index as i64, todo.text, todo.status, todo.updated_at],
                 )
                 .map_err(db_error)?;
         }
+        transaction.commit().map_err(db_error)?;
         Ok(())
     }
     /// Append one todo item without re-emitting the full list (~30 tokens).
@@ -837,8 +1140,16 @@ impl Store {
         let mut todos = self.todos(conversation_id)?;
         let todo = todos.get_mut(index).ok_or("Unknown todo index.")?;
         if let Some(status) = status {
-            if ![crate::plans::PENDING, crate::plans::IN_PROGRESS, crate::plans::COMPLETED].contains(&status) {
-                return Err(format!("Unknown todo status '{status}'. Use pending, in_progress, or completed."));
+            if ![
+                crate::plans::PENDING,
+                crate::plans::IN_PROGRESS,
+                crate::plans::COMPLETED,
+            ]
+            .contains(&status)
+            {
+                return Err(format!(
+                    "Unknown todo status '{status}'. Use pending, in_progress, or completed."
+                ));
             }
             todo.status = status.to_string();
         }
@@ -875,8 +1186,275 @@ impl Store {
     }
     pub fn clear_goal(&self, conversation_id: &str) -> Result<()> {
         self.connection
-            .execute("DELETE FROM goals WHERE conversation_id=?1", [conversation_id])
+            .execute(
+                "DELETE FROM goals WHERE conversation_id=?1",
+                [conversation_id],
+            )
             .map_err(db_error)?;
+        Ok(())
+    }
+    /// Store one code-review finding. Findings are durable per conversation,
+    /// so a later turn can read back the verdict the model handed over.
+    pub fn insert_finding(&self, finding: &crate::findings::Finding) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO findings(id,conversation_id,file,line,summary,failure_scenario,category,state,note,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    finding.id,
+                    finding.conversation_id,
+                    finding.file,
+                    finding.line,
+                    finding.summary,
+                    finding.failure_scenario,
+                    finding.category,
+                    finding.state,
+                    finding.note,
+                    finding.created_at
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// The findings of one conversation, oldest first. A `None` state lists
+    /// every finding; otherwise only the findings in that state.
+    pub fn list_findings(
+        &self,
+        conversation_id: &str,
+        state: Option<&str>,
+    ) -> Result<Vec<crate::findings::Finding>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, conversation_id, file, line, summary, failure_scenario, category, state, note, created_at
+                 FROM findings WHERE conversation_id=?1 AND (?2 IS NULL OR state=?2) ORDER BY created_at, rowid",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![conversation_id, state], |row| {
+                Ok(crate::findings::Finding {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    file: row.get(2)?,
+                    line: row.get(3)?,
+                    summary: row.get(4)?,
+                    failure_scenario: row.get(5)?,
+                    category: row.get(6)?,
+                    state: row.get(7)?,
+                    note: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)
+    }
+    /// One finding of one conversation.
+    pub fn finding(
+        &self,
+        conversation_id: &str,
+        id: &str,
+    ) -> Result<Option<crate::findings::Finding>> {
+        self.connection
+            .query_row(
+                "SELECT id, conversation_id, file, line, summary, failure_scenario, category, state, note, created_at
+                 FROM findings WHERE id=?1 AND conversation_id=?2",
+                params![id, conversation_id],
+                |row| {
+                    Ok(crate::findings::Finding {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        file: row.get(2)?,
+                        line: row.get(3)?,
+                        summary: row.get(4)?,
+                        failure_scenario: row.get(5)?,
+                        category: row.get(6)?,
+                        state: row.get(7)?,
+                        note: row.get(8)?,
+                        created_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    /// Mark one finding resolved and record what was done about it.
+    pub fn resolve_finding(
+        &self,
+        conversation_id: &str,
+        id: &str,
+        note: Option<&str>,
+    ) -> Result<crate::findings::Finding> {
+        // The row has to belong to this conversation: a finding of another
+        // conversation is not addressable from here.
+        self.finding(conversation_id, id)?
+            .ok_or("Unknown finding for this conversation.")?;
+        self.connection
+            .execute(
+                "UPDATE findings SET state='resolved', note=?2 WHERE id=?1 AND conversation_id=?3",
+                params![id, note, conversation_id],
+            )
+            .map_err(db_error)?;
+        self.finding(conversation_id, id)?
+            .ok_or("Unknown finding for this conversation.".into())
+    }
+    /// Store one task of a conversation's task graph.
+    pub fn insert_task(&self, task: &crate::tasks::Task) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO tasks(id,conversation_id,title,detail,owner,state,note,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    task.id,
+                    task.conversation_id,
+                    task.title,
+                    task.detail,
+                    task.owner,
+                    task.state,
+                    task.note,
+                    task.created_at,
+                    task.updated_at
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// Update the mutable fields of one task. Dependencies live in their own
+    /// table and are replaced through `set_task_dependencies`.
+    pub fn save_task(&self, task: &crate::tasks::Task) -> Result<()> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE tasks SET title=?1, detail=?2, owner=?3, state=?4, note=?5, updated_at=?6
+                 WHERE id=?7 AND conversation_id=?8",
+                params![
+                    task.title,
+                    task.detail,
+                    task.owner,
+                    task.state,
+                    task.note,
+                    task.updated_at,
+                    task.id,
+                    task.conversation_id
+                ],
+            )
+            .map_err(db_error)?;
+        if changed == 0 {
+            return Err("Unknown task for this conversation.".into());
+        }
+        Ok(())
+    }
+    /// One task of one conversation.
+    pub fn task(&self, conversation_id: &str, id: &str) -> Result<Option<crate::tasks::Task>> {
+        self.connection
+            .query_row(
+                "SELECT id, conversation_id, title, detail, owner, state, note, created_at, updated_at
+                 FROM tasks WHERE id=?1 AND conversation_id=?2",
+                params![id, conversation_id],
+                |row| {
+                    Ok(crate::tasks::Task {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        title: row.get(2)?,
+                        detail: row.get(3)?,
+                        owner: row.get(4)?,
+                        state: row.get(5)?,
+                        note: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    /// The tasks of one conversation, oldest first.
+    pub fn tasks(&self, conversation_id: &str) -> Result<Vec<crate::tasks::Task>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, conversation_id, title, detail, owner, state, note, created_at, updated_at
+                 FROM tasks WHERE conversation_id=?1 ORDER BY created_at, rowid",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([conversation_id], |row| {
+                Ok(crate::tasks::Task {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    title: row.get(2)?,
+                    detail: row.get(3)?,
+                    owner: row.get(4)?,
+                    state: row.get(5)?,
+                    note: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)
+    }
+    /// Delete one task. Dependencies that point at it are removed with it.
+    pub fn delete_task(&self, conversation_id: &str, id: &str) -> Result<bool> {
+        let changed = self
+            .connection
+            .execute(
+                "DELETE FROM tasks WHERE id=?1 AND conversation_id=?2",
+                params![id, conversation_id],
+            )
+            .map_err(db_error)?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        self.connection
+            .execute(
+                "DELETE FROM task_dependencies WHERE task_id=?1 OR depends_on=?2",
+                params![id, id],
+            )
+            .map_err(db_error)?;
+        Ok(true)
+    }
+    /// The ids one task depends on.
+    pub fn task_dependencies(&self, task_id: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT depends_on FROM task_dependencies WHERE task_id=?1 ORDER BY depends_on")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([task_id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)
+    }
+    /// The ids that depend on one task.
+    pub fn task_dependents(&self, task_id: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT task_id FROM task_dependencies WHERE depends_on=?1 ORDER BY task_id")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([task_id], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)
+    }
+    /// Replace the dependency set of one task.
+    pub fn set_task_dependencies(&self, task_id: &str, depends_on: &[String]) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM task_dependencies WHERE task_id=?1",
+                [task_id],
+            )
+            .map_err(db_error)?;
+        for dependency in depends_on {
+            self.connection
+                .execute(
+                    "INSERT OR IGNORE INTO task_dependencies(task_id, depends_on) VALUES (?1,?2)",
+                    params![task_id, dependency],
+                )
+                .map_err(db_error)?;
+        }
         Ok(())
     }
     pub fn teach_fact(&self, scope: &str, fact: &str, origin: &str) -> Result<crate::memory::Fact> {
@@ -928,7 +1506,73 @@ impl Store {
             .map_err(db_error)?;
         Ok(changed > 0)
     }
-    pub fn compaction(&self, conversation_id: &str) -> Result<Option<crate::compaction::Checkpoint>> {
+    /// Store one observed approval decision in the taste signal log.
+    ///
+    /// The log is bounded per conversation: once a conversation holds more
+    /// than [`crate::taste::MAX_SIGNALS`] entries the oldest rows are
+    /// dropped, so the derived profile can never grow without limit.
+    pub fn insert_taste_signal(&self, signal: &crate::taste::TasteSignal) -> Result<()> {
+        let arguments = serde_json::to_string(&signal.arguments).map_err(|e| e.to_string())?;
+        let result = serde_json::to_string(&signal.result).map_err(|e| e.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO taste_signals(id, conversation_id, tool, decision, arguments, result, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    signal.id,
+                    signal.conversation_id,
+                    signal.tool,
+                    signal.decision.as_str(),
+                    arguments,
+                    result,
+                    signal.created_at
+                ],
+            )
+            .map_err(db_error)?;
+        // Keep the newest signals; the oldest fall out of the log.
+        self.connection
+            .execute(
+                "DELETE FROM taste_signals WHERE conversation_id=?1 AND id NOT IN (
+                    SELECT id FROM taste_signals WHERE conversation_id=?1
+                    ORDER BY created_at DESC, rowid DESC LIMIT ?2)",
+                params![signal.conversation_id, crate::taste::MAX_SIGNALS as i64],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// The taste signals of one conversation, oldest first.
+    pub fn taste_signals(&self, conversation_id: &str) -> Result<Vec<crate::taste::TasteSignal>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, conversation_id, tool, decision, arguments, result, created_at
+                 FROM taste_signals WHERE conversation_id=?1 ORDER BY created_at, rowid",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([conversation_id], |row| {
+                let decision: String = row.get(3)?;
+                let arguments: String = row.get(4)?;
+                let result: String = row.get(5)?;
+                Ok(crate::taste::TasteSignal {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    tool: row.get(2)?,
+                    decision: crate::taste::Decision::from_str(&decision)
+                        .unwrap_or(crate::taste::Decision::Accepted),
+                    arguments: serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null),
+                    result: serde_json::from_str(&result).unwrap_or(serde_json::Value::Null),
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)
+    }
+    pub fn compaction(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<crate::compaction::Checkpoint>> {
         self.connection
             .query_row(
                 "SELECT conversation_id, cutoff, artifact_id, created_at FROM compaction WHERE conversation_id=?1",
@@ -952,12 +1596,6 @@ impl Store {
                  ON CONFLICT(conversation_id) DO UPDATE SET cutoff=excluded.cutoff, artifact_id=excluded.artifact_id, created_at=excluded.created_at",
                 params![checkpoint.conversation_id, checkpoint.cutoff, checkpoint.artifact_id, checkpoint.created_at],
             )
-            .map_err(db_error)?;
-        Ok(())
-    }
-    pub fn clear_compaction(&self, conversation_id: &str) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM compaction WHERE conversation_id=?1", [conversation_id])
             .map_err(db_error)?;
         Ok(())
     }
@@ -998,9 +1636,20 @@ impl Store {
             .map_err(db_error)?
             .ok_or_else(|| "Source conversation no longer exists.".to_string())?;
         let prefix = self.messages(source_id)?;
-        if !prefix.iter().any(|message| message.id == through_message_id) {
+        if !prefix
+            .iter()
+            .any(|message| message.id == through_message_id)
+        {
             return Err("Fork point message is not in this conversation.".into());
         }
+        let snapshot = if prefix
+            .last()
+            .is_some_and(|message| message.id == through_message_id)
+        {
+            self.cached_model_history(source_id)?
+        } else {
+            None
+        };
         let mut forked = self.create_conversation()?;
         forked.title = format!("Fork of {}", source.title);
         forked.provider_id = source.provider_id;
@@ -1015,7 +1664,10 @@ impl Store {
             let _ = self.save_conversation_tools(&forked.id, &tools);
         }
         if let Ok(Some(freeze)) = self.prompt_freeze(source_id) {
-            let _ = self.save_prompt_freeze(&PromptFreeze { conversation_id: forked.id.clone(), ..freeze });
+            let _ = self.save_prompt_freeze(&PromptFreeze {
+                conversation_id: forked.id.clone(),
+                ..freeze
+            });
         }
         for message in prefix {
             let id = uuid::Uuid::new_v4().to_string();
@@ -1026,9 +1678,17 @@ impl Store {
                     params![id, forked.id, message.role, message.content, message.reasoning, message.status, message.created_at, message.error],
                 )
                 .map_err(db_error)?;
+            if let Some(metrics) = &message.metrics {
+                self.save_message_metrics(&id, metrics)?;
+            }
             if message.id == through_message_id {
+                self.copy_model_content(&message.id, &id)?;
+                if let Some(snapshot) = &snapshot {
+                    self.save_model_history(&forked.id, &id, snapshot)?;
+                }
                 break;
             }
+            self.copy_model_content(&message.id, &id)?;
         }
         Ok(forked)
     }
@@ -1075,11 +1735,9 @@ impl Store {
             return Ok(());
         }
         let has_messages: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM messages LIMIT 1)",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT EXISTS(SELECT 1 FROM messages LIMIT 1)", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(false);
         if !has_messages {
             return Ok(());
@@ -1119,7 +1777,8 @@ impl Store {
             for (_id, role, content, reasoning, _status, created_at) in messages {
                 if role == "user" {
                     let ev_id = uuid::Uuid::new_v4().to_string();
-                    let payload = serde_json::json!({"role": "user", "content": content}).to_string();
+                    let payload =
+                        serde_json::json!({"role": "user", "content": content}).to_string();
                     let _ = connection.execute(
                         "INSERT INTO session_events (id, conversation_id, run_id, seq, step_id, tool_call_id, event_type, payload, ignorable, created_at)
                          VALUES (?1, ?2, NULL, ?3, 'user_input', NULL, 'user_msg', ?4, 0, ?5)",
@@ -1138,7 +1797,8 @@ impl Store {
                         seq += 1;
                     }
                     let ev_id = uuid::Uuid::new_v4().to_string();
-                    let payload = serde_json::json!({"role": "assistant", "content": content}).to_string();
+                    let payload =
+                        serde_json::json!({"role": "assistant", "content": content}).to_string();
                     let _ = connection.execute(
                         "INSERT INTO session_events (id, conversation_id, run_id, seq, step_id, tool_call_id, event_type, payload, ignorable, created_at)
                          VALUES (?1, ?2, NULL, ?3, 'step_end', NULL, 'step_end', ?4, 0, ?5)",
@@ -1172,12 +1832,34 @@ impl Store {
             .flatten();
         Ok((max_seq.unwrap_or(0) + 1) as u64)
     }
+    /// Append a session event.
+    ///
+    /// When the caller does not pin a sequence number, the next one is
+    /// allocated **inside the same write transaction as the insert**. The
+    /// live database has more than one connection (tool dispatch, language
+    /// servers, subagents), and a read-then-write allocation across two
+    /// connections could hand the same sequence number to two events. The
+    /// `IMMEDIATE` transaction takes SQLite's write lock up front, so the
+    /// allocation and the insert are serialized.
     pub fn append_session_event(&self, event: &crate::sessions::SessionEvent) -> Result<u64> {
-        let seq = if event.seq > 0 {
-            event.seq
-        } else {
-            self.next_session_event_seq(&event.conversation_id)?
-        };
+        if event.seq > 0 {
+            return self.insert_session_event(event, event.seq);
+        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_error)?;
+        let seq = self.next_session_event_seq(&event.conversation_id)?;
+        self.insert_session_event(event, seq)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(seq)
+    }
+    fn insert_session_event(
+        &self,
+        event: &crate::sessions::SessionEvent,
+        seq: u64,
+    ) -> Result<u64> {
         let payload_str = serde_json::to_string(&event.payload).map_err(|e| e.to_string())?;
         self.connection
             .execute(
@@ -1246,6 +1928,23 @@ impl Store {
         source_id: &str,
         up_to_seq: u64,
     ) -> Result<(Conversation, u64)> {
+        // The whole copy is atomic. A failure part-way through would
+        // otherwise leave a half-forked conversation in the database.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(db_error)?;
+        let forked = self.fork_session_events_inner(source_id, up_to_seq)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(forked)
+    }
+
+    fn fork_session_events_inner(
+        &self,
+        source_id: &str,
+        up_to_seq: u64,
+    ) -> Result<(Conversation, u64)> {
         let source: Conversation = self
             .connection
             .query_row(
@@ -1287,7 +1986,10 @@ impl Store {
             let _ = self.save_conversation_tools(&forked.id, &tools);
         }
         if let Ok(Some(freeze)) = self.prompt_freeze(source_id) {
-            let _ = self.save_prompt_freeze(&PromptFreeze { conversation_id: forked.id.clone(), ..freeze });
+            let _ = self.save_prompt_freeze(&PromptFreeze {
+                conversation_id: forked.id.clone(),
+                ..freeze
+            });
         }
 
         // session_events.run_id references runs(id) with ON DELETE SET NULL:
@@ -1296,8 +1998,13 @@ impl Store {
         let run_exists = |run_id: &Option<String>| -> bool {
             match run_id {
                 None => true,
-                Some(id) => self.connection
-                    .query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1)", [id], |row| row.get::<_, bool>(0))
+                Some(id) => self
+                    .connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1)",
+                        [id],
+                        |row| row.get::<_, bool>(0),
+                    )
                     .unwrap_or(false),
             }
         };
@@ -1306,7 +2013,11 @@ impl Store {
             let new_event = crate::sessions::SessionEvent {
                 id: uuid::Uuid::new_v4().to_string(),
                 conversation_id: forked.id.clone(),
-                run_id: if run_exists(&ev.run_id) { ev.run_id.clone() } else { None },
+                run_id: if run_exists(&ev.run_id) {
+                    ev.run_id.clone()
+                } else {
+                    None
+                },
                 seq: ev.seq,
                 step_id: ev.step_id,
                 tool_call_id: ev.tool_call_id,
@@ -1334,6 +2045,10 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![id, forked.id, msg.role, msg.content, msg.reasoning, msg.status, msg.created_at, msg.error],
             );
+            self.copy_model_content(&msg.id, &id)?;
+            if let Some(metrics) = &msg.metrics {
+                self.save_message_metrics(&id, metrics)?;
+            }
         }
 
         // Carry over conversation-scoped harness state so the fork keeps its
@@ -1374,35 +2089,6 @@ impl Store {
             .optional()
             .map_err(db_error)
     }
-    pub fn artifacts_for_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Vec<crate::artifacts::ArtifactRecord>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT id, conversation_id, run_id, tool_name, mime_type, size_bytes, sha256, content, created_at
-                 FROM artifacts WHERE conversation_id=?1 ORDER BY created_at",
-            )
-            .map_err(db_error)?;
-        let rows = statement
-            .query_map([conversation_id], |row| {
-                let size_bytes: i64 = row.get(5)?;
-                Ok(crate::artifacts::ArtifactRecord {
-                    id: row.get(0)?,
-                    conversation_id: row.get(1)?,
-                    run_id: row.get(2)?,
-                    tool_name: row.get(3)?,
-                    mime_type: row.get(4)?,
-                    size_bytes: size_bytes as usize,
-                    sha256: row.get(6)?,
-                    content: row.get(7)?,
-                    created_at: row.get(8)?,
-                })
-            })
-            .map_err(db_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)
-    }
     pub fn conversation_exists(&self, id: &str) -> Result<bool> {
         self.connection
             .query_row(
@@ -1415,7 +2101,8 @@ impl Store {
     pub fn conversation_tools(&self, id: &str) -> Result<ConversationTools> {
         let value: Option<Option<String>> = self.connection.query_row(
             "SELECT t.value FROM conversations c LEFT JOIN conversation_tools t ON t.conversation_id=c.id WHERE c.id=?1", [id], |row| row.get(0),
-        ).optional().map_err(db_error)?;        let tools: ConversationTools = match value {
+        ).optional().map_err(db_error)?;
+        let tools: ConversationTools = match value {
             None => return Err("Conversation no longer exists.".into()),
             Some(None) => ConversationTools::default(),
             Some(Some(value)) => serde_json::from_str(&value)
@@ -1572,7 +2259,10 @@ impl Store {
             .optional()
             .map_err(db_error)?;
         let (provider_id, model_id, required) = row.ok_or("Conversation no longer exists.")?;
-        let selection = ModelSelection { provider_id, model_id: model_id.unwrap_or_default() };
+        let selection = ModelSelection {
+            provider_id,
+            model_id: model_id.unwrap_or_default(),
+        };
         selection.validate()?;
         Ok((selection, required != 0))
     }
@@ -1587,7 +2277,9 @@ impl Store {
             "UPDATE conversations SET provider_id=?1,model_id=?2,provider_selection_required=0,updated_at=?3 WHERE id=?4",
             params![selection.provider_id, (!selection.model_id.is_empty()).then_some(&selection.model_id), now(), id],
         ).map_err(db_error)?;
-        if changed == 0 { return Err("Conversation no longer exists.".into()); }
+        if changed == 0 {
+            return Err("Conversation no longer exists.".into());
+        }
         Ok(())
     }
     pub fn preferred_model(&self) -> Result<ModelSelection> {
@@ -1600,7 +2292,13 @@ impl Store {
         self.save_setting(PREFERRED_MODEL_KEY, selection)
     }
     pub fn provider_exists(&self, id: &str) -> Result<bool> {
-        self.connection.query_row("SELECT EXISTS(SELECT 1 FROM providers WHERE id=?1)", [id], |row| row.get(0)).map_err(db_error)
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM providers WHERE id=?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
     }
     pub fn provider(&self, id: &str) -> Result<Option<ProviderConnection>> {
         self.connection.query_row(
@@ -1615,12 +2313,31 @@ impl Store {
     }
     pub fn providers(&self) -> Result<Vec<ProviderConnection>> {
         let mut statement = self.connection.prepare("SELECT id,name,api_format,base_url,verified,last_tested_at,models FROM providers ORDER BY name COLLATE NOCASE,id").map_err(db_error)?;
-        let rows = statement.query_map([], |row| {
-            let models: String = row.get(6)?;
-            let models = serde_json::from_str::<Vec<RemoteModel>>(&models).map_err(|error| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error)))?;
-            Ok(ProviderConnection { id: row.get(0)?, name: row.get(1)?, api_format: row.get(2)?, base_url: row.get(3)?, verified: row.get::<_, i64>(4)? != 0, last_tested_at: row.get(5)?, models, has_api_key: false })
-        }).map_err(db_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)
+        let rows = statement
+            .query_map([], |row| {
+                let models: String = row.get(6)?;
+                let models =
+                    serde_json::from_str::<Vec<RemoteModel>>(&models).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                Ok(ProviderConnection {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    api_format: row.get(2)?,
+                    base_url: row.get(3)?,
+                    verified: row.get::<_, i64>(4)? != 0,
+                    last_tested_at: row.get(5)?,
+                    models,
+                    has_api_key: false,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)
     }
     pub fn save_provider(&self, provider: &ProviderConnection) -> Result<()> {
         let models = serde_json::to_string(&provider.models).map_err(|error| error.to_string())?;
@@ -1631,22 +2348,56 @@ impl Store {
         Ok(())
     }
     pub fn delete_provider(&self, id: &str) -> Result<bool> {
-        let changed = self.connection.execute("DELETE FROM providers WHERE id=?1", [id]).map_err(db_error)?;
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        let changed = transaction
+            .execute("DELETE FROM providers WHERE id=?1", [id])
+            .map_err(db_error)?;
         if changed > 0 {
-            self.connection.execute("UPDATE conversations SET provider_selection_required=1 WHERE provider_id=?1", [id]).map_err(db_error)?;
+            transaction
+                .execute(
+                    "UPDATE conversations SET provider_selection_required=1 WHERE provider_id=?1",
+                    [id],
+                )
+                .map_err(db_error)?;
+            if self.preferred_model()?.provider_id.as_deref() == Some(id) {
+                self.save_preferred_model(&ModelSelection::default())?;
+            }
         }
+        transaction.commit().map_err(db_error)?;
         Ok(changed > 0)
     }
-    pub fn update_provider_test(&self, id: &str, verified: bool, tested_at: Option<i64>, models: &[RemoteModel]) -> Result<()> {
+    pub fn update_provider_test(
+        &self,
+        id: &str,
+        verified: bool,
+        tested_at: Option<i64>,
+        models: &[RemoteModel],
+    ) -> Result<()> {
         let models = serde_json::to_string(models).map_err(|error| error.to_string())?;
-        let changed = self.connection.execute("UPDATE providers SET verified=?1,last_tested_at=?2,models=?3 WHERE id=?4", params![verified, tested_at, models, id]).map_err(db_error)?;
-        if changed == 0 { return Err("Provider no longer exists.".into()); }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE providers SET verified=?1,last_tested_at=?2,models=?3 WHERE id=?4",
+                params![verified, tested_at, models, id],
+            )
+            .map_err(db_error)?;
+        if changed == 0 {
+            return Err("Provider no longer exists.".into());
+        }
         Ok(())
     }
     pub fn update_provider_models(&self, id: &str, models: &[RemoteModel]) -> Result<()> {
         let models = serde_json::to_string(models).map_err(|error| error.to_string())?;
-        let changed = self.connection.execute("UPDATE providers SET models=?1 WHERE id=?2", params![models, id]).map_err(db_error)?;
-        if changed == 0 { return Err("Provider no longer exists.".into()); }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE providers SET models=?1 WHERE id=?2",
+                params![models, id],
+            )
+            .map_err(db_error)?;
+        if changed == 0 {
+            return Err("Provider no longer exists.".into());
+        }
         Ok(())
     }
     pub fn default_subscription_providers() -> Vec<ProviderConnection> {
@@ -1664,10 +2415,38 @@ pub fn default_subscription_providers() -> Vec<ProviderConnection> {
             verified: false,
             last_tested_at: None,
             models: vec![
-                RemoteModel { id: "gpt-4o".into(), context_length: Some(128_000), max_output_tokens: Some(16_384), supports_images: false, tool_support: crate::providers::ToolSupport::Supported },
-                RemoteModel { id: "gpt-4o-mini".into(), context_length: Some(128_000), max_output_tokens: Some(16_384), supports_images: false, tool_support: crate::providers::ToolSupport::Supported },
-                RemoteModel { id: "o3-mini".into(), context_length: Some(200_000), max_output_tokens: Some(100_000), supports_images: false, tool_support: crate::providers::ToolSupport::Supported },
-                RemoteModel { id: "o1".into(), context_length: Some(200_000), max_output_tokens: Some(100_000), supports_images: false, tool_support: crate::providers::ToolSupport::Supported },
+                RemoteModel {
+                    controls: None,
+                    id: "gpt-4o".into(),
+                    context_length: Some(128_000),
+                    max_output_tokens: Some(16_384),
+                    supports_images: false,
+                    tool_support: crate::providers::ToolSupport::Supported,
+                },
+                RemoteModel {
+                    controls: None,
+                    id: "gpt-4o-mini".into(),
+                    context_length: Some(128_000),
+                    max_output_tokens: Some(16_384),
+                    supports_images: false,
+                    tool_support: crate::providers::ToolSupport::Supported,
+                },
+                RemoteModel {
+                    controls: None,
+                    id: "o3-mini".into(),
+                    context_length: Some(200_000),
+                    max_output_tokens: Some(100_000),
+                    supports_images: false,
+                    tool_support: crate::providers::ToolSupport::Supported,
+                },
+                RemoteModel {
+                    controls: None,
+                    id: "o1".into(),
+                    context_length: Some(200_000),
+                    max_output_tokens: Some(100_000),
+                    supports_images: false,
+                    tool_support: crate::providers::ToolSupport::Supported,
+                },
             ],
             has_api_key: false,
         },
@@ -1679,10 +2458,38 @@ pub fn default_subscription_providers() -> Vec<ProviderConnection> {
             verified: false,
             last_tested_at: None,
             models: vec![
-                RemoteModel { id: "grok-2".into(), context_length: Some(131_072), max_output_tokens: Some(8_192), supports_images: false, tool_support: crate::providers::ToolSupport::Supported },
-                RemoteModel { id: "grok-2-latest".into(), context_length: Some(131_072), max_output_tokens: Some(8_192), supports_images: false, tool_support: crate::providers::ToolSupport::Supported },
-                RemoteModel { id: "grok-3".into(), context_length: Some(131_072), max_output_tokens: Some(16_384), supports_images: false, tool_support: crate::providers::ToolSupport::Supported },
-                RemoteModel { id: "grok-beta".into(), context_length: Some(131_072), max_output_tokens: Some(8_192), supports_images: false, tool_support: crate::providers::ToolSupport::Supported },
+                RemoteModel {
+                    controls: None,
+                    id: "grok-2".into(),
+                    context_length: Some(131_072),
+                    max_output_tokens: Some(8_192),
+                    supports_images: false,
+                    tool_support: crate::providers::ToolSupport::Supported,
+                },
+                RemoteModel {
+                    controls: None,
+                    id: "grok-2-latest".into(),
+                    context_length: Some(131_072),
+                    max_output_tokens: Some(8_192),
+                    supports_images: false,
+                    tool_support: crate::providers::ToolSupport::Supported,
+                },
+                RemoteModel {
+                    controls: None,
+                    id: "grok-3".into(),
+                    context_length: Some(131_072),
+                    max_output_tokens: Some(16_384),
+                    supports_images: false,
+                    tool_support: crate::providers::ToolSupport::Supported,
+                },
+                RemoteModel {
+                    controls: None,
+                    id: "grok-beta".into(),
+                    context_length: Some(131_072),
+                    max_output_tokens: Some(8_192),
+                    supports_images: false,
+                    tool_support: crate::providers::ToolSupport::Supported,
+                },
             ],
             has_api_key: false,
         },
@@ -1691,10 +2498,13 @@ pub fn default_subscription_providers() -> Vec<ProviderConnection> {
 
 impl Store {
     pub fn messages(&self, id: &str) -> Result<Vec<Message>> {
-        let mut statement = self.connection.prepare("SELECT id,conversation_id,role,content,reasoning,status,created_at,error FROM messages WHERE conversation_id=?1 ORDER BY created_at,rowid").map_err(db_error)?;
+        let mut statement = self.connection.prepare("SELECT m.id,m.conversation_id,m.role,m.content,m.reasoning,m.status,m.created_at,m.error,i.metrics_json FROM messages m LEFT JOIN message_inference i ON i.message_id=m.id WHERE m.conversation_id=?1 ORDER BY m.created_at,m.rowid").map_err(db_error)?;
         let rows = statement
             .query_map([id], |row| {
                 Ok(Message {
+                    metrics: row
+                        .get::<_, Option<String>>(8)?
+                        .and_then(|value| serde_json::from_str(&value).ok()),
                     error: row.get(7)?,
                     id: row.get(0)?,
                     conversation_id: row.get(1)?,
@@ -1709,6 +2519,15 @@ impl Store {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_error)
     }
+    pub fn save_message_metrics(
+        &self,
+        message_id: &str,
+        metrics: &crate::inference::ResponseMetrics,
+    ) -> Result<()> {
+        let value = serde_json::to_string(metrics).map_err(|e| e.to_string())?;
+        self.connection.execute("INSERT INTO message_inference(message_id,metrics_json) VALUES(?1,?2) ON CONFLICT(message_id) DO UPDATE SET metrics_json=excluded.metrics_json", params![message_id, value]).map_err(db_error)?;
+        Ok(())
+    }
     pub fn append_message(
         &self,
         conversation_id: &str,
@@ -1720,6 +2539,7 @@ impl Store {
             return Err("Message exceeds the 1 MiB limit.".into());
         }
         let message = Message {
+            metrics: None,
             error: None,
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: conversation_id.into(),
@@ -1741,11 +2561,33 @@ impl Store {
         Ok(message)
     }
     pub fn begin_turn(&self, conversation_id: &str, content: &str) -> Result<Message> {
+        self.begin_turn_inner(conversation_id, content, None)
+    }
+
+    /// Persist the rendered user content atomically with the UI turn. Replaying
+    /// the plain UI draft would drop volatile injections and invalidate the KV
+    /// prefix at the first historical user message.
+    pub fn begin_turn_with_model_content(
+        &self,
+        conversation_id: &str,
+        content: &str,
+        model_content: &serde_json::Value,
+    ) -> Result<Message> {
+        self.begin_turn_inner(conversation_id, content, Some(model_content))
+    }
+
+    fn begin_turn_inner(
+        &self,
+        conversation_id: &str,
+        content: &str,
+        model_content: Option<&serde_json::Value>,
+    ) -> Result<Message> {
         let content = content.trim();
         if content.is_empty() || content.len() > 1_048_576 {
             return Err("Enter a message no larger than 1 MiB.".into());
         }
         let assistant = Message {
+            metrics: None,
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: conversation_id.into(),
             role: "assistant".into(),
@@ -1763,7 +2605,16 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(db_error)?;
-        transaction.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'user',?3,'complete',?4)", params![uuid::Uuid::new_v4().to_string(), conversation_id, content, assistant.created_at]).map_err(db_error)?;
+        let user_id = uuid::Uuid::new_v4().to_string();
+        transaction.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'user',?3,'complete',?4)", params![user_id, conversation_id, content, assistant.created_at]).map_err(db_error)?;
+        if let Some(model_content) = model_content {
+            transaction
+                .execute(
+                    "INSERT INTO model_message_contents(message_id,content_json) VALUES(?1,?2)",
+                    params![user_id, model_content.to_string()],
+                )
+                .map_err(db_error)?;
+        }
         transaction.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'assistant','','streaming',?3)", params![assistant.id, conversation_id, assistant.created_at]).map_err(db_error)?;
         if existing {
             transaction
@@ -1787,6 +2638,127 @@ impl Store {
         transaction.commit().map_err(db_error)?;
         Ok(assistant)
     }
+
+    pub fn save_model_content(&self, message_id: &str, content: &serde_json::Value) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO model_message_contents(message_id,content_json) VALUES(?1,?2)
+             ON CONFLICT(message_id) DO UPDATE SET content_json=excluded.content_json",
+                params![message_id, content.to_string()],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn save_native_tool_round(
+        &self,
+        message_id: &str,
+        content: &serde_json::Value,
+    ) -> Result<()> {
+        let content = content.to_string();
+        if content.len() > 5 * 1024 * 1024 {
+            return Err("Native tool-round context exceeds5MiB.".into());
+        }
+        let changed = self
+            .connection
+            .execute(
+                "INSERT INTO native_tool_rounds(message_id,content_json)
+            SELECT id,?2 FROM messages WHERE id=?1 AND role='tool'
+            ON CONFLICT(message_id) DO UPDATE SET content_json=excluded.content_json",
+                params![message_id, content],
+            )
+            .map_err(db_error)?;
+        if changed != 1 {
+            return Err("Native context requires an existing tool audit.".into());
+        }
+        Ok(())
+    }
+
+    fn copy_model_content(&self, source_id: &str, target_id: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO model_message_contents(message_id,content_json)
+             SELECT ?2,content_json FROM model_message_contents WHERE message_id=?1",
+                params![source_id, target_id],
+            )
+            .map_err(db_error)?;
+        self.connection
+            .execute(
+                "INSERT INTO native_tool_rounds(message_id,content_json)
+            SELECT ?2,content_json FROM native_tool_rounds WHERE message_id=?1",
+                params![source_id, target_id],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn model_contents(
+        &self,
+        conversation_id: &str,
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT c.message_id,c.content_json FROM model_message_contents c
+             JOIN messages m ON m.id=c.message_id WHERE m.conversation_id=?1
+             UNION ALL SELECT c.message_id,c.content_json FROM native_tool_rounds c
+             JOIN messages m ON m.id=c.message_id WHERE m.conversation_id=?1",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([conversation_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_error)?;
+        rows.map(|row| {
+            let (id, content) = row.map_err(db_error)?;
+            let value = serde_json::from_str(&content)
+                .map_err(|_| "Saved model message content is invalid.".to_string())?;
+            Ok((id, value))
+        })
+        .collect()
+    }
+
+    /// One bounded snapshot per conversation, not one growing copy per turn.
+    /// This preserves synthetic plan/continue messages, exact result ordering,
+    /// and the final text chunk independently of the consolidated UI answer.
+    pub fn save_model_history(
+        &self,
+        conversation_id: &str,
+        through_message_id: &str,
+        messages: &[serde_json::Value],
+    ) -> Result<()> {
+        let checkpoint = self
+            .compaction(conversation_id)?
+            .map(|checkpoint| checkpoint.artifact_id);
+        let rendered = serde_json::to_string(messages).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT INTO conversation_model_history(conversation_id,through_message_id,checkpoint_id,messages_json) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(conversation_id) DO UPDATE SET through_message_id=excluded.through_message_id,checkpoint_id=excluded.checkpoint_id,messages_json=excluded.messages_json",
+            params![conversation_id, through_message_id, checkpoint, rendered],
+        ).map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn cached_model_history(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>> {
+        let checkpoint = self
+            .compaction(conversation_id)?
+            .map(|checkpoint| checkpoint.artifact_id);
+        let saved: Option<String> = self.connection.query_row(
+            "SELECT messages_json FROM conversation_model_history WHERE conversation_id=?1 AND checkpoint_id IS ?2
+             AND through_message_id=(SELECT id FROM messages WHERE conversation_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 1)",
+            params![conversation_id, checkpoint], |row| row.get(0),
+        ).optional().map_err(db_error)?;
+        saved
+            .map(|saved| {
+                serde_json::from_str(&saved)
+                    .map_err(|_| "Saved model history is invalid.".to_string())
+            })
+            .transpose()
+    }
     pub fn update_message(
         &self,
         id: &str,
@@ -1801,6 +2773,19 @@ impl Store {
             )
             .map_err(db_error)?;
         Ok(())
+    }
+    /// The current status of a message row, or `None` when it does not exist.
+    pub fn message_status(&self, message_id: &str) -> Result<Option<String>> {
+        let status: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT status FROM messages WHERE id=?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(status)
     }
     pub(crate) fn setting<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> Result<T> {
         let value: Option<String> = self
@@ -1820,6 +2805,40 @@ impl Store {
         let text = serde_json::to_string(value).map_err(|error| error.to_string())?;
         self.connection.execute("INSERT INTO settings VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,text]).map_err(db_error)?;
         Ok(())
+    }
+    /// Commit a rehearsal intent and its discovery index together before any
+    /// remote creation. Taking the SQLite write lock before reading prevents
+    /// concurrent rehearsal starts from losing each other's discovery handles.
+    pub(crate) fn save_rehearsal_ledger(&self, id: &str, ledger: &serde_json::Value) -> Result<()> {
+        uuid::Uuid::parse_str(id).map_err(|_| "Invalid rehearsal ID.")?;
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES ('development.rehearsal_index','[]')",
+            [],
+        )
+        .map_err(db_error)?;
+        let text: String = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key='development.rehearsal_index'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?;
+        let mut index: Vec<String> =
+            serde_json::from_str(&text).map_err(|_| "Invalid rehearsal discovery index.")?;
+        if !index.iter().any(|entry| entry == id) {
+            if index.len() >= 128 {
+                return Err("Rehearsal journal limit reached; inspect existing ledgers.".into());
+            }
+            index.push(id.into());
+        }
+        tx.execute("INSERT INTO settings(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![format!("development.rehearsal.{id}"), serde_json::to_string(ledger).map_err(|e| e.to_string())?]).map_err(db_error)?;
+        tx.execute(
+            "UPDATE settings SET value=?1 WHERE key='development.rehearsal_index'",
+            [serde_json::to_string(&index).map_err(|e| e.to_string())?],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)
     }
     pub fn runtime_config(&self) -> Result<RuntimeConfig> {
         self.setting("runtime")
@@ -1860,16 +2879,19 @@ impl Store {
     ) -> Result<Option<bool>> {
         // Path-keyed booleans are the old unreliable signal. They stay on disk
         // and are treated as unknown so one bad parse cannot disable tools.
-        let _support: std::collections::BTreeMap<String, bool> = self.setting(LOCAL_TOOL_CALLING_SUPPORT_KEY)?;
+        let _support: std::collections::BTreeMap<String, bool> =
+            self.setting(LOCAL_TOOL_CALLING_SUPPORT_KEY)?;
         let _ = (runtime_path, model_path);
         Ok(None)
     }
     pub fn tool_compatibility(&self, fingerprint: &str) -> Result<Option<String>> {
-        let support: std::collections::BTreeMap<String, String> = self.setting(TOOL_COMPATIBILITY_KEY)?;
+        let support: std::collections::BTreeMap<String, String> =
+            self.setting(TOOL_COMPATIBILITY_KEY)?;
         Ok(support.get(fingerprint).cloned())
     }
     pub fn record_tool_compatibility(&self, fingerprint: &str, state: &str) -> Result<()> {
-        let mut support: std::collections::BTreeMap<String, String> = self.setting(TOOL_COMPATIBILITY_KEY)?;
+        let mut support: std::collections::BTreeMap<String, String> =
+            self.setting(TOOL_COMPATIBILITY_KEY)?;
         support.insert(fingerprint.to_string(), state.to_string());
         self.save_setting(TOOL_COMPATIBILITY_KEY, &support)
     }
@@ -1879,7 +2901,8 @@ impl Store {
         model_path: &str,
         supported: bool,
     ) -> Result<()> {
-        let mut support: std::collections::BTreeMap<String, bool> = self.setting(LOCAL_TOOL_CALLING_SUPPORT_KEY)?;
+        let mut support: std::collections::BTreeMap<String, bool> =
+            self.setting(LOCAL_TOOL_CALLING_SUPPORT_KEY)?;
         support.insert(tool_calling_key(runtime_path, model_path), supported);
         self.save_setting(LOCAL_TOOL_CALLING_SUPPORT_KEY, &support)
     }
@@ -1910,17 +2933,19 @@ impl Store {
         let mut stmt = self.connection.prepare(
             "SELECT id, conversation_id, question, answer, sources_json, trace_json, created_at FROM research_sessions WHERE (?1 IS NULL OR conversation_id = ?1) ORDER BY created_at DESC LIMIT ?2"
         ).map_err(db_error)?;
-        let rows = stmt.query_map(params![conversation_id, limit], |row| {
-            Ok(PersistedResearch {
-                id: row.get(0)?,
-                conversation_id: row.get::<_, Option<String>>(1)?,
-                question: row.get(2)?,
-                answer: row.get::<_, Option<String>>(3)?,
-                sources_json: row.get(4)?,
-                trace_json: row.get::<_, Option<String>>(5)?,
-                created_at: row.get(6)?,
+        let rows = stmt
+            .query_map(params![conversation_id, limit], |row| {
+                Ok(PersistedResearch {
+                    id: row.get(0)?,
+                    conversation_id: row.get::<_, Option<String>>(1)?,
+                    question: row.get(2)?,
+                    answer: row.get::<_, Option<String>>(3)?,
+                    sources_json: row.get(4)?,
+                    trace_json: row.get::<_, Option<String>>(5)?,
+                    created_at: row.get(6)?,
+                })
             })
-        }).map_err(db_error)?;
+            .map_err(db_error)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)
     }
 
@@ -1944,20 +2969,24 @@ impl Store {
     }
 
     pub fn delete_research_session(&self, id: &str) -> Result<bool> {
-        let changed = self.connection
+        let changed = self
+            .connection
             .execute("DELETE FROM research_sessions WHERE id = ?1", [id])
             .map_err(db_error)?;
         Ok(changed > 0)
     }
 
     pub fn save_research_task(&self, task: &crate::research_tasks::ResearchTask) -> Result<()> {
-        crate::research_tasks::ensure_table(&self.connection)?;
         let budgets = serde_json::to_string(&task.budgets).map_err(|error| error.to_string())?;
-        let operations = serde_json::to_string(&task.operations).map_err(|error| error.to_string())?;
-        let results = serde_json::to_string(&task.completed_results).map_err(|error| error.to_string())?;
-        let requirements = serde_json::to_string(&task.requirements).map_err(|error| error.to_string())?;
+        let operations =
+            serde_json::to_string(&task.operations).map_err(|error| error.to_string())?;
+        let results =
+            serde_json::to_string(&task.completed_results).map_err(|error| error.to_string())?;
+        let requirements =
+            serde_json::to_string(&task.requirements).map_err(|error| error.to_string())?;
         let findings = serde_json::to_string(&task.findings).map_err(|error| error.to_string())?;
-        let pending = serde_json::to_string(&task.pending_work).map_err(|error| error.to_string())?;
+        let pending =
+            serde_json::to_string(&task.pending_work).map_err(|error| error.to_string())?;
         self.connection
             .execute(
                 "INSERT INTO research_tasks(id, conversation_id, question, status, budgets_json, operations_json, results_json, requirements_json, findings_json, pending_json, created_at, updated_at)
@@ -1973,7 +3002,6 @@ impl Store {
     }
 
     pub fn research_task(&self, id: &str) -> Result<Option<crate::research_tasks::ResearchTask>> {
-        crate::research_tasks::ensure_table(&self.connection)?;
         self.connection
             .query_row(
                 "SELECT id, conversation_id, question, status, budgets_json, operations_json, results_json, requirements_json, findings_json, pending_json, created_at, updated_at FROM research_tasks WHERE id=?1",
@@ -2007,7 +3035,6 @@ impl Store {
     }
 
     pub fn running_research_task_ids(&self) -> Result<Vec<String>> {
-        crate::research_tasks::ensure_table(&self.connection)?;
         let mut statement = self
             .connection
             .prepare("SELECT id FROM research_tasks WHERE status IN ('running','paused') ORDER BY updated_at DESC LIMIT 50")
@@ -2020,8 +3047,10 @@ impl Store {
         Ok(ids)
     }
 
-    pub fn recoverable_research_tasks(&self, conversation_id: &str) -> Result<Vec<crate::research_tasks::ResearchTask>> {
-        crate::research_tasks::ensure_table(&self.connection)?;
+    pub fn recoverable_research_tasks(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<crate::research_tasks::ResearchTask>> {
         let mut statement = self
             .connection
             .prepare(
@@ -2033,7 +3062,31 @@ impl Store {
             .map_err(db_error)?
             .filter_map(|row| row.ok())
             .collect();
-        Ok(ids.into_iter().filter_map(|id| self.research_task(&id).ok().flatten()).collect())
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| self.research_task(&id).ok().flatten())
+            .collect())
+    }
+
+    /// The conversation's most recently touched task in ANY state — progress
+    /// reporting must keep working after the task settles.
+    pub fn latest_research_task(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<crate::research_tasks::ResearchTask>> {
+        let id = self
+            .connection
+            .query_row(
+                "SELECT id FROM research_tasks WHERE conversation_id=?1 ORDER BY updated_at DESC LIMIT 1",
+                [conversation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        match id {
+            Some(id) => self.research_task(&id),
+            None => Ok(None),
+        }
     }
 }
 
@@ -2043,6 +3096,122 @@ fn tool_calling_key(runtime_path: &str, model_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A second connection to the live database must never run crash
+    /// recovery.
+    ///
+    /// Recovery marks every `streaming` message as interrupted. A tool that
+    /// is executing right now has a `streaming` audit row, so recovery on a
+    /// second connection would flip that row out of `'streaming'` and defeat
+    /// the `OLD.status!='streaming'` guard on the `native_tool_round_edit`
+    /// trigger — which then deletes the native provider context anchored on
+    /// that row, mid-turn.
+    #[test]
+    fn a_second_connection_does_not_recover_an_in_flight_tool_audit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("live.sqlite");
+        let store = super::Store::open(&path).unwrap();
+        let conversation = store.create_conversation().unwrap().id;
+        let audit = store
+            .append_message(
+                &conversation,
+                "tool",
+                &serde_json::json!({"request":{}}).to_string(),
+                "streaming",
+            )
+            .unwrap();
+        let native = serde_json::json!({
+            "kind": "locallm.native-message/1",
+            "message": {"role":"assistant","content":"","tool_calls":[],
+                        "locallm_responses_output":[]}
+        });
+        store.save_native_tool_round(&audit.id, &native).unwrap();
+
+        // A second connection to the same live file — the shape used by tool
+        // dispatch, language servers and subagents.
+        let second = super::Store::open(&path).unwrap();
+        assert_eq!(
+            second
+                .message_status(&audit.id)
+                .unwrap()
+                .as_deref(),
+            Some("streaming"),
+            "a second connection must not mark a running tool's audit as interrupted"
+        );
+
+        // The foreground settles the audit row.
+        store
+            .update_message(
+                &audit.id,
+                &serde_json::json!({"request":{},"result":{}}).to_string(),
+                "",
+                "complete",
+            )
+            .unwrap();
+
+        let contents = store.model_contents(&conversation).unwrap();
+        assert!(
+            contents.contains_key(&audit.id),
+            "native provider context must survive a second connection and the audit settle"
+        );
+    }
+    /// Recovery is a startup action, not a connection action. The explicit
+    /// one-shot path still marks abandoned work as interrupted.
+    #[test]
+    fn explicit_startup_recovery_marks_abandoned_work_as_interrupted() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = super::Store::open(&temp.path().join("live.sqlite")).unwrap();
+        let conversation = store.create_conversation().unwrap().id;
+        let audit = store
+            .append_message(&conversation, "tool", "{}", "streaming")
+            .unwrap();
+        store.recover_interrupted().unwrap();
+        assert_eq!(
+            store.message_status(&audit.id).unwrap().as_deref(),
+            Some("interrupted")
+        );
+    }
+    #[test]
+    fn latest_run_recovers_legacy_pause_and_does_not_leak_it_into_new_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = super::Store::open(&temp.path().join("pause.sqlite")).unwrap();
+        let chat = store.create_conversation().unwrap().id;
+        let mut task =
+            crate::research_tasks::ResearchTask::new(&chat, "Paused request", Default::default())
+                .unwrap();
+        task.pause().unwrap();
+        store.save_research_task(&task).unwrap();
+        let mut run = crate::agent_run::RunRecord {
+            id: "old".into(),
+            conversation_id: chat.clone(),
+            status: crate::agent_run::RunState::PreparingNextRound,
+            model_provider: None,
+            model_id: None,
+            checkpoint: None,
+            error: Some(crate::agent_run::pause_notice(false).into()),
+            created_at: 1,
+            updated_at: 2,
+        };
+        store.save_run(&run).unwrap();
+        assert_eq!(
+            store.latest_run(&chat).unwrap().unwrap().status,
+            crate::agent_run::RunState::Paused
+        );
+        run.id = "new".into();
+        run.created_at = 3;
+        run.status = crate::agent_run::RunState::Completed;
+        run.error = None;
+        store.save_run(&run).unwrap();
+        assert_eq!(
+            store.latest_run(&chat).unwrap().unwrap().status,
+            crate::agent_run::RunState::Completed
+        );
+        run.id = "child".into();
+        run.created_at = 4;
+        run.checkpoint = Some("subagent".into());
+        run.status = crate::agent_run::RunState::Generating;
+        store.save_run(&run).unwrap();
+        assert_eq!(store.latest_run(&chat).unwrap().unwrap().id, "new");
+    }
     use super::*;
 
     #[test]
@@ -2076,7 +3245,10 @@ mod tests {
         reloaded.mark_interrupted_for_recovery();
         store.save_research_task(&reloaded).unwrap();
         let resumed = store.research_task(&task.id).unwrap().unwrap();
-        assert_eq!(resumed.operations[1].status, crate::research_tasks::OperationStatus::Unknown);
+        assert_eq!(
+            resumed.operations[1].status,
+            crate::research_tasks::OperationStatus::Unknown
+        );
         assert_eq!(resumed.status, crate::research_tasks::TaskStatus::Paused);
         assert_eq!(resumed.completed_results.len(), 1);
         let recoverable = store.recoverable_research_tasks(&conversation.id).unwrap();
@@ -2085,10 +3257,26 @@ mod tests {
 
     #[test]
     fn arex_gets_a_reasoning_safe_response_budget_without_lowering_explicit_limits() {
-        let arex = Preferences { model_path: "C:/models/BAAI_AREX-Turbo-Q4_K_M.gguf".into(), max_tokens: 2048, ..Default::default() };
+        let arex = Preferences {
+            model_path: "C:/models/BAAI_AREX-Turbo-Q4_K_M.gguf".into(),
+            max_tokens: 2048,
+            ..Default::default()
+        };
         assert_eq!(arex.clone().apply_model_defaults().max_tokens, 8192);
-        assert_eq!(Preferences { max_tokens: 12000, ..arex.clone() }.apply_model_defaults().max_tokens, 12000);
-        let base = Preferences { model_path: "C:/models/model.gguf".into(), max_tokens: 2048, ..Default::default() };
+        assert_eq!(
+            Preferences {
+                max_tokens: 12000,
+                ..arex.clone()
+            }
+            .apply_model_defaults()
+            .max_tokens,
+            12000
+        );
+        let base = Preferences {
+            model_path: "C:/models/model.gguf".into(),
+            max_tokens: 2048,
+            ..Default::default()
+        };
         assert_eq!(base.clone().apply_model_defaults().max_tokens, 2048);
         let fitted = crate::context::fit_response_budget(
             arex.clone().apply_model_defaults().max_tokens,
@@ -2156,6 +3344,42 @@ mod tests {
         assert_eq!(messages[0].reasoning, "Partial reasoning");
     }
     #[test]
+    fn response_metrics_persist_and_follow_message_forks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.sqlite");
+        let store = Store::open(&path).unwrap();
+        let conversation = store.create_conversation().unwrap();
+        let message = store
+            .append_message(
+                &conversation.id,
+                "assistant",
+                "Measured response",
+                "complete",
+            )
+            .unwrap();
+        let metrics = crate::inference::ResponseMetrics { model: "fixture.gguf".into(), total_ms: 5820.0, preparation_ms: Some(100.0), tools_ms: Some(200.0), approval_ms: Some(300.0),
+            rounds: vec![crate::inference::InferenceRound { phase: None, complete: true, first_token_ms: Some(820.0), first_visible_answer_ms: Some(1200.0), reasoning_ms: Some(400.0), duration_ms: 5820.0,
+                usage: serde_json::from_value(serde_json::json!({"inputTokens":1085,"outputTokens":123,"promptMs":1000.0,"generationMs":5000.0,"processedPromptTokens":385})).unwrap() }] };
+        store.save_message_metrics(&message.id, &metrics).unwrap();
+        let fork = store
+            .fork_conversation(&conversation.id, &message.id)
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        for id in [&conversation.id, &fork.id] {
+            let rows = store.messages(id).unwrap();
+            let recorded = rows[0].metrics.as_ref().unwrap();
+            assert_eq!(recorded.model, "fixture.gguf");
+            assert_eq!(recorded.rounds[0].first_token_ms, Some(820.0));
+            assert_eq!(recorded.rounds[0].first_visible_answer_ms, Some(1200.0));
+            assert_eq!(recorded.rounds[0].reasoning_ms, Some(400.0));
+            assert_eq!(recorded.preparation_ms, Some(100.0));
+            assert_eq!(recorded.tools_ms, Some(200.0));
+            assert_eq!(recorded.approval_ms, Some(300.0));
+            assert_eq!(recorded.rounds[0].usage.output_tokens, Some(123));
+        }
+    }
+    #[test]
     fn conversation_tools_are_isolated_durable_and_deleted_with_chat() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tools.sqlite");
@@ -2211,20 +3435,46 @@ mod tests {
         {
             let store = Store::open(&path).unwrap();
             assert_eq!(
-                store.local_tool_calling_supported("runtime-a", "model-a").unwrap(),
+                store
+                    .local_tool_calling_supported("runtime-a", "model-a")
+                    .unwrap(),
                 None,
             );
-            store.record_local_tool_calling_support("runtime-a", "model-a", false).unwrap();
-            store.record_local_tool_calling_support("runtime-b", "model-a", true).unwrap();
+            store
+                .record_local_tool_calling_support("runtime-a", "model-a", false)
+                .unwrap();
+            store
+                .record_local_tool_calling_support("runtime-b", "model-a", true)
+                .unwrap();
         }
         let store = Store::open(&path).unwrap();
         // The path-keyed false flag is historical and must not disable tools.
-        assert_eq!(store.local_tool_calling_supported("runtime-a", "model-a").unwrap(), None);
-        assert_eq!(store.local_tool_calling_supported("runtime-b", "model-a").unwrap(), None);
-        store.record_tool_compatibility("fp-old", "unsupported").unwrap();
-        store.record_tool_compatibility("fp-new", "supported").unwrap();
-        assert_eq!(store.tool_compatibility("fp-old").unwrap().as_deref(), Some("unsupported"));
-        assert_eq!(store.tool_compatibility("fp-new").unwrap().as_deref(), Some("supported"));
+        assert_eq!(
+            store
+                .local_tool_calling_supported("runtime-a", "model-a")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .local_tool_calling_supported("runtime-b", "model-a")
+                .unwrap(),
+            None
+        );
+        store
+            .record_tool_compatibility("fp-old", "unsupported")
+            .unwrap();
+        store
+            .record_tool_compatibility("fp-new", "supported")
+            .unwrap();
+        assert_eq!(
+            store.tool_compatibility("fp-old").unwrap().as_deref(),
+            Some("unsupported")
+        );
+        assert_eq!(
+            store.tool_compatibility("fp-new").unwrap().as_deref(),
+            Some("supported")
+        );
         assert_eq!(store.tool_compatibility("fp-replaced").unwrap(), None);
     }
 
@@ -2233,7 +3483,7 @@ mod tests {
         let mut settings = ConversationTools {
             access_mode: crate::permissions::AccessMode::Ask,
             sources: vec!["__workspace".into(), "__execution".into()],
-            tools: (0..26)
+            tools: (0..(crate::tool_discovery::MAX_CATALOG - crate::workspace::TOOL_COUNT - 1))
                 .map(|index| crate::connectors::ToolSelection {
                     connector_id: "github".into(),
                     tool_name: format!("tool_{index}"),
@@ -2280,7 +3530,9 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.remembered_tools().unwrap(), Some(selection.clone()));
         // An explicitly empty selection is a saved preference, not a missing one.
-        store.save_remembered_tools(&RememberedTools::default()).unwrap();
+        store
+            .save_remembered_tools(&RememberedTools::default())
+            .unwrap();
         let store = Store::open(&path).unwrap();
         assert_eq!(
             store.remembered_tools().unwrap(),
@@ -2292,8 +3544,22 @@ mod tests {
             ..RememberedTools::default()
         };
         assert!(store.save_remembered_tools(&unknown_source).is_err());
+        let large = RememberedTools {
+            tools: (0..65)
+                .map(|index| crate::connectors::ToolSelection {
+                    connector_id: "github".into(),
+                    tool_name: format!("selected_{index}"),
+                })
+                .collect(),
+            ..RememberedTools::default()
+        };
+        store.save_remembered_tools(&large).unwrap();
+        assert_eq!(store.remembered_tools().unwrap(), Some(large));
+        store
+            .save_remembered_tools(&RememberedTools::default())
+            .unwrap();
         let excessive = RememberedTools {
-            tools: (0..33)
+            tools: (0..=crate::tool_discovery::MAX_CATALOG)
                 .map(|index| crate::connectors::ToolSelection {
                     connector_id: "github".into(),
                     tool_name: format!("tool_{index}"),
@@ -2335,7 +3601,10 @@ mod tests {
                 store.save_remembered_tools(&selection).unwrap();
             }
             let store = Store::open(&path).unwrap();
-            assert_eq!(serde_json::to_value(store.remembered_tools().unwrap().unwrap()).unwrap(), expected);
+            assert_eq!(
+                serde_json::to_value(store.remembered_tools().unwrap().unwrap()).unwrap(),
+                expected
+            );
         }
     }
 
@@ -2363,8 +3632,12 @@ mod tests {
     fn legacy_remembered_tools_default_to_asking() {
         let selection: RememberedTools = serde_json::from_value(serde_json::json!({
             "sources": [], "tools": []
-        })).unwrap();
-        assert_eq!(serde_json::to_value(selection).unwrap()["accessMode"], "ask");
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(selection).unwrap()["accessMode"],
+            "ask"
+        );
     }
 
     #[test]
@@ -2374,22 +3647,38 @@ mod tests {
         {
             let store = Store::open(&path).unwrap();
             let conversation = store.create_conversation().unwrap();
-            store.save_conversation_tools(&conversation.id, &ConversationTools {
-                access_mode: crate::permissions::AccessMode::FullAccess,
-                ..Default::default()
-            }).unwrap();
-            store.save_setting("remembered_tools", &serde_json::json!({"sources":["__execution"],"tools":[]})).unwrap();
+            store
+                .save_conversation_tools(
+                    &conversation.id,
+                    &ConversationTools {
+                        access_mode: crate::permissions::AccessMode::FullAccess,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store
+                .save_setting(
+                    "remembered_tools",
+                    &serde_json::json!({"sources":["__execution"],"tools":[]}),
+                )
+                .unwrap();
         }
         {
             let store = Store::open(&path).unwrap();
             let mut remembered = store.remembered_tools().unwrap().unwrap();
-            assert_eq!(remembered.access_mode, crate::permissions::AccessMode::FullAccess);
+            assert_eq!(
+                remembered.access_mode,
+                crate::permissions::AccessMode::FullAccess
+            );
             assert_eq!(remembered.sources, ["__execution"]);
             remembered.access_mode = crate::permissions::AccessMode::Ask;
             store.save_remembered_tools(&remembered).unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.remembered_tools().unwrap().unwrap().access_mode, crate::permissions::AccessMode::Ask);
+        assert_eq!(
+            store.remembered_tools().unwrap().unwrap().access_mode,
+            crate::permissions::AccessMode::Ask
+        );
     }
 
     #[test]
@@ -2417,7 +3706,9 @@ mod tests {
                 .unwrap();
             // Make the second conversation the most recently updated one with an
             // explicitly empty selection; it must win and drop the permission mode.
-            store.rename_conversation(&second, "Later conversation").unwrap();
+            store
+                .rename_conversation(&second, "Later conversation")
+                .unwrap();
             store
                 .save_conversation_tools(&second, &ConversationTools::default())
                 .unwrap();
@@ -2473,14 +3764,19 @@ mod tests {
             verified: true,
             last_tested_at: Some(123),
             models: vec![RemoteModel {
+                controls: None,
                 id: "fixture-model".into(),
                 context_length: Some(8192),
                 max_output_tokens: Some(1024),
-                supports_images: false, tool_support: crate::providers::ToolSupport::Supported,
+                supports_images: false,
+                tool_support: crate::providers::ToolSupport::Supported,
             }],
             has_api_key: false,
         };
-        let selection = ModelSelection { provider_id: Some(provider.id.clone()), model_id: "fixture-model".into() };
+        let selection = ModelSelection {
+            provider_id: Some(provider.id.clone()),
+            model_id: "fixture-model".into(),
+        };
         {
             let store = Store::open(&path).unwrap();
             store.save_provider(&provider).unwrap();
@@ -2489,10 +3785,21 @@ mod tests {
             assert_eq!(conversation.provider_id, Some(provider.id.clone()));
             assert_eq!(conversation.model_id, Some("fixture-model".into()));
             assert!(!conversation.provider_selection_required);
-            assert_eq!(store.conversation_model(&conversation.id).unwrap(), (selection.clone(), false));
+            assert_eq!(
+                store.conversation_model(&conversation.id).unwrap(),
+                (selection.clone(), false)
+            );
             store.delete_provider(&provider.id).unwrap();
-            assert_eq!(store.conversation_model(&conversation.id).unwrap(), (selection, true));
-            assert!(!store.providers().unwrap().iter().any(|p| p.id == provider.id));
+            assert_eq!(
+                store.conversation_model(&conversation.id).unwrap(),
+                (selection, true)
+            );
+            assert_eq!(store.preferred_model().unwrap(), ModelSelection::default());
+            assert!(!store
+                .providers()
+                .unwrap()
+                .iter()
+                .any(|p| p.id == provider.id));
         }
         let store = Store::open(&path).unwrap();
         let conversations = store.list_conversations().unwrap();
@@ -2553,6 +3860,9 @@ mod tests {
                 .unwrap();
         }
         let store = Store::open(&path).unwrap();
+        // Recovery is a startup action, not a connection action: a second
+        // connection must not interrupt a tool that is running right now.
+        store.recover_interrupted().unwrap();
         let messages = store.messages(&id).unwrap();
         assert_eq!(messages[0].status, "interrupted");
         assert_eq!(messages[0].content, "Partial response");
@@ -2570,10 +3880,173 @@ mod tests {
             created_at: 1,
         };
         store.save_prompt_freeze(&freeze).unwrap();
-        assert_eq!(store.prompt_freeze(&conv.id).unwrap().unwrap().selection_hash, "abc");
-        let user = store.append_message(&conv.id, "user", "hi", "complete").unwrap();
+        assert_eq!(
+            store
+                .prompt_freeze(&conv.id)
+                .unwrap()
+                .unwrap()
+                .selection_hash,
+            "abc"
+        );
+        let user = store
+            .append_message(&conv.id, "user", "hi", "complete")
+            .unwrap();
         let forked = store.fork_conversation(&conv.id, &user.id).unwrap();
-        assert_eq!(store.prompt_freeze(&forked.id).unwrap().unwrap().aliases_json, "[\"todo_write\"]");
+        assert_eq!(
+            store
+                .prompt_freeze(&forked.id)
+                .unwrap()
+                .unwrap()
+                .aliases_json,
+            "[\"todo_write\"]"
+        );
+    }
+
+    #[test]
+    fn rendered_content_survives_restart_and_forks_without_changing_ui_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache-history.sqlite");
+        let (conversation_id, assistant_id) = {
+            let store = Store::open(&path).unwrap();
+            let conversation = store.create_conversation().unwrap();
+            let rendered = serde_json::json!("[injected system_time]\n2026-10-15\n\nHello");
+            let assistant = store
+                .begin_turn_with_model_content(&conversation.id, "Hello", &rendered)
+                .unwrap();
+            store
+                .finish_message(&assistant.id, "OpeningDone", "private", "complete", None)
+                .unwrap();
+            store
+                .save_model_content(&assistant.id, &serde_json::json!("Done"))
+                .unwrap();
+            let fork = store
+                .fork_conversation(&conversation.id, &assistant.id)
+                .unwrap();
+            let rows = store.messages(&fork.id).unwrap();
+            assert_eq!(rows[0].content, "Hello");
+            let contents = store.model_contents(&fork.id).unwrap();
+            assert_eq!(contents[&rows[0].id], rendered);
+            assert_eq!(contents[&rows[1].id], "Done");
+            (conversation.id, assistant.id)
+        };
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.model_contents(&conversation_id).unwrap()[&assistant_id],
+            "Done"
+        );
+        store.delete_conversation(&conversation_id).unwrap();
+        assert!(store.model_contents(&conversation_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn model_transcript_extends_the_exact_previous_prefix_and_invalidates_on_new_rows() {
+        let store = Store::open_memory().unwrap();
+        let conversation = store.create_conversation().unwrap();
+        let rendered = serde_json::json!("[injected memory]\nproject notes\n\nWork");
+        let assistant = store
+            .begin_turn_with_model_content(&conversation.id, "Work", &rendered)
+            .unwrap();
+        store
+            .finish_message(&assistant.id, "PlanProgressDone", "", "complete", None)
+            .unwrap();
+        let transcript = vec![
+            serde_json::json!({"role":"user","content":rendered}),
+            serde_json::json!({"role":"assistant","content":"Plan"}),
+            serde_json::json!({"role":"user","content":"Implement the plan"}),
+            serde_json::json!({"role":"assistant","content":"Progress","tool_calls":[{"id":"c1","type":"function","function":{"name":"clock","arguments":"{}"}}]}),
+            serde_json::json!({"role":"tool","tool_call_id":"c1","content":"result"}),
+            serde_json::json!({"role":"assistant","content":"Done"}),
+        ];
+        store
+            .save_model_history(&conversation.id, &assistant.id, &transcript)
+            .unwrap();
+        let history = store
+            .cached_model_history(&conversation.id)
+            .unwrap()
+            .unwrap();
+        let first = crate::prompt::build_turn_messages("System", &[], None, &transcript[0]);
+        let next = crate::prompt::build_turn_messages(
+            "System",
+            &history,
+            Some("new clock"),
+            &serde_json::json!({"role":"user","content":"Next"}),
+        );
+        assert_eq!(&next[..first.len()], first.as_slice());
+        assert_eq!(&next[1..next.len() - 1], transcript.as_slice());
+        store
+            .append_message(&conversation.id, "user", "New message", "complete")
+            .unwrap();
+        assert!(store
+            .cached_model_history(&conversation.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn explicit_compaction_invalidates_model_snapshot_and_deletion_cascades() {
+        let store = Store::open_memory().unwrap();
+        let conversation = store.create_conversation().unwrap();
+        let assistant = store.begin_turn(&conversation.id, "Work").unwrap();
+        store
+            .save_model_history(&conversation.id, &assistant.id, &[])
+            .unwrap();
+        store
+            .save_compaction(&crate::compaction::Checkpoint {
+                conversation_id: conversation.id.clone(),
+                cutoff: 0,
+                artifact_id: "new-checkpoint".into(),
+                created_at: now(),
+            })
+            .unwrap();
+        assert!(store
+            .cached_model_history(&conversation.id)
+            .unwrap()
+            .is_none());
+        store.delete_conversation(&conversation.id).unwrap();
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_model_history",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn completed_transcript_forks_exactly_and_edits_invalidate_it() {
+        let store = Store::open_memory().unwrap();
+        let conversation = store.create_conversation().unwrap();
+        let assistant = store.begin_turn(&conversation.id, "Work").unwrap();
+        store
+            .finish_message(&assistant.id, "Done", "", "complete", None)
+            .unwrap();
+        let transcript = vec![
+            serde_json::json!({"role":"user","content":"Work"}),
+            serde_json::json!({"role":"assistant","content":"Done"}),
+        ];
+        store
+            .save_model_history(&conversation.id, &assistant.id, &transcript)
+            .unwrap();
+        let fork = store
+            .fork_conversation(&conversation.id, &assistant.id)
+            .unwrap();
+        assert_eq!(
+            store.cached_model_history(&fork.id).unwrap().unwrap(),
+            transcript
+        );
+        store
+            .update_message(&assistant.id, "Edited", "", "complete")
+            .unwrap();
+        assert!(store
+            .cached_model_history(&conversation.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.cached_model_history(&fork.id).unwrap().unwrap(),
+            transcript
+        );
     }
 
     #[test]
@@ -2696,29 +4169,42 @@ mod tests {
     fn forked_conversation_keeps_message_history_and_run_lineage() {
         let store = Store::open_memory().unwrap();
         let conv = store.create_conversation().unwrap();
-        store.append_message(&conv.id, "user", "Plan the release", "complete").unwrap();
-        store.append_message(&conv.id, "assistant", "Here is the plan", "complete").unwrap();
+        store
+            .append_message(&conv.id, "user", "Plan the release", "complete")
+            .unwrap();
+        store
+            .append_message(&conv.id, "assistant", "Here is the plan", "complete")
+            .unwrap();
         // Real run row so session_events.run_id FK lineage is preserved.
         let now = now();
-        store.save_run(&crate::agent_run::RunRecord {
-            id: "run-1".into(), conversation_id: conv.id.clone(),
-            status: crate::agent_run::RunState::Completed,
-            model_provider: None, model_id: None, checkpoint: None,
-            error: None, created_at: now, updated_at: now,
-        }).unwrap();
-        for (seq, event_type) in [(1u64, "user_msg"), (2u64, "assistant_msg")] {
-            store.append_session_event(&crate::sessions::SessionEvent {
-                id: format!("ev-{seq}"),
+        store
+            .save_run(&crate::agent_run::RunRecord {
+                id: "run-1".into(),
                 conversation_id: conv.id.clone(),
-                run_id: Some("run-1".into()),
-                seq,
-                step_id: Some("step-0".into()),
-                tool_call_id: None,
-                event_type: event_type.into(),
-                payload: serde_json::json!({}),
-                ignorable: false,
-                created_at: 1000,
-            }).unwrap();
+                status: crate::agent_run::RunState::Completed,
+                model_provider: None,
+                model_id: None,
+                checkpoint: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        for (seq, event_type) in [(1u64, "user_msg"), (2u64, "assistant_msg")] {
+            store
+                .append_session_event(&crate::sessions::SessionEvent {
+                    id: format!("ev-{seq}"),
+                    conversation_id: conv.id.clone(),
+                    run_id: Some("run-1".into()),
+                    seq,
+                    step_id: Some("step-0".into()),
+                    tool_call_id: None,
+                    event_type: event_type.into(),
+                    payload: serde_json::json!({}),
+                    ignorable: false,
+                    created_at: 1000,
+                })
+                .unwrap();
         }
         let (forked, _) = store.fork_session_events(&conv.id, 2).unwrap();
         let messages = store.messages(&forked.id).unwrap();
@@ -2734,9 +4220,25 @@ mod tests {
     fn search_sessions_finds_matching_message_excerpts() {
         let store = Store::open_memory().unwrap();
         let conv = store.create_conversation().unwrap();
-        store.rename_conversation(&conv.id, "Knowledge query").unwrap();
-        store.append_message(&conv.id, "user", "How does quantum computing work?", "complete").unwrap();
-        store.append_message(&conv.id, "assistant", "Quantum computers leverage superposition and entanglement.", "complete").unwrap();
+        store
+            .rename_conversation(&conv.id, "Knowledge query")
+            .unwrap();
+        store
+            .append_message(
+                &conv.id,
+                "user",
+                "How does quantum computing work?",
+                "complete",
+            )
+            .unwrap();
+        store
+            .append_message(
+                &conv.id,
+                "assistant",
+                "Quantum computers leverage superposition and entanglement.",
+                "complete",
+            )
+            .unwrap();
 
         let hits = store.search_sessions("superposition", 10).unwrap();
         assert_eq!(hits.len(), 1);

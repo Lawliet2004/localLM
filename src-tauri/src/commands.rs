@@ -45,33 +45,41 @@ pub async fn bootstrap(state: State<'_, AppState>) -> Result<Bootstrap, String> 
     })
 }
 
-fn provider_views(store: &crate::store::Store, vault: &crate::vault::Vault) -> Result<Vec<ProviderConnection>, String> {
-    store.providers()?.into_iter().map(|mut provider| {
-        if provider.id == "chatgpt-subscription" || provider.api_format == providers::CHATGPT_SUBSCRIPTION {
-            provider.has_api_key = crate::subscription_auth::load_session(vault, "chatgpt")?.is_some();
-        } else if provider.id == "grok-subscription" || provider.api_format == providers::GROK_SUBSCRIPTION {
-            provider.has_api_key = crate::subscription_auth::load_session(vault, "grok")?.is_some();
-        } else {
-            provider.has_api_key = vault.load(&providers::credential_id(&provider.id))?.is_some();
-        }
-        Ok(provider)
-    }).collect()
+fn provider_views(
+    store: &crate::store::Store,
+    vault: &crate::vault::Vault,
+) -> Result<Vec<ProviderConnection>, String> {
+    store
+        .providers()?
+        .into_iter()
+        .map(|mut provider| {
+            if provider.id == "chatgpt-subscription"
+                || provider.api_format == providers::CHATGPT_SUBSCRIPTION
+            {
+                provider.has_api_key =
+                    vault.contains(crate::subscription_auth::VAULT_CHATGPT_SUB)?;
+            } else if provider.id == "grok-subscription"
+                || provider.api_format == providers::GROK_SUBSCRIPTION
+            {
+                provider.has_api_key = vault.contains(crate::subscription_auth::VAULT_GROK_SUB)?;
+            } else {
+                provider.has_api_key = vault.contains(&providers::credential_id(&provider.id))?;
+            }
+            Ok(provider)
+        })
+        .collect()
 }
 
 #[tauri::command]
-pub async fn save_provider(state: State<'_, AppState>, mut draft: ProviderDraft) -> Result<ProviderConnection, String> {
-    let _operation = state.operation.try_lock().map_err(|_| "Wait for the active operation before changing providers.")?;
-    let existing = draft.id.as_deref().map(|id| state.database().and_then(|store| store.provider(id))).transpose()?.flatten();
-    providers::validate_provider_draft(&draft, existing.is_some())?;
-    let id = draft.id.take().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    providers::validate_provider_id(&id)?;
-    let base_url = providers::validate_base_url(&draft.base_url)?;
-    if let Some(key) = &draft.api_key {
-        state.daytona_vault.save(&providers::credential_id(&id), key.as_bytes())?;
-    }
-    let provider = ProviderConnection { id: id.clone(), name: draft.name, api_format: draft.api_format, base_url, verified: false, last_tested_at: None, models: draft.models, has_api_key: state.daytona_vault.load(&providers::credential_id(&id))?.is_some() };
-    state.database()?.save_provider(&provider)?;
-    Ok(provider)
+pub async fn save_provider(
+    state: State<'_, AppState>,
+    draft: ProviderDraft,
+) -> Result<ProviderConnection, String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the active operation before changing providers.")?;
+    providers::save_connection(&*state.database()?, &state.daytona_vault, draft)
 }
 
 #[tauri::command]
@@ -82,68 +90,151 @@ pub fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderConnecti
 
 #[tauri::command]
 pub async fn delete_provider(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let _operation = state.operation.try_lock().map_err(|_| "Stop the active operation before deleting a provider.")?;
-    providers::validate_provider_id(&id)?;
-    state.daytona_vault.clear(&providers::credential_id(&id))?;
-    if !state.database()?.delete_provider(&id)? {
-        return Err("Provider no longer exists.".into());
-    }
-    Ok(())
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Stop the active operation before deleting a provider.")?;
+    providers::delete_connection(&*state.database()?, &state.daytona_vault, &id)
+}
+
+#[tauri::command]
+pub async fn delete_provider_api_key(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Stop the active operation before deleting an API key.")?;
+    providers::delete_api_key(&*state.database()?, &state.daytona_vault, &id)
 }
 
 async fn resolve_provider_key(
     state: &State<'_, AppState>,
     provider: &ProviderConnection,
 ) -> Result<String, String> {
-    if provider.api_format == providers::CHATGPT_SUBSCRIPTION || provider.id == "chatgpt-subscription" {
+    if provider.api_format == providers::CHATGPT_SUBSCRIPTION
+        || provider.id == "chatgpt-subscription"
+    {
         crate::subscription_auth::get_valid_access_token(&state.daytona_vault, "chatgpt").await
-    } else if provider.api_format == providers::GROK_SUBSCRIPTION || provider.id == "grok-subscription" {
+    } else if provider.api_format == providers::GROK_SUBSCRIPTION
+        || provider.id == "grok-subscription"
+    {
         crate::subscription_auth::get_valid_access_token(&state.daytona_vault, "grok").await
     } else {
-        match state
-            .daytona_vault
-            .load(&providers::credential_id(&provider.id))?
-        {
-            Some(bytes) => String::from_utf8(bytes).map_err(|_| "Saved provider API key is invalid.".to_string()),
-            // Loopback engines may run unauthenticated; the test still proves
-            // the endpoint answers.
-            None if providers::is_loopback_base_url(&provider.base_url) => Ok(String::new()),
-            None => Err("Save an API key before testing this provider.".into()),
-        }
+        providers::resolve_api_key(
+            provider,
+            state
+                .daytona_vault
+                .load(&providers::credential_id(&provider.id))?,
+        )
     }
 }
 
 #[tauri::command]
-pub async fn test_provider(state: State<'_, AppState>, id: String) -> Result<ProviderTestResult, String> {
-    let _operation = state.operation.try_lock().map_err(|_| "Wait for the active operation before testing a provider.")?;
-    let provider = state.database()?.provider(&id)?.ok_or("Provider no longer exists.")?;
+pub async fn test_provider(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ProviderTestResult, String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the active operation before testing a provider.")?;
+    let provider = state
+        .database()?
+        .provider(&id)?
+        .ok_or("Provider no longer exists.")?;
     let key = resolve_provider_key(&state, &provider).await?;
     let result = match providers::test_connection(&provider, &key).await {
         Ok(result) => result,
         Err(error) => {
-            state.database()?.update_provider_test(&id, false, Some(crate::store::now()), &provider.models)?;
+            state.database()?.update_provider_test(
+                &id,
+                false,
+                Some(crate::store::now()),
+                &provider.models,
+            )?;
             return Err(error);
         }
     };
-    let models = if result.model_list_supported { providers::merge_listed_models(&provider.models, &result.models) } else { provider.models.clone() };
-    state.database()?.update_provider_test(&id, result.verified, Some(crate::store::now()), &models)?;
+    let models = if result.model_list_supported {
+        providers::merge_listed_models(&provider.models, &result.discovered_models)
+    } else {
+        provider.models.clone()
+    };
+    state.database()?.update_provider_test(
+        &id,
+        result.verified,
+        Some(crate::store::now()),
+        &models,
+    )?;
     Ok(result)
 }
 
+/// Test an unsaved provider draft — same code path as `test_provider` but the
+/// draft's key is used directly and nothing is written to the store or vault.
 #[tauri::command]
-pub async fn list_provider_models(state: State<'_, AppState>, id: String) -> Result<ProviderConnection, String> {
-    let _operation = state.operation.try_lock().map_err(|_| "Wait for the active operation before listing provider models.")?;
-    let provider = state.database()?.provider(&id)?.ok_or("Provider no longer exists.")?;
+pub async fn test_provider_draft(
+    state: State<'_, AppState>,
+    draft: ProviderDraft,
+) -> Result<ProviderTestResult, String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the active operation before testing a provider.")?;
+    let key = draft.api_key.clone().unwrap_or_default();
+    let provider = providers::connection_from_draft(draft)?;
+    providers::test_connection(&provider, &key).await
+}
+
+/// List models for an unsaved provider draft without persisting anything.
+#[tauri::command]
+pub async fn list_provider_models_draft(
+    state: State<'_, AppState>,
+    draft: ProviderDraft,
+) -> Result<Vec<providers::RemoteModel>, String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the active operation before listing provider models.")?;
+    let key = draft.api_key.clone().unwrap_or_default();
+    let provider = providers::connection_from_draft(draft)?;
+    let result = providers::list_models(&provider, &key).await?;
+    if !result.supported {
+        return Err(
+            "This provider does not expose model listing. Enter a model ID manually.".into(),
+        );
+    }
+    Ok(providers::merge_listed_models(
+        &provider.models,
+        &result.details,
+    ))
+}
+
+#[tauri::command]
+pub async fn list_provider_models(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<ProviderConnection, String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the active operation before listing provider models.")?;
+    let provider = state
+        .database()?
+        .provider(&id)?
+        .ok_or("Provider no longer exists.")?;
     let key = resolve_provider_key(&state, &provider).await?;
     let result = providers::list_models(&provider, &key).await?;
     if !result.supported {
-        return Err("This provider does not expose model listing. Enter a model ID manually.".into());
+        return Err(
+            "This provider does not expose model listing. Enter a model ID manually.".into(),
+        );
     }
-    let models = providers::merge_listed_models(&provider.models, &result.models);
+    let models = providers::merge_listed_models(&provider.models, &result.details);
     state.database()?.update_provider_models(&id, &models)?;
     let mut updated = provider;
     updated.models = models;
-    updated.has_api_key = true;
+    updated.has_api_key = state
+        .daytona_vault
+        .contains(&providers::credential_id(&id))?;
     Ok(updated)
 }
 
@@ -153,18 +244,34 @@ pub fn preferred_model(state: State<'_, AppState>) -> Result<ModelSelection, Str
 }
 
 #[tauri::command]
-pub async fn save_preferred_model(state: State<'_, AppState>, selection: ModelSelection) -> Result<(), String> {
-    let _operation = state.operation.try_lock().map_err(|_| "Wait for the active operation before changing models.")?;
+pub async fn save_preferred_model(
+    state: State<'_, AppState>,
+    selection: ModelSelection,
+) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the active operation before changing models.")?;
     state.database()?.save_preferred_model(&selection)
 }
 
 #[tauri::command]
-pub async fn save_conversation_model(state: State<'_, AppState>, id: String, selection: ModelSelection) -> Result<(), String> {
-    let _operation = state.operation.try_lock().map_err(|_| "Wait for the active operation before changing models.")?;
+pub async fn save_conversation_model(
+    state: State<'_, AppState>,
+    id: String,
+    selection: ModelSelection,
+) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the active operation before changing models.")?;
     state.database()?.save_conversation_model(&id, &selection)
 }
 #[tauri::command]
-pub fn create_conversation(state: State<'_, AppState>, project_id: Option<String>) -> Result<Conversation, String> {
+pub fn create_conversation(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+) -> Result<Conversation, String> {
     let store = state.database()?;
     let conversation = store.create_conversation()?;
     // Chats always file under a folder: assign one in the same call so the row
@@ -187,6 +294,14 @@ pub async fn delete_conversation(state: State<'_, AppState>, id: String) -> Resu
         .operation
         .try_lock()
         .map_err(|_| "Stop the active operation before deleting a conversation.")?;
+    state.automation.stop_conversation(&id).await;
+    state.previews.stop_conversation(&id);
+    // Stop every child this conversation owns before its rows disappear.
+    // `process_stop` and `terminal_close` need the id, and the conversation
+    // that produced it no longer exists, so a running child would otherwise
+    // be left with no reachable handle.
+    state.processes.stop_owned(&id);
+    state.terminals.lock().await.close_owned(&id).await;
     let store = state.database()?;
     store.delete_conversation(&id)?;
     crate::workspace_ui::remove_task_meta(&store, &id)
@@ -236,7 +351,8 @@ pub fn save_runtime_config(
         let store = state.database()?;
         store.save_runtime_config(&config)?;
         let mut preferences = store.preferences()?;
-        let fitted = crate::context::fit_response_budget(preferences.max_tokens, config.context_length);
+        let fitted =
+            crate::context::fit_response_budget(preferences.max_tokens, config.context_length);
         if fitted != preferences.max_tokens {
             preferences.max_tokens = fitted;
             store.save_preferences(&preferences)?;
@@ -317,7 +433,7 @@ fn configure_local_model_runtime(
         return Ok(());
     };
     let Some(runtime) = find_standard_runtime(&state.data_dir, project_root) else {
-        return Err("Install a standard llama.cpp runtime or select a compatible llama-server.exe in Models, then load the model.".into());
+        return Err("Select a native llama-server executable for your operating system using Browse runtime in Model files, save settings, then load the model.".into());
     };
     let canonical = std::fs::canonicalize(&runtime)
         .map_err(|error| format!("Standard runtime exists but cannot be resolved: {error}"))?;
@@ -337,7 +453,10 @@ mod model_runtime_tests {
         let development = project.path().join(".local/runtime/llama-server.exe");
         std::fs::create_dir_all(development.parent().unwrap()).unwrap();
         std::fs::write(&development, b"runtime").unwrap();
-        assert_eq!(find_standard_runtime(data.path(), project.path()), Some(development));
+        assert_eq!(
+            find_standard_runtime(data.path(), project.path()),
+            Some(development)
+        );
     }
 }
 
@@ -364,11 +483,36 @@ pub async fn test_provider_inference(
         .operation
         .try_lock()
         .map_err(|_| "Wait for the active operation before testing a provider.")?;
-    let provider = state.database()?.provider(&id)?.ok_or("Provider no longer exists.")?;
-    crate::local_only::inference_allowed(&provider.base_url)?;
+    let provider = state
+        .database()?
+        .provider(&id)?
+        .ok_or("Provider no longer exists.")?;
+    // This is the explicit manual-verification path for providers without
+    // model listing — user-configured endpoints may answer over HTTPS, the
+    // same rules chat inference follows.
+    if providers::is_subscription_format(&provider.api_format) {
+        crate::local_only::inference_allowed(&provider.base_url)?;
+    }
     let key = resolve_provider_key(&state, &provider).await?;
-    let result = providers::test_inference(&provider, &key, &model_id).await?;
-    state.database()?.update_provider_test(&id, true, Some(crate::store::now()), &provider.models)?;
+    let result = match providers::test_inference(&provider, &key, &model_id).await {
+        Ok(result) => result,
+        Err(error) => {
+            // A failed inference check must not leave a stale verified flag.
+            state.database()?.update_provider_test(
+                &id,
+                false,
+                Some(crate::store::now()),
+                &provider.models,
+            )?;
+            return Err(error);
+        }
+    };
+    state.database()?.update_provider_test(
+        &id,
+        true,
+        Some(crate::store::now()),
+        &provider.models,
+    )?;
     Ok(result)
 }
 
@@ -385,7 +529,7 @@ pub fn get_conversation_run(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Option<crate::agent_run::RunRecord>, String> {
-    state.database()?.active_run(&conversation_id)
+    state.database()?.latest_run(&conversation_id)
 }
 
 #[tauri::command]
@@ -428,9 +572,18 @@ pub async fn import_subscription_cli(
         .map_err(|_| "Wait for the active operation before syncing credentials.")?;
     crate::subscription_auth::import_cli_session(&state.daytona_vault, &provider)?;
     if let Ok(store) = state.database() {
-        let provider_id = if provider == "chatgpt" { "chatgpt-subscription" } else { "grok-subscription" };
+        let provider_id = if provider == "chatgpt" {
+            "chatgpt-subscription"
+        } else {
+            "grok-subscription"
+        };
         if let Ok(Some(prov)) = store.provider(provider_id) {
-            let _ = store.update_provider_test(provider_id, true, Some(crate::store::now()), &prov.models);
+            let _ = store.update_provider_test(
+                provider_id,
+                true,
+                Some(crate::store::now()),
+                &prov.models,
+            );
         }
     }
     crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
@@ -464,9 +617,18 @@ pub async fn save_manual_subscription_token(
         account_id.as_deref(),
     )?;
     if let Ok(store) = state.database() {
-        let provider_id = if provider == "chatgpt" { "chatgpt-subscription" } else { "grok-subscription" };
+        let provider_id = if provider == "chatgpt" {
+            "chatgpt-subscription"
+        } else {
+            "grok-subscription"
+        };
         if let Ok(Some(prov)) = store.provider(provider_id) {
-            let _ = store.update_provider_test(provider_id, true, Some(crate::store::now()), &prov.models);
+            let _ = store.update_provider_test(
+                provider_id,
+                true,
+                Some(crate::store::now()),
+                &prov.models,
+            );
         }
     }
     crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
@@ -483,7 +645,11 @@ pub async fn disconnect_subscription(
         .map_err(|_| "Wait for the active operation before disconnecting.")?;
     crate::subscription_auth::clear_session(&state.daytona_vault, &provider)?;
     if let Ok(store) = state.database() {
-        let provider_id = if provider == "chatgpt" { "chatgpt-subscription" } else { "grok-subscription" };
+        let provider_id = if provider == "chatgpt" {
+            "chatgpt-subscription"
+        } else {
+            "grok-subscription"
+        };
         if let Ok(Some(prov)) = store.provider(provider_id) {
             let _ = store.update_provider_test(provider_id, false, None, &prov.models);
         }
@@ -510,9 +676,18 @@ pub async fn start_subscription_sign_in(
     )
     .await?;
     if let Ok(store) = state.database() {
-        let provider_id = if provider == "chatgpt" { "chatgpt-subscription" } else { "grok-subscription" };
+        let provider_id = if provider == "chatgpt" {
+            "chatgpt-subscription"
+        } else {
+            "grok-subscription"
+        };
         if let Ok(Some(prov)) = store.provider(provider_id) {
-            let _ = store.update_provider_test(provider_id, true, Some(crate::store::now()), &prov.models);
+            let _ = store.update_provider_test(
+                provider_id,
+                true,
+                Some(crate::store::now()),
+                &prov.models,
+            );
         }
     }
     crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
@@ -522,4 +697,3 @@ pub async fn start_subscription_sign_in(
 pub fn cancel_subscription_sign_in(state: State<'_, AppState>) {
     state.oauth_cancel.send_replace(true);
 }
-

@@ -12,6 +12,7 @@ struct Snapshot {
     conversation: Conversation,
     tool_selection: ConversationTools,
     messages: Vec<Message>,
+    presentations: Vec<crate::presentation::Record>,
 }
 
 fn snapshot(store: &Store, id: &str) -> Result<Snapshot, String> {
@@ -21,11 +22,12 @@ fn snapshot(store: &Store, id: &str) -> Result<Snapshot, String> {
         .find(|item| item.id == id)
         .ok_or("Conversation no longer exists.")?;
     Ok(Snapshot {
-        schema_version: 1,
+        schema_version: 2,
         exported_at: crate::store::now(),
         conversation,
         tool_selection: store.conversation_tools(id)?,
         messages: store.messages(id)?,
+        presentations: store.presentations(id)?,
     })
 }
 
@@ -138,7 +140,8 @@ mod tests {
     use super::*;
     fn fixture() -> Snapshot {
         Snapshot {
-            schema_version: 1,
+            schema_version: 2,
+            presentations: vec![],
             exported_at: 123,
             conversation: Conversation {
                 id: "chat".into(),
@@ -151,6 +154,7 @@ mod tests {
             tool_selection: ConversationTools::default(),
             messages: vec![
                 Message {
+                    metrics: None,
                     error: None,
                     id: "assistant".into(),
                     conversation_id: "chat".into(),
@@ -161,6 +165,7 @@ mod tests {
                     created_at: 110,
                 },
                 Message {
+                    metrics: None,
                     error: None,
                     id: "tool".into(),
                     conversation_id: "chat".into(),
@@ -178,7 +183,8 @@ mod tests {
         let snapshot = fixture();
         let json: serde_json::Value =
             serde_json::from_slice(&render(&snapshot, "json").unwrap()).unwrap();
-        assert_eq!(json["schemaVersion"], 1);
+        assert_eq!(json["schemaVersion"], 2);
+        assert!(json["presentations"].is_array());
         assert_eq!(json["messages"][0]["reasoning"], "Thinking evidence");
         assert_eq!(json["messages"][0]["status"], "interrupted");
         assert_eq!(json["messages"][1]["content"], snapshot.messages[1].content);

@@ -1,0 +1,70 @@
+{
+  "node": "v22.22.1",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 5 7535HS with Radeon Graphics",
+    "logicalCpus": 12,
+    "totalMemoryBytes": 15916511232
+  },
+  "samples": 300,
+  "results": {
+    "core": {
+      "sourceChars": 73,
+      "validationP50Ms": 0.09555100000000039,
+      "validationP95Ms": 0.14292999999997846
+    },
+    "data": {
+      "sourceChars": 80,
+      "validationP50Ms": 0.08638400000000956,
+      "validationP95Ms": 0.13954400000000078
+    },
+    "coding": {
+      "sourceChars": 80,
+      "validationP50Ms": 0.04505499999999074,
+      "validationP95Ms": 0.07648399999999356
+    },
+    "invalid": {
+      "sourceChars": 41,
+      "validationP50Ms": 0.047739999999976135,
+      "validationP95Ms": 0.07658500000002277
+    }
+  },
+  "prompts": {
+    "full": {
+      "chars": 5967,
+      "bytes": 6019
+    },
+    "core": {
+      "chars": 4809,
+      "bytes": 4851
+    },
+    "data": {
+      "chars": 5355,
+      "bytes": 5403
+    },
+    "coding": {
+      "chars": 4989,
+      "bytes": 5033
+    }
+  },
+  "chunks": [
+    {
+      "file": "GenUiBlock-IZTW8DJ1.js",
+      "bytes": 2714,
+      "gzipBytes": 1188
+    },
+    {
+      "file": "GenUiSurface-OjCbJcFR.js",
+      "bytes": 671,
+      "gzipBytes": 454
+    },
+    {
+      "file": "actions-TbRnZrCy.js",
+      "bytes": 209217,
+      "gzipBytes": 64527
+    }
+  ],
+  "nodeProcessPeakRssKiB": 164208,
+  "limitations": "Warm Node CPU validation; excludes React/browser paint, native app RAM, tokenizer counts and inference. Chunks are current build size, not a measured incremental baseline."
+}

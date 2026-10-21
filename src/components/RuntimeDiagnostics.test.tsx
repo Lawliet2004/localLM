@@ -3,7 +3,8 @@ import userEvent from '@testing-library/user-event';
 import { expect, it, vi } from 'vitest';
 import { RuntimeDiagnostics } from './RuntimeDiagnostics';
 const read = vi.hoisted(() => vi.fn());
-vi.mock('../lib/api', () => ({ nativeAvailable: true, errorMessage: String, api: { readRuntimeLog: read } }));
+const retest = vi.hoisted(() => vi.fn());
+vi.mock('../lib/api', () => ({ nativeAvailable: true, errorMessage: String, api: { readRuntimeLog: read, retestToolCalling: retest } }));
 it('renders log text literally and refreshes after an error', async () => {
   read.mockRejectedValueOnce('Read failed').mockResolvedValueOnce({ content: '<script>example</script>', truncated: true });
   render(<RuntimeDiagnostics />);
@@ -14,9 +15,10 @@ it('renders log text literally and refreshes after an error', async () => {
   expect(screen.getByRole('status')).toHaveTextContent('final 64 KiB');
   expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   expect(screen.queryByText(/offered again on the next message/i)).not.toBeInTheDocument();
+  retest.mockResolvedValue({ supported: true, message: 'Native structured tool call verified. No tool action was executed.' });
   await userEvent.click(screen.getByRole('button', { name: 'Retest tool calling' }));
-  expect(screen.getByText(/Tool calling will be offered again on the next message/i)).toBeInTheDocument();
-  expect(screen.getByText(/malformed call is repaired once without disabling later turns/i)).toBeInTheDocument();
+  expect(await screen.findByText('Native structured tool call verified. No tool action was executed.')).toBeInTheDocument();
+  expect(retest).toHaveBeenCalledTimes(1);
   expect(screen.getByRole('status')).toHaveTextContent('final 64 KiB');
   expect(read).toHaveBeenCalledTimes(2);
 });

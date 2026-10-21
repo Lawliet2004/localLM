@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Download, HardDrive, Heart, Search, Trash2, Play, RefreshCw, ExternalLink } from 'lucide-react';
 import { api, errorMessage, nativeAvailable, type ModelInstallStatus } from '../lib/api';
 import type { HardwareStatus, HubRepo, HubSearchHit, InstalledModel } from '../lib/types';
 import { modelLabel } from '../lib/localModels';
-import { compactCount, downloadSize, fitKind, fitLabel, parseHubQuery, preferredFile, preferredProjector, projectorFiles, quantLabel, repoParts, weightFiles } from '../lib/modelStudio';
+import { compactCount, downloadSize, fitKind, fitLabel, hubSize, parseHubQuery, preferredFile, preferredProjector, projectorFiles, quantLabel, repoParts, weightFiles } from '../lib/modelStudio';
 import { gib } from '../lib/runtimeGuidance';
 import { samePath } from '../lib/pathUtils';
 
@@ -39,6 +39,7 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
   const [searched, setSearched] = useState(false);
   const [browseMode, setBrowseMode] = useState<'popular' | 'search'>('popular');
   const [hardware, setHardware] = useState<HardwareStatus | null>(null);
+  const hubRequest = useRef(0);
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
@@ -62,9 +63,10 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
+    const request = hubRequest.current;
     void api.searchHuggingFace('').then(value => {
-      if (!disposed) { setResults(value); setSearched(true); setBrowseMode('popular'); }
-    }).catch(e => { if (!disposed) setError(errorMessage(e)); });
+      if (!disposed && request === hubRequest.current) { setResults(value); setSearched(true); setBrowseMode('popular'); }
+    }).catch(e => { if (!disposed && request === hubRequest.current) setError(errorMessage(e)); });
     return () => { disposed = true; };
   }, []);
   const locked = busy || working;
@@ -85,8 +87,10 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
     finally { setWorking(false); }
   }
   async function openRepo(value: string) {
+    const request = ++hubRequest.current;
     setCatalog(null); setFilename(''); setProjector('');
     const result = await api.huggingFaceFiles(value.trim(), token || undefined);
+    if (request !== hubRequest.current) return;
     setCatalog(result);
     const weights = preferredFile(result.files);
     setFilename(weights);
@@ -101,24 +105,28 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
       await openRepo(repo);
       return;
     }
+    const request = ++hubRequest.current;
     setCatalog(null);
     setFilename('');
     setProjector('');
-    setResults(await api.searchHuggingFace(raw, token || undefined));
+    setResults([]);
+    const results = await api.searchHuggingFace(raw, token || undefined);
+    if (request !== hubRequest.current) return;
+    setResults(results);
     setSearched(true);
     setBrowseMode(raw.trim() ? 'search' : 'popular');
   }
-  const quantRows = useMemo(() => catalog ? weightFiles(catalog.files).map(file => {
-    const bytes = downloadSize(catalog.files, file.filename) ?? file.bytes;
-    const kind = fitKind(bytes, hardware);
-    return { file, bytes, kind, quant: quantLabel(file.filename) };
-  }) : [], [catalog, hardware]);
-  const selected = quantRows.find(row => row.file.filename === filename);
   const projectors = useMemo(() => catalog ? projectorFiles(catalog.files) : [], [catalog]);
   const projectorBytes = useMemo(() => {
     if (!catalog || !projector) return 0;
     return downloadSize(catalog.files, projector) ?? catalog.files.find(file => file.filename === projector)?.bytes ?? 0;
   }, [catalog, projector]);
+  const quantRows = useMemo(() => catalog ? weightFiles(catalog.files).map(file => {
+    const bytes = downloadSize(catalog.files, file.filename) ?? file.bytes;
+    const kind = fitKind(bytes, hardware, projectorBytes);
+    return { file, bytes, kind, quant: quantLabel(file.filename) };
+  }) : [], [catalog, hardware, projectorBytes]);
+  const selected = quantRows.find(row => row.file.filename === filename);
   const visibleModels = models.filter(model => {
     const haystack = `${modelLabel(model.filename)} ${model.filename} ${model.repo ?? ''}`.toLowerCase();
     return haystack.includes(libraryQuery.trim().toLowerCase());
@@ -131,7 +139,7 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
     {view === 'discover' ? <div className="studio-discover">
       <section className="studio-pane" aria-labelledby="discover-heading">
         <div className="studio-pane-head">
-          <div><p className="eyebrow">HUGGING FACE</p><h2 id="discover-heading">Discover</h2></div>
+          <div><p className="eyebrow">Hugging Face</p><h2 id="discover-heading">Discover</h2></div>
         </div>
         <p className="section-description">Search GGUF models, paste an owner/name, or drop a Hugging Face URL. Choose a quantization that fits this machine, then download.</p>
         <form className="studio-search" onSubmit={e => { e.preventDefault(); void run(() => searchHub(query)); }}>
@@ -140,8 +148,10 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
           </label>
           <button className="primary" disabled={locked}>Search</button>
         </form>
+        {working && <p role="status">Searching Hugging Face…</p>}
+        {error && <p className="error" role="alert">{error}</p>}
         <details className="hub-access"><summary>Private or gated repository</summary><label>Hugging Face read token<input type="password" autoComplete="off" value={token} onChange={e => setToken(e.target.value)} placeholder="hf_…" /></label><small>Used only for this page session. Accept any required license on Hugging Face first.</small></details>
-        {searched && !results.length && !catalog && <p>No matching repositories. Try another name or paste an owner/model.</p>}
+        {searched && !results.length && !catalog && !working && !error && <p>No matching repositories. Try another name or paste an owner/model.</p>}
         {results.length > 0 && <div className="studio-results" aria-label={browseMode === 'popular' ? 'Popular GGUF models' : 'Hugging Face search results'}>
           <p className="hub-results-heading">{browseMode === 'popular' ? 'Popular GGUF models' : 'Search results'}</p>
           {results.map(hit => {
@@ -162,34 +172,36 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
             <a className="secondary" href={`https://huggingface.co/${catalog.repo}`} target="_blank" rel="noreferrer"><ExternalLink size={14} />Hugging Face</a>
           </div>
           <p className="section-description">{catalog.repo} · SHA-256 verified · Split models download every shard together. Q4_K_M is the usual starting point when it is available.</p>
+          <p className="section-description">Sizes show GiB and Hugging Face's decimal GB/MB; the byte counts are the same. MTP heads, projectors, and adapters are excluded from standalone models.</p>
           {!quantRows.length ? <p>No downloadable GGUF weight files with verification metadata found in this repository.</p> : <div className="quant-table" role="table" aria-label="GGUF file / quantization">
             <div className="quant-row quant-head" role="row"><div className="quant-select"><span>Quant</span><span>File</span><span>Size</span><span>This machine</span></div><span /></div>
             {quantRows.map(row => <div className={`quant-row${filename === row.file.filename ? ' selected' : ''}`} key={row.file.filename} role="row">
               <button type="button" className="quant-select" disabled={locked} aria-pressed={filename === row.file.filename} onClick={() => { setFilename(row.file.filename); setProjector(current => current || preferredProjector(catalog?.files ?? [], row.file.filename)); }}>
                 <strong>{row.quant}</strong>
                 <span className="quant-name">{row.file.filename.split('/').pop()}</span>
-                <span>{gib(row.bytes)}</span>
+                <span className="quant-size" title={`${row.bytes.toLocaleString()} bytes`}><span>{gib(row.bytes)}</span><small>{hubSize(row.bytes)}</small></span>
                 <span className={`fit-badge fit-${row.kind}`}>{fitLabel(row.kind)}</span>
               </button>
               <button type="button" className="secondary" aria-label={`Download ${row.quant}`} disabled={downloadLocked} onClick={() => { setFilename(row.file.filename); void download(catalog.repo, catalog.revision, row.file.filename, projector || undefined); }}>Download</button>
             </div>)}
           </div>}
+          {selected && <p className="section-description">Memory candidates include the weights{projector ? ' and selected projector' : ''}, plus at least 1 GiB of runtime headroom, using currently free memory. Context cache and image buffers need additional memory; these estimates do not guarantee a fit.</p>}
           {selected && projectors.length > 0 && <div className="quant-projector">
-            <label>Vision projector (optional, enables image input)
+            <label>Vision projector (required for image input)
               <select aria-label="Vision projector" value={projector} disabled={locked} onChange={e => setProjector(e.target.value)}>
                 <option value="">None · text only</option>
-                {projectors.map(file => <option key={file.filename} value={file.filename}>{file.filename.split('/').pop()} · {gib(file.bytes)}</option>)}
+                {projectors.map(file => <option key={file.filename} value={file.filename}>{file.filename.split('/').pop()} · {gib(file.bytes)} ({hubSize(file.bytes)})</option>)}
               </select>
-              <small>Multimodal models need their matching mmproj file to see images. {projector ? `${gib(projectorBytes)} downloads with the model.` : 'Leave empty for text-only chat.'}</small>
+              <small>This GGUF package stores its multimodal encoder/projector weights separately. Native image support needs one matching projector; None keeps text-only chat. F16 and BF16 are 16-bit alternatives; F32 uses more space.</small>
             </label>
           </div>}
-          {selected && <div className="quant-cta"><div><strong>{selected.quant}</strong><p>{gib(selected.bytes)}{projector ? ` + ${gib(projectorBytes)} projector` : ''} · {fitLabel(selected.kind)}. Projectors and adapters are companion files, not standalone chat models.</p></div><button type="button" className="primary" disabled={downloadLocked || !filename} onClick={() => void download(catalog.repo, catalog.revision, filename, projector || undefined)}><Download size={14} />Download model{projector ? ' + projector' : ''}</button></div>}
+          {selected && <div className="quant-cta"><div><strong>{selected.quant} · {projector ? 'Image + text' : 'Text only'}</strong><p>{gib(selected.bytes)} weights{projector ? ` + ${gib(projectorBytes)} projector` : ''}</p><p>Total download: {gib(selected.bytes + projectorBytes)} ({hubSize(selected.bytes + projectorBytes)}) · {fitLabel(selected.kind)}</p></div><button type="button" className="primary" disabled={downloadLocked || !filename} onClick={() => void download(catalog.repo, catalog.revision, filename, projector || undefined)}><Download size={14} />Download model{projector ? ' + projector' : ''}</button></div>}
         </>}
 
       </section>
     </div> : <section className="studio-pane studio-library" aria-labelledby="library-heading">
       <div className="studio-pane-head">
-        <div><p className="eyebrow">ON THIS MACHINE</p><h2 id="library-heading">My Models <span className="selection-badge">{models.length}</span></h2></div>
+        <div><p className="eyebrow">On this machine</p><h2 id="library-heading">My Models <span className="selection-badge">{models.length}</span></h2></div>
         <button type="button" className="secondary" disabled={locked || loading} onClick={() => void run(onRefresh)}><RefreshCw size={14} />Refresh</button>
       </div>
       <p className="section-description">Load any downloaded GGUF, including the original catalog models. Each file remembers its runtime settings. Deleting a model keeps your conversations.</p>
@@ -224,7 +236,7 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
         </article>;
       })}</div>
     </section>}
-    {error && <p className="error" role="alert">{error}</p>}
+    {view === 'library' && error && <p className="error" role="alert">{error}</p>}
     {notice && <p className="success" role="status">{notice}</p>}
   </div>;
 }

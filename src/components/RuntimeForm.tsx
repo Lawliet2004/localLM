@@ -10,6 +10,8 @@ interface Props {
   onSave: (config: RuntimeConfig) => void;
   busy: boolean;
   modelPath?: string;
+  projectorPath?: string;
+  onChooseProjector?: () => void;
   runtime?: RuntimeStatus;
 }
 
@@ -19,12 +21,14 @@ function meterMax(used: number | null, available: number | null) {
   return Math.max(used, available);
 }
 
-export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props) {
+export function RuntimeForm({ initial, onSave, busy, modelPath, projectorPath, onChooseProjector, runtime }: Props) {
   const [config, setConfig] = useState(initial);
   const [error, setError] = useState('');
   const [model, setModel] = useState<ModelMetadata | null>(null);
   const [hardware, setHardware] = useState<HardwareStatus | null>(null);
   const [metadataError, setMetadataError] = useState('');
+  const [projectorBytes, setProjectorBytes] = useState<number | null>(projectorPath ? null : 0);
+  const [projectorError, setProjectorError] = useState('');
   useEffect(() => setConfig(initial), [initial]);
   useEffect(() => {
     if (!nativeAvailable || !modelPath) return;
@@ -34,15 +38,26 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props
     void api.hardwareStatus().then(value => { if (!disposed) setHardware(value); }).catch(() => {});
     return () => { disposed = true; };
   }, [modelPath]);
+  useEffect(() => {
+    let disposed = false;
+    setProjectorError('');
+    setProjectorBytes(projectorPath ? null : 0);
+    if (projectorPath && nativeAvailable) {
+      void api.readModelMetadata(projectorPath).then(value => {
+        if (!disposed) setProjectorBytes(value.fileBytes);
+      }).catch(error => { if (!disposed) setProjectorError(String(error)); });
+    }
+    return () => { disposed = true; };
+  }, [projectorPath]);
   const maxContext = Math.min(model?.contextLength ?? contextSafetyLimit, contextSafetyLimit);
   const modelLayers = model ? modelMaxLayers(model) : null;
   const maxLayers = modelLayers ?? 999;
-  const fittedLayers = model ? fittingGpuLayers(model, hardware, { ...config, gpuLayers: -1 }) : null;
+  const fittedLayers = model ? fittingGpuLayers(model, hardware, { ...config, gpuLayers: -1 }, projectorBytes) : null;
   const estimateConfig = config.gpuLayers === -1 && fittedLayers != null
     ? { ...config, gpuLayers: modelLayers != null && fittedLayers >= modelLayers ? -1 : fittedLayers }
     : config;
-  const estimate = model ? estimateMemory(model, estimateConfig) : null;
-  const recommended = model ? recommendedConfig(model, hardware) : null;
+  const estimate = model ? estimateMemory(model, estimateConfig, projectorBytes) : null;
+  const recommended = model ? recommendedConfig(model, hardware, projectorBytes, config) : null;
   const gpu = hardware?.gpus[0];
   const freeGpu = gpu?.memoryTotalMib != null && gpu?.memoryUsedMib != null ? (gpu.memoryTotalMib - gpu.memoryUsedMib) * 2 ** 20 : null;
   const planningGpu = availableGpuBytes(hardware);
@@ -52,6 +67,9 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props
   }
   const device = config.gpuLayers === 0 ? 'cpu' : config.gpuLayers === -1 ? 'auto' : 'custom';
   const loadedHere = Boolean(runtime?.gpuOffload && runtime.phase === 'ready' && samePath(runtime.modelPath, modelPath));
+  const loadedModel = runtime?.phase === 'ready' && samePath(runtime.modelPath, modelPath);
+  const vision = config.visionEnabled !== false;
+  const projectorOffload = config.offloadProjector !== false;
   return <form className="runtime-form" onSubmit={event => {
     event.preventDefault();
     if (!config.flashAttention && config.cacheTypeV !== 'f16') {
@@ -113,15 +131,35 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props
           {config.contextLength > maxContext && <p className="error" role="alert">Saved context exceeds this model’s limit. Choose a smaller value before saving.</p>}
         </article>
         <article className="runtime-card runtime-card-wide">
+          <div className="runtime-card-head"><Sparkles size={18} /><div><small>Optional model component</small><strong>Vision projector</strong></div></div>
+          <p className="runtime-help">Keep the matching projector downloaded and choose whether to load it. Its placement is independent of the language model's GPU layers.</p>
+          <label className="check-row"><input type="checkbox" checked={vision} disabled={busy} onChange={e => update('visionEnabled', e.target.checked)} />Load vision projector</label>
+          <label>Projector placement<select aria-label="Projector placement" value={projectorOffload ? 'gpu' : 'cpu'} disabled={busy || !vision} onChange={e => update('offloadProjector', e.target.value === 'gpu')}>
+            <option value="gpu">GPU preferred · use VRAM</option>
+            <option value="cpu">CPU only · use system RAM</option>
+          </select></label>
+          <dl className="runtime-stats">
+            <div><dt>Configured file</dt><dd className="runtime-projector-file" title={projectorPath}>{projectorPath?.split(/[\\/]/).pop() || 'No projector configured'}</dd></div>
+            <div><dt>Projector weights</dt><dd>{!projectorPath ? 'None' : projectorBytes === null ? 'Size unknown' : gib(projectorBytes)}</dd></div>
+            <div><dt>After saving</dt><dd>{!vision || !projectorPath ? 'Off · text only' : projectorOffload ? 'On · GPU preferred' : 'On · CPU only'}</dd></div>
+            {loadedModel && <div><dt>Currently loaded</dt><dd>{runtime.projector ? `On · ${runtime.projector.offload ? 'GPU preferred' : 'CPU only'}` : runtime.projector === null ? 'Off · text only' : 'Status unavailable; reload to check'}</dd></div>}
+            {loadedModel && runtime.projector && <div><dt>Loaded file</dt><dd className="runtime-projector-file" title={runtime.projector.path}>{runtime.projector.path.split(/[\\/]/).pop()}</dd></div>}
+          </dl>
+          {onChooseProjector && <button type="button" className="secondary" disabled={busy} onClick={onChooseProjector}>Choose projector file…</button>}
+          {vision && !projectorPath && <p className="runtime-help">Choose a matching mmproj file to enable images. Until then the model loads with text input only.</p>}
+          {vision && projectorError && <p className="selection-warning">Projector unavailable: {projectorError}. Choose an existing matching file, or turn off Load vision projector.</p>}
+          <p className="runtime-help">Turning this off keeps the file and frees its runtime memory after reload. CPU placement keeps image input while saving projector VRAM. GPU preferred allows acceleration when supported. These are startup settings: saving reloads the model and clears its in-memory prompt cache; conversation history stays saved. Projector layers cannot be split individually with these runtime controls.</p>
+        </article>
+        <article className="runtime-card runtime-card-wide">
           <div className="runtime-card-head"><MemoryStick size={18} /><div><small>Memory this configuration will use</small><strong>{model ? gib(model.fileBytes) : 'Unknown'} weights on disk</strong></div></div>
           {estimate ? <div className="memory-meters" aria-label="Estimated model memory">
             <div className={estimate.gpuBytes != null && freeGpu != null && estimate.gpuBytes + 2 ** 30 > freeGpu ? 'tight' : undefined}>
-              <div className="memory-meter-head"><small>GPU · weights + cache</small><strong>{estimate.gpuBytes == null ? 'Unknown' : gib(estimate.gpuBytes)}</strong></div>
+              <div className="memory-meter-head"><small>GPU · weights + cache + projector</small><strong>{estimate.gpuBytes == null ? 'Unknown' : gib(estimate.gpuBytes)}</strong></div>
               <progress aria-label="Estimated GPU memory" value={estimate.gpuBytes ?? 0} max={meterMax(estimate.gpuBytes, freeGpu)} />
               <span>{freeGpu == null ? 'Available VRAM unknown' : `${gib(freeGpu)} VRAM free now`}</span>
             </div>
             <div className={estimate.ramBytes != null && hardware?.memoryAvailableBytes != null && estimate.ramBytes + 2 ** 30 > hardware.memoryAvailableBytes ? 'tight' : undefined}>
-              <div className="memory-meter-head"><small>System RAM · weights + cache</small><strong>{estimate.ramBytes == null ? 'Unknown' : gib(estimate.ramBytes)}</strong></div>
+              <div className="memory-meter-head"><small>System RAM · weights + cache + projector</small><strong>{estimate.ramBytes == null ? 'Unknown' : gib(estimate.ramBytes)}</strong></div>
               <progress aria-label="Estimated system memory" value={estimate.ramBytes ?? 0} max={meterMax(estimate.ramBytes, hardware?.memoryAvailableBytes ?? null)} />
               <span>{hardware?.memoryAvailableBytes == null ? 'Available RAM unknown' : `${gib(hardware.memoryAvailableBytes)} RAM free now`}</span>
             </div>
@@ -130,7 +168,7 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props
               <span>At {config.contextLength.toLocaleString()} context tokens{estimate.partial ? ' · cache layout incomplete' : ''}</span>
             </div>
           </div> : <p className="runtime-help">Memory estimates appear after the selected GGUF header can be read.</p>}
-          <p className="runtime-help">Planning estimates, not measured allocation. {estimate?.partial ? 'Cache layout or layer count is unavailable, so GPU/RAM totals are incomplete. ' : ''}Layer sizes vary. Compute buffers, runtime overhead and memory-mapped pages are excluded. About 1 GiB of GPU headroom is reserved in the “fits in VRAM” figure{planningGpu != null ? ` (${gib(planningGpu)} usable after that reserve)` : ''}.</p>
+          <p className="runtime-help">Planning estimates, not measured allocation. {estimate?.partial ? 'Cache layout, layer count, or projector size is unavailable, so GPU/RAM totals are incomplete. ' : ''}Projector weight size is charged to its selected device. Layer sizes vary. Image/compute buffers, runtime overhead and memory-mapped pages are excluded. About 1 GiB of GPU headroom is reserved in the “fits in VRAM” figure{planningGpu != null ? ` (${gib(planningGpu)} usable after that reserve)` : ''}.</p>
           {estimate?.gpuBytes != null && freeGpu !== null && estimate.gpuBytes + 2 ** 30 > freeGpu && <p className="selection-warning">GPU memory is tight. Reduce GPU layers or context, or move the cache to RAM. Other running models are included in the available-memory reading.</p>}
           {estimate?.ramBytes != null && hardware?.memoryAvailableBytes != null && estimate.ramBytes + 2 ** 30 > hardware.memoryAvailableBytes && <p className="selection-warning">System RAM is tight. Reduce context or choose a smaller quantization.</p>}
         </article>
@@ -172,6 +210,6 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, runtime }: Props
       </fieldset>
     </details>
     {error && <p className="error" role="alert">{error}</p>}
-    <div className="form-footer"><small>{runtime?.phase === 'ready' ? 'Saving reloads the model so the new context is actually loaded.' : 'Load the model after saving to allocate the selected context window.'}</small><button className="primary" type="submit" disabled={busy}>Save configuration</button></div>
+    <div className="form-footer"><small>{runtime?.phase === 'ready' ? 'Saving reloads the model to apply context, memory, and projector settings.' : 'Load the model after saving to apply context, memory, and projector settings.'}</small><button className="primary" type="submit" disabled={busy}>Save configuration</button></div>
   </form>;
 }

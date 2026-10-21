@@ -7,17 +7,25 @@ import type { PlannedQuery, FreshnessWindow, LLMProvider } from '../types';
 import { planQueriesDeterministically } from './fallback_planner';
 import { QUERY_PLAN_SCHEMA } from './query_schema';
 
+export type PlanningStrategy = 'auto' | 'rules' | 'model';
+
 export class QueryPlanner {
   constructor(private llmProvider?: LLMProvider) {}
 
+  /**
+   * `strategy` decides who plans. `rules`/`auto`-on-small-modes keep planning
+   * free; `model` (or `auto` on a deep turn) spends one bounded LLM call and
+   * still falls back to deterministic planning when the model fails.
+   */
   async planQueries(
     question: string,
     freshness: FreshnessWindow = 'any',
     maxQueries: number = 4,
-    currentDate?: string
+    currentDate?: string,
+    strategy: PlanningStrategy = 'model'
   ): Promise<PlannedQuery[]> {
     maxQueries = Math.max(1, Math.min(4, Math.floor(maxQueries) || 1));
-    if (!this.llmProvider) {
+    if (strategy === 'rules' || !this.llmProvider) {
       return planQueriesDeterministically(question, freshness, maxQueries);
     }
 
@@ -48,6 +56,7 @@ Return valid JSON: {"queries": [{"query": "...", "purpose": "...", "freshness": 
         userPrompt,
         temperature: 0.1,
         maxTokens: 400,
+        reasoningEffort: 'low',
         responseSchema: {
           ...QUERY_PLAN_SCHEMA,
           properties: { queries: { ...QUERY_PLAN_SCHEMA.properties.queries, maxItems: maxQueries } },

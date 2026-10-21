@@ -7,6 +7,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 #[derive(Clone, Serialize)]
@@ -62,9 +63,11 @@ struct Connection {
     service: ConnectorSession,
     tools: Vec<ToolView>,
     local_name: Option<String>,
+    /// Per-session input gate + associated-call registry for typed MCP input.
+    input: Arc<crate::mcp_input::SessionInput>,
 }
 enum ConnectorSession {
-    Remote(RunningService<RoleClient, ()>),
+    Remote(RunningService<RoleClient, crate::mcp_input::McpSessionHandler>),
     Local(crate::local_mcp_process::LocalSession),
 }
 impl ConnectorSession {
@@ -126,6 +129,12 @@ pub struct McpHub {
     connections: HashMap<String, Connection>,
     vault: Arc<crate::vault::Vault>,
     restore_errors: HashMap<String, String>,
+    /// Connectors whose shutdown was signalled but whose exit was never
+    /// confirmed. A second Disconnect reports this state instead of a false
+    /// success: the session is already gone from the map, so there is nothing
+    /// left to shut down and the old "try Disconnect again" advice could not
+    /// do anything.
+    unconfirmed_shutdowns: HashSet<String>,
 }
 
 const CONNECTED_KEY: &str = "connected_connectors";
@@ -135,25 +144,67 @@ fn remembered_connections(store: &crate::store::Store) -> Result<Vec<String>, St
         return Ok(ids);
     }
     // Older versions remembered selected tools, but not their live connections.
-    let ids: std::collections::BTreeSet<_> = store.remembered_tools()?.unwrap_or_default()
-        .tools.into_iter().map(|tool| tool.connector_id).collect();
+    let ids: std::collections::BTreeSet<_> = store
+        .remembered_tools()?
+        .unwrap_or_default()
+        .tools
+        .into_iter()
+        .map(|tool| tool.connector_id)
+        .collect();
     let ids: Vec<_> = ids.into_iter().collect();
     store.save_setting(CONNECTED_KEY, &ids)?;
     Ok(ids)
 }
 
-fn remember_connection(store: &crate::store::Store, id: &str, connected: bool) -> Result<(), String> {
+fn remember_connection(
+    store: &crate::store::Store,
+    id: &str,
+    connected: bool,
+) -> Result<(), String> {
     let mut ids = remembered_connections(store)?;
     ids.retain(|saved| saved != id);
-    if connected { ids.push(id.into()); }
+    if connected {
+        ids.push(id.into());
+    }
     store.save_setting(CONNECTED_KEY, &ids)
 }
 
 pub async fn restore_connections(state: &crate::AppState) -> Result<(), String> {
-    let mut hub = state.connectors.lock().await;
     let ids = remembered_connections(&*state.database()?)?;
-    hub.restore_saved(&ids).await;
+    // The handshake runs **without** the hub lock. That lock is also what a
+    // chat turn needs to read the live connections, so holding it across DNS
+    // resolution, an HTTP request, a process spawn and a tool-catalog read
+    // would stall the first turn of every conversation until every saved
+    // connector had finished.
+    let vault = { state.connectors.lock().await.vault.clone() };
+    for id in ids {
+        let established = McpHub::establish(vault.clone(), &id).await;
+        let mut hub = state.connectors.lock().await;
+        match established {
+            Ok((_view, connection)) => {
+                if let Some(old) = hub.connections.remove(&id) {
+                    let _ = old.service.cancel().await;
+                }
+                hub.connections.insert(id.clone(), connection);
+                hub.restore_errors.remove(&id);
+            }
+            Err(error) => {
+                hub.restore_errors.insert(id.clone(), error);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Read a connector's stored API token from the vault.
+fn token_from(
+    vault: &crate::vault::Vault,
+    id: &str,
+) -> Result<Option<String>, String> {
+    vault
+        .load(&format!("token-{id}"))?
+        .map(|bytes| String::from_utf8(bytes).map_err(|_| "Invalid stored token encoding.".into()))
+        .transpose()
 }
 
 pub struct AgentTool {
@@ -172,16 +223,28 @@ impl Clone for AgentTool {
             ToolBackend::Skills(reader) => ToolBackend::Skills(reader.clone()),
             ToolBackend::Execution(execution) => ToolBackend::Execution(execution.clone()),
             ToolBackend::Workspace(workspace) => ToolBackend::Workspace(workspace.clone()),
+            ToolBackend::Automation(_) | ToolBackend::DetachedAutomation => {
+                ToolBackend::DetachedAutomation
+            }
             // MCP peers hold a live session handle that cannot cross the
             // workflow/spawn boundary; mark the clone detached.
-            ToolBackend::Mcp { local_name, .. } => ToolBackend::DetachedMcp { local_name: local_name.clone() },
-            ToolBackend::DetachedMcp { local_name } => ToolBackend::DetachedMcp { local_name: local_name.clone() },
+            ToolBackend::Mcp { local_name, .. } => ToolBackend::DetachedMcp {
+                local_name: local_name.clone(),
+            },
+            ToolBackend::DetachedMcp { local_name } => ToolBackend::DetachedMcp {
+                local_name: local_name.clone(),
+            },
         };
-        Self { connector: self.connector.clone(), tool: self.tool.clone(), alias: self.alias.clone(), backend }
+        Self {
+            connector: self.connector.clone(),
+            tool: self.tool.clone(),
+            alias: self.alias.clone(),
+            backend,
+        }
     }
 }
 pub fn tool_alias(connector: &str, name: &str) -> String {
-    if connector == "System" {
+    if matches!(connector, "System" | "Browser" | "Computer") {
         return name.into();
     }
     // Harness tools are exposed to the model under their bare registry alias
@@ -220,6 +283,8 @@ pub fn tool_alias(connector: &str, name: &str) -> String {
 }
 enum ToolBackend {
     System,
+    Automation(Arc<crate::automation::Executor>),
+    DetachedAutomation,
     Harness {
         name: String,
     },
@@ -229,6 +294,10 @@ enum ToolBackend {
     Mcp {
         peer: rmcp::Peer<RoleClient>,
         local_name: Option<String>,
+        protocol: Option<crate::mcp_protocol::Operation>,
+        /// Session input channel; cloned `DetachedMcp` backends drop it, so
+        /// detached children have no live input authority by construction.
+        session: Arc<crate::mcp_input::SessionInput>,
     },
     /// Clone marker for MCP tools carried across workflow/spawn boundaries.
     /// The live peer cannot be cloned; the alias/definition still describe the
@@ -240,14 +309,48 @@ enum ToolBackend {
     Workspace(Arc<crate::workspace::Workspace>),
 }
 impl AgentTool {
+    pub fn automation(
+        executor: Arc<crate::automation::Executor>,
+        tool: ToolView,
+        computer: bool,
+    ) -> Self {
+        Self {
+            connector: if computer { "Computer" } else { "Browser" }.into(),
+            alias: tool.name.clone(),
+            tool,
+            backend: ToolBackend::Automation(executor),
+        }
+    }
     pub fn local_server_name(&self) -> Option<&str> {
         match &self.backend {
-            ToolBackend::Mcp { local_name, .. } | ToolBackend::DetachedMcp { local_name } => local_name.as_deref(),
+            ToolBackend::Mcp { local_name, .. } | ToolBackend::DetachedMcp { local_name } => {
+                local_name.as_deref()
+            }
             _ => None,
         }
     }
     pub fn is_mcp(&self) -> bool {
-        matches!(&self.backend, ToolBackend::Mcp { .. } | ToolBackend::DetachedMcp { .. })
+        matches!(
+            &self.backend,
+            ToolBackend::Mcp { .. } | ToolBackend::DetachedMcp { .. }
+        )
+    }
+    pub fn is_mcp_protocol(&self) -> bool {
+        self.is_mcp()
+            && (matches!(
+                &self.backend,
+                ToolBackend::Mcp {
+                    protocol: Some(_),
+                    ..
+                }
+            ) || self.tool.name.starts_with(crate::mcp_protocol::PREFIX))
+    }
+    pub(crate) fn discovery_available(&self) -> bool {
+        match &self.backend {
+            ToolBackend::Mcp { peer, .. } => !peer.is_transport_closed(),
+            ToolBackend::DetachedMcp { .. } | ToolBackend::DetachedAutomation => false,
+            _ => true,
+        }
     }
     pub fn is_harness(&self) -> bool {
         matches!(&self.backend, ToolBackend::Harness { .. })
@@ -256,6 +359,15 @@ impl AgentTool {
         match &self.backend {
             ToolBackend::Harness { name } => Some(name.as_str()),
             _ => None,
+        }
+    }
+    pub fn signature_arguments(&self, args: &Value) -> Value {
+        match &self.backend {
+            ToolBackend::Mcp {
+                protocol: Some(operation),
+                ..
+            } => operation.signature_arguments(args),
+            _ => args.clone(),
         }
     }
     pub fn daytona(executor: crate::daytona_execution::Executor) -> Self {
@@ -269,6 +381,10 @@ impl AgentTool {
         } else if matches!(self.backend, ToolBackend::Harness { .. }) {
             // Orchestration tools (workflows, Ralph, parallel children) settle durably.
             600
+        } else if matches!(self.backend, ToolBackend::Execution(_)) {
+            // Native shell requests can run for the user's 300-second cap;
+            // the execution service enforces that cap and owns cleanup.
+            310
         } else {
             120
         })
@@ -293,7 +409,8 @@ impl AgentTool {
     /// the harness registry; execution runs through the harness dispatcher so
     /// approval, audit, and run states apply. Direct calls fail loud.
     pub fn harness(alias: &str) -> Result<Self, String> {
-        let tool = crate::harness::definition(alias).ok_or_else(|| format!("Unknown harness tool '{alias}'."))?;
+        let tool = crate::harness::definition(alias)
+            .ok_or_else(|| format!("Unknown harness tool '{alias}'."))?;
         Ok(Self {
             connector: "Harness".into(),
             alias: alias.into(),
@@ -301,11 +418,90 @@ impl AgentTool {
             backend: ToolBackend::Harness { name: alias.into() },
         })
     }
+    /// A user-authored plugin tool. The schema comes from the plugin file;
+    /// the call runs through the harness dispatcher like every other harness
+    /// tool, so approval, audit and run states apply. Plugin tools are not
+    /// in the static harness registry, so the definition is built here.
+    pub fn plugin(spec: crate::tool_spec::ToolSpec) -> Self {
+        Self {
+            connector: "Plugin".into(),
+            alias: spec.name.clone(),
+            tool: crate::connectors::ToolView {
+                name: spec.name.clone(),
+                description: spec.description.clone(),
+                input_schema: spec.input,
+            },
+            backend: ToolBackend::Harness { name: spec.name.clone() },
+        }
+    }
+    /// Typed backend family for tool-envelope normalization — the dispatch
+    /// site knows which backend produced a result; classification never has
+    /// to sniff payload text.
+    pub fn envelope_family(&self) -> crate::tool_envelope::Family {
+        match &self.backend {
+            ToolBackend::System => crate::tool_envelope::Family::System,
+            ToolBackend::Automation(_) | ToolBackend::DetachedAutomation => {
+                crate::tool_envelope::Family::Automation
+            }
+            ToolBackend::Harness { .. } => crate::tool_envelope::Family::Harness,
+            ToolBackend::Daytona(_) => crate::tool_envelope::Family::Cloud,
+            ToolBackend::Skills(_) => crate::tool_envelope::Family::Skills,
+            ToolBackend::Execution(_) => crate::tool_envelope::Family::Execution,
+            ToolBackend::Mcp { .. } | ToolBackend::DetachedMcp { .. } => {
+                crate::tool_envelope::Family::Mcp
+            }
+            ToolBackend::Workspace(_) => crate::tool_envelope::Family::Workspace,
+        }
+    }
     pub fn trusted_read(&self) -> bool {
         matches!(&self.backend, ToolBackend::System)
             || matches!(&self.backend, ToolBackend::Harness { name } if crate::harness::is_trusted_read(name))
             || (matches!(&self.backend, ToolBackend::Workspace(_))
-                && matches!(self.tool.name.as_str(), "read_file" | "list_files"))
+                && matches!(
+                    self.tool.name.as_str(),
+                    "read_file"
+                        | "list_files"
+                        | "list_tree"
+                        | "search_files"
+                        | "search_content"
+                        | "glob_files"
+                        | "file_info"
+                        | "document_inspect"
+                        | "document_read"
+                        | "view_image"
+                        | "notebook_read"
+                ))
+    }
+    /// Reads that may overlap inside a bounded concurrent group. Centralized
+    /// here so the parent batch, PTC `parallel` blocks and any future
+    /// scheduler share one classification: trusted reads only, never the
+    /// stateful control aliases (`finish`/`update_context` terminate or mutate
+    /// the turn) and never anything behind an approval gate.
+    pub fn concurrent_read(&self) -> bool {
+        self.trusted_read()
+            && !crate::git_tools::owns(&self.alias)
+            && !crate::lsp_tools::owns(&self.alias)
+            && !matches!(self.alias.as_str(), "finish" | "update_context")
+    }
+    pub fn requires_approval(&self, arguments: &Value) -> bool {
+        self.tool.input_schema["x-locallm-always-ask"] == true
+            || (matches!(self.alias.as_str(), "lsp_apply_edit" | "lsp_rename")
+                && arguments["confirmed_annotations"]
+                    .as_array()
+                    .is_some_and(|v| !v.is_empty()))
+            || matches!(&self.backend, ToolBackend::Execution(execution) if execution.requires_approval(&self.tool.name, arguments))
+    }
+    pub fn prepare_arguments(&self, arguments: Value) -> Result<Value, String> {
+        let arguments = if matches!(&self.backend, ToolBackend::Harness { .. }) {
+            crate::arex::normalize_arguments(&self.tool.name, arguments)
+        } else {
+            arguments
+        };
+        crate::tool_validation::validate(&self.tool.input_schema, &arguments)?;
+        if let ToolBackend::Execution(execution) = &self.backend {
+            return execution.prepare_arguments(&self.tool.name, arguments);
+        }
+        Ok(arguments)
     }
     pub fn execution(execution: Arc<crate::execution::LocalExecution>, tool: ToolView) -> Self {
         let alias = if tool.name == "execute_command" {
@@ -332,29 +528,52 @@ impl AgentTool {
         serde_json::json!({"type":"function","function":{"name":self.alias,"description":format!("{}: {} — {}", self.connector,self.tool.name,self.tool.description),"parameters":self.tool.input_schema}})
     }
     pub async fn call(&self, arguments: Value) -> Result<Value, String> {
-        self.call_with_stream(arguments, None).await
+        self.call_with_input(arguments, None, None).await
     }
-    pub async fn call_with_stream(
+    /// `input` carries live user authority for typed MCP input (form
+    /// elicitation + MRTR continuation). Callers without a UI channel pass
+    /// `None`: the call still serializes on the session gate, but any server
+    /// question fails explicitly instead of hanging.
+    pub async fn call_with_input(
         &self,
         arguments: Value,
         on_chunk: Option<crate::execution::ChunkCallback>,
+        input: Option<crate::mcp_input::CallUi>,
     ) -> Result<Value, String> {
-        let peer = match &self.backend {
+        if matches!(&self.backend, ToolBackend::DetachedAutomation) {
+            return Err("Automation belongs to the parent conversation. Ask the parent to perform this action.".into());
+        }
+        if matches!(&self.backend, ToolBackend::DetachedMcp { .. }) {
+            return Err("This connector tool was inherited without its live session. Ask the parent for what you need instead.".into());
+        }
+        // Recheck the public shape at the common dispatch boundary. A native
+        // source snapshot has already been shown by the approval dispatcher;
+        // its hash and bytes are verified again by the execution service.
+        let mut public_arguments = arguments.clone();
+        if matches!(&self.backend, ToolBackend::Execution(_)) {
+            if let Some(fields) = public_arguments.as_object_mut() {
+                fields.remove("approved_source");
+            }
+        }
+        crate::tool_validation::validate(&self.tool.input_schema, &public_arguments)?;
+        match &self.backend {
+            ToolBackend::Automation(executor) => return executor.call(&self.tool.name, arguments).await,
+            ToolBackend::DetachedAutomation => Err("Automation belongs to the parent conversation. Ask the parent to perform this action.".into()),
             ToolBackend::System => {
                 if self.tool.name == "system_time" {
                     return crate::system_tools::execute_system_time(&arguments);
                 }
-                return Err("Unknown system tool.".into());
+                Err("Unknown system tool.".into())
             }
             ToolBackend::Harness { name } => {
-                return Err(format!("Harness tool '{name}' runs through the agent dispatcher, not direct calls."));
+                Err(format!("Harness tool '{name}' runs through the agent dispatcher, not direct calls."))
             }
             ToolBackend::Daytona(executor) => return executor.call(arguments).await,
             ToolBackend::Skills(reader) => {
                 let reader = reader.clone();
-                return tokio::task::spawn_blocking(move || reader.call(arguments))
+                tokio::task::spawn_blocking(move || reader.call(arguments))
                     .await
-                    .map_err(|_| "Skill read failed unexpectedly.")?;
+                    .map_err(|_| "Skill read failed unexpectedly.")?
             }
             ToolBackend::Execution(execution) => {
                 if self.tool.name == "execute_command" {
@@ -363,37 +582,99 @@ impl AgentTool {
                     return execution.run_with_stream(arguments, on_chunk).await;
                 }
             }
-            ToolBackend::Mcp { peer, .. } => peer,
+            ToolBackend::Mcp { peer, protocol, session, .. } => {
+                // The scope serializes this call on the session input gate and
+                // registers it as the associated operation; it clears pending
+                // questions when it drops, however the call ends.
+                let scope = session.enter(input, &self.tool.name).await?;
+                match protocol {
+                    Some(operation) => crate::mcp_protocol::execute(peer, &self.connector, *operation, arguments, &scope).await,
+                    None => mcp_tool_call(peer, &self.tool.name, arguments, &scope).await,
+                }
+            }
             ToolBackend::DetachedMcp { .. } => {
-                return Err("This connector tool was inherited without its live session. Ask the parent for what you need instead.".into());
+                Err("This connector tool was inherited without its live session. Ask the parent for what you need instead.".into())
             }
             ToolBackend::Workspace(workspace) => {
                 let workspace = workspace.clone();
                 let name = self.tool.name.clone();
-                return tokio::task::spawn_blocking(move || workspace.call(&name, arguments))
+                tokio::task::spawn_blocking(move || workspace.call(&name, arguments))
                     .await
-                    .map_err(|_| "Workspace operation failed unexpectedly.")?;
+                    .map_err(|_| "Workspace operation failed unexpectedly.")?
             }
-        };
-        let arguments = arguments
+        }
+    }
+}
+
+/// SSE reconnect policy for remote connector transports. The pinned SDK's
+/// default retries indefinitely (`max_times: None`), and it can only treat its
+/// own private fatal-error type as terminal — our bounded-stream oversized
+/// event is generic retryable — so a persistent GET-channel failure would
+/// silently reconnect forever. Capped retries surface a real error.
+fn sse_retry_policy() -> rmcp::transport::common::client_side_sse::ExponentialBackoff {
+    let mut retry = rmcp::transport::common::client_side_sse::ExponentialBackoff::default();
+    retry.max_times = Some(8);
+    retry
+}
+
+/// One bounded MRTR round-trip for a connector tool: `call_tool_once`, answer
+/// `inputRequired` through the associated-call input scope, echo the opaque
+/// `request_state` verbatim, and surface `task` results explicitly. The outer
+/// dispatch deadline still applies; a user cancellation is never converted
+/// into a client-side success and the result bound stays at 256 KiB.
+async fn mcp_tool_call(
+    peer: &rmcp::Peer<RoleClient>,
+    name: &str,
+    arguments: Value,
+    scope: &crate::mcp_input::InputScope,
+) -> Result<Value, String> {
+    let mut params = rmcp::model::CallToolRequestParams::new(name.to_string()).with_arguments(
+        arguments
             .as_object()
             .ok_or("Tool arguments must be an object.")?
-            .clone();
-        let response = peer.call_tool_once(rmcp::model::CallToolRequestParams::new(self.tool.name.clone()).with_arguments(arguments)).await.map_err(|_| "Connector tool request failed. Its remote outcome may be unknown; do not automatically retry.".to_string())?;
+            .clone(),
+    );
+    for _ in 0..crate::mcp_input::MAX_CONTINUATION_ROUNDS {
+        let response = peer.call_tool_once(params.clone()).await.map_err(|_| "Connector tool request failed. Its remote outcome may be unknown; do not automatically retry.".to_string())?;
         match response {
             rmcp::model::CallToolResponse::Complete(result) => {
+                if scope.cancelled() {
+                    return Err("The input request was cancelled before completion; the remote outcome may be unknown and is not retried.".into());
+                }
                 let value =
                     serde_json::to_value(result).map_err(|_| "Could not decode tool result.")?;
                 if value.to_string().len() > 262_144 {
                     return Err("Tool result exceeds 256 KiB. Request a narrower result.".into());
                 }
-                Ok(value)
+                return Ok(value);
             }
-            _ => Err(
-                "This tool requires additional server input, which is not supported yet.".into(),
-            ),
+            rmcp::model::CallToolResponse::InputRequired(required) => {
+                if !scope.live() {
+                    return Err(
+                        "This tool requires interactive input that is unavailable for this call."
+                            .into(),
+                    );
+                }
+                if required
+                    .request_state
+                    .as_ref()
+                    .is_some_and(|state| state.len() > crate::mcp_input::MAX_REQUEST_STATE_BYTES)
+                {
+                    return Err("The server sent an oversized continuation state.".into());
+                }
+                params.request_state = required.request_state.clone();
+                params.input_responses = Some(scope.fulfill(required.input_requests).await?);
+            }
+            rmcp::model::CallToolResponse::Task(task) => {
+                return Err(format!(
+                    "The server delegated '{name}' to task '{}', but task polling is not supported; the remote outcome is unknown and the call is not retried.",
+                    task.task.task_id
+                ));
+            }
+            _ => return Err("The server sent an unsupported tool response type.".into()),
         }
     }
+    Err("The server required more input rounds than allowed; the call was abandoned.".into())
 }
 
 fn presets() -> Vec<ConnectorView> {
@@ -460,19 +741,25 @@ impl McpHub {
         ids: &[String],
         selections: &[ToolSelection],
     ) -> Result<(Vec<AgentTool>, Vec<String>), String> {
-        if ids.len() > 32 || selections.len() > 32 {
-            return Err("At most 32 tools can be offered in a turn.".into());
+        if ids.len() > 64 || selections.len() > crate::tool_discovery::MAX_CATALOG {
+            return Err("Select at most64 connector sources and4096 tools.".into());
         }
         let live = self.active_connector_ids();
         let mut unavailable = Vec::new();
-        for id in ids.iter().chain(selections.iter().map(|tool| &tool.connector_id)) {
+        for id in ids
+            .iter()
+            .chain(selections.iter().map(|tool| &tool.connector_id))
+        {
             if !live.contains(id) && !unavailable.contains(id) {
                 unavailable.push(id.clone());
             }
         }
         let ids: Vec<_> = ids.iter().filter(|id| live.contains(id)).cloned().collect();
-        let selections: Vec<_> = selections.iter()
-            .filter(|tool| live.contains(&tool.connector_id)).cloned().collect();
+        let selections: Vec<_> = selections
+            .iter()
+            .filter(|tool| live.contains(&tool.connector_id))
+            .cloned()
+            .collect();
         Ok((self.selected_tools(&ids, &selections)?, unavailable))
     }
 
@@ -481,8 +768,8 @@ impl McpHub {
         ids: &[String],
         selections: &[ToolSelection],
     ) -> Result<Vec<AgentTool>, String> {
-        if ids.len() > 32 || selections.len() > 32 {
-            return Err("At most 32 tools can be offered in a turn.".into());
+        if ids.len() > 64 || selections.len() > crate::tool_discovery::MAX_CATALOG {
+            return Err("Select at most64 connector sources and4096 tools.".into());
         }
         let mut tools = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -509,8 +796,8 @@ impl McpHub {
                 ids.contains(id),
             )?;
             for tool in selected {
-                if tools.len() >= 32 {
-                    break;
+                if tools.len() >= crate::tool_discovery::MAX_CATALOG {
+                    return Err("Selected connector catalog exceeds4096 tools; narrow the selected sources.".into());
                 }
                 tools.push(AgentTool {
                     connector: id.clone(),
@@ -519,6 +806,8 @@ impl McpHub {
                     backend: ToolBackend::Mcp {
                         peer: connection.service.peer(),
                         local_name: connection.local_name.clone(),
+                        protocol: crate::mcp_protocol::Operation::from_name(&tool.name),
+                        session: connection.input.clone(),
                     },
                 });
             }
@@ -530,24 +819,33 @@ impl McpHub {
             connections: HashMap::new(),
             vault,
             restore_errors: HashMap::new(),
+            unconfirmed_shutdowns: HashSet::new(),
         }
     }
+    /// Reconnect saved connectors.
+    ///
+    /// The production startup path establishes the sessions **without** the
+    /// hub lock (see `restore_connections`), so this helper is only used by
+    /// tests that drive the hub directly.
+    #[cfg(test)]
     async fn restore_saved(&mut self, ids: &[String]) {
         for id in ids {
-            if self.active_connector_ids().contains(id) { continue; }
+            if self.active_connector_ids().contains(id) {
+                continue;
+            }
             if let Err(error) = self.connect(id).await {
                 self.restore_errors.insert(id.clone(), error);
             }
         }
     }
     fn token(&self, id: &str) -> Result<Option<String>, String> {
-        self.vault
-            .load(&format!("token-{id}"))?
-            .map(|bytes| {
-                String::from_utf8(bytes).map_err(|_| "Invalid stored token encoding.".into())
-            })
-            .transpose()
+        token_from(&self.vault, id)
     }
+    /// Store a connector's API token in the vault.
+    ///
+    /// The keyring call blocks, so the async caller path uses
+    /// `spawn_blocking` around it instead of calling this directly.
+    #[cfg(test)]
     fn save_token(&self, id: &str, value: &str) -> Result<(), String> {
         if preset_credential(id)? != "header" {
             return Err("This connector does not use an API token. Use account sign-in for OAuth connectors.".into());
@@ -591,7 +889,9 @@ impl McpHub {
         let mut ids: Vec<String> = self
             .connections
             .iter()
-            .filter(|(_, conn)| !conn.service.is_closed() && !conn.service.peer().is_transport_closed())
+            .filter(|(_, conn)| {
+                !conn.service.is_closed() && !conn.service.peer().is_transport_closed()
+            })
             .map(|(id, _)| id.clone())
             .collect();
         ids.sort();
@@ -637,22 +937,52 @@ impl McpHub {
         servers.remove(index);
         crate::local_mcp_config::save(&self.vault, &servers)
     }
+    /// Establish a connector session and record it.
+    ///
+    /// The handshake itself runs in [`McpHub::establish`], **without** the
+    /// hub lock: the global connectors mutex is also what a chat turn needs
+    /// to read the live connections, so holding it across DNS resolution, an
+    /// HTTP request, a process spawn and a tool-catalog read would stall
+    /// every turn until every connector finished.
     pub async fn connect(&mut self, id: &str) -> Result<ConnectorView, String> {
         let local = crate::local_mcp_config::load(&self.vault)?
+            .into_iter()
+            .any(|server| server.id == id);
+        if local && self.connections.contains_key(id) {
+            return Err("Disconnect the local server before reconnecting.".into());
+        }
+        let (view, connection) = Self::establish(self.vault.clone(), id).await?;
+        if let Some(old) = self.connections.remove(id) {
+            let _ = old.service.cancel().await;
+        }
+        self.connections.insert(id.into(), connection);
+        self.restore_errors.remove(id);
+        Ok(view)
+    }
+
+    /// Establish a connector session without touching the hub's map.
+    async fn establish(
+        vault: Arc<crate::vault::Vault>,
+        id: &str,
+    ) -> Result<(ConnectorView, Connection), String> {
+        let local = crate::local_mcp_config::load(&vault)?
             .into_iter()
             .find(|server| server.id == id);
         let mut item = match &local {
             Some(server) => local_view(server),
             None => preset(id)?,
         };
-        if local.is_some() && self.connections.contains_key(id) {
-            return Err("Disconnect the local server before reconnecting.".into());
-        }
         let credential = preset_credential(id).ok();
         let secret = if local.is_some() {
             None
         } else if credential == Some("header") {
-            self.token(id)?
+            // The keyring call is a blocking D-Bus round trip: it must not
+            // run on a tokio worker thread.
+            let vault_for_read = std::sync::Arc::clone(&vault);
+            let id = id.to_string();
+            tokio::task::spawn_blocking(move || token_from(&vault_for_read, &id))
+                .await
+                .map_err(|error| error.to_string())??
         } else {
             // OAuth presets authenticate through the sign-in flow; a saved
             // bearer token must never be attached to them. Public presets
@@ -662,14 +992,40 @@ impl McpHub {
         if item.auth_type == "apiKey" && secret.is_none() {
             return Err("Add an API token before connecting.".into());
         }
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| "Could not initialize connector networking.")?;
+        let client = if local.is_some() {
+            None
+        } else {
+            // The endpoint is vetted before it is used: a connector must not
+            // be able to reach a loopback, private or cloud-metadata
+            // address, and the socket must not re-resolve the name to a
+            // different answer than the vetted one.
+            let url = reqwest::Url::parse(&item.url).map_err(|_| "Connector endpoint is invalid.")?;
+            let vetted = crate::sandbox::vet_fetch_target(&url, false)
+                .await
+                .map_err(|error| format!("Connector endpoint rejected: {error}"))?;
+            let mut builder = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy();
+            if let Some(domain) = &vetted.domain {
+                if !vetted.addrs.is_empty() {
+                    builder = builder.resolve_to_addrs(domain, &vetted.addrs);
+                }
+            }
+            Some(
+                builder
+                    .build()
+                    .map_err(|_| "Could not initialize connector networking.")?,
+            )
+        };
         let mut config = StreamableHttpClientTransportConfig::with_uri(item.url.clone())
             .max_concurrent_requests(2);
+        // The SDK default retries the GET SSE channel forever; a permanent
+        // failure (oversized event, dead endpoint) would silently stall the
+        // server-initiated channel. Bound reconnects so exhaustion surfaces a
+        // real error while ordinary blips still recover transparently.
+        config.retry_config = Arc::new(sse_retry_policy());
         if let Some(secret) = &secret {
             config = config.auth_header(secret);
         }
@@ -682,10 +1038,22 @@ impl McpHub {
                 .map(|secret| error.replace(secret, "[redacted]"))
                 .unwrap_or(error)
         };
+        // Per-session typed-input channel shared by every tool issued through
+        // this connection; the handler advertises form elicitation only.
+        let input = crate::mcp_input::SessionInput::new(
+            id.to_string(),
+            local.as_ref().map(|server| server.name.clone()),
+        );
         let service = if let Some(server) = &local {
-            ConnectorSession::Local(crate::local_mcp_process::connect(server).await?)
+            ConnectorSession::Local(
+                crate::local_mcp_process::connect(
+                    server,
+                    crate::mcp_input::McpSessionHandler::new(input.clone()),
+                )
+                .await?,
+            )
         } else if item.auth_type == "oauth" {
-            let mut manager = crate::oauth::manager(id, &item.url, self.vault.clone()).await?;
+            let mut manager = crate::oauth::manager(id, &item.url, vault.clone()).await?;
             if !manager
                 .initialize_from_store()
                 .await
@@ -693,40 +1061,64 @@ impl McpHub {
             {
                 return Err("Sign in to this connector first.".into());
             }
-            let client = rmcp::transport::auth::AuthClient::new(client, manager);
+            let client = rmcp::transport::auth::AuthClient::new(
+                crate::mcp_http::BoundedHttpClient::new(
+                    client.ok_or("Connector networking is unavailable.")?,
+                ),
+                manager,
+            );
             let transport = StreamableHttpClientTransport::with_client(client, config);
             ConnectorSession::Remote(
-                tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
-                    .await
-                    .map_err(|_| "Connector handshake timed out.")?
-                    .map_err(|_| {
-                        "Authorized connection failed. Check account access or sign in again."
-                            .to_string()
-                    })?,
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    crate::mcp_input::McpSessionHandler::new(input.clone()).serve(transport),
+                )
+                .await
+                .map_err(|_| "Connector handshake timed out.")?
+                .map_err(|_| {
+                    "Authorized connection failed. Check account access or sign in again."
+                        .to_string()
+                })?,
             )
         } else {
-            let transport = StreamableHttpClientTransport::with_client(client, config);
+            let transport = StreamableHttpClientTransport::with_client(
+                crate::mcp_http::BoundedHttpClient::new(
+                    client.ok_or("Connector networking is unavailable.")?,
+                ),
+                config,
+            );
             ConnectorSession::Remote(
-                tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
-                    .await
-                    .map_err(|_| "Connector handshake timed out.")?
-                    .map_err(|error| redact(format!("Could not connect: {error}")))?,
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    crate::mcp_input::McpSessionHandler::new(input.clone()).serve(transport),
+                )
+                .await
+                .map_err(|_| "Connector handshake timed out.")?
+                .map_err(|error| redact(format!("Could not connect: {error}")))?,
             )
         };
-        let result = tokio::time::timeout(
-            Duration::from_secs(30),
-            crate::tool_discovery::discover(|cursor| {
-                let peer = service.peer();
-                async move {
-                    peer.list_tools(Some(
-                        rmcp::model::PaginatedRequestParams::default().with_cursor(cursor),
-                    ))
-                    .await
-                    .map_err(|error| error.to_string())
-                }
-            }),
-        )
-        .await;
+        let result = if service
+            .peer()
+            .peer_info()
+            .is_some_and(|info| info.capabilities.tools.is_none())
+        {
+            Ok(Ok(Vec::new()))
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                crate::tool_discovery::discover(|cursor| {
+                    let peer = service.peer();
+                    async move {
+                        peer.list_tools(Some(
+                            rmcp::model::PaginatedRequestParams::default().with_cursor(cursor),
+                        ))
+                        .await
+                        .map_err(|error| error.to_string())
+                    }
+                }),
+            )
+            .await
+        };
         let tools = match result {
             Ok(Ok(tools)) => tools,
             result => {
@@ -742,7 +1134,14 @@ impl McpHub {
             let _ = service.cancel().await;
             return Err("Connector returned more than 512 tools.".into());
         }
-        let views: Vec<_> = tools
+        if tools
+            .iter()
+            .any(|tool| tool.name.starts_with(crate::mcp_protocol::PREFIX))
+        {
+            let _ = service.cancel().await;
+            return Err("Server tool names conflict with the reserved __locallm_mcp_ protocol namespace; rename the conflicting tool on the server.".into());
+        }
+        let mut views: Vec<_> = tools
             .into_iter()
             .map(|tool| ToolView {
                 name: tool.name.into_owned(),
@@ -753,6 +1152,7 @@ impl McpHub {
                 input_schema: Value::Object((*tool.input_schema).clone()),
             })
             .collect();
+        views.extend(crate::mcp_protocol::definitions(&service.peer()));
         if serde_json::to_vec(&views)
             .map_err(|error| error.to_string())?
             .len()
@@ -761,22 +1161,31 @@ impl McpHub {
             let _ = service.cancel().await;
             return Err("Connector tool catalog exceeds 2 MiB.".into());
         }
-        if let Some(old) = self.connections.remove(id) {
-            let _ = old.service.cancel().await;
-        }
-        self.connections.insert(
-            id.into(),
-            Connection {
-                service,
-                tools: views.clone(),
-                local_name: local.as_ref().map(|server| server.name.clone()),
-            },
-        );
         item.connected = true;
         item.has_credential = secret.is_some() || item.auth_type == "oauth";
-        item.tools = views;
-        self.restore_errors.remove(id);
-        Ok(item)
+        item.tools = views.clone();
+        Ok((
+            item,
+            Connection {
+                service,
+                tools: views,
+                local_name: local.as_ref().map(|server| server.name.clone()),
+                input,
+            },
+        ))
+    }
+    /// Shut down every live connector session.
+    ///
+    /// Tauri ends the application with `std::process::exit`, so no destructor
+    /// runs and a `Drop`-based shutdown never fires. Without this the MCP
+    /// server processes outlive the app.
+    pub async fn disconnect_all(&mut self) {
+        let ids: Vec<String> = self.connections.keys().cloned().collect();
+        for id in ids {
+            if let Some(connection) = self.connections.remove(&id) {
+                let _ = connection.service.cancel().await;
+            }
+        }
     }
     pub async fn disconnect(&mut self, id: &str, forget: bool) -> Result<(), String> {
         self.restore_errors.remove(id);
@@ -786,15 +1195,33 @@ impl McpHub {
         if !local {
             preset(id)?;
         }
+        if self.unconfirmed_shutdowns.remove(id) {
+            return Err(
+                "That connector was already signalled to stop, but its exit was never confirmed. It is no longer reachable through this app; stop it manually if it is still running."
+                    .into(),
+            );
+        }
         if let Some(connection) = self.connections.remove(id) {
             // A failed local shutdown keeps the saved configuration but
             // releases the session lock so the user can retry, inspect, or
             // remove the server. Cleanup never deletes saved configuration.
-            connection.service.cancel().await?;
+            if let Err(error) = connection.service.cancel().await {
+                self.unconfirmed_shutdowns.insert(id.to_string());
+                return Err(error);
+            }
         }
         if forget && !local {
-            self.vault.clear(&format!("token-{id}"))?;
-            self.vault.clear(&format!("oauth-{id}"))?;
+            // The keyring call is a blocking D-Bus round trip: it must not
+            // run on a tokio worker thread.
+            let vault = self.vault.clone();
+            let token_id = format!("token-{id}");
+            let oauth_id = format!("oauth-{id}");
+            tokio::task::spawn_blocking(move || {
+                vault.clear(&token_id)?;
+                vault.clear(&oauth_id)
+            })
+            .await
+            .map_err(|error| error.to_string())??;
         }
         Ok(())
     }
@@ -850,11 +1277,32 @@ pub async fn connect_connector(
     id: String,
     api_token: Option<String>,
 ) -> Result<ConnectorView, String> {
-    let mut hub = state.connectors.lock().await;
     if let Some(secret) = api_token {
-        hub.save_token(&id, &secret)?;
+        // The keyring call is a blocking D-Bus round trip: it must not run
+        // on a tokio worker thread.
+        let vault = { state.connectors.lock().await.vault.clone() };
+        let credential = format!("token-{id}");
+        let secret = secret.into_bytes();
+        tokio::task::spawn_blocking(move || {
+            if preset_credential(&credential)? != "header" {
+                return Err("This connector does not use an API token. Use account sign-in for OAuth connectors.".into());
+            }
+            validate_token(std::str::from_utf8(&secret).map_err(|_| "Invalid token encoding.")?)?;
+            vault.save(&credential, &secret)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
     }
-    let connected = hub.connect(&id).await?;
+    // The handshake runs without the hub lock; only the bookkeeping that
+    // records the finished session needs it.
+    let vault = { state.connectors.lock().await.vault.clone() };
+    let (connected, connection) = McpHub::establish(vault, &id).await?;
+    let mut hub = state.connectors.lock().await;
+    if let Some(old) = hub.connections.remove(&id) {
+        let _ = old.service.cancel().await;
+    }
+    hub.connections.insert(id.clone(), connection);
+    hub.restore_errors.remove(&id);
     let saved = remember_connection(&*state.database()?, &id, true);
     if let Err(error) = saved {
         let _ = hub.disconnect(&id, false).await;
@@ -899,9 +1347,22 @@ pub fn cancel_connector_sign_in(state: tauri::State<'_, crate::AppState>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sse_reconnects_are_bounded_not_infinite() {
+        // rmcp's default ExponentialBackoff has max_times None — a persistent
+        // GET-channel failure would reconnect forever. The bound must stay.
+        assert_eq!(super::sse_retry_policy().max_times, Some(8));
+    }
     #[tokio::test]
     async fn malformed_protocol_input_and_unexpected_exit_are_reported() {
-        async fn fixture(name: &str, script: &str) -> (tempfile::TempDir, super::McpHub, crate::local_mcp_config::LocalServer) {
+        async fn fixture(
+            name: &str,
+            script: &str,
+        ) -> (
+            tempfile::TempDir,
+            super::McpHub,
+            crate::local_mcp_config::LocalServer,
+        ) {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("fixture.cjs");
             std::fs::write(&path, script).unwrap();
@@ -919,15 +1380,30 @@ mod tests {
             hub.save_local(server.clone()).unwrap();
             (temp, hub, server)
         }
-        let (_temp, mut hub, server) = fixture("garbage", "process.stdout.write('not json\\n'); setInterval(()=>{},1000);\n").await;
+        let (_temp, mut hub, server) = fixture(
+            "garbage",
+            "process.stdout.write('not json\\n'); setInterval(()=>{},1000);\n",
+        )
+        .await;
         let error = match hub.connect(&server.id).await {
             Ok(_) => panic!("garbage protocol unexpectedly connected"),
             Err(error) => error,
         };
         assert!(error.contains("handshake"), "unexpected error: {error}");
-        assert!(!hub.list().unwrap().iter().find(|item| item.id == server.id).unwrap().connected);
+        assert!(
+            !hub.list()
+                .unwrap()
+                .iter()
+                .find(|item| item.id == server.id)
+                .unwrap()
+                .connected
+        );
         hub.remove_local(&server.id).unwrap();
-        let (_temp, mut hub, server) = fixture("truncated", "process.stdout.write('{\"jsonrpc\":\"2.0\",\"id\":'); setInterval(()=>{},1000);\n").await;
+        let (_temp, mut hub, server) = fixture(
+            "truncated",
+            "process.stdout.write('{\"jsonrpc\":\"2.0\",\"id\":'); setInterval(()=>{},1000);\n",
+        )
+        .await;
         let error = match hub.connect(&server.id).await {
             Ok(_) => panic!("truncated protocol unexpectedly connected"),
             Err(error) => error,
@@ -940,7 +1416,14 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("handshake"), "unexpected error: {error}");
-        assert!(!hub.list().unwrap().iter().find(|item| item.id == server.id).unwrap().connected);
+        assert!(
+            !hub.list()
+                .unwrap()
+                .iter()
+                .find(|item| item.id == server.id)
+                .unwrap()
+                .connected
+        );
         hub.remove_local(&server.id).unwrap();
         // A server that exits right after discovery leaves a closed transport;
         // selection must report it as disconnected instead of offering stale tools.
@@ -1010,12 +1493,24 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         assert!(view.connected);
         assert_eq!(view.tools.len(), 1);
         let (unselected, omitted) = hub.tools_for_turn(&[], &[]).unwrap();
-        assert!(unselected.is_empty(), "Connecting a server must not enable its tools");
+        assert!(
+            unselected.is_empty(),
+            "Connecting a server must not enable its tools"
+        );
         assert!(omitted.is_empty());
         let choices = vec![
-            super::ToolSelection { connector_id: server.id.clone(), tool_name: "read_file".into() },
-            super::ToolSelection { connector_id: "parallel-web".into(), tool_name: "web_search".into() },
-            super::ToolSelection { connector_id: "deepwiki".into(), tool_name: "ask_question".into() },
+            super::ToolSelection {
+                connector_id: server.id.clone(),
+                tool_name: "read_file".into(),
+            },
+            super::ToolSelection {
+                connector_id: "parallel-web".into(),
+                tool_name: "web_search".into(),
+            },
+            super::ToolSelection {
+                connector_id: "deepwiki".into(),
+                tool_name: "ask_question".into(),
+            },
         ];
         let (available, omitted) = hub.tools_for_turn(&[], &choices).unwrap();
         assert_eq!(available.len(), 1);
@@ -1025,7 +1520,14 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         assert!(hub.save_local(server.clone()).is_err());
         assert!(hub.read_local(&server.id).is_err());
         assert!(hub.remove_local(&server.id).is_err());
-        assert!(!hub.list().unwrap().iter().find(|item| item.id == server.id).unwrap().tools.is_empty());
+        assert!(!hub
+            .list()
+            .unwrap()
+            .iter()
+            .find(|item| item.id == server.id)
+            .unwrap()
+            .tools
+            .is_empty());
         let tools = hub
             .selected_tools(
                 &[],
@@ -1092,14 +1594,19 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         drop(hub);
         let store = crate::store::Store::open(&db_path).unwrap();
         let mut hub = super::McpHub::new(vault.clone());
-        hub.restore_saved(&super::remembered_connections(&store).unwrap()).await;
+        hub.restore_saved(&super::remembered_connections(&store).unwrap())
+            .await;
         let views = hub.list().unwrap();
         let restored = views.iter().find(|item| item.id == server.id).unwrap();
         assert!(restored.connected);
         assert_eq!(restored.tools.len(), 1);
         let unauthenticated = views.iter().find(|item| item.id == "tavily").unwrap();
         assert!(!unauthenticated.connected);
-        assert!(unauthenticated.connection_error.as_deref().unwrap().contains("API token"));
+        assert!(unauthenticated
+            .connection_error
+            .as_deref()
+            .unwrap()
+            .contains("API token"));
         // Repeated restoration must not launch a second local process.
         hub.restore_saved(std::slice::from_ref(&server.id)).await;
         assert!(!hub.restore_errors.contains_key(&server.id));
@@ -1163,13 +1670,26 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             crate::workspace::Workspace::open(directory.path().to_str().unwrap()).unwrap(),
         );
         let tools = workspace.tools();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), crate::workspace::TOOL_COUNT);
         assert!(tools.iter().any(|tool| tool.tool.name == "edit_file"));
-        assert_eq!(tools.iter().filter(|tool| tool.trusted_read()).count(), 2);
+        assert_eq!(tools.iter().filter(|tool| tool.trusted_read()).count(), 11);
         for tool in tools {
             assert_eq!(
                 tool.trusted_read(),
-                matches!(tool.tool.name.as_str(), "read_file" | "list_files")
+                matches!(
+                    tool.tool.name.as_str(),
+                    "read_file"
+                        | "list_files"
+                        | "list_tree"
+                        | "search_files"
+                        | "search_content"
+                        | "glob_files"
+                        | "file_info"
+                        | "document_inspect"
+                        | "document_read"
+                        | "view_image"
+                        | "notebook_read"
+                )
             );
         }
     }
@@ -1187,7 +1707,10 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
         assert_eq!(tool_alias("Workspace", "read_file"), "workspace_read_file");
         assert_eq!(tool_alias("Local execution", "run_code"), "local_run_code");
-        assert_eq!(tool_alias("Local execution", "execute_command"), "local_execute_command");
+        assert_eq!(
+            tool_alias("Local execution", "execute_command"),
+            "local_execute_command"
+        );
         assert_eq!(tool_alias("Harness", "todo_write"), "todo_write");
     }
     #[test]
@@ -1306,8 +1829,12 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         let hub = super::McpHub::new(vault);
         assert!(hub.save_token("github", "fixture-token-abcdef").is_ok());
         assert!(hub.save_token("github", " token-with-space").is_err());
-        assert!(hub.save_token("github", "token\r\nAuthorization: injected").is_err());
-        assert!(hub.save_token("unknown-connector", "fixture-token-abcdef").is_err());
+        assert!(hub
+            .save_token("github", "token\r\nAuthorization: injected")
+            .is_err());
+        assert!(hub
+            .save_token("unknown-connector", "fixture-token-abcdef")
+            .is_err());
         // OAuth presets have no bearer-token path: leftover tokens are ignored
         // at connect time and rejected at save time, so an OAuth sign-in can
         // never silently fall back to a bearer header.

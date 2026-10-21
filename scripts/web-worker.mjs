@@ -6,6 +6,7 @@ import { renderPage } from './web-render.mjs';
 import { DocumentStore } from '../src/web/documents/document_store.ts';
 import { extractAtomicClaims } from '../src/web/verification/claim_extractor.ts';
 import { ClaimVerifier } from '../src/web/verification/claim_verifier.ts';
+import { WeatherProvider, validateWeatherRequest } from '../src/web/verticals/weather/weather_provider.ts';
 
 /** Bounded page shape returned to the model for visit/fetch-url calls. */
 function shapeDocument(doc) {
@@ -18,6 +19,21 @@ function shapeDocument(doc) {
     headings: (doc.headings || []).slice(0, 30),
     links: (doc.links || []).slice(0, 20),
   };
+}
+
+/** Persist a fetched document into a research session so open/find can
+ * revisit it later. Sessions are sqlite rows keyed by id; unknown ids start a
+ * new minimal session whose only content is this document. */
+function stashDocument(storage, sessionId, doc) {
+  if (typeof sessionId !== 'string' || !sessionId) throw new Error('store needs a sessionId');
+  if (!doc || typeof doc.id !== 'string' || typeof doc.url !== 'string') throw new Error('store needs a fetched document');
+  let session;
+  try { session = storage.load(sessionId); } catch { session = { id: sessionId, documents: [] }; }
+  const documents = Array.isArray(session.documents) ? session.documents : [];
+  if (!documents.some(d => d.id === doc.id)) documents.push(doc);
+  session.documents = documents;
+  storage.save(session);
+  return { sessionId, documentId: doc.id, url: doc.url, title: doc.title };
 }
 
 function loadDocumentStore(storage, sessionId) {
@@ -42,12 +58,41 @@ for await (const chunk of process.stdin) {
   if (input.length > 64000) throw new Error('Research input too large');
 }
 let storage;
-try {
-  const request = JSON.parse(input);
+async function runRequest(request) {
+  // Weather is independent of search configuration, storage, and inference.
+  if (request.action === 'weather') {
+    validateWeatherRequest(request.location, request.forecastDays);
+    if (request.temperatureUnit !== undefined && !['celsius', 'fahrenheit'].includes(request.temperatureUnit)) throw new Error('Temperature unit must be celsius or fahrenheit.');
+    const provider = new WeatherProvider();
+    const cache = request.weatherCachePath ? new SqliteStorage(request.weatherCachePath) : null;
+    try {
+      const key = JSON.stringify([String(request.location || '').trim().toLocaleLowerCase('en'), request.forecastDays ?? 3, request.temperatureUnit ?? 'celsius']);
+      const cached = await cache?.get('weather-v2', key);
+      if (cached) return { ...cached, cached: true };
+      const report = await provider.executeLocation(request.location, request.forecastDays, request.temperatureUnit);
+      const result = { ...report, cached: false, evidence: provider.formatReportAsEvidence(report) };
+      await cache?.set('weather-v2', key, result, 600);
+      return result;
+    } finally { cache?.close(); }
+  }
   storage = new SqliteStorage(request.databasePath || ':memory:');
+  if (request.action === 'clear-cache') {
+    await storage.clear();
+    if (request.weatherCachePath) {
+      const weatherCache = new SqliteStorage(request.weatherCachePath);
+      try { await weatherCache.clear(); } finally { weatherCache.close(); }
+    }
+    return { cleared: true };
+  }
+  // Progress protocol: \x1e-prefixed JSON lines on stderr. The Rust bridge
+  // parses them into activity events; other stderr stays the error channel.
+  const emitProgress = (progress) => {
+    try { process.stderr.write(`\x1e${JSON.stringify(progress)}\n`); } catch { /* best effort */ }
+  };
   const engine = new WebSearchEngine({
     config: request.config,
     storage,
+    onProgress: emitProgress,
     fetcher: new PinnedPageFetcher(request.config?.fetch?.globalConcurrency, request.config?.fetch?.perDomainConcurrency),
     jsRender: request.config?.fetch?.jsRenderFallback
       ? (url) => renderPage(url, {
@@ -92,8 +137,19 @@ try {
     }
   } else if (request.action === 'search') {
     result = await engine.searchQueries(request.query);
-  } else if (request.action === 'fetch-url') {
-    result = shapeDocument(await engine.fetchUrl(request.url));
+  } else if (request.action === 'store' || request.action === 'fetch-url') {
+    if (request.action === 'store') {
+      // Session-side stash for an already-fetched document (no network).
+      result = stashDocument(storage, request.sessionId, request.document);
+    } else {
+      const doc = await engine.fetchUrl(request.url);
+      if (typeof request.sessionId === 'string' && request.sessionId) {
+        stashDocument(storage, request.sessionId, doc);
+        result = { ...shapeDocument(doc), sessionId: request.sessionId, documentId: doc.id };
+      } else {
+        result = shapeDocument(doc);
+      }
+    }
   } else if (request.action === 'fetch-urls') {
     // One worker process serves the whole visit batch; per-page failures are
     // isolated so a single bad URL never discards the rest.
@@ -123,7 +179,12 @@ try {
       .filter((item) => item.claim.trim().length > 0);
     result = new ClaimVerifier().verifyClaimsDeterministic(claims, evidence);
   } else {
-    const session = await engine.research(request.question, { mode: request.mode });
+    const session = await engine.research(request.question, {
+      mode: request.mode,
+      freshness: request.freshness,
+      language: request.language,
+      category: request.category,
+    });
     storage.save(session);
     result = request.full ? session : {
       id: session.id, question: session.question, answer: session.answer,
@@ -134,6 +195,10 @@ try {
     };
     if (request.trace) process.stderr.write(formatDiagnosticReport(session) + '\n');
   }
+  return result;
+}
+try {
+  const result = await runRequest(JSON.parse(input));
   process.stdout.write(JSON.stringify(result));
 } catch (error) {
   process.stderr.write(String(error.message || error) + '\n');

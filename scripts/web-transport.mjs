@@ -150,7 +150,7 @@ export class PinnedPageFetcher {
         }
         if (res.status !== 200) throw new Error(`Page unavailable: HTTP ${res.status}`);
         const mime = String(res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-        if (!['text/html','text/plain','text/markdown','application/xhtml+xml','application/json','application/pdf'].includes(mime)) throw new Error(`Unsupported MIME ${mime}`);
+        if (!['text/html','text/plain','text/markdown','text/csv','application/csv','text/tab-separated-values','application/xhtml+xml','application/json','application/pdf'].includes(mime) && !/^application\/[\w.+-]+\+json$/.test(mime)) throw new Error(`Unsupported MIME ${mime}`);
         // PDFs travel as latin1 text so the worker's extractor sees raw bytes.
         const body = mime === 'application/pdf' ? res.body.toString('latin1') : res.body.toString('utf8');
         return {url: raw, finalUrl: url.href, success: true, status: res.status, body, mimeType: mime, durationMs: Date.now() - started};

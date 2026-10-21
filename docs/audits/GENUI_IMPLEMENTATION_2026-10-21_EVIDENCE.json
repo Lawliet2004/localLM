@@ -1,0 +1,286 @@
+{
+  "sourceSha256": {
+    "scripts/assert-genui-chart.mjs": "48f2d801cc35adee3771ac8a97c49ecf26b38d12729994a84c7feef9847fe21d",
+    "scripts/assert-genui-code.mjs": "9fe65ac99b1a44f36ce2475c835c6606c60ea80d0049ba62d55da99863777dba",
+    "scripts/native-genui-acceptance.mjs": "26140056dbfb79a0a9cd555f0579c941884b761de8b949cb5dbc1c121e4db5fb",
+    "scripts/native-genui-acceptance.py": "199e6bf73a64daa2ba85594d39a95b5cc1e78b1503715984777eef9750058d92",
+    "src-tauri/src/chat.rs": "f44091bdb5e7f1004238818b56dae04fe9c75bdd45b53b917da4e7bb134ac37a",
+    "src-tauri/src/inference.rs": "5c29d56baf4db2af2c26519e22c5b333bb6615346cff1efd6de40332101a2817",
+    "src-tauri/src/lib.rs": "6e5a351a8d7017f3defef38c25791eccb634186e691c7819d409f4e7cc4a94bc",
+    "src-tauri/src/presentation.rs": "ff9192cd13fa696e9dfc4c3208c7a50b6f4cb7cad41ab962e4217bd488f14014",
+    "src-tauri/src/presentation_store.rs": "80cd6c82be5b4aad361f938af8d32f246c313448ac12351c79d041bb9073332b",
+    "src-tauri/src/presentation_tests.rs": "4f38f95fae1fca1208d219a464c53a386a3c021ce6b2b54f2f38e7eb6463f29b",
+    "src/components/Chat.tsx": "208ff6c365aadf42965c897943fbc4cf38727bd816878927331f58e8735f9519",
+    "src/components/PresentationDefaults.tsx": "b7c77bb4e9e08bd2ba3e53875daad7de423f583361fa5db608887fa3a9b17978",
+    "src/genui/Chart.tsx": "2dc8b21f5350eb020a93c7e88cb530105e7bc0834b463ffd7f0a39c66f6e3eb6",
+    "src/genui/Coding.tsx": "e1d1713b7866ab4dad0f92045dc627e6d4fbb3ce19a712340e48aef1f1543cd2",
+    "src/genui/DataTable.tsx": "405d4bd4789e38231d62e2c68be55b5923e0c16348516a114fc2af9c1b073ec4",
+    "src/genui/Diagram.tsx": "1b0b148e97db6fa30aa460890250d37ccecf4d505776ce04e8f6c465b41e6b72",
+    "src/genui/Education.tsx": "967cab75843546d21551417bcaacdea518621e33f476d6f412942bdd461e1499",
+    "src/genui/Experiences.tsx": "94e35ef3c8edecce95ee3404903391d1018217a47c6aac8cfd22e8f551e90a97",
+    "src/genui/GenUiSurface.tsx": "2b002fcca5de822e8048ec33430dc6e757bbbd450e351216fc2f9ee2f7f8f0c0",
+    "src/genui/MessageRenderer.tsx": "ff36687f1cb7cc547ca2cefccc1c0aba20b53565249e0956408da81199f84a04",
+    "src/genui/RichComponents.tsx": "487af2866299dab7fc2084b109a21161d0751d168ac428e426d44f68ae0c55cf",
+    "src/genui/ValidatedRenderer.test.tsx": "7e4148e5626bbc1ebb2395ac4a6a1f2e7b6094ee056f3a358f99f4f3fe7196d6",
+    "src/genui/ValidatedRenderer.tsx": "c5a74c20bc69520e34b67077374e2fc09c44e0047bdb0533388ecc19b00e2d58",
+    "src/genui/VisualAnswer.test.tsx": "80925bea850c2199ad0625a52c62636684838bc75dde42c507848ee10f571f64",
+    "src/genui/VisualAnswer.tsx": "00d3e4672b2b3dfce3722c36a690b5ddb54c0845df0dd69067952e0ab9da10d6",
+    "src/genui/VisualErrorBoundary.tsx": "cf98143c77e0a7e25eb2ea7312b1fd07c5772e19d015c3e3ab5a01b332e9783d",
+    "src/genui/VisualMarkdown.tsx": "6b55e3eb0c0a0f00e77196456a0c9565443d5b7f92f1136d38fd7c1d027c63db",
+    "src/genui/actions.test.ts": "acc0e8e97362c892e8121cf3405153b62af21398df60c7b54933acd0e6da35c3",
+    "src/genui/actions.ts": "05351e97a616cc45e80b73405945f62695965f546ffcdc603a626628974d3281",
+    "src/genui/audit-regressions.test.tsx": "e7472a5430ec256476f1440053ffbd37addb92438d12f7c7444ab1a7e40dd338",
+    "src/genui/authoritativeData.test.tsx": "6afe87e805dd26ae54a9eaa02e7ed090f04b3bb6db6e85aaec4235f674c6001d",
+    "src/genui/authoritativeData.ts": "c8f723c4d68a7c5dbbd3f131eeb3e3132e99061017626795c324f96443afa054",
+    "src/genui/catalog.ts": "c97d2dcdc7f07b36d7d0fc32be4e02383a0dd51c700ae5d7740c58677b7e91d8",
+    "src/genui/componentTypes.ts": "11dc9921a0f00b6ec2b60de8e6734988d9fd38d1fdedc3d202fc3cb578563011",
+    "src/genui/dataGrounding.test.ts": "46086fd277a00067b9ef66331d71bd306ecce24a0b1c18ede57520f3874a3c6f",
+    "src/genui/dataGrounding.ts": "99c20bdb52041b9544a64d535d05da6747817a1fb9022511ba810d3be9735d4e",
+    "src/genui/diff.ts": "b3b72c23063fe2cc06fb3806d684c94bc0feae5e67b1d1b99b8ec27422295d4d",
+    "src/genui/experiences.test.tsx": "fd4a4c8c4d199bbba1156d6341108b2bcb3b3a80805f42ef1eb3fe329b7ba674",
+    "src/genui/grounding.test.ts": "c27349f8ca4b70306adcc4f5ed732eb665d6f704b3ddced617988c8f2021b5e5",
+    "src/genui/grounding.tsx": "776197509363c264cf98c87c303a3e8317982403f5d594489275cb6889f17c02",
+    "src/genui/library.test.ts": "84acb2f22d2c3835aefc17a2a17cafdf1797da4b15bf4148c4ee582f0e00cb94",
+    "src/genui/library.tsx": "de8b2566a3a97e95660112dd5c7196b7ba4e52cdd35ad80846c20d4887cadc87",
+    "src/genui/model-output.test.tsx": "d4d604de0fca96968553bc2af65cdcbf98e61602c8026bba0d4b21b02a8ffae1",
+    "src/genui/progressive.ts": "c46254e9dcafe67ae1f68fb7dbc09afea63b9acd00794f70a8c7d55e74e54284",
+    "src/genui/render-failure.test.tsx": "4a07360e7d2f08824ef50d110ca9205105db937219545935d03cfecf8fbdb4cf",
+    "src/genui/repair.test.ts": "29c794fe3abcfb284e0f522b59c1853459ec7c027a0bff4e54c74ada003d1b1e",
+    "src/genui/repair.ts": "f330272eceebeafc748dcf803a6b76d7053233298ba61fb6a6c409142d5da368",
+    "src/genui/rich.test.tsx": "176ce99120f5bc33f6b78898873bbd791ed378860890be1e83a1079ac743bbe4",
+    "src/genui/richCatalog.ts": "1d3f6c5b3786235f7c9a9c94f54422f5b15739933d3d85f22c159e5b30b7f209",
+    "src/genui/simulations.ts": "684874598552014c25c40e112b6cd66eed2274f91d7141cc4d97813721d53293",
+    "src/genui/specification.test.ts": "e28823bb5769348f7f146ff10467c3802820aa2b44c3e15846e87875a4551727",
+    "src/genui/specification.ts": "726e74e1bec450ff842fd8317c952274b50761e5d48d250d5ecc422a2c2bae3a",
+    "src/genui/validation.test.ts": "2754047ca682428bc80e51f110fe5cfbfa38b3515101b19b48ff17c0ea11a7e0",
+    "src/genui/validation.ts": "00b3a64bc41b8769b0f432e619770dde50a08dc296054297c1d925f5c7928c1a",
+    "src/hooks/usePresentationMode.ts": "5415ea7f46127efdd753d806bdca7629721170ee65692b5e5e8e8d5f11447ac3"
+  },
+  "checks": {
+    "frontend": {
+      "passed": 784,
+      "skipped": 1,
+      "command": "npm test -- --maxWorkers=2",
+      "log": "/tmp/locallm-genui-delivery-frontend.log"
+    },
+    "rust": {
+      "status": "passed",
+      "passed": 821,
+      "failed": 0,
+      "ignored": 17,
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml --lib --no-run --message-format=json; copy emitted library test executable outside Cargo target; run copied executable --test-threads=2",
+      "scope": "frozen final source snapshot; library suite only",
+      "log": "/tmp/locallm-genui-delivery-pinned-rust.log",
+      "buildLog": "/tmp/locallm-genui-pinned-test-build.log",
+      "testExecutableSha256": "3a0c2a5b02ef51cd7d4794fdde244f17badd6fce8f3e72c189f4fe0023f17aa3"
+    },
+    "providerAndPresentation": {
+      "passed": 11,
+      "command": "cargo test --manifest-path src-tauri/Cargo.toml --lib presentation::",
+      "log": "/tmp/locallm-genui-delivery-policy-tests.log",
+      "scope": "frozen final source snapshot"
+    },
+    "clippy": {
+      "status": "failed",
+      "libraryDiagnostics": 84,
+      "testLibraryDiagnostics": 102,
+      "command": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+      "scope": "frozen final source snapshot",
+      "log": "/tmp/locallm-genui-delivery-clippy.log",
+      "note": "No presentation.rs/presentation_store.rs/presentation_tests.rs diagnostics. The two added diagnostics versus the earlier check are in the real formatter.rs restored by another session."
+    },
+    "browser": {
+      "status": "not run",
+      "reason": "Explicit AGENTS.md prohibition"
+    },
+    "typecheck": {
+      "status": "passed",
+      "command": "npm run typecheck",
+      "log": "/tmp/locallm-genui-delivery-typecheck.log"
+    },
+    "tauriBuild": {
+      "status": "passed",
+      "command": "CARGO_TARGET_DIR=/home/papan/Desktop/Projects/localLM/src-tauri/target npx tauri build --debug --no-bundle",
+      "scope": "frozen final source snapshot",
+      "log": "/tmp/locallm-genui-final-build.log"
+    },
+    "planApprovalIntegration": {
+      "status": "passed",
+      "count": 1,
+      "log": "/tmp/locallm-genui-plan-integration.log",
+      "method": "loopback fixture with real plan/approval/write/final-answer/formatter boundaries; not selected-model reliability"
+    },
+    "rustOriginalConsolidation": {
+      "status": "failed",
+      "passed": 819,
+      "failed": 2,
+      "ignored": 17,
+      "log": "/tmp/locallm-genui-delivery-rust.log",
+      "failures": [
+        "runtime::tests::runtime_exits_when_parent_is_forcibly_killed",
+        "skills::tests::dependency_status_reports_actionable_remedies_without_launching"
+      ],
+      "diagnosis": "Both depend on current_exe path; another Cargo session replaced/unlinked the shared target executable. Full suite rerun from a pinned executable, no tests omitted."
+    },
+    "liveRustCheck": {
+      "status": "passed",
+      "command": "cargo check --manifest-path src-tauri/Cargo.toml --lib",
+      "warnings": 14,
+      "log": "/tmp/locallm-genui-delivery-live-check.log",
+      "scope": "live working tree at check time; concurrent unrelated work may change afterward"
+    }
+  },
+  "designDetector": [],
+  "offlineMeasurements": {
+    "node": "v22.22.1",
+    "host": {
+      "platform": "linux",
+      "arch": "x64",
+      "cpu": "AMD Ryzen 5 7535HS with Radeon Graphics",
+      "logicalCpus": 12,
+      "totalMemoryBytes": 15916511232
+    },
+    "samples": 300,
+    "results": {
+      "core": {
+        "sourceChars": 73,
+        "validationP50Ms": 0.1692199999999957,
+        "validationP95Ms": 0.3365360000000237
+      },
+      "data": {
+        "sourceChars": 80,
+        "validationP50Ms": 0.11615900000003876,
+        "validationP95Ms": 0.18617200000005596
+      },
+      "coding": {
+        "sourceChars": 80,
+        "validationP50Ms": 0.09460899999999128,
+        "validationP95Ms": 0.13315099999999802
+      },
+      "invalid": {
+        "sourceChars": 41,
+        "validationP50Ms": 0.08872800000006009,
+        "validationP95Ms": 0.13229999999998654
+      },
+      "streamingPrefix": {
+        "sourceChars": 485,
+        "validationP50Ms": 3.495877000000064,
+        "validationP95Ms": 5.181923999999981,
+        "samples": 100
+      }
+    },
+    "prompts": {
+      "full": {
+        "chars": 10162,
+        "bytes": 10250
+      },
+      "core": {
+        "chars": 5901,
+        "bytes": 5951
+      },
+      "data": {
+        "chars": 7325,
+        "bytes": 7387
+      },
+      "education": {
+        "chars": 8576,
+        "bytes": 8648
+      },
+      "coding": {
+        "chars": 6896,
+        "bytes": 6956
+      }
+    },
+    "chunks": [
+      {
+        "file": "GenUiBlock-C-eq1vva.js",
+        "bytes": 2754,
+        "gzipBytes": 1210
+      },
+      {
+        "file": "GenUiSurface-Bx-8HLFk.js",
+        "bytes": 673,
+        "gzipBytes": 458
+      },
+      {
+        "file": "VisualAnswer-E4aL6QGM.js",
+        "bytes": 5535,
+        "gzipBytes": 2307
+      },
+      {
+        "file": "actions-CKt417nM.js",
+        "bytes": 244213,
+        "gzipBytes": 75332
+      }
+    ],
+    "nodeProcessPeakRssKiB": 201852,
+    "limitations": "Earlier warm Node CPU validation; excludes React/browser paint, native app RAM and inference. Historical chunks below are not the final bundle comparison. Final sizes are in bundleComparison."
+  },
+  "bundleComparison": {
+    "measuredAt": "2026-10-20T21:55:14.504Z",
+    "measurements": {
+      "markdown": {
+        "bytes": 2269653,
+        "gzipBytes": 660174,
+        "files": 5
+      },
+      "visual": {
+        "bytes": 2544809,
+        "gzipBytes": 747159,
+        "files": 12
+      }
+    },
+    "incremental": {
+      "bytes": 275156,
+      "gzipBytes": 86985
+    },
+    "method": "Same source/config and fonts; baseline substitutes Markdown/literal-code implementations at the three visual entrypoints. Sum of all JS/CSS, not network initial-load or lazy-load timing."
+  },
+  "native": {
+    "report": "../benchmarks/genui-native-delivery-2026-10-21.json",
+    "overall": "failed",
+    "chart": "passed exact values and native renderer",
+    "restart": "passed separate restore-only run",
+    "fixtures": "passed",
+    "toolScenario": "failed: runtime HTTP 500 NotImplemented: map: filter-mapping not implemented; no tool result",
+    "sourceSha256": "967a2fecaab847bd08c4380b74f41880bfef1d97f998ab0de73713e1881f6e49",
+    "binarySha256": "6b6c15018c8206b8f42006cbaef48258a38f4a3e1d8343e3bd17b9dc629d2bac",
+    "scope": "final genui source snapshot; concurrent unrelated live backend edits not certified",
+    "rawArtifacts": ".local/qa/genui-delivery-native-2026-10-21"
+  },
+  "repeatedLocalModel": {
+    "report": "../benchmarks/genui-repeated-local-2026-10-21.json",
+    "samples": 18,
+    "visualSamples": 15,
+    "rawValid": 0,
+    "repairedValid": 9,
+    "serverRendered": 9,
+    "failedVisualSamples": 6,
+    "compilerObservedSamples": 5,
+    "note": "Direct-generation experiment; no single-pass route enabled. Core outputs missed Diagram and had delimiters missing; Data outputs omitted EOF closers and fell back. Raw-content token counts exclude framing; usage counters unavailable in this run."
+  },
+  "limitationsDocument": "GENUI_VERIFICATION_LIMITS.md",
+  "boundChartExperiment": {
+    "report": "../benchmarks/genui-bound-chart-2026-10-21.json",
+    "samples": 3,
+    "rawValid": 3,
+    "grounded": 3,
+    "serverRendered": 3,
+    "medianTotalMs": 4120.124,
+    "inputTokens": 1009,
+    "outputTokens": 17,
+    "method": "Explicit host-bound numeric table, selected local GGUF, cache disabled; different prompt/input representation from the failed transcription experiments."
+  },
+  "compactTranscriptionExperiment": {
+    "report": "../benchmarks/genui-compact-chart-negative-2026-10-21.json",
+    "samples": 3,
+    "schemaValidAfterRepair": 3,
+    "grounded": 0,
+    "note": "Model changed label/value associations. Retained as failed factual output; SourceChart avoids model transcription."
+  },
+  "sourceSnapshotPath": ".local/qa/genui-final-source-snapshot-2026-10-21",
+  "genuiMatchesNativeSnapshot": true,
+  "productionAcceptance": "not fully accepted: native tool-runtime failure, strict Clippy, browser restriction and unverified external/platform gates",
+  "sourceHashesCapturedAt": "2026-10-20T22:10:04.717304+00:00",
+  "sourceHashScope": "Live files at capture time; native certification uses separate frozen source and binary hashes in native."
+}

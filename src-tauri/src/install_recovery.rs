@@ -30,6 +30,17 @@ fn regular(directory: &Dir, name: &str) -> bool {
         .symlink_metadata(name)
         .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
+
+/// A partial download left behind by an interrupted install.
+///
+/// The downloader writes `<name>.part` next to its destination: either
+/// directly inside `<models>/` or inside a model's `<64-hex-digest>/`
+/// directory. The startup collector must recognise those names, or an
+/// interrupted multi-gigabyte download is never reclaimed and the app-data
+/// directory grows without bound.
+fn partial(name: &str) -> bool {
+    name.ends_with(".part") && name.len() > ".part".len()
+}
 pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
     if !root.exists() {
         return Ok(0);
@@ -40,18 +51,24 @@ pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
     for name in entries(&directory)? {
         if !runtime {
             if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
-                let metadata = directory.symlink_metadata(&name).map_err(|e| e.to_string())?;
+                let metadata = directory
+                    .symlink_metadata(&name)
+                    .map_err(|e| e.to_string())?;
                 if metadata.is_dir() && !metadata.file_type().is_symlink() {
                     let model = directory.open_dir(&name).map_err(|e| e.to_string())?;
                     for file in entries(&model)? {
-                        if owned(&file, ".locallm-download-", ".part") && regular(&model, &file) {
+                        if (owned(&file, ".locallm-download-", ".part") || partial(&file))
+                            && regular(&model, &file)
+                        {
                             model.remove_file(&file).map_err(|e| e.to_string())?;
                             removed += 1;
                         }
                     }
                 }
             }
-            if owned(&name, ".locallm-download-", ".part") && regular(&directory, &name) {
+            if (owned(&name, ".locallm-download-", ".part") || partial(&name))
+                && regular(&directory, &name)
+            {
                 directory
                     .remove_file(&name)
                     .map_err(|error| error.to_string())?;
@@ -148,6 +165,25 @@ mod tests {
             std::fs::read(outside.path().join("llama-server.exe")).unwrap(),
             b"preserved"
         );
+    }
+    /// The downloader writes `<name>.part`; the collector must reclaim those
+    /// or an interrupted multi-gigabyte download is never reclaimed.
+    #[test]
+    fn reclaims_the_partial_names_the_downloader_actually_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        let model_dir = temp.path().join(&digest);
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.gguf.part"), b"partial").unwrap();
+        std::fs::write(model_dir.join("model.gguf"), b"keep").unwrap();
+        std::fs::write(temp.path().join("catalog-model.gguf.part"), b"partial").unwrap();
+        std::fs::write(temp.path().join("notes.txt"), b"keep").unwrap();
+
+        assert_eq!(clean(temp.path(), false).unwrap(), 2);
+        assert!(!model_dir.join("model.gguf.part").exists());
+        assert!(!temp.path().join("catalog-model.gguf.part").exists());
+        assert_eq!(std::fs::read(model_dir.join("model.gguf")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(temp.path().join("notes.txt")).unwrap(), b"keep");
     }
     #[test]
     fn removes_only_recognized_partial_layouts() {

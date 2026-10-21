@@ -106,6 +106,29 @@ fn valid_filename(name: &str) -> bool {
         && name.split('/').all(valid_component)
         && name.to_lowercase().ends_with(".gguf")
 }
+fn is_companion_path(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("mmproj")
+        || lower.split('/').any(|part| {
+            [
+                "mtp",
+                "imatrix",
+                "adapter",
+                "adapters",
+                "lora",
+                "projector",
+                "projectors",
+            ]
+            .iter()
+            .any(|prefix| {
+                part.strip_prefix(*prefix)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '_', '-']))
+            })
+        })
+}
+fn is_weight_file(name: &str) -> bool {
+    valid_filename(name) && !is_companion_path(name)
+}
 fn digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -256,6 +279,9 @@ pub async fn hugging_face_files(repo: String, token: Option<String>) -> Result<H
 
 /// Resolve all shards at the same revision; a partial set is never a usable model.
 fn selected_files<'a>(files: &'a [HubFile], name: &str) -> Result<Vec<&'a HubFile>, String> {
+    if !is_weight_file(name) {
+        return Err("Select standalone model weights. MTP heads, projectors, calibration files, and adapters are companion files.".into());
+    }
     let selected = files
         .iter()
         .find(|f| f.filename == name)
@@ -357,7 +383,7 @@ pub async fn download_hugging_face_model(
           inner.0.path = Some(directory.join(files[0].filename.rsplit('/').next().unwrap()).to_string_lossy().into_owned());
           inner.0.total = total; inner.0.received = already; inner.0.phase = if already > 0 { "resuming".into() } else { "downloading".into() }; }
         if needed > 0 && download::available_space(&directory)? < download::required_space(needed)? { return Err("Not enough disk space for this model and verification overhead.".into()); }
-        let mut builder = reqwest::Client::builder().https_only(true).connect_timeout(Duration::from_secs(15)).timeout(Duration::from_secs(7200));
+        let mut builder = download::client_builder();
         if let Some(token) = token.as_deref().filter(|s| !s.is_empty()) {
             let mut headers = reqwest::header::HeaderMap::new();
             let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| "Invalid read token.")?;
@@ -514,7 +540,7 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
         if item.file_type().map_err(|e| e.to_string())?.is_symlink() {
             continue;
         }
-        if path.is_dir() && depth > 0 {
+        if path.is_dir() && depth > 0 && !is_companion_path(&item.file_name().to_string_lossy()) {
             scan(&path, depth - 1, result)?;
         } else if path
             .extension()
@@ -539,7 +565,7 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
         })
         .collect();
     for file in &hub_files {
-        if file.filename.to_lowercase().contains("mmproj") {
+        if !is_weight_file(&file.filename) {
             continue;
         }
         if file.filename.contains("-of-") && !file.filename.contains("-00001-of-") {
@@ -619,7 +645,8 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
             projector_path,
         });
     }
-    if let Some(state) = pending_download(directory) {
+    if let Some(state) = pending_download(directory).filter(|state| is_weight_file(&state.filename))
+    {
         let dest = root.join(state.filename.rsplit('/').next().unwrap_or(&state.filename));
         let part = download::partial_path(&dest);
         let received = std::fs::metadata(&part)
@@ -687,8 +714,9 @@ fn inventory(state: &AppState) -> Result<Vec<InstalledModel>, String> {
         if !result.iter().any(|m| m.files.contains(&path_string))
             && path.is_file()
             && path
-                .extension()
-                .is_some_and(|s| s.eq_ignore_ascii_case("gguf"))
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_weight_file)
         {
             result.push(InstalledModel {
                 id: path_string.clone(),
@@ -821,6 +849,8 @@ fn cleanup_model_storage(model: &InstalledModel, data_dir: &Path) -> Result<(), 
 #[derive(Serialize, Deserialize)]
 struct Profile {
     runtime_path: String,
+    #[serde(default)]
+    projector_path: Option<String>,
     config: crate::runtime_config::RuntimeConfig,
 }
 fn profile_path(state: &AppState, path: &str) -> PathBuf {
@@ -846,6 +876,7 @@ fn write_profile(
     state: &AppState,
     model_path: &str,
     runtime_path: &str,
+    projector_path: &str,
     config: &crate::runtime_config::RuntimeConfig,
 ) -> Result<(), String> {
     if model_path.is_empty() {
@@ -853,6 +884,7 @@ fn write_profile(
     }
     let profile = Profile {
         runtime_path: runtime_path.to_string(),
+        projector_path: Some(projector_path.to_string()),
         config: config.clone(),
     };
     let bytes = serde_json::to_vec(&profile).map_err(|e| e.to_string())?;
@@ -881,6 +913,7 @@ pub fn save_active_profile(
         state,
         &preferences.model_path,
         &preferences.runtime_path,
+        &preferences.projector_path,
         config,
     )
 }
@@ -904,6 +937,28 @@ fn initial_config(
             / 2)
         .clamp(1, 256) as u32,
         ..Default::default()
+    }
+}
+
+fn restore_model_profile(
+    preferences: &mut crate::store::Preferences,
+    model: &InstalledModel,
+    profile: Option<Profile>,
+) -> crate::runtime_config::RuntimeConfig {
+    if let Some(profile) = profile {
+        preferences.runtime_path = profile.runtime_path;
+        preferences.projector_path = profile
+            .projector_path
+            .unwrap_or_else(|| model.projector_path.clone().unwrap_or_default());
+        profile.config
+    } else {
+        // Choose the model's companion before launching, including on first use.
+        preferences.projector_path = model.projector_path.clone().unwrap_or_default();
+        initial_config(
+            crate::gguf::model_metadata(Path::new(&model.path))
+                .ok()
+                .as_ref(),
+        )
     }
 }
 #[tauri::command]
@@ -931,6 +986,7 @@ pub async fn use_installed_model(
                 &state,
                 &preferences.model_path,
                 &preferences.runtime_path,
+                &preferences.projector_path,
                 &current_config,
             )?;
         }
@@ -942,19 +998,20 @@ pub async fn use_installed_model(
         } else if let Ok(bytes) = std::fs::read(profile_path(&state, &model.path)) {
             let profile: Profile =
                 serde_json::from_slice(&bytes).map_err(|_| "Saved model profile is invalid.")?;
-            preferences.runtime_path = profile.runtime_path;
-            profile.config
+            restore_model_profile(&mut preferences, model, Some(profile))
         } else {
-            initial_config(
-                crate::gguf::model_metadata(Path::new(&model.path))
-                    .ok()
-                    .as_ref(),
-            )
+            restore_model_profile(&mut preferences, model, None)
         };
         preferences.model_path = model.path.clone();
         store.save_preferences(&preferences)?;
         store.save_runtime_config(&config)?;
-        write_profile(&state, &model.path, &preferences.runtime_path, &config)?;
+        write_profile(
+            &state,
+            &model.path,
+            &preferences.runtime_path,
+            &preferences.projector_path,
+            &config,
+        )?;
     }
     crate::commands::load_selected_model(&state).await
 }
@@ -962,6 +1019,124 @@ pub async fn use_installed_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires live Hugging Face access"]
+    async fn live_hub_search_catalog_and_verified_download() {
+        let hits = search_hugging_face("gemma 4 e4b".into(), None)
+            .await
+            .unwrap();
+        assert!(
+            !hits.is_empty(),
+            "Live model search returned no repositories"
+        );
+        let repo = repository("unsloth/gemma-4-E4B-it-GGUF".into(), None, None)
+            .await
+            .unwrap();
+        assert!(repo
+            .files
+            .iter()
+            .any(|file| file.filename == "gemma-4-E4B-it-Q4_K_M.gguf"));
+        assert!(!projector_candidates(&repo.files).is_empty());
+        // Exercise production HTTPS, disk-space checks, streaming, checksum
+        // verification and publication with a small immutable file, not weights.
+        let url = format!(
+            "https://huggingface.co/{}/resolve/{}/config.json",
+            repo.repo, repo.revision
+        );
+        let client = download::client().unwrap();
+        let bytes = client
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(!bytes.is_empty() && bytes.len() < 64 * 1024);
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let (_sender, cancel) = tokio::sync::watch::channel(false);
+        download::fetch(
+            &client,
+            &download::Asset {
+                url: &url,
+                bytes: bytes.len() as u64,
+                sha256: &hash,
+            },
+            &path,
+            cancel,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.as_ref());
+        println!(
+            "Live Hugging Face: {} search results, {} GGUF files, {} bytes downloaded and verified",
+            hits.len(),
+            repo.files.len(),
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn model_profiles_restore_projector_paths_and_modes_without_cross_model_leaks() {
+        let mut model = InstalledModel {
+            id: "new-model.gguf".into(),
+            filename: "new-model.gguf".into(),
+            path: "new-model.gguf".into(),
+            bytes: 100,
+            repo: None,
+            revision: None,
+            files: vec!["new-model.gguf".into()],
+            complete: true,
+            received: 100,
+            projector_filename: Some("mmproj-new.gguf".into()),
+            projector_path: Some("/models/mmproj-new.gguf".into()),
+        };
+        let mut preferences = crate::store::Preferences {
+            projector_path: "/models/mmproj-previous.gguf".into(),
+            ..Default::default()
+        };
+        restore_model_profile(&mut preferences, &model, None);
+        assert_eq!(preferences.projector_path, "/models/mmproj-new.gguf");
+        let config = crate::runtime_config::RuntimeConfig {
+            vision_enabled: false,
+            offload_projector: false,
+            ..Default::default()
+        };
+        let profile = Profile {
+            runtime_path: "server".into(),
+            projector_path: Some("/custom/mmproj-new-F16.gguf".into()),
+            config: config.clone(),
+        };
+        let restored: Profile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        let restored_config = restore_model_profile(&mut preferences, &model, Some(restored));
+        assert_eq!(restored_config, config);
+        assert_eq!(preferences.projector_path, "/custom/mmproj-new-F16.gguf");
+        // Old profiles did not have a projector field or runtime mode settings.
+        let mut legacy = serde_json::to_value(&profile).unwrap();
+        legacy.as_object_mut().unwrap().remove("projector_path");
+        legacy["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("visionEnabled");
+        legacy["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("offloadProjector");
+        let legacy = serde_json::from_value(legacy).unwrap();
+        let legacy_config = restore_model_profile(&mut preferences, &model, Some(legacy));
+        assert!(legacy_config.vision_enabled && legacy_config.offload_projector);
+        assert_eq!(preferences.projector_path, "/models/mmproj-new.gguf");
+        model.projector_path = None;
+        restore_model_profile(&mut preferences, &model, None);
+        assert!(preferences.projector_path.is_empty());
+    }
+
     #[test]
     fn new_models_do_not_inherit_unsupported_quantized_cache_settings() {
         let config = initial_config(Some(&crate::gguf::ModelMetadata {
@@ -1015,6 +1190,72 @@ mod tests {
         }
         assert!(valid_filename("Q4_K_M/model.gguf"));
     }
+    #[test]
+    fn companion_files_cannot_be_downloaded_as_standalone_models() {
+        for name in [
+            "mtp-gemma-4-E4B-it.gguf",
+            "MTP/mtp-gemma-4-E4B-it-Q8_0.gguf",
+            "MTP/gemma-4-E4B-it-Q4_K_M.gguf",
+            "folder/MTP-MODEL.GGUF",
+            "mmproj-BF16.gguf",
+            "imatrix_unsloth.gguf",
+            "adapters/custom.gguf",
+            "lora-model.gguf",
+        ] {
+            let files = vec![HubFile {
+                filename: name.into(),
+                bytes: 100,
+                sha256: "a".repeat(64),
+            }];
+            assert!(selected_files(&files, name).is_err(), "{name}");
+        }
+        for name in ["gemma-4-E4B-it-Q4_K_M.gguf", "Qwen3.5-27B-MTP-Q4_K_M.gguf"] {
+            let files = vec![HubFile {
+                filename: name.into(),
+                bytes: 100,
+                sha256: "a".repeat(64),
+            }];
+            assert!(selected_files(&files, name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn scan_excludes_companions_and_old_companion_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "model-Q4_K_M.gguf",
+            "mtp-gemma-4-E4B-it.gguf",
+            "mmproj-F16.gguf",
+            "imatrix_unsloth.gguf",
+        ] {
+            std::fs::write(dir.path().join(name), b"GGUF").unwrap();
+        }
+        let mtp = dir.path().join("MTP");
+        std::fs::create_dir(&mtp).unwrap();
+        std::fs::write(mtp.join("gemma-4-E4B-it-Q8_0.gguf"), b"GGUF").unwrap();
+        let pending = dir.path().join("a".repeat(64));
+        std::fs::create_dir(&pending).unwrap();
+        std::fs::write(pending.join("mtp-gemma-4-E4B-it.gguf.part"), b"GGUF").unwrap();
+        let download = DownloadState {
+            repo: "unsloth/gemma-4-E4B-it-GGUF".into(),
+            revision: "a".repeat(40),
+            filename: "mtp-gemma-4-E4B-it.gguf".into(),
+            bytes: 98_653_248,
+            sha256: "a".repeat(64),
+            received: 4,
+            projector: None,
+        };
+        std::fs::write(
+            pending.join("download.json"),
+            serde_json::to_vec(&download).unwrap(),
+        )
+        .unwrap();
+        let mut result = Vec::new();
+        scan(dir.path(), 1, &mut result).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].filename, "model-Q4_K_M.gguf");
+    }
+
     #[test]
     fn split_models_require_every_shard_and_preserve_order() {
         let files = vec![HubFile {

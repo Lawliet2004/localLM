@@ -78,7 +78,11 @@ pub fn explicit_constraints(request: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|sentence| {
             let lower = sentence.to_ascii_lowercase();
-            lower.contains("must") || lower.contains("do not") || lower.contains("don't") || lower.contains("never") || lower.contains("only ")
+            lower.contains("must")
+                || lower.contains("do not")
+                || lower.contains("don't")
+                || lower.contains("never")
+                || lower.contains("only ")
         })
         .map(str::to_string)
         .collect()
@@ -112,79 +116,204 @@ pub struct CompactionOutcome {
 pub fn auto_enabled(store: &crate::store::Store, conversation_id: &str) -> bool {
     store
         .setting::<Option<bool>>(&format!("{AUTO_KEY_PREFIX}{conversation_id}"))
-        .unwrap_or(None).unwrap_or(true)
+        .unwrap_or(None)
+        .unwrap_or(true)
 }
 
 pub const AUTO_THRESHOLD_PERCENT: u64 = 80;
 
-/// Global capability switch. Corrupt or missing capability settings fail open
-/// in the same way as the rest of the capability registry.
+/// Global capability switch. Corrupt capability settings fail closed: an
+/// unreadable kill switch disables compaction rather than enabling it.
 pub fn capability_enabled(store: &crate::store::Store) -> bool {
-    crate::capabilities::is_enabled(store, "compaction").unwrap_or(true)
+    crate::capabilities::is_enabled(store, "compaction").unwrap_or(false)
 }
 
 pub fn should_compact(input: u64, reserve: u32, capacity: u32) -> bool {
-    capacity > 0 && input.saturating_add(u64::from(reserve)) >=
-        u64::from(capacity).saturating_mul(AUTO_THRESHOLD_PERCENT).div_ceil(100)
+    capacity > 0
+        && input.saturating_add(u64::from(reserve))
+            >= u64::from(capacity)
+                .saturating_mul(AUTO_THRESHOLD_PERCENT)
+                .div_ceil(100)
 }
 
-/// Reduce only completed exchanges, never an assistant call without its result.
-/// Keep instructions, the latest user request, and the latest complete exchange.
-/// The bounded extract is a navigation aid, not a fabricated model summary.
-pub fn compact_model_messages(
-    store: &crate::store::Store,
-    conversation_id: &str,
-    messages: &mut Vec<Value>,
-) -> Result<Option<String>, String> {
-    let Some(user) = messages.iter().rposition(|m| m["role"] == "user") else { return Ok(None) };
-    let tail = messages.iter().enumerate().skip(user + 1)
-        .rfind(|(_, m)| m["role"] == "assistant").map(|(i, _)| i).unwrap_or(messages.len());
-    let leading = messages.iter().take_while(|m| m["role"] == "system").count();
-    let volatile = if user > leading && messages[user - 1]["role"] == "system" { Some(user - 1) } else { None };
+/// A planned compaction: the kept buffer (with the checkpoint notice already
+/// inserted) and the messages that were dropped.
+pub struct CompactionPlan {
+    /// The artifact id the checkpoint notice points at.
+    pub id: String,
+    /// The messages that stay in the model-visible buffer.
+    pub kept: Vec<Value>,
+    /// The messages that leave the model-visible buffer.
+    pub dropped: Vec<Value>,
+}
+
+/// Plan a compaction of the model-visible buffer.
+///
+/// Returns the kept and dropped message vectors for a retention window, or
+/// `None` when there is nothing to drop.
+///
+/// `keep` counts **turns** in the history region — a turn being a user
+/// message and everything that follows it up to the next user message. The
+/// window is cut on a user boundary, so an assistant message and its tool
+/// results are never split apart.
+///
+/// The current draft (the last user message) is always kept. When the buffer
+/// carries an assistant exchange *after* the last user message, that exchange
+/// is kept too: it is the newest complete exchange.
+pub fn plan_compaction(messages: &[Value], keep: usize) -> Option<CompactionPlan> {
+    let user = messages.iter().rposition(|m| m["role"] == "user")?;
+    // The newest complete exchange: an assistant message that follows the
+    // last user message. In the model-visible turn buffer the draft is last,
+    // so this is normally empty.
+    let tail = messages
+        .iter()
+        .enumerate()
+        .skip(user + 1)
+        .rfind(|(_, m)| m["role"] == "assistant")
+        .map(|(i, _)| i)
+        .unwrap_or(messages.len());
+    let leading = messages
+        .iter()
+        .take_while(|m| m["role"] == "system")
+        .count();
+    let volatile = if user > leading && messages[user - 1]["role"] == "system" {
+        Some(user - 1)
+    } else {
+        None
+    };
+    // Turn starts inside the **history** region only — strictly before the
+    // current draft, which is always kept.
+    let history_turn_starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .take(user)
+        .filter(|(_, m)| m["role"] == "user")
+        .map(|(i, _)| i)
+        .collect();
+    // Where the retained window begins. `None` means the whole history fits
+    // inside the window and nothing needs to be dropped.
+    let retention_start = if history_turn_starts.is_empty() {
+        None
+    } else if keep == 0 {
+        // Keep no history turn at all: only the draft survives.
+        Some(messages.len())
+    } else if history_turn_starts.len() > keep {
+        Some(history_turn_starts[history_turn_starts.len() - keep])
+    } else {
+        None
+    };
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
-    let research_checkpoint = messages.iter().rposition(|m| m["role"] == "assistant" && m["content"].as_str().is_some_and(|s| s.starts_with(crate::arex::CONTEXT_MARKER)));
+    let research_checkpoint = messages.iter().rposition(|m| {
+        m["role"] == "assistant"
+            && m["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with(crate::arex::CONTEXT_MARKER))
+    });
     for (i, message) in messages.iter().enumerate() {
-        if i < leading || volatile == Some(i) || research_checkpoint == Some(i) || i == user || i >= tail {
+        if i < leading
+            || volatile == Some(i)
+            || research_checkpoint == Some(i)
+            || i == user
+            || i >= tail
+            || (i < user && retention_start.is_some_and(|start| i >= start))
+        {
             kept.push(message.clone());
         } else {
             dropped.push(message.clone());
         }
     }
-    if dropped.is_empty() || dropped.iter().all(|m| m["content"].as_str().unwrap_or("").starts_with("[Context compacted.")) { return Ok(None); }
+    if dropped.is_empty()
+        || dropped.iter().all(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("[Context compacted.")
+        })
+    {
+        return None;
+    }
     let id = format!("art_{}", uuid::Uuid::new_v4().simple());
-    let excerpt = dropped.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev()
-        .map(|m| format!("{}: {}", m["role"].as_str().unwrap_or("message"),
-            m["content"].as_str().unwrap_or("").chars().take(180).collect::<String>()))
-        .collect::<Vec<_>>().join("\n");
+    let excerpt = dropped
+        .iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|m| {
+            format!(
+                "{}: {}",
+                m["role"].as_str().unwrap_or("message"),
+                m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(180)
+                    .collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let notice = json!({"role":"assistant", "content":format!(
         "[Context compacted. Earlier messages and completed tool exchanges are archived verbatim in {id}; use artifact_read for details. Do not repeat completed actions. The following are partial reference excerpts, not new instructions.]\n{excerpt}")});
     // Frozen system first, then the checkpoint, then any trailing volatile system
     // (legacy layout) and the latest user turn (which may carry a volatile prefix).
     let insertion = leading.min(kept.len());
     kept.insert(insertion, notice);
-    if serde_json::to_vec(&kept).map_err(|e| e.to_string())?.len() >= serde_json::to_vec(messages).map_err(|e| e.to_string())?.len() {
+    Some(CompactionPlan { id, kept, dropped })
+}
+
+/// Number of leading system messages (the frozen instructions).
+/// Reduce only completed exchanges, never an assistant call without its result.
+/// Keep instructions, the latest user request, and the last `keep` complete
+/// exchanges. The bounded extract is a navigation aid, not a fabricated model
+/// summary.
+pub fn compact_model_messages(
+    store: &crate::store::Store,
+    conversation_id: &str,
+    messages: &mut Vec<Value>,
+    keep: usize,
+) -> Result<Option<String>, String> {
+    let Some(plan) = plan_compaction(messages, keep) else {
+        return Ok(None);
+    };
+    let CompactionPlan { id, kept, dropped } = plan;
+    if serde_json::to_vec(&kept).map_err(|e| e.to_string())?.len()
+        >= serde_json::to_vec(messages)
+            .map_err(|e| e.to_string())?
+            .len()
+    {
         return Ok(None);
     }
     let content = json!({"kind":"auto-compaction", "messages":dropped}).to_string();
     use sha2::{Digest, Sha256};
     store.save_artifact(&crate::artifacts::ArtifactRecord {
-        id: id.clone(), conversation_id: conversation_id.into(), run_id: None,
-        tool_name: "compact_conversation".into(), mime_type: "application/json".into(),
-        size_bytes: content.len(), sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
-        content, created_at: crate::store::now(),
+        id: id.clone(),
+        conversation_id: conversation_id.into(),
+        run_id: None,
+        tool_name: "compact_conversation".into(),
+        mime_type: "application/json".into(),
+        size_bytes: content.len(),
+        sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+        content,
+        created_at: crate::store::now(),
     })?;
-    persist_live_cutoff(store, conversation_id, &id)?;
+    persist_live_cutoff(store, conversation_id, &id, keep)?;
     *messages = kept;
     Ok(Some(id))
 }
 
 /// Persist a user-boundary cutoff so the next turn replays the compacted prefix
 /// instead of resurrecting dropped history from SQLite.
+///
+/// The window is the same one the model just saw, so the next turn replays
+/// the turns that stayed in context instead of silently narrowing to one.
 fn persist_live_cutoff(
     store: &crate::store::Store,
     conversation_id: &str,
     artifact_id: &str,
+    keep: usize,
 ) -> Result<(), String> {
     if conversation_id.is_empty() {
         return Ok(());
@@ -193,7 +322,7 @@ fn persist_live_cutoff(
         Ok(messages) => messages,
         Err(_) => return Ok(()),
     };
-    let Some(boundary) = kept_boundary(&stored, 1) else {
+    let Some(boundary) = kept_boundary(&stored, keep) else {
         return Ok(());
     };
     let cutoff = stored[boundary - 1].created_at;
@@ -221,13 +350,21 @@ fn persist_live_cutoff(
     })
 }
 
-pub fn set_auto(store: &crate::store::Store, conversation_id: &str, enabled: bool) -> Result<(), String> {
+pub fn set_auto(
+    store: &crate::store::Store,
+    conversation_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
     store.save_setting(&format!("{AUTO_KEY_PREFIX}{conversation_id}"), &enabled)
 }
 
 pub fn keep_last(store: &crate::store::Store) -> usize {
     let val = store.setting::<u32>(KEEP_LAST_KEY).unwrap_or(0);
-    if val == 0 { 10 } else { val.clamp(1, 200) as usize }
+    if val == 0 {
+        10
+    } else {
+        val.clamp(1, 200) as usize
+    }
 }
 
 pub fn set_keep_last(store: &crate::store::Store, keep: usize) -> Result<(), String> {
@@ -343,13 +480,21 @@ pub fn outcome(
 ) -> Result<CompactionOutcome, String> {
     let checkpoint = compact_now(store, conversation_id, keep)?;
     let messages = store.messages(conversation_id)?;
-    let dropped = messages.iter().filter(|message| message.created_at <= checkpoint.cutoff).count();
+    let dropped = messages
+        .iter()
+        .filter(|message| message.created_at <= checkpoint.cutoff)
+        .count();
     let kept = messages.len() - dropped;
     let note = format!(
         "Compacted {dropped} older message(s) into artifact {}. Recent turns stay in context; the full transcript, audits, and session events remain in the local database. If a needed fact is missing, read the artifact back with artifact_read.",
         checkpoint.artifact_id
     );
-    Ok(CompactionOutcome { checkpoint, dropped_messages: dropped, kept_messages: kept, note })
+    Ok(CompactionOutcome {
+        checkpoint,
+        dropped_messages: dropped,
+        kept_messages: kept,
+        note,
+    })
 }
 
 #[tauri::command]
@@ -422,10 +567,13 @@ mod tests {
 
     #[test]
     fn checkpoint_keeps_the_request_constraints_and_audited_operations() {
-        let request = "Compare the two reports. You must cite a page. Do not repeat a completed write.";
+        let request =
+            "Compare the two reports. You must cite a page. Do not repeat a completed write.";
         let constraints = explicit_constraints(request);
         assert!(constraints.iter().any(|line| line.contains("must cite")));
-        assert!(constraints.iter().any(|line| line.to_lowercase().contains("do not")));
+        assert!(constraints
+            .iter()
+            .any(|line| line.to_lowercase().contains("do not")));
         let checkpoint = checkpoint_from_audits(
             request,
             &constraints,
@@ -437,11 +585,31 @@ mod tests {
         );
         assert_eq!(checkpoint.version, 1);
         assert_eq!(checkpoint.original_request, request);
-        assert_eq!(checkpoint.completed_operation_ids, vec!["call-1".to_string()]);
-        assert_eq!(checkpoint.unresolved, vec!["Second source was not opened".to_string()]);
-        assert_eq!(checkpoint.next_action.as_deref(), Some("Second source was not opened"));
-        let again = checkpoint_from_audits(request, &constraints, &["call-1".into()], &[], &[], &checkpoint.unresolved, &["art_1".into()]);
-        assert_eq!(again.completed_operation_ids, checkpoint.completed_operation_ids);
+        assert_eq!(
+            checkpoint.completed_operation_ids,
+            vec!["call-1".to_string()]
+        );
+        assert_eq!(
+            checkpoint.unresolved,
+            vec!["Second source was not opened".to_string()]
+        );
+        assert_eq!(
+            checkpoint.next_action.as_deref(),
+            Some("Second source was not opened")
+        );
+        let again = checkpoint_from_audits(
+            request,
+            &constraints,
+            &["call-1".into()],
+            &[],
+            &[],
+            &checkpoint.unresolved,
+            &["art_1".into()],
+        );
+        assert_eq!(
+            again.completed_operation_ids,
+            checkpoint.completed_operation_ids
+        );
     }
 
     #[test]
@@ -456,13 +624,27 @@ mod tests {
             json!({"role":"assistant","tool_calls":[{"id":"latest"}],"content":"Testing"}),
             json!({"role":"tool","tool_call_id":"latest","content":"tests passed"}),
         ];
-        let artifact = compact_model_messages(&store, &id, &mut messages).unwrap().unwrap();
+        let artifact = compact_model_messages(&store, &id, &mut messages, 10)
+            .unwrap()
+            .unwrap();
         assert_eq!(messages[0]["content"], "Keep instructions");
-        assert!(messages.iter().any(|m| m["content"] == "Implement the feature"));
-        assert_eq!(messages[messages.len()-2]["tool_calls"][0]["id"], "latest");
+        assert!(messages
+            .iter()
+            .any(|m| m["content"] == "Implement the feature"));
+        assert_eq!(
+            messages[messages.len() - 2]["tool_calls"][0]["id"],
+            "latest"
+        );
         assert_eq!(messages.last().unwrap()["tool_call_id"], "latest");
-        assert!(store.artifact(&artifact).unwrap().unwrap().content.contains("old"));
-        assert!(compact_model_messages(&store, &id, &mut messages).unwrap().is_none());
+        assert!(store
+            .artifact(&artifact)
+            .unwrap()
+            .unwrap()
+            .content
+            .contains("old"));
+        assert!(compact_model_messages(&store, &id, &mut messages, 10)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -476,9 +658,14 @@ mod tests {
             json!({"role":"system","content":"[injected plan]\nopen todos: x"}),
             json!({"role":"user","content":"draft"}),
         ];
-        compact_model_messages(&store, &id, &mut messages).unwrap().unwrap();
+        compact_model_messages(&store, &id, &mut messages, 10)
+            .unwrap()
+            .unwrap();
         assert_eq!(messages[0]["content"], "frozen");
-        assert!(messages[1]["content"].as_str().unwrap().starts_with("[Context compacted."));
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Context compacted."));
         assert_eq!(messages[2]["content"], "[injected plan]\nopen todos: x");
         assert_eq!(messages.last().unwrap()["content"], "draft");
     }
@@ -493,15 +680,23 @@ mod tests {
             json!({"role":"assistant","content":"x".repeat(4000)}),
             json!({"role":"user","content":"[injected plan]\nopen todos: x\n\ndraft"}),
         ];
-        compact_model_messages(&store, &id, &mut messages).unwrap().unwrap();
+        compact_model_messages(&store, &id, &mut messages, 10)
+            .unwrap()
+            .unwrap();
         assert_eq!(messages[0]["content"], "frozen");
-        assert!(messages[1]["content"].as_str().unwrap().starts_with("[Context compacted."));
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Context compacted."));
         assert_eq!(
             messages.last().unwrap()["content"],
             "[injected plan]\nopen todos: x\n\ndraft"
         );
         assert_eq!(
-            messages.iter().filter(|message| message["role"] == "system").count(),
+            messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .count(),
             1
         );
     }
@@ -522,7 +717,10 @@ mod tests {
             json!({"role":"assistant","content":"reply two"}),
             json!({"role":"user","content":"draft"}),
         ];
-        let artifact = compact_model_messages(&store, &id, &mut messages).unwrap().unwrap();
+        // Keep one history turn: the older turn and its reply are dropped.
+        let artifact = compact_model_messages(&store, &id, &mut messages, 1)
+            .unwrap()
+            .unwrap();
         let checkpoint = store.compaction(&id).unwrap().unwrap();
         assert_eq!(checkpoint.artifact_id, artifact);
         assert_eq!(checkpoint.cutoff, 2);
@@ -540,13 +738,16 @@ mod tests {
         let store = crate::store::Store::open_memory().unwrap();
         let id = store.create_conversation().unwrap().id;
         for (role, content, created_at) in rows {
-            store.insert_message_at(&id, role, content, "complete", *created_at).unwrap();
+            store
+                .insert_message_at(&id, role, content, "complete", *created_at)
+                .unwrap();
         }
         (store, id)
     }
 
     fn row(role: &str, content: &str, created_at: i64) -> Message {
         Message {
+            metrics: None,
             error: None,
             id: format!("m{created_at}-{role}"),
             conversation_id: "chat".into(),
@@ -570,7 +771,10 @@ mod tests {
             ("user", "turn four", 6),
         ]);
         let checkpoint = compact_now(&store, &id, 2).unwrap();
-        assert_eq!(checkpoint.cutoff, 3, "cutoff is the last dropped row's timestamp");
+        assert_eq!(
+            checkpoint.cutoff, 3,
+            "cutoff is the last dropped row's timestamp"
+        );
         // Replay keeps the checkpoint notice plus the last two complete turns.
         let previous = store.messages(&id).unwrap();
         let replay = crate::history::model_history_with_cutoff(
@@ -578,9 +782,17 @@ mod tests {
             Some((checkpoint.cutoff, checkpoint.artifact_id.as_str())),
         )
         .unwrap();
-        assert!(serde_json::to_string(&replay).unwrap().contains(&checkpoint.artifact_id), "checkpoint notice cites the artifact");
+        assert!(
+            serde_json::to_string(&replay)
+                .unwrap()
+                .contains(&checkpoint.artifact_id),
+            "checkpoint notice cites the artifact"
+        );
         let serialized = serde_json::to_string(&replay).unwrap();
-        assert!(!serialized.contains("turn two"), "dropped turn content no longer replays");
+        assert!(
+            !serialized.contains("turn two"),
+            "dropped turn content no longer replays"
+        );
         assert!(serialized.contains("turn three"));
         // The dropped transcript stays queryable in the artifact.
         let artifact = store.artifact(&checkpoint.artifact_id).unwrap().unwrap();
@@ -597,10 +809,16 @@ mod tests {
             ("user", "next question", 4),
         ]);
         let checkpoint = compact_now(&store, &id, 1).unwrap();
-        assert_eq!(checkpoint.cutoff, 3, "the tool audit belongs to the dropped turn");
+        assert_eq!(
+            checkpoint.cutoff, 3,
+            "the tool audit belongs to the dropped turn"
+        );
         let kept = store.messages(&id).unwrap();
-        let replay =
-            crate::history::model_history_with_cutoff(&kept, Some((checkpoint.cutoff, checkpoint.artifact_id.as_str()))).unwrap();
+        let replay = crate::history::model_history_with_cutoff(
+            &kept,
+            Some((checkpoint.cutoff, checkpoint.artifact_id.as_str())),
+        )
+        .unwrap();
         assert!(replay.len() >= 2);
         assert_eq!(replay.last().unwrap()["content"], "next question");
     }
@@ -635,13 +853,27 @@ mod tests {
         let second = compact_now(&store, &id, 2).unwrap();
         assert!(second.cutoff >= first.cutoff);
         let artifact = store.artifact(&second.artifact_id).unwrap().unwrap();
-        assert!(artifact.content.contains("\"one\""), "the later checkpoint still spans the earliest messages");
+        assert!(
+            artifact.content.contains("\"one\""),
+            "the later checkpoint still spans the earliest messages"
+        );
         let outcome = outcome(&store, &id, 2).unwrap_err();
-        assert!(outcome.contains("Nothing to compact"), "nothing new is left beyond the window");
+        assert!(
+            outcome.contains("Nothing to compact"),
+            "nothing new is left beyond the window"
+        );
         assert_eq!(keep_last(&store), 10);
         set_keep_last(&store, 300).unwrap();
-        assert_eq!(keep_last(&store), 200, "the window clamps to a bounded range");
-        assert_eq!(row("user", "x", 1).role, "user", "row helper stays exercised");
+        assert_eq!(
+            keep_last(&store),
+            200,
+            "the window clamps to a bounded range"
+        );
+        assert_eq!(
+            row("user", "x", 1).role,
+            "user",
+            "row helper stays exercised"
+        );
     }
 
     #[test]
@@ -656,7 +888,10 @@ mod tests {
             ("assistant", "epoch reply 3", base_ts + 5000),
         ]);
         let checkpoint = compact_now(&store, &id, 1).unwrap();
-        assert!(checkpoint.cutoff > u32::MAX as i64, "cutoff preserves full 64-bit epoch timestamp without clamping");
+        assert!(
+            checkpoint.cutoff > u32::MAX as i64,
+            "cutoff preserves full 64-bit epoch timestamp without clamping"
+        );
         assert_eq!(checkpoint.cutoff, base_ts + 3000);
 
         let messages = store.messages(&id).unwrap();
@@ -667,9 +902,18 @@ mod tests {
         .unwrap();
 
         let serialized = serde_json::to_string(&replay).unwrap();
-        assert!(!serialized.contains("epoch turn 1"), "dropped turn 1 does not replay");
-        assert!(!serialized.contains("epoch turn 2"), "dropped turn 2 does not replay");
-        assert!(serialized.contains("epoch turn 3"), "kept turn 3 remains in replay");
+        assert!(
+            !serialized.contains("epoch turn 1"),
+            "dropped turn 1 does not replay"
+        );
+        assert!(
+            !serialized.contains("epoch turn 2"),
+            "dropped turn 2 does not replay"
+        );
+        assert!(
+            serialized.contains("epoch turn 3"),
+            "kept turn 3 remains in replay"
+        );
 
         let outcome_res = outcome(&store, &id, 1);
         // Note: outcome calls compact_now again, which returns 'nothing new' since cutoff hasn't changed.
@@ -697,7 +941,10 @@ mod tests {
 
         let serialized = serde_json::to_string(&replay).unwrap();
         assert!(!serialized.contains("turn one"));
-        assert!(serialized.contains("turn two"), "kept turn two is preserved even with identical timestamps");
+        assert!(
+            serialized.contains("turn two"),
+            "kept turn two is preserved even with identical timestamps"
+        );
     }
 
     #[test]
@@ -711,10 +958,19 @@ mod tests {
         let text = serde_json::to_string(&summary).unwrap();
         // Round-trip through storage: constraints, findings, refs survive.
         let restored: ResearchStateSummary = serde_json::from_str(&text).unwrap();
-        assert_eq!(restored.requirements, vec!["Compare A and B benchmarks".to_string()]);
+        assert_eq!(
+            restored.requirements,
+            vec!["Compare A and B benchmarks".to_string()]
+        );
         assert_eq!(restored.findings, vec!["A scores 90 [S1]".to_string()]);
-        assert_eq!(restored.source_refs, vec!["S1 https://example.com/a".to_string()]);
-        assert_eq!(restored.pending_work, vec!["verify B benchmarks".to_string()]);
+        assert_eq!(
+            restored.source_refs,
+            vec!["S1 https://example.com/a".to_string()]
+        );
+        assert_eq!(
+            restored.pending_work,
+            vec!["verify B benchmarks".to_string()]
+        );
         // Bounds hold for large states.
         let big = summarize_research_state(
             &(0..100).map(|i| format!("req {i}")).collect::<Vec<_>>(),

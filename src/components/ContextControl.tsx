@@ -76,6 +76,14 @@ export function ContextControl({ conversationId, usage, busy, onCompact, compact
             {usage.estimated ? 'Estimated: ' : ''}{usage.inputTokens.toLocaleString()} input + {usage.responseReserve.toLocaleString()} reserved / {usage.contextLength.toLocaleString()} tokens
           </p>
         )}
+        {usage?.cachedTokens != null && (
+          <p className="context-detail" aria-label="Prompt cache usage">
+            {usage.cachedTokens.toLocaleString()} input tokens reused
+            {usage.cacheHitRate != null ? ` (${Math.round(usage.cacheHitRate * 100)}% cache hit)` : ''}
+            {usage.cacheWriteTokens != null && usage.cacheWriteTokens > 0 ? ` · ${usage.cacheWriteTokens.toLocaleString()} written to cache` : ''}
+            {usage.promptMs != null ? ` · ${(usage.promptMs / 1000).toFixed(2)}s prompt processing` : ''}
+          </p>
+        )}
         <label className="context-auto"><input type="checkbox" checked={auto} disabled={busy || saving || conversationId === 'new' || !nativeAvailable} onChange={async e => {
           const next = e.target.checked; setSaving(true); setError('');
           try { await api.setCompactionAuto(conversationId, next); setAuto(next); } catch (e) { setError(errorMessage(e)); } finally { setSaving(false); }

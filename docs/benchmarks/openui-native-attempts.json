@@ -1,0 +1,28 @@
+{
+  "attempts": [
+    {
+      "scenario": "Sales request following unrelated fixture history",
+      "status": "error",
+      "chartRendered": false,
+      "reason": "Invalid generated component arguments; authoritative answer followed prior fixture."
+    },
+    {
+      "scenario": "Fresh conversation, abbreviated month/count pairs",
+      "status": "error",
+      "chartRendered": false,
+      "reason": "Model interpreted month/count pairs as dates; chart grounding rejected unsupported values."
+    },
+    {
+      "scenario": "Explicit unit counts, Quick mode; earlier native model history still present",
+      "status": "error",
+      "chartRendered": false,
+      "reason": "Authoritative table correct; generated program had unmatched component delimiters. Original answer preserved."
+    },
+    {
+      "scenario": "Explicit unit counts, Quick mode, empty conversation; before closer repair",
+      "status": "error",
+      "chartRendered": false,
+      "reason": "Authoritative table correct; known component closer omitted before parent array. Original answer preserved; fixture added for bounded repair."
+    }
+  ]
+}

@@ -1,389 +1,172 @@
-import { Fragment, useEffect, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ChevronRight } from 'lucide-react';
 import { api, nativeAvailable } from '../lib/api';
 import type { Message, SessionEvent } from '../lib/types';
 import { isPlanStateTool } from './PlanChecklist';
-import { TraceIcon, groupKindOf, toolKindOf, type TraceKind } from './TraceIcon';
+import { MarkdownView } from './MarkdownView';
+import { TraceIcon, groupKindOf, toolKindOf } from './TraceIcon';
 
 export function useSessionActivity(conversationId: string, generating: boolean) {
   const [events, setEvents] = useState<SessionEvent[]>([]);
+  const generatingRef = useRef(generating);
+  generatingRef.current = generating;
+  const reload = useRef<(() => void) | null>(null);
   useEffect(() => {
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
+    let disposed = false, loading = false, queued = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     let cursor = 0;
     setEvents([]);
     if (!nativeAvailable || conversationId === 'new' || !api.getSessionEvents) return;
     async function load() {
+      if (disposed) return;
+      if (loading) { queued = true; return; }
+      loading = true; clearTimeout(timer);
+      let full = false, failed = false;
       try {
         const batch = await api.getSessionEvents(conversationId, cursor, 500);
         if (disposed) return;
         if (batch.length) {
-          cursor = Math.max(...batch.map(e => e.seq)) + 1;
-          setEvents(current => [...new Map([...current, ...batch].map(e => [e.seq, e])).values()].sort((a, b) => a.seq - b.seq));
+          cursor = Math.max(...batch.map(event => event.seq)) + 1;
+          setEvents(current => [...new Map([...current, ...batch].map(event => [event.seq, event])).values()].sort((a, b) => a.seq - b.seq));
         }
-        if (batch.length === 500 || generating) timer = setTimeout(() => void load(), batch.length === 500 ? 0 : 750);
-      } catch { if (!disposed && generating) timer = setTimeout(() => void load(), 2000); }
+        full = batch.length === 500;
+      } catch { failed = true; }
+      finally {
+        loading = false;
+        if (!disposed && (queued || full || generatingRef.current)) {
+          timer = setTimeout(() => void load(), queued || full ? 0 : failed ? 2000 : 750);
+          queued = false;
+        }
+      }
     }
+    reload.current = () => void load();
     void load();
-    return () => { disposed = true; clearTimeout(timer); };
-  }, [conversationId, generating]);
+    return () => { disposed = true; clearTimeout(timer); reload.current = null; };
+  }, [conversationId]);
+  useEffect(() => { reload.current?.(); }, [generating]);
   return events;
 }
 
-interface TimelineItem {
-  id: string;
-  kind: 'model_response' | 'compaction' | 'edit' | 'tool' | 'thought';
-  icon?: TraceKind;
-  rawEvent?: SessionEvent;
-  toolMessage?: Message;
-  content?: string;
-  artifact?: string;
-  thoughtText?: string;
-  duration?: string;
-  toolName?: string;
-  filename?: string;
-  isFolder?: boolean;
-  isSearch?: boolean;
-  isTask?: boolean;
-  isCommand?: boolean;
+/** Join each event once. Run id prevents reused tool ids crossing turns. */
+export function activityTools(events: SessionEvent[], messages: Message[]): Message[] {
+  const results = new Map(events.filter(e => e.eventType === 'tool_result').map(e => [`${e.runId}:${e.toolCallId}`, e.payload as Record<string, any>]));
+  const ended = new Set(events.filter(e => e.eventType === 'turn_end').map(e => e.runId));
+  const live = new Map(messages.map(m => [m.id, m]));
+  for (const message of messages) if (message.role === 'tool') {
+    try { const parsed = JSON.parse(message.content); if (typeof parsed.request?.callId === 'string') live.set(`tool-${parsed.request.callId}`, message); } catch { /* Legacy tool text. */ }
+  }
+  const base: Message = { id: '', conversationId: '', role: 'tool', content: '', reasoning: '', createdAt: 0, status: 'complete' };
+  if (!events.some(e => e.eventType === 'tool_call')) return messages.filter(m => m.role === 'tool' && !isPlanMessage(m));
+  return events.filter(e => e.eventType === 'tool_call').flatMap(event => {
+    const call = event.payload as Record<string, any>;
+    if (isPlanStateTool(String(call.name ?? ''))) return [];
+    const result = results.get(`${event.runId}:${event.toolCallId}`);
+    const persisted = live.get(`tool-${event.toolCallId}`);
+    if (persisted && (persisted.status !== 'streaming' || !result)) return [persisted];
+    return [result ? { ...base, id: event.id, conversationId: event.conversationId, createdAt: event.createdAt, content: JSON.stringify({ request: { ...call, name: result.name ?? call.name, arguments: call.arguments, decision: result.decision ?? call.decision }, result: result.result ?? result }) } : live.get(`tool-${event.toolCallId}`) ?? { ...base, id: event.id, status: ended.has(event.runId) ? 'interrupted' as const : 'streaming' as const, content: JSON.stringify({ request: { name: call.name, arguments: call.arguments, decision: ended.has(event.runId) ? undefined : 'pending' }, result: {} }) }];
+  });
+}
+function isPlanMessage(message: Message) {
+  try { const value = JSON.parse(message.content); return isPlanStateTool(value.request?.name ?? value.name ?? ''); } catch { return false; }
+}
+function needsAttention(message: Message) {
+  if (['streaming', 'error', 'interrupted'].includes(message.status)) return true;
+  try { const value = JSON.parse(message.content); return Boolean(value.result?.error || value.result?.isError || ['error', 'failed', 'failure', 'denied', 'interrupted', 'cancelled', 'unknown', 'partial'].includes(value.result?.status) || value.request?.decision === 'denied'); } catch { return false; }
 }
 
-interface ActivityBlock {
-  key: string;
-  type: 'group' | 'edit' | 'compaction' | 'model_response';
-  items?: TimelineItem[];
-  item?: TimelineItem;
-  title?: string;
-  icon?: TraceKind;
+function toolMeta(message: Message): { name: string; args: Record<string, unknown> } {
+  try {
+    const value = JSON.parse(message.content);
+    const request = value.request ?? value;
+    return {
+      name: typeof request.name === 'string' ? request.name : '',
+      args: request.arguments && typeof request.arguments === 'object' ? request.arguments as Record<string, unknown> : {},
+    };
+  } catch { return { name: '', args: {} }; }
 }
 
-export function ActivityTimeline({ events, messages, renderMessage, renderTool }: {
+export function activityLabel(tools: Message[]): string {
+  const kinds = new Set(tools.map(tool => { const meta = toolMeta(tool); return toolKindOf(meta.name, meta.args); }));
+  const labels: string[] = [];
+  if (kinds.has('edit')) labels.push('Edited files');
+  if (kinds.has('read')) labels.push('Read files');
+  if (kinds.has('search') || kinds.has('folder') || kinds.has('explore')) labels.push('Searched files');
+  if (kinds.has('web')) labels.push('Browsed the web');
+  if (kinds.has('command')) labels.push(tools.filter(tool => { const meta = toolMeta(tool); return toolKindOf(meta.name, meta.args) === 'command'; }).length === 1 ? 'Ran a command' : 'Ran commands');
+  if (kinds.has('tool') || kinds.has('task')) labels.push('Used tools');
+  return labels.map((label, index) => index ? label.toLowerCase() : label).join(', ');
+}
+
+function ActivityGroup({ tools, renderTool, live }: { tools: Message[]; renderTool: (message: Message) => ReactNode; live: boolean }) {
+  const completed = tools.filter(tool => !needsAttention(tool));
+  const attention = tools.filter(needsAttention);
+  const kinds = completed.map(tool => { const meta = toolMeta(tool); return toolKindOf(meta.name, meta.args); });
+  return <>
+    {completed.length > 0 && <details className="activity-summary" open={live || undefined}>
+      <summary className="card-header"><TraceIcon kind={groupKindOf(kinds)} size={16} /><span className="activity-summary-label">{activityLabel(completed)}</span><ChevronRight size={14} className="trace-chevron" aria-hidden="true" /><span className="sr-only">{completed.length} {completed.length === 1 ? 'tool used' : 'tools used'}</span></summary>
+      <div className="activity-summary-rows">{completed.map(tool => <Fragment key={tool.id}>{renderTool(tool)}</Fragment>)}</div>
+    </details>}
+    {attention.map(tool => <Fragment key={tool.id}>{renderTool(tool)}</Fragment>)}
+  </>;
+}
+
+/** Only split journal commentary when it is an exact prefix of the saved answer.
+ * This keeps old, partial, or mismatched journals from duplicating model output. */
+export function activitySegments(events: SessionEvent[], content: string): { seq: number; content: string }[] {
+  const segments: { seq: number; content: string }[] = [];
+  let remaining = content;
+  for (const event of events) {
+    if (event.eventType !== 'model_response') continue;
+    const payload = event.payload as { content?: unknown; final?: unknown };
+    if (payload.final !== false || typeof payload.content !== 'string' || !payload.content.trim()) continue;
+    const text = payload.content.trim();
+    if (!remaining.trimStart().startsWith(text)) return [];
+    segments.push({ seq: event.seq, content: text });
+    remaining = remaining.trimStart().slice(text.length);
+  }
+  return segments;
+}
+
+export function ActivityTimeline({ events, messages, renderMessage, renderTool, generating = false }: {
   events: SessionEvent[]; messages: Message[];
   renderMessage: (message: Message) => ReactNode; renderTool: (message: Message) => ReactNode;
+  generating?: boolean;
 }) {
-  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
-
-  const assistant = messages.find(m => m.role === 'assistant');
-  const base: Message = assistant ?? { id: '', conversationId: '', role: 'assistant', content: '', reasoning: '', createdAt: 0, status: 'complete' };
-  const completedText = events.filter(e => e.eventType === 'model_response').map(e => (e.payload as {content?: string}).content ?? '').join('');
-  const completedReasoning = events.filter(e => e.eventType === 'reasoning').map(e => (e.payload as {text?: string}).text ?? '').join('');
-  const liveText = assistant?.content.startsWith(completedText) ? assistant.content.slice(completedText.length) : '';
-  const liveReasoning = assistant?.reasoning.startsWith(completedReasoning) ? assistant.reasoning.slice(completedReasoning.length) : '';
-  const isStreaming = assistant?.status === 'streaming';
-
-  // Parse events into typed TimelineItems
-  const timelineItems: TimelineItem[] = [];
-
-  if (events.length === 0) {
-    if (assistant?.reasoning) {
-      timelineItems.push({
-        id: `thought-${assistant.id || 'initial'}`,
-        kind: 'thought',
-        thoughtText: assistant.reasoning,
-        duration: isStreaming ? undefined : '8s',
-      });
-    }
-
-    for (const msg of messages) {
-      if (msg.role === 'tool') {
-        let toolName = 'tool';
-        let args: Record<string, any> = {};
-        let res: Record<string, any> = {};
-        try {
-          const parsed = JSON.parse(msg.content);
-          const req = parsed.request || parsed;
-          toolName = req.name || 'tool';
-          args = req.arguments || {};
-          res = parsed.result || {};
-        } catch { /* ignore */ }
-        if (isPlanStateTool(toolName)) continue;
-
-        const diff = res?.diff;
-        const path = (args.path ?? args.AbsolutePath ?? args.TargetFile ?? args.file) as string | undefined;
-        const filename = path ? path.split(/[\\/]/).pop() : undefined;
-        const isEdit = /edit|create_file|write_to_file|replace/.test(toolName) || Boolean(diff);
-        const isSearch = /search|grep|find|locate/.test(toolName);
-        const isFolder = /list_dir|list_files|browse_dir/.test(toolName);
-        const isTask = toolName === 'manage_task';
-        const isCommand = Boolean(args.command || args.CommandLine || /exec|run_code|terminal|run_command/.test(toolName));
-
-        timelineItems.push({
-          id: msg.id,
-          kind: isEdit ? 'edit' : 'tool',
-          icon: toolKindOf(toolName, args, res),
-          toolMessage: msg,
-          toolName,
-          filename,
-          isFolder,
-          isSearch,
-          isTask,
-          isCommand,
-        });
-      }
-    }
-
-    if (assistant?.content && !isStreaming) {
-      timelineItems.push({
-        id: `resp-${assistant.id || 'final'}`,
-        kind: 'model_response',
-        content: assistant.content,
-      });
-    }
-  } else {
-    for (let i = 0; i < events.length; i++) {
-      const event = events[i];
-      const payload = (event.payload ?? {}) as Record<string, any>;
-
-      if (event.eventType === 'model_response') {
-        timelineItems.push({
-          id: event.id,
-          kind: 'model_response',
-          rawEvent: event,
-          content: payload.content ?? '',
-        });
-        continue;
-      }
-
-      if (event.eventType === 'compaction') {
-        timelineItems.push({
-          id: event.id,
-          kind: 'compaction',
-          rawEvent: event,
-          artifact: payload.artifact,
-        });
-        continue;
-      }
-
-      if (event.eventType === 'reasoning') {
-        let durationStr: string | undefined = undefined;
-        if (typeof payload.duration === 'string') {
-          durationStr = payload.duration;
-        } else if (typeof payload.durationMs === 'number') {
-          durationStr = `${Math.round(payload.durationMs / 1000)}s`;
-        } else if (typeof payload.seconds === 'number') {
-          durationStr = `${payload.seconds}s`;
-        } else if (events[i + 1]?.createdAt && event.createdAt) {
-          const delta = events[i + 1].createdAt - event.createdAt;
-          const sec = delta > 10000 ? Math.round(delta / 1000) : delta;
-          if (sec > 0 && sec < 3600) {
-            durationStr = `${sec}s`;
-          }
-        }
-        if (!durationStr) {
-          const words = (payload.text ?? '').trim().split(/\s+/).filter(Boolean).length;
-          const estimatedSec = Math.max(2, Math.min(30, Math.round(words / 15)));
-          durationStr = `${estimatedSec}s`;
-        }
-
-        timelineItems.push({
-          id: event.id,
-          kind: 'thought',
-          rawEvent: event,
-          thoughtText: payload.text ?? '',
-          duration: durationStr,
-        });
-        continue;
-      }
-
-      if (event.eventType === 'tool_call') {
-        const callName = String((payload as { name?: string }).name ?? '');
-        if (isPlanStateTool(callName)) continue;
-        const result = events.find(e => e.eventType === 'tool_result' && e.runId === event.runId && e.toolCallId === event.toolCallId)?.payload as Record<string, any> | undefined;
-        const live = messages.find(m => m.id === `tool-${event.toolCallId}`);
-        const ended = events.some(e => e.eventType === 'turn_end' && e.runId === event.runId);
-        const toolMessage: Message = result ? {
-          ...base, id: event.id, role: 'tool', status: 'complete',
-          content: JSON.stringify({ request: { name: result.name ?? payload.name, arguments: payload.arguments, decision: result.decision }, result: result.result }),
-        } : live ?? { ...base, id: event.id, role: 'tool', status: ended ? 'interrupted' : 'streaming', content: JSON.stringify({ request: { name: payload.name, arguments: payload.arguments, decision: ended ? undefined : 'pending' }, result: {} }) };
-
-        const toolName = (result?.name ?? payload.name ?? '') as string;
-        const args = (payload.arguments ?? {}) as Record<string, any>;
-        const res = (result?.result ?? {}) as Record<string, any>;
-        const diff = res?.diff;
-        const path = (args.path ?? args.AbsolutePath ?? args.TargetFile ?? args.file) as string | undefined;
-        const filename = path ? path.split(/[\\/]/).pop() : undefined;
-
-        const isEdit = /edit|create_file|write_to_file|replace/.test(toolName) || Boolean(diff);
-        const isSearch = /search|grep|find|locate/.test(toolName);
-        const isFolder = /list_dir|list_files|browse_dir/.test(toolName);
-        const isTask = toolName === 'manage_task';
-        const isCommand = Boolean(args.command || args.CommandLine || /exec|run_code|terminal|run_command/.test(toolName));
-
-        timelineItems.push({
-          id: event.id,
-          kind: isEdit ? 'edit' : 'tool',
-          icon: toolKindOf(toolName, args, res),
-          rawEvent: event,
-          toolMessage,
-          toolName,
-          filename,
-          isFolder,
-          isSearch,
-          isTask,
-          isCommand,
-        });
-        continue;
-      }
-    }
+  const assistants = messages.filter(m => m.role === 'assistant');
+  const assistant = assistants[assistants.length - 1];
+  const tools = useMemo(() => activityTools(events, messages), [events, messages]);
+  const reasoning = assistant?.reasoning || events.filter(e => e.eventType === 'reasoning').map(e => (e.payload as { text?: string }).text ?? '').join('\n\n');
+  const durations = events.filter(e => e.eventType === 'reasoning').map(e => (e.payload as { durationMs?: unknown }).durationMs);
+  const measured = durations.length > 0 && durations.every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0);
+  const reasoningMs = measured ? (durations as number[]).reduce((sum, value) => sum + value, 0) : undefined;
+  const compactions = events.filter(e => e.eventType === 'compaction');
+  const [thoughtOpen, setThoughtOpen] = useState(false);
+  const thoughtContent = useRef<HTMLDivElement>(null);
+  const hasAnswer = Boolean(assistant?.content?.trim());
+  const live = generating && Boolean(reasoning);
+  const thinking = live && !hasAnswer;
+  useEffect(() => { setThoughtOpen(live); }, [live]);
+  useEffect(() => {
+    if (live && thoughtContent.current) thoughtContent.current.scrollTop = thoughtContent.current.scrollHeight;
+  }, [reasoning, live]);
+  const segments = assistant && assistants.length === 1 && assistant.presentation?.format !== 'openui' ? activitySegments(events, assistant.content) : [];
+  let remaining = assistant?.content ?? '';
+  let lastSeq = -Infinity;
+  const toolEvents = events.filter(event => event.eventType === 'tool_call' && !isPlanStateTool(String((event.payload as { name?: string }).name ?? '')));
+  const groups: ReactNode[] = [];
+  for (const segment of segments) {
+    const before = tools.filter((_, index) => toolEvents[index] && toolEvents[index].seq > lastSeq && toolEvents[index].seq < segment.seq);
+    if (before.length) groups.push(<ActivityGroup key={`tools-${segment.seq}`} tools={before} renderTool={renderTool} live={false} />);
+    groups.push(<Fragment key={`commentary-${segment.seq}`}>{renderMessage({ ...assistant!, id: `${assistant!.id}-round-${segment.seq}`, content: segment.content, reasoning: '', status: 'complete', presentation: undefined, metrics: null, error: null })}</Fragment>);
+    remaining = remaining.trimStart().slice(segment.content.length);
+    lastSeq = segment.seq;
   }
-
-  // Group items into blocks
-  const blocks: ActivityBlock[] = [];
-  let pendingGroup: TimelineItem[] = [];
-
-  const flushPendingGroup = (isActiveEnd = false) => {
-    if (!pendingGroup.length) return;
-    const items = [...pendingGroup];
-    const key = `grp-${items[0].id}`;
-
-    // Compute title
-    const fileCount = items.filter(it => it.kind === 'tool' && !it.isSearch && !it.isFolder && !it.isTask && !it.isCommand).length;
-    const folderCount = items.filter(it => it.isFolder).length;
-    const searchCount = items.filter(it => it.isSearch).length;
-    const taskCount = items.filter(it => it.isTask).length;
-    const commandCount = items.filter(it => it.isCommand).length;
-
-    let title = '';
-    if (commandCount > 0 && fileCount === 0 && searchCount === 0 && folderCount === 0 && taskCount === 0) {
-      const prefix = isActiveEnd ? 'Running' : 'Ran';
-      title = `${prefix} ${commandCount} ${commandCount === 1 ? 'command' : 'commands'}`;
-    } else {
-      const parts: string[] = [];
-      if (fileCount > 0) parts.push(`${fileCount} ${fileCount === 1 ? 'file' : 'files'}`);
-      if (folderCount > 0) parts.push(`${folderCount} ${folderCount === 1 ? 'folder' : 'folders'}`);
-      if (searchCount > 0) parts.push(`${searchCount} ${searchCount === 1 ? 'search' : 'searches'}`);
-      if (taskCount > 0) parts.push(`${taskCount} ${taskCount === 1 ? 'task' : 'tasks'}`);
-      if (!parts.length && commandCount > 0) parts.push(`${commandCount} ${commandCount === 1 ? 'command' : 'commands'}`);
-      if (!parts.length && items.some(it => it.kind === 'thought')) parts.push(`${items.length} ${items.length === 1 ? 'item' : 'items'}`);
-      const prefix = isActiveEnd ? 'Exploring' : 'Explored';
-      title = `${prefix} ${parts.join(', ')}`;
-    }
-
-    const icon = items.every(it => it.kind === 'thought')
-      ? 'thought'
-      : groupKindOf(items.flatMap(it => (it.icon ? [it.icon] : [])));
-
-    blocks.push({
-      key,
-      type: 'group',
-      items,
-      title,
-      icon,
-    });
-    pendingGroup = [];
-  };
-
-  for (let idx = 0; idx < timelineItems.length; idx++) {
-    const item = timelineItems[idx];
-    if (item.kind === 'model_response') {
-      flushPendingGroup(false);
-      blocks.push({ key: `resp-${item.id}`, type: 'model_response', item });
-    } else if (item.kind === 'compaction') {
-      flushPendingGroup(false);
-      blocks.push({ key: `comp-${item.id}`, type: 'compaction', item });
-    } else if (item.kind === 'edit') {
-      flushPendingGroup(false);
-      blocks.push({ key: `edit-${item.id}`, type: 'edit', item });
-    } else {
-      pendingGroup.push(item);
-    }
-  }
-  flushPendingGroup(isStreaming);
-
-  return (
-    <div className="activity-feed">
-      {blocks.map((block, blockIndex) => {
-        if (block.type === 'model_response' && block.item) {
-          return (
-            <Fragment key={block.key}>
-              {renderMessage({
-                ...base,
-                id: block.item.id,
-                content: block.item.content ?? '',
-                reasoning: '',
-                status: 'complete',
-              })}
-            </Fragment>
-          );
-        }
-
-        if (block.type === 'compaction' && block.item) {
-          return (
-            <details key={block.key} className="activity-reasoning activity-compaction">
-              <summary>
-                <TraceIcon kind="system" size={12} />
-                <span>Context compacted · continuing</span>
-              </summary>
-              <p>Older activity archived at the 80% threshold. Artifact: {block.item.artifact}</p>
-            </details>
-          );
-        }
-
-        if (block.type === 'edit' && block.item?.toolMessage) {
-          return (
-            <div key={block.key} className="activity-edit-wrapper">
-              {renderTool(block.item.toolMessage)}
-            </div>
-          );
-        }
-
-        if (block.type === 'group' && block.items) {
-          const isLastGroup = blockIndex === blocks.length - 1;
-          const isLive = isStreaming && isLastGroup;
-          const defaultExpanded = isStreaming || isLastGroup || block.items.length <= 1;
-          const isExpanded = openGroups[block.key] ?? defaultExpanded;
-
-          return (
-            <div key={block.key} className={`activity-group ${isLive ? 'is-live' : ''}`}>
-              <button
-                type="button"
-                className={`activity-group-header ${isExpanded ? 'expanded' : ''}`}
-                onClick={() => setOpenGroups(curr => ({ ...curr, [block.key]: !isExpanded }))}
-                aria-expanded={isExpanded}
-              >
-                <TraceIcon kind={block.icon ?? 'explore'} size={13} />
-                <span className="activity-group-title">{block.title}</span>
-                <span className="activity-group-count">{block.items.length}</span>
-                <ChevronRight size={13} className="activity-group-chevron" />
-              </button>
-              <div
-                className="activity-group-items"
-                style={{ display: isExpanded ? 'flex' : 'none' }}
-              >
-                {block.items.map(item => {
-                  if (item.kind === 'thought') {
-                    return (
-                      <details key={item.id} className="trace-thought-details">
-                        <summary className="trace-thought-pill">
-                          <TraceIcon kind="thought" size={12} />
-                          <span className="trace-thought-label">Thought for {item.duration ?? '8s'}</span>
-                          <ChevronRight size={13} className="thought-chevron" />
-                        </summary>
-                        <div className="trace-thought-content">{item.thoughtText}</div>
-                      </details>
-                    );
-                  }
-                  if (item.toolMessage) {
-                    return (
-                      <Fragment key={item.id}>
-                        {renderTool(item.toolMessage)}
-                      </Fragment>
-                    );
-                  }
-                  return null;
-                })}
-              </div>
-            </div>
-          );
-        }
-
-        return null;
-      })}
-
-      {((events.length > 0 && (liveText || liveReasoning || assistant?.status === 'streaming')) ||
-        (events.length === 0 && isStreaming && (assistant?.content || assistant?.reasoning))) &&
-        renderMessage({ ...base, id: `${base.id}-live`, content: events.length > 0 ? liveText : (assistant?.content ?? ''), reasoning: events.length > 0 ? liveReasoning : (assistant?.reasoning ?? '') })}
-      {assistant?.error && <p role="alert" className="error-banner">{assistant.error}</p>}
-    </div>
-  );
+  const trailing = segments.length ? tools.filter((_, index) => !toolEvents[index] || toolEvents[index].seq > lastSeq) : tools;
+  return <div className="activity-feed">
+    {reasoning && <details className="trace-thought-details" data-testid="turn-reasoning" open={thoughtOpen} onToggle={e => setThoughtOpen((e.currentTarget as HTMLDetailsElement).open)}><summary className="card-header trace-thought-pill"><TraceIcon kind="thought" size={14} /><span className={`trace-thought-label${thinking ? ' is-live' : ''}`}>{thinking ? 'Thinking…' : reasoningMs === undefined ? 'Reasoning' : `Reasoning · ${(reasoningMs / 1000).toFixed(1)}s`}</span><ChevronRight size={14} className="trace-chevron thought-chevron" aria-hidden="true" /></summary><div className="trace-thought-content" ref={thoughtContent}><MarkdownView content={reasoning} assistant streaming={thinking} /></div></details>}
+    {groups}
+    <ActivityGroup tools={trailing} renderTool={renderTool} live={generating} />
+    {assistants.map(message => <Fragment key={message.id}>{renderMessage(message === assistant && segments.length ? { ...message, content: remaining.trimStart() } : message)}</Fragment>)}
+    {compactions.map(event => <details className="activity-compaction" key={event.id}><summary>Context compacted · continuing</summary><p>{typeof (event.payload as { artifact?: unknown }).artifact === 'string' ? (event.payload as { artifact: string }).artifact : 'Older activity was summarized to make room for the next steps.'}</p></details>)}
+  </div>;
 }

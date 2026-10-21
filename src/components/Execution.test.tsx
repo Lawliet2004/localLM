@@ -1,12 +1,14 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { Execution } from './Execution';
-const fixtures=vi.hoisted(()=>({pending:vi.fn()}));
+const fixtures=vi.hoisted(()=>({pending:vi.fn(),health:vi.fn(),saveSearch:vi.fn()}));
 vi.mock('../lib/api',()=>({nativeAvailable:true,errorMessage:String,api:{
   getExecutionConfig:async()=>({pythonPath:'',nodePath:'',powershellPath:''}),
   getWebSearchConfig:async()=>({provider:'searxng',searxngBaseUrl:'http://127.0.0.1:8080',googleApiKey:'',googleCxId:'',searchFallbackEnabled:true}),
   pendingDaytonaOperations:fixtures.pending,
   hasDaytonaKey:async()=>false,
+  webSearchHealth:fixtures.health,
+  saveWebSearchConfig:fixtures.saveSearch,
 }}));
 describe('cloud recovery visibility',()=>{
   it('refreshes background cleanup and stops polling after unmount',async()=>{
@@ -36,5 +38,29 @@ describe('cloud recovery visibility',()=>{
     fixtures.pending.mockRejectedValue(new Error('Journal unavailable'));
     render(<Execution/>);
     expect(await screen.findByRole('alert')).toHaveTextContent('Journal unavailable');
+  });
+});
+
+describe('SearXNG connection settings', () => {
+  it('checks the current form without saving it and shows actionable API failures', async () => {
+    fixtures.pending.mockResolvedValue([]);
+    fixtures.health.mockReset().mockResolvedValue({ search: 'error', searchError: 'Enable json under search.formats in settings.yml.' });
+    fixtures.saveSearch.mockReset();
+    render(<Execution />);
+    await act(async () => {});
+    fireEvent.change(screen.getByLabelText('SearXNG base URL'), { target: { value: 'http://localhost:9090/search-proxy' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Check connection' }));
+    await waitFor(() => expect(fixtures.health).toHaveBeenCalledWith(expect.objectContaining({ searxngBaseUrl: 'http://localhost:9090/search-proxy' })));
+    expect(await screen.findByText(/Search: error\. Enable json under search.formats/)).toBeInTheDocument();
+    expect(fixtures.saveSearch).not.toHaveBeenCalled();
+  });
+
+  it('shows partial engine failures in connection feedback', async () => {
+    fixtures.pending.mockResolvedValue([]);
+    fixtures.health.mockReset().mockResolvedValue({ search: 'degraded', searxngDiagnostics: { engines: { duckduckgo: 'CAPTCHA' } } });
+    render(<Execution />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: 'Check connection' }));
+    expect(await screen.findByText(/Search: degraded.*duckduckgo: CAPTCHA/)).toBeInTheDocument();
   });
 });

@@ -22,7 +22,10 @@ pub fn parse_iana_offset(tz_name: &str) -> Option<chrono::FixedOffset> {
     }
 
     // Direct UTC / GMT checks
-    if normalized.eq_ignore_ascii_case("utc") || normalized.eq_ignore_ascii_case("gmt") || normalized.eq_ignore_ascii_case("z") {
+    if normalized.eq_ignore_ascii_case("utc")
+        || normalized.eq_ignore_ascii_case("gmt")
+        || normalized.eq_ignore_ascii_case("z")
+    {
         return Some(chrono::FixedOffset::east_opt(0).unwrap());
     }
 
@@ -33,7 +36,10 @@ pub fn parse_iana_offset(tz_name: &str) -> Option<chrono::FixedOffset> {
         let (hours, mins) = if let Some((h, m)) = rest.split_once(':') {
             (h.parse::<i32>().ok()?, m.parse::<i32>().ok()?)
         } else if rest.len() == 4 {
-            (rest[..2].parse::<i32>().ok()?, rest[2..].parse::<i32>().ok()?)
+            (
+                rest[..2].parse::<i32>().ok()?,
+                rest[2..].parse::<i32>().ok()?,
+            )
         } else if let Ok(h) = rest.parse::<i32>() {
             (h, 0)
         } else {
@@ -48,20 +54,27 @@ pub fn parse_iana_offset(tz_name: &str) -> Option<chrono::FixedOffset> {
 
     // Common standard IANA timezone mappings
     match normalized.to_ascii_lowercase().as_str() {
-        "asia/kolkata" | "asia/calcutta" | "ist" => chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60),
-        "asia/shanghai" | "asia/hong_kong" | "asia/singapore" | "cst" => chrono::FixedOffset::east_opt(8 * 3600),
+        "asia/kolkata" | "asia/calcutta" | "ist" => {
+            chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
+        }
+        "asia/shanghai" | "asia/hong_kong" | "asia/singapore" | "cst" => {
+            chrono::FixedOffset::east_opt(8 * 3600)
+        }
         "asia/tokyo" | "jst" => chrono::FixedOffset::east_opt(9 * 3600),
         "asia/dubai" => chrono::FixedOffset::east_opt(4 * 3600),
         "asia/bangkok" | "asia/jakarta" => chrono::FixedOffset::east_opt(7 * 3600),
         "europe/london" | "europe/belfast" | "wwe" => chrono::FixedOffset::east_opt(0),
-        "europe/paris" | "europe/berlin" | "europe/rome" | "europe/madrid" | "europe/amsterdam" | "cet" => chrono::FixedOffset::east_opt(3600),
+        "europe/paris" | "europe/berlin" | "europe/rome" | "europe/madrid" | "europe/amsterdam"
+        | "cet" => chrono::FixedOffset::east_opt(3600),
         "europe/helsinki" | "europe/athens" | "eet" => chrono::FixedOffset::east_opt(2 * 3600),
         "america/new_york" | "est" | "us/eastern" => chrono::FixedOffset::west_opt(5 * 3600),
         "america/chicago" | "us/central" => chrono::FixedOffset::west_opt(6 * 3600),
         "america/denver" | "mst" | "us/mountain" => chrono::FixedOffset::west_opt(7 * 3600),
         "america/los_angeles" | "pst" | "us/pacific" => chrono::FixedOffset::west_opt(8 * 3600),
         "america/sao_paulo" => chrono::FixedOffset::west_opt(3 * 3600),
-        "australia/sydney" | "australia/melbourne" | "aest" => chrono::FixedOffset::east_opt(10 * 3600),
+        "australia/sydney" | "australia/melbourne" | "aest" => {
+            chrono::FixedOffset::east_opt(10 * 3600)
+        }
         "pacific/auckland" | "nzst" => chrono::FixedOffset::east_opt(12 * 3600),
         _ => None,
     }

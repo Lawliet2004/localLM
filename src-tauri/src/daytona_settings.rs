@@ -111,8 +111,8 @@ fn pending(
         .pending()
 }
 #[tauri::command]
-pub fn has_daytona_key(state: tauri::State<'_, crate::AppState>) -> Result<bool, String> {
-    Ok(state.daytona_vault.load("daytona")?.is_some())
+pub async fn has_daytona_key(state: tauri::State<'_, crate::AppState>) -> Result<bool, String> {
+    Ok(state.daytona_vault.load_blocking("daytona").await?.is_some())
 }
 #[tauri::command]
 pub async fn save_daytona_key(
@@ -135,7 +135,10 @@ pub async fn save_daytona_key(
     {
         return Err("Resolve pending cloud cleanup before replacing its credential.".into());
     }
-    state.daytona_vault.save("daytona", key.as_bytes())
+    state
+        .daytona_vault
+        .save_blocking("daytona", key.as_bytes().to_vec())
+        .await
 }
 #[tauri::command]
 pub async fn forget_daytona_key(state: tauri::State<'_, crate::AppState>) -> Result<(), String> {
@@ -150,7 +153,7 @@ pub async fn forget_daytona_key(state: tauri::State<'_, crate::AppState>) -> Res
     if !pending(&state)?.is_empty() {
         return Err("Resolve pending cloud cleanup before forgetting its credential.".into());
     }
-    state.daytona_vault.clear("daytona")
+    state.daytona_vault.clear_blocking("daytona").await
 }
 #[tauri::command]
 pub async fn retry_daytona_cleanup(

@@ -1,29 +1,22 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Archive,
-  Bell,
-  BookOpen,
   ChevronDown,
-  Cpu,
   Folder,
   MessageCircle,
   MoreHorizontal,
   PenSquare,
   Pin,
-  Plug,
   Plus,
   Search,
-  Settings,
-  Terminal,
   Trash2,
-  Wrench,
 } from 'lucide-react';
 import { confirm, open } from '@tauri-apps/plugin-dialog';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import { allProjects, conversationProjectId, groupByProject } from '../lib/projects';
 import type { Conversation, Hit, Project, WorkspaceIndex } from '../lib/types';
 
-export type Page = 'chat' | 'models' | 'connectors' | 'skills' | 'execution' | 'tools';
+export type Page = 'chat' | 'general' | 'appearance' | 'models' | 'connectors' | 'skills' | 'execution' | 'bash' | 'python' | 'development-tools' | 'language-servers' | 'weather' | 'web-search' | 'inference' | 'diagnostics' | 'security' | 'git' | 'browser-use' | 'computer-use' | 'tools' | 'hooks' | 'permission-rules' | 'plugins';
 
 interface Props {
   page: Page;
@@ -37,7 +30,6 @@ interface Props {
   onSearch: (search: string) => void;
   theme: string;
   onTheme: () => void;
-  onCollapse: () => void;
   workspace?: WorkspaceIndex;
   onWorkspace?: (index: WorkspaceIndex) => void;
   onProject?: (id: string | null) => void;
@@ -59,15 +51,46 @@ function formatRelativeTime(timestamp: number, fallback = '2d'): string {
   return `${months}mo`;
 }
 
+function readSidebarWidth(): number {
+  try {
+    return Math.max(220, Math.min(440, Number(localStorage.getItem('locallm-sidebar-width')) || 260));
+  } catch {
+    return 260;
+  }
+}
+
+function newProjectId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch {
+    // Fall through to the entropy fallback below.
+  }
+  return `project-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 export function Sidebar(props: Props) {
-  const [width, setWidth] = useState(() => Math.max(220, Math.min(440, Number(localStorage.getItem('locallm-sidebar-width')) || 260)));
+  const [width, setWidth] = useState(readSidebarWidth);
   useEffect(() => {
     document.documentElement.style.setProperty('--sidebar-width', `${width}px`);
-    localStorage.setItem('locallm-sidebar-width', String(width));
+    try {
+      localStorage.setItem('locallm-sidebar-width', String(width));
+    } catch {
+      // Storage may be full or denied; the in-memory width keeps the sidebar usable.
+    }
   }, [width]);
 
-  const [brandMenuOpen, setBrandMenuOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  useEffect(() => {
+    const showSearch = () => {
+      setSearchOpen(true);
+      setTimeout(() => document.querySelector<HTMLInputElement>('input[aria-label="Search conversations"]')?.focus(), 0);
+    };
+    window.addEventListener('locallm-search', showSearch);
+    return () => window.removeEventListener('locallm-search', showSearch);
+  }, []);
+
   const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
   const [unfiledExpanded, setUnfiledExpanded] = useState(false);
@@ -75,7 +98,6 @@ export function Sidebar(props: Props) {
   const [projectMenuOpenId, setProjectMenuOpenId] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
-  const brandRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     function handlePointerDown(e: MouseEvent) {
@@ -85,15 +107,11 @@ export function Sidebar(props: Props) {
       if (projectMenuRef.current && !projectMenuRef.current.contains(e.target as Node)) {
         setProjectMenuOpenId(null);
       }
-      if (brandRef.current && !brandRef.current.contains(e.target as Node)) {
-        setBrandMenuOpen(false);
-      }
     }
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') {
         setMenuOpenId(null);
         setProjectMenuOpenId(null);
-        setBrandMenuOpen(false);
       }
     }
     window.addEventListener('mousedown', handlePointerDown);
@@ -108,14 +126,16 @@ export function Sidebar(props: Props) {
   const [saving, setSaving] = useState(false);
   const workspace = props.workspace ?? { projects: [], tasks: {} };
 
-  async function change(action: () => Promise<WorkspaceIndex>) {
+  async function change(action: () => Promise<WorkspaceIndex>): Promise<WorkspaceIndex | null> {
     setSaving(true);
     setError('');
     try {
       const next = await action();
       props.onWorkspace?.(next);
+      return next;
     } catch (e) {
       setError(errorMessage(e));
+      return null;
     } finally {
       setSaving(false);
     }
@@ -125,17 +145,20 @@ export function Sidebar(props: Props) {
     if (!nativeAvailable) return null;
     try {
       const selected = await open({ directory: true, multiple: false, title: 'Select Project Folder' });
-      if (selected && typeof selected === 'string') {
-        const parts = selected.replace(/\\/g, '/').split('/');
-        const name = parts[parts.length - 1] || 'New Project';
-        const id = name.toLowerCase().replace(/[^a-z0-9]/g, '-');
-        await change(() => api.saveProject({ id, name, path: selected }));
-        return id;
-      }
+      if (!selected || typeof selected !== 'string') return null;
+      const existing = workspace.projects.find(p => p.path === selected);
+      if (existing) return existing.id;
+      const parts = selected.replace(/\\/g, '/').split('/');
+      const name = parts[parts.length - 1] || 'New Project';
+      const id = newProjectId();
+      const next = await change(() => api.saveProject({ id, name, path: selected }));
+      if (!next) return null;
+      const saved = next.projects.find(p => p.id === id) ?? next.projects.find(p => p.path === selected);
+      return saved?.id ?? null;
     } catch (e) {
       setError(errorMessage(e));
+      return null;
     }
-    return null;
   }
 
   async function handleDeleteProject(project: Project) {
@@ -169,9 +192,12 @@ export function Sidebar(props: Props) {
 
   const [hits, setHits] = useState<Hit[]>([]);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState('');
+  const [searchAttempt, setSearchAttempt] = useState(0);
 
   useEffect(() => {
     const query = props.search.trim();
+    setSearchError('');
     if (!query) {
       setHits([]);
       setSearching(false);
@@ -186,7 +212,7 @@ export function Sidebar(props: Props) {
           if (!cancelled) setHits(results || []);
         }
       } catch {
-        if (!cancelled) setHits([]);
+        if (!cancelled) { setHits([]); setSearchError('Conversation search failed. Try again.'); }
       } finally {
         if (!cancelled) setSearching(false);
       }
@@ -196,7 +222,7 @@ export function Sidebar(props: Props) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [props.search]);
+  }, [props.search, searchAttempt]);
 
   const queryLower = props.search.toLowerCase();
   const matchingTitleConversations = props.conversations.filter(item =>
@@ -264,7 +290,7 @@ export function Sidebar(props: Props) {
           </button>
         </div>
         {menuOpenId === c.id && (
-          <div className="codex-task-dropdown-menu" role="menu" ref={menuRef}>
+          <div className="task-dropdown-menu" role="menu" ref={menuRef}>
             <button
               aria-label={`${meta.pinned ? 'Unpin' : 'Pin'} ${c.title}`}
               disabled={saving || props.busy || !nativeAvailable}
@@ -306,7 +332,7 @@ export function Sidebar(props: Props) {
         tabIndex={0}
         onPointerDown={e => e.currentTarget.setPointerCapture(e.pointerId)}
         onPointerMove={e => {
-          if (e.currentTarget.hasPointerCapture(e.pointerId)) setWidth(Math.max(220, Math.min(440, e.clientX)));
+          if (e.currentTarget.hasPointerCapture(e.pointerId)) setWidth(Math.max(220, Math.min(440, e.clientX - (e.currentTarget.parentElement?.getBoundingClientRect().left ?? 0))));
         }}
         onPointerUp={e => e.currentTarget.releasePointerCapture(e.pointerId)}
         onKeyDown={e => {
@@ -317,14 +343,15 @@ export function Sidebar(props: Props) {
         }}
       />
 
-      {/* Top Header: Brand Dropdown & Top Actions */}
+      {/* Home navigation & top actions */}
       <div className="sidebar-top-bar">
-        <div className="sidebar-brand-wrapper" ref={brandRef}>
+        <div className="sidebar-brand-wrapper">
           <button
             className="sidebar-brand-btn"
-            aria-label="Workspace menu"
-            aria-expanded={brandMenuOpen}
-            onClick={() => setBrandMenuOpen(b => !b)}
+            aria-label="localLM home"
+            title="Home"
+            disabled={props.busy}
+            onClick={() => props.onPage('chat')}
           >
             <div className="sidebar-brand-mark" aria-hidden="true">
               <svg viewBox="0 0 512 512" width="14" height="14">
@@ -334,66 +361,7 @@ export function Sidebar(props: Props) {
               </svg>
             </div>
             <span className="sidebar-brand-title">localLM</span>
-            <ChevronDown size={14} className={`sidebar-brand-chevron ${brandMenuOpen ? 'open' : ''}`} />
           </button>
-          {brandMenuOpen && (
-            <div className="sidebar-brand-menu" role="menu">
-              <button
-                role="menuitem"
-                onClick={() => {
-                  props.onPage('chat');
-                  setBrandMenuOpen(false);
-                }}
-              >
-                LocalLM Workspace
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  props.onPage('connectors');
-                  setBrandMenuOpen(false);
-                }}
-              >
-                Connectors
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  props.onPage('skills');
-                  setBrandMenuOpen(false);
-                }}
-              >
-                Skills
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  props.onPage('tools');
-                  setBrandMenuOpen(false);
-                }}
-              >
-                Tools &amp; Permissions
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  props.onPage('models');
-                  setBrandMenuOpen(false);
-                }}
-              >
-                Models &amp; Runtime
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  props.onPage('execution');
-                  setBrandMenuOpen(false);
-                }}
-              >
-                Execution
-              </button>
-            </div>
-          )}
         </div>
         <div className="sidebar-top-actions">
           <button
@@ -403,14 +371,6 @@ export function Sidebar(props: Props) {
             onClick={() => setSearchOpen(s => !s)}
           >
             <Search size={15} />
-          </button>
-          <button
-            className="icon-button"
-            aria-label="Notifications"
-            title="Notifications"
-            onClick={() => {}}
-          >
-            <Bell size={15} />
           </button>
         </div>
       </div>
@@ -443,54 +403,7 @@ export function Sidebar(props: Props) {
         <Plus size={14} className="new-chat-plus" />
       </button>
 
-      {/* Top quick navigation links: Toolsets & Features */}
-      <nav className="codex-nav locallm-nav" aria-label="Quick links">
-        <button
-          className={props.page === 'connectors' ? 'selected' : ''}
-          aria-label="Connectors"
-          title="Connectors (MCP servers, external tools)"
-          onClick={() => props.onPage('connectors')}
-        >
-          <Plug size={15} />
-          <span>Connectors</span>
-        </button>
-        <button
-          className={props.page === 'skills' ? 'selected' : ''}
-          aria-label="Skills"
-          title="Skills (Reusable workflow instructions & scripts)"
-          onClick={() => props.onPage('skills')}
-        >
-          <BookOpen size={15} />
-          <span>Skills</span>
-        </button>
-        <button
-          className={props.page === 'tools' ? 'selected' : ''}
-          aria-label="Tools"
-          title="Tools & permissions"
-          onClick={() => props.onPage('tools')}
-        >
-          <Wrench size={15} />
-          <span>Tools</span>
-        </button>
-        <button
-          className={props.page === 'models' ? 'selected' : ''}
-          aria-label="Models & runtime"
-          title="Models & runtime (Local GGUF, llama.cpp, API providers)"
-          onClick={() => props.onPage('models')}
-        >
-          <Cpu size={15} />
-          <span>Models &amp; runtime</span>
-        </button>
-        <button
-          className={props.page === 'execution' ? 'selected' : ''}
-          aria-label="Execution"
-          title="Execution (Interpreters, Web Search)"
-          onClick={() => props.onPage('execution')}
-        >
-          <Terminal size={15} />
-          <span>Execution</span>
-        </button>
-      </nav>
+
 
       {/* Projects section heading with add project button */}
       <div className="sidebar-section-header">
@@ -510,10 +423,11 @@ export function Sidebar(props: Props) {
 
       {/* Project list & nested chats */}
       <div className="conversation-list codex-project-list">
+        {!props.search.trim() && !effectiveProjects.length && !unfiledConversations.length && <p className="sidebar-project-empty">Add a folder to start a project.</p>}
         {props.search.trim() ? (
           <>
-            <div className="history-heading">
-              <span>{searching ? 'SEARCHING…' : 'SEARCH RESULTS'}</span>
+            <div className="history-heading" role="status" aria-live="polite" aria-atomic="true">
+              <span>{searching ? 'Searching conversations…' : 'Search results'}</span>
               <span>{matchingTitleConversations.length + hits.length}</span>
             </div>
             {matchingTitleConversations.map(c => renderChatItem(c))}
@@ -539,7 +453,8 @@ export function Sidebar(props: Props) {
                 ))}
               </div>
             )}
-            {!matchingTitleConversations.length && !hits.length && !searching && (
+            {searchError && <p className="error" role="alert">{searchError}<button onClick={() => setSearchAttempt(attempt => attempt + 1)}>Retry search</button></p>}
+            {!searchError && !matchingTitleConversations.length && !hits.length && !searching && (
               <p className="history-empty">No matching conversations found.</p>
             )}
           </>
@@ -559,21 +474,25 @@ export function Sidebar(props: Props) {
                 <div className="codex-project-group" key={project.id}>
                   <div
                     className={`codex-folder-header ${props.projectId === project.id ? 'active-folder' : ''} ${projectMenuOpenId === project.id ? 'menu-open' : ''}`}
-                    onClick={() => toggleFolder(project.id)}
                     onContextMenu={e => {
                       e.preventDefault();
                       setProjectMenuOpenId(project.id);
                     }}
-                    title={project.path ? `${project.name} (${project.path})` : project.name}
                   >
-                    <div className="codex-folder-label">
+                    <button
+                      type="button"
+                      className="codex-folder-label"
+                      aria-expanded={!isCollapsed}
+                      title={project.path ? `${project.name} (${project.path})` : project.name}
+                      onClick={() => toggleFolder(project.id)}
+                    >
                       <ChevronDown
                         size={13}
                         className={`codex-folder-chevron ${isCollapsed ? 'collapsed' : ''}`}
                       />
                       <Folder size={14} className="codex-folder-icon" />
                       <span className="codex-folder-name">{project.name}</span>
-                    </div>
+                    </button>
 
                     {totalCount > 0 && (
                       <span className="codex-folder-count" aria-hidden="true">{totalCount}</span>
@@ -622,7 +541,7 @@ export function Sidebar(props: Props) {
 
                       {projectMenuOpenId === project.id && (
                         <div
-                          className="codex-task-dropdown-menu codex-folder-dropdown-menu"
+                          className="task-dropdown-menu codex-folder-dropdown-menu"
                           role="menu"
                           ref={projectMenuRef}
                           onClick={e => e.stopPropagation()}
@@ -706,18 +625,6 @@ export function Sidebar(props: Props) {
             </div>
           </>
         )}
-      </div>
-
-      <div className="sidebar-footer codex-sidebar-footer">
-        <button
-          className={`sidebar-settings-btn ${props.page !== 'chat' ? 'active-settings' : ''}`}
-          aria-label="Settings"
-          onClick={() => props.onPage(props.page === 'chat' ? 'models' : 'chat')}
-          title="Settings (Models & runtime, Connectors, Skills, Tools, Execution)"
-        >
-          <Settings size={15} className="settings-gear-icon" />
-          <span>Settings</span>
-        </button>
       </div>
     </aside>
   );

@@ -21,6 +21,7 @@ import type {
   TokenStats,
   SearchMeta,
   SearchResult,
+  FreshnessWindow,
 } from './types';
 import { emptySearchMeta, hasSearchMeta, mergeSearchMeta } from './types';
 import { createConfig } from './config/defaults';
@@ -36,7 +37,7 @@ import { GoogleSearchProvider } from './search/google_provider';
 import { rankSearchResults } from './ranking/search_ranker';
 import { selectPagesToFetch } from './fetch/fetch_policy';
 import { HttpFetcher } from './fetch/http_fetcher';
-import { fetchPageCascade } from './fetch/cascade';
+import { fetchPageCascade, type CascadeOutcome, type CascadeOptions } from './fetch/cascade';
 import { DomainStatsStore, orderByDomainHealth } from './fetch/domain_stats';
 import { fallbackSnippetExtraction } from './extraction/extraction_fallback';
 import { chunkDocument } from './chunking/semantic_chunker';
@@ -54,6 +55,7 @@ import { ClaimVerifier } from './verification/claim_verifier';
 import { evaluateResearchRetry, isRepeatedQuery } from './verification/research_retry';
 import { initResearchState, recordRound, classifyRequirements } from './planning/research_state';
 import { WeatherProvider } from './verticals/weather/weather_provider';
+import { extractStructuredContent } from './extraction/structured_content';
 import { CurrencyProvider } from './verticals/currency/currency_provider';
 import { TimeProvider } from './verticals/time/time_provider';
 import { SearchCache } from './cache/search_cache';
@@ -72,6 +74,13 @@ export * from './config/schema';
 export * from './config/defaults';
 export { formatDiagnosticReport } from './observability/metrics';
 
+export interface ResearchProgress {
+  stage: 'route' | 'plan' | 'search' | 'fetch' | 'evidence' | 'answer' | 'verify';
+  message: string;
+  done?: number;
+  total?: number;
+}
+
 export interface EngineDependencies {
   searchProvider?: SearchProvider;
   llmProvider?: LLMProvider;
@@ -81,6 +90,8 @@ export interface EngineDependencies {
   jsRender?: import('./fetch/cascade').JsRenderer;
   storage?: StorageAdapter;
   config?: Partial<WebSearchConfig>;
+  /** Optional stage callback; the worker maps it onto its progress protocol. */
+  onProgress?: (progress: ResearchProgress) => void;
 }
 
 export class WebSearchEngine {
@@ -104,6 +115,22 @@ export class WebSearchEngine {
   private answerGenerator: AnswerGenerator;
   private claimVerifier: ClaimVerifier;
   private logger: PipelineLogger;
+  private onProgress?: (progress: ResearchProgress) => void;
+  /** Concurrent calls for one URL share a single fetch cascade. */
+  private inflightFetches = new Map<string, Promise<CascadeOutcome>>();
+
+  private progress(stage: ResearchProgress['stage'], message: string, extra?: { done?: number; total?: number }) {
+    try { this.onProgress?.({ stage, message, ...extra }); } catch { /* reporting never breaks research */ }
+  }
+
+  private fetchCascade(url: string, options: CascadeOptions): Promise<CascadeOutcome> {
+    const pending = this.inflightFetches.get(url);
+    if (pending) return pending;
+    const promise = fetchPageCascade(url, this.fetcher, options)
+      .finally(() => { if (this.inflightFetches.get(url) === promise) this.inflightFetches.delete(url); });
+    this.inflightFetches.set(url, promise);
+    return promise;
+  }
 
   constructor(deps: EngineDependencies = {}) {
     this.config = createConfig(deps.config);
@@ -145,6 +172,7 @@ export class WebSearchEngine {
     this.answerGenerator = new AnswerGenerator(this.llmProvider);
     this.claimVerifier = new ClaimVerifier(this.config.verification.enabled ? this.llmProvider : undefined);
     this.logger = new PipelineLogger(false);
+    this.onProgress = deps.onProgress;
   }
 
   /**
@@ -172,24 +200,17 @@ export class WebSearchEngine {
     reranker: string;
     llm: string;
     google: string;
+    searchError?: string;
+    searxngDiagnostics?: import('./search/searxng_provider').SearXNGDiagnostics;
   }> {
-    let searchStatus = 'ready';
-    try {
-      if (this.searchProvider instanceof SearXNGProvider) {
-        // Ping health
-        const res = await fetch(new URL('/', this.config.searxngBaseUrl).toString(), {
-          method: 'HEAD',
-          signal: AbortSignal.timeout(5000),
-          redirect: 'error',
-        });
-        searchStatus = res.ok ? 'healthy' : `http_${res.status}`;
-      }
-    } catch {
-      searchStatus = 'unreachable';
-    }
+    const searchHealth = this.config.searchProvider === 'google' && (!this.config.googleApiKey || !this.config.googleCxId)
+      ? { search: 'not_configured', searchError: 'Configure a Google API key and Custom Search Engine ID.' }
+      : this.searchProvider instanceof SearXNGProvider
+      ? await this.searchProvider.checkHealth()
+      : { search: 'ready' };
 
     return {
-      search: searchStatus,
+      ...searchHealth,
       database: this.config.cache.enabled ? 'configured' : 'disabled',
       embeddingModel: this.config.retrieval.embeddings ? this.embeddingProvider.constructor.name : 'disabled',
       reranker: this.config.reranking.enabled ? this.reranker.constructor.name : 'disabled',
@@ -217,13 +238,19 @@ export class WebSearchEngine {
     }
     const options = { maxConcurrentQueries: this.config.maxConcurrentQueries, retries: this.config.searchRetries, retryDelayMs: this.config.searchRetryDelayMs };
     const result = await new SearchService(this.searchProvider, options).executeSearches(planned, 10);
-    if (result.results.length || !this.fallbackProvider) return result;
+    if (result.results.length || result.meta.answers.length || result.meta.infoboxes.length || !this.fallbackProvider) return result;
     if (this.fallbackProvider instanceof GoogleSearchProvider && !(await this.claimGoogleQuota(planned.length))) return result;
-    return new SearchService(this.fallbackProvider, options).executeSearches(planned, 10);
+    const fallback = await new SearchService(this.fallbackProvider, options).executeSearches(planned, 10);
+    return {
+      ...fallback,
+      failureCount: result.failureCount + fallback.failureCount,
+      failures: [...result.failures, ...fallback.failures],
+      meta: mergeSearchMeta(result.meta, fallback.meta),
+    };
   }
 
   async fetchUrl(rawUrl: string): Promise<RetrievedDocument> {
-    const outcome = await fetchPageCascade(rawUrl, this.fetcher, {
+    const outcome = await this.fetchCascade(rawUrl, {
       timeoutSeconds: this.config.fetch.timeoutSeconds,
       maxBytes: this.config.fetch.maxBytes,
       userAgent: this.config.fetch.userAgent,
@@ -233,6 +260,12 @@ export class WebSearchEngine {
     });
     const res = outcome.raw;
     const mime = (res?.mimeType || '').split(';')[0].trim().toLowerCase();
+    if (res?.success && typeof res.body === 'string' && (['application/json', 'text/csv', 'application/csv', 'text/tab-separated-values'].includes(mime) || mime.endsWith('+json'))) {
+      const structured = extractStructuredContent(res.body, mime);
+      const url = res.finalUrl || rawUrl;
+      return { id: `data-${Date.now()}`, url, domain: new URL(url).hostname, title: new URL(url).pathname.split('/').pop() || 'Structured document',
+        text: structured.text, retrievedAt: new Date().toISOString(), searchResultIds: [], metadata: { extractionMethod: structured.extractionMethod, rowCount: structured.rows } };
+    }
     if (res?.success && res.body && (mime === 'application/pdf' || /\.pdf(\?|#|$)/i.test(res.finalUrl || rawUrl))) {
       const latin1 = res.body || '';
       const bytes = Uint8Array.from(latin1, (ch) => ch.charCodeAt(0) & 0xff);
@@ -299,7 +332,7 @@ export class WebSearchEngine {
       if (cached) return { doc: { ...cached, id: `doc-${index + 1}` }, method: 'cache' };
     }
 
-    const outcome = await fetchPageCascade(candidate.url, this.fetcher, {
+    const outcome = await this.fetchCascade(candidate.url, {
       timeoutSeconds: this.config.fetch.timeoutSeconds,
       maxBytes: this.config.fetch.maxBytes,
       userAgent: this.config.fetch.userAgent,
@@ -368,7 +401,7 @@ export class WebSearchEngine {
    */
   async research(
     question: string,
-    options: { mode?: ResearchMode; currentDate?: string } = {}
+    options: { mode?: ResearchMode; currentDate?: string; freshness?: FreshnessWindow; language?: string; category?: string } = {}
   ): Promise<ResearchSession> {
     if (!this.config.enabled) throw new Error('Web research is disabled');
     if (!question.trim() || question.length > 8000) throw new Error('Question must contain 1–8000 characters');
@@ -391,7 +424,17 @@ export class WebSearchEngine {
     trace.startTimer('route');
     const route = routeRequest(normalizedReq.normalizedQuery);
     trace.endTimer('route');
+    // Caller-supplied freshness narrows the routed window (never widens past it).
+    if (options.freshness && options.freshness !== 'any' && options.freshness !== route.freshness) {
+      const order = ['realtime', 'day', 'week', 'month', 'year', 'any'];
+      if (order.indexOf(options.freshness) < order.indexOf(route.freshness)) {
+        route.freshness = options.freshness;
+      }
+    }
     this.logger.log('route_selected', { route });
+    this.progress('route', route.requiresWebSearch
+      ? `Web research (${route.vertical.toLowerCase()})`
+      : route.requiresExternalData ? `${route.vertical.charAt(0)}${route.vertical.slice(1).toLowerCase()} lookup` : 'Direct answer');
 
     const sourceManager = new SourceManager();
 
@@ -542,12 +585,28 @@ export class WebSearchEngine {
     const retryReserve = this.config.verification.enabled ? Math.min(this.config.verification.maxResearchRetries, Math.max(0, maxQueries - 1)) : 0;
     maxQueries -= retryReserve;
 
+    // Rules-first planning: fast/normal answer well with deterministic query
+    // shaping, so `auto` only spends a model call on deep research.
+    const planningStrategy =
+      this.config.planning === 'model' ? 'model'
+      : this.config.planning === 'rules' ? 'rules'
+      : (mode === 'deep' ? 'model' : 'rules');
     const plannedQueries = await this.queryPlanner.planQueries(
       question,
       route.freshness,
       maxQueries,
-      curDate
+      curDate,
+      planningStrategy
     );
+    // Caller filters (e.g. `web_search` language/category args) apply to every
+    // planned query, including pagination and suggestion follow-ups below.
+    if (options.language || options.category) {
+      for (const q of plannedQueries) {
+        if (options.language) q.language = options.language;
+        if (options.category) q.category = options.category;
+      }
+    }
+    this.progress('search', `Searching ${plannedQueries.length} ${plannedQueries.length === 1 ? 'query' : 'queries'}…`);
     trace.endTimer('planning');
     trace.update({ queriesGenerated: plannedQueries.length });
     this.logger.log('queries_generated', { plannedQueries });
@@ -593,25 +652,33 @@ export class WebSearchEngine {
       }
       trace.update({ providerUsed: primaryName, fallbackUsed: false, fallbackReason: '' });
       // Automatic fallback: primary empty + fallback configured + quota remains.
-      if (searchOutcome.results.length === 0 && this.fallbackProvider) {
+      if (searchOutcome.results.length === 0 && !searchOutcome.meta.answers.length && !searchOutcome.meta.infoboxes.length && this.fallbackProvider) {
         const fallbackName = this.fallbackProvider instanceof GoogleSearchProvider ? 'google' : 'searxng';
         let reason = '';
         if (fallbackName === 'google' && !(await this.claimGoogleQuota(plannedQueries.length))) {
           reason = 'google daily quota exhausted';
         } else {
-          const fbService = new SearchService(this.fallbackProvider);
+          const fbService = new SearchService(this.fallbackProvider, {
+            maxConcurrentQueries: this.config.maxConcurrentQueries,
+            retries: this.config.searchRetries,
+            retryDelayMs: this.config.searchRetryDelayMs,
+          });
           const fbOutcome = await fbService.executeSearches(plannedQueries, this.config.resultsPerQuery);
+          const failures = [...(searchOutcome.failures || []), ...fbOutcome.failures];
+          const meta = mergeSearchMeta(searchOutcome.meta, fbOutcome.meta);
           if (fbOutcome.results.length > 0) {
-            searchOutcome = fbOutcome;
+            searchOutcome = { ...fbOutcome, failures, failureCount: failures.length, meta };
             reason = `primary ${primaryName} empty; fell back to ${fallbackName}`;
             if (this.config.cache.enabled) {
               await this.searchCache.set(fallbackName, cacheKey, fbOutcome.results, route.freshness, this.config.cache.searchTtlSeconds.default);
             }
           } else {
+            searchOutcome = { ...searchOutcome, failures, failureCount: failures.length, meta };
             reason = `primary ${primaryName} and fallback ${fallbackName} both empty`;
           }
         }
-        trace.update({ providerUsed: fallbackName, fallbackUsed: searchOutcome.results.length > 0, fallbackReason: reason });
+        trace.update({ providerUsed: searchOutcome.results.length ? fallbackName : primaryName, fallbackUsed: searchOutcome.results.length > 0, fallbackReason: reason,
+          queryFailures: searchOutcome.failures, searchFailureCount: searchOutcome.failureCount });
         this.logger.log('search_fallback', { primary: primaryName, fallback: fallbackName, reason });
       }
     }
@@ -624,6 +691,7 @@ export class WebSearchEngine {
       raw: searchOutcome.rawCount,
       unique: searchOutcome.results.length,
     });
+    this.progress('search', `Search returned ${searchOutcome.results.length} unique ${searchOutcome.results.length === 1 ? 'result' : 'results'}`);
 
     // Selective pagination: when page one yields nothing usable but queries
     // succeeded, spend one budgeted page-two fetch per query (honors the
@@ -637,13 +705,13 @@ export class WebSearchEngine {
       const pagedPages: number[] = [];
       let pagedRaw = 0;
       const remaining = Math.max(0, totalQueryBudget - plannedQueries.length);
-      for (const q of plannedQueries.slice(0, Math.max(1, remaining))) {
+      for (const q of plannedQueries.slice(0, remaining)) {
+        plannedQueries.push({ ...q, page: 2, purpose: `${q.purpose} (page 2)` });
         const extra = await paged.fetchAdditionalPage(q, 2, this.config.resultsPerQuery);
         if (extra.results.length > 0) {
           pagedResults.push(...extra.results);
           pagedRaw += extra.results.length;
           pagedPages.push(2);
-          plannedQueries.push({ ...q, page: 2, purpose: `${q.purpose} (page 2)` });
           if (extra.meta) searchOutcome.meta = mergeSearchMeta(searchOutcome.meta, extra.meta);
         }
       }
@@ -671,11 +739,11 @@ export class WebSearchEngine {
       );
       if (suggestion) {
         const extra = await new SearchService(this.searchProvider, { retries: 0 }).executeSearches(
-          [{ query: suggestion, purpose: 'SearXNG related-search suggestion', freshness: route.freshness }],
+          [{ query: suggestion, purpose: 'SearXNG related-search suggestion', freshness: route.freshness, language: options.language, category: options.category }],
           this.config.resultsPerQuery,
         );
         if (extra.results.length > 0) {
-          plannedQueries.push({ query: suggestion, purpose: 'SearXNG related-search suggestion', freshness: route.freshness });
+          plannedQueries.push({ query: suggestion, purpose: 'SearXNG related-search suggestion', freshness: route.freshness, language: options.language, category: options.category });
           const fused = fuseSearchResults([
             { query: 'primary', results: searchOutcome.results },
             { query: suggestion, results: extra.results },
@@ -729,8 +797,15 @@ export class WebSearchEngine {
     let waybackRecoveries = 0;
     const domainsChronicSkipped: string[] = [];
 
+    if (pagesToFetch.length > 0) {
+      this.progress('fetch', `Reading ${pagesToFetch.length} ${pagesToFetch.length === 1 ? 'page' : 'pages'}…`, { done: 0, total: pagesToFetch.length });
+    }
+    let fetchedCount = 0;
     const fetchPromises = pagesToFetch.map(async (candidate, index) => {
-      return this.retrieveCandidate(candidate, index + documents.length, route.freshness);
+      const outcome = await this.retrieveCandidate(candidate, index + documents.length, route.freshness);
+      fetchedCount += 1;
+      this.progress('fetch', `Reading pages ${fetchedCount}/${pagesToFetch.length}`, { done: fetchedCount, total: pagesToFetch.length });
+      return outcome;
     });
 
     const settledDocs = await Promise.allSettled(fetchPromises);
@@ -842,6 +917,7 @@ export class WebSearchEngine {
     const finalClaims = detectEvidenceConflicts(deduplicatedClaims);
     trace.endTimer('evidence');
     trace.update({ evidenceClaims: finalClaims.length });
+    this.progress('evidence', `Extracted ${finalClaims.length} evidence ${finalClaims.length === 1 ? 'claim' : 'claims'}`);
 
     // Step 12: Context Building & Token Budget Management
     trace.startTimer('context_builder');
@@ -854,6 +930,7 @@ export class WebSearchEngine {
 
     // Step 13: Grounded Answer Synthesis
     trace.startTimer('generation');
+    this.progress('answer', 'Composing grounded answer…');
     let answerOutcome = await this.answerGenerator.generateAnswer(
       groundedContext,
       sourceManager.getAllSources(),
@@ -910,6 +987,8 @@ export class WebSearchEngine {
       if (!retryEval.shouldRetry || !retryEval.targetedQuery) {
         break;
       }
+      if (options.language) retryEval.targetedQuery.language = options.language;
+      if (options.category) retryEval.targetedQuery.category = options.category;
 
       retryCount++;
       trace.startTimer(`retry_${retryCount}`);

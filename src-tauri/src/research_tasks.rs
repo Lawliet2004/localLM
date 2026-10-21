@@ -11,7 +11,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub const TASKS_TABLE: &str = "research_tasks";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -90,12 +89,24 @@ pub struct TaskBudgets {
     pub operation_timeout_secs: u64,
 }
 
-fn default_task_secs() -> u64 { 1800 }
-fn default_max_rounds() -> usize { 8 }
-fn default_max_searches() -> usize { 12 }
-fn default_max_documents() -> usize { 20 }
-fn default_max_retries() -> usize { 2 }
-fn default_op_secs() -> u64 { 240 }
+fn default_task_secs() -> u64 {
+    1800
+}
+fn default_max_rounds() -> usize {
+    8
+}
+fn default_max_searches() -> usize {
+    12
+}
+fn default_max_documents() -> usize {
+    20
+}
+fn default_max_retries() -> usize {
+    2
+}
+fn default_op_secs() -> u64 {
+    240
+}
 
 impl Default for TaskBudgets {
     fn default() -> Self {
@@ -164,7 +175,11 @@ pub struct ResearchTask {
 }
 
 impl ResearchTask {
-    pub fn new(conversation_id: &str, question: &str, budgets: TaskBudgets) -> Result<Self, String> {
+    pub fn new(
+        conversation_id: &str,
+        question: &str,
+        budgets: TaskBudgets,
+    ) -> Result<Self, String> {
         if question.trim().is_empty() || question.len() > 8000 {
             return Err("Task question must contain 1-8000 bytes.".into());
         }
@@ -180,7 +195,13 @@ impl ResearchTask {
             completed_results: Vec::new(),
             requirements: Vec::new(),
             findings: Vec::new(),
-            pending_work: vec!["plan".into(), "search".into(), "read".into(), "verify".into(), "answer".into()],
+            pending_work: vec![
+                "plan".into(),
+                "search".into(),
+                "read".into(),
+                "verify".into(),
+                "answer".into(),
+            ],
             created_at: now,
             updated_at: now,
         })
@@ -209,7 +230,8 @@ impl ResearchTask {
             updated_at: crate::store::now(),
         });
         if let Some(summary) = summary {
-            self.completed_results.push(json!({"kind": kind, "summary": summary}));
+            self.completed_results
+                .push(json!({"kind": kind, "summary": summary}));
         }
         self.pending_work.retain(|work| work != kind);
         self.updated_at = crate::store::now();
@@ -217,13 +239,18 @@ impl ResearchTask {
     }
 
     pub fn budget_exhausted(&self) -> bool {
-        let searches = self.operations.iter().filter(|op| op.kind == "search").count();
+        let searches = self
+            .operations
+            .iter()
+            .filter(|op| op.kind == "search")
+            .count();
         let rounds = self.operations.len();
         searches >= self.budgets.max_searches || rounds >= self.budgets.max_rounds
     }
 
     pub fn elapsed_exhausted(&self) -> bool {
-        crate::store::now().saturating_sub(self.created_at) > (self.budgets.task_timeout_secs as i64) * 1000
+        crate::store::now().saturating_sub(self.created_at)
+            > (self.budgets.task_timeout_secs as i64) * 1000
     }
 
     pub fn pause(&mut self) -> Result<(), String> {
@@ -269,7 +296,10 @@ impl ResearchTask {
             return Err("Task already reached a terminal state.".into());
         }
         for op in &mut self.operations {
-            if matches!(op.status, OperationStatus::Running | OperationStatus::Pending) {
+            if matches!(
+                op.status,
+                OperationStatus::Running | OperationStatus::Pending
+            ) {
                 op.status = OperationStatus::Unknown;
                 op.error = Some("Cancelled; the action may already have changed data.".into());
             }
@@ -329,7 +359,11 @@ impl ResearchTask {
     }
 
     pub fn progress_summary(&self) -> Value {
-        let completed = self.operations.iter().filter(|op| op.status == OperationStatus::Completed).count();
+        let completed = self
+            .operations
+            .iter()
+            .filter(|op| op.status == OperationStatus::Completed)
+            .count();
         json!({
             "taskId": self.id,
             "status": self.status.as_str(),
@@ -342,20 +376,16 @@ impl ResearchTask {
 }
 
 #[allow(dead_code)]
-fn _storage_contract() {
-    let _ = TASKS_TABLE;
-    let _ = TaskStatus::parse("running");
-    let _ = OperationStatus::Pending.as_str();
-    let task = ResearchTask::new("c", "q", TaskBudgets::default()).unwrap();
-    let _ = task.elapsed_exhausted();
-}
-
 /// Called from application startup and from `restart_generation`.
-pub fn recover_interrupted(store: &crate::store::Store) -> Result<crate::agent_run::RestartReport, String> {
+pub fn recover_interrupted(
+    store: &crate::store::Store,
+) -> Result<crate::agent_run::RestartReport, String> {
     let mut replayed = Vec::new();
     let mut any_unknown = false;
     for id in store.running_research_task_ids()? {
-        let Some(mut task) = store.research_task(&id)? else { continue };
+        let Some(mut task) = store.research_task(&id)? else {
+            continue;
+        };
         let report = task.restart_from_ledger();
         replayed.extend(report.replayed_write_ids);
         any_unknown = true;
@@ -368,38 +398,22 @@ pub fn recover_interrupted(store: &crate::store::Store) -> Result<crate::agent_r
     })
 }
 
-pub fn ensure_table(connection: &rusqlite::Connection) -> Result<(), String> {
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS research_tasks(
-                id TEXT PRIMARY KEY,
-                conversation_id TEXT NOT NULL,
-                question TEXT NOT NULL,
-                status TEXT NOT NULL,
-                budgets_json TEXT NOT NULL,
-                operations_json TEXT NOT NULL DEFAULT '[]',
-                results_json TEXT NOT NULL DEFAULT '[]',
-                requirements_json TEXT NOT NULL DEFAULT '[]',
-                findings_json TEXT NOT NULL DEFAULT '[]',
-                pending_json TEXT NOT NULL DEFAULT '[]',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS research_tasks_conversation ON research_tasks(conversation_id, created_at);",
-        )
-        .map_err(|error| format!("Local database: {error}"))?;
-    Ok(())
-}
-
+/// The research-task table and its index are created by the store's schema
+/// batch, so every connection already has them.
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn checkpoint_pause_resume_cancel_flow() {
-        let mut task = ResearchTask::new("conv", "Compare A and B", TaskBudgets::default()).unwrap();
+        let mut task =
+            ResearchTask::new("conv", "Compare A and B", TaskBudgets::default()).unwrap();
         assert!(!task.is_terminal());
-        assert!(task.checkpoint_operation("search", OperationStatus::Completed, Some("3 hits".into())));
+        assert!(task.checkpoint_operation(
+            "search",
+            OperationStatus::Completed,
+            Some("3 hits".into())
+        ));
         assert_eq!(task.completed_results.len(), 1);
         task.pause().unwrap();
         assert!(task.resume().is_ok());
@@ -413,12 +427,22 @@ mod tests {
     fn restart_recovery_marks_running_unknown_without_replaying() {
         let mut task = ResearchTask::new("conv", "Long research", TaskBudgets::default()).unwrap();
         task.operations.push(TaskOperation {
-            id: "op1".into(), kind: "search".into(), status: OperationStatus::Running,
-            attempts: 1, result_summary: None, error: None, updated_at: 0,
+            id: "op1".into(),
+            kind: "search".into(),
+            status: OperationStatus::Running,
+            attempts: 1,
+            result_summary: None,
+            error: None,
+            updated_at: 0,
         });
         task.operations.push(TaskOperation {
-            id: "op2".into(), kind: "read".into(), status: OperationStatus::Pending,
-            attempts: 0, result_summary: None, error: None, updated_at: 0,
+            id: "op2".into(),
+            kind: "read".into(),
+            status: OperationStatus::Pending,
+            attempts: 0,
+            result_summary: None,
+            error: None,
+            updated_at: 0,
         });
         task.mark_interrupted_for_recovery();
         assert_eq!(task.operations[0].status, OperationStatus::Unknown);
@@ -428,9 +452,17 @@ mod tests {
 
     #[test]
     fn budget_exhaustion_yields_recoverable_partial_results() {
-        let budgets = TaskBudgets { max_searches: 1, max_rounds: 4, ..TaskBudgets::default() };
+        let budgets = TaskBudgets {
+            max_searches: 1,
+            max_rounds: 4,
+            ..TaskBudgets::default()
+        };
         let mut task = ResearchTask::new("conv", "Q", budgets).unwrap();
-        assert!(!task.checkpoint_operation("search", OperationStatus::Completed, Some("partial".into())));
+        assert!(!task.checkpoint_operation(
+            "search",
+            OperationStatus::Completed,
+            Some("partial".into())
+        ));
         assert!(task.budget_exhausted());
         assert_eq!(task.completed_results.len(), 1);
         let summary = task.progress_summary();
@@ -440,8 +472,18 @@ mod tests {
 
     #[test]
     fn budgets_validate_loudly() {
-        assert!(TaskBudgets { task_timeout_secs: 10, ..TaskBudgets::default() }.validate().is_err());
-        assert!(TaskBudgets { max_rounds: 99, ..TaskBudgets::default() }.validate().is_err());
+        assert!(TaskBudgets {
+            task_timeout_secs: 10,
+            ..TaskBudgets::default()
+        }
+        .validate()
+        .is_err());
+        assert!(TaskBudgets {
+            max_rounds: 99,
+            ..TaskBudgets::default()
+        }
+        .validate()
+        .is_err());
         assert!(TaskBudgets::default().validate().is_ok());
         assert!(ResearchTask::new("c", "", TaskBudgets::default()).is_err());
     }

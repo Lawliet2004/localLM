@@ -8,13 +8,14 @@ export const DEFAULT_CONFIG: WebSearchConfig = {
   extractEvidenceWithModel: false,
   enabled: true,
   mode: 'normal',
+  planning: 'auto',
   profile: 'standard',
   searxngBaseUrl: 'http://127.0.0.1:8080',
-  // Fan-out to ~11 engines under parallel AREX queries regularly exceeds 8s;
-  // a 15s budget keeps whole query batches from timing out together.
+  // Allow for the instance's outgoing request timeout and response processing.
   searxngTimeoutMs: 15000,
-  searxngEngines: ['google cse', 'yep', 'duckduckgo', 'google news', 'reuters', 'wikipedia', 'wikinews', 'stackoverflow', 'github', 'arxiv', 'openstreetmap'],
-  searxngDisabledEngines: ['google', 'bing', 'yandex', 'brave', 'qwant'],
+  // Let each self-hosted instance manage its engine catalogue and credentials.
+  searxngEngines: [],
+  searxngDisabledEngines: [],
   searchProvider: 'searxng',
   googleApiKey: '',
   googleCxId: '',
@@ -23,9 +24,11 @@ export const DEFAULT_CONFIG: WebSearchConfig = {
     googleDailyLimit: 90,
   },
   queries: {
-    fast: 2,
-    normal: 4,
-    deep: 6,
+    // Bounded agent budgets (Direct is handled before search and costs 0):
+    // fast = quick lookups, normal = standard research, deep = multi-source.
+    fast: 1,
+    normal: 2,
+    deep: 4,
   },
   maxConcurrentQueries: 4,
   searchRetries: 1,
@@ -33,9 +36,9 @@ export const DEFAULT_CONFIG: WebSearchConfig = {
   enablePagination: true,
   resultsPerQuery: 10,
   fetch: {
-    fastPages: 4,
-    normalPages: 8,
-    deepPages: 20,
+    fastPages: 3,
+    normalPages: 6,
+    deepPages: 10,
     timeoutSeconds: 10,
     deepTimeoutSeconds: 20,
     maxBytes: 5 * 1024 * 1024, // 5MB
@@ -105,17 +108,36 @@ export const DEFAULT_CONFIG: WebSearchConfig = {
 /**
  * Creates configuration adjusted for the low_memory profile.
  */
+/**
+ * Environment overrides, applied last so a deployment can pin the SearXNG
+ * endpoint and engine catalogue without touching app settings (the app always
+ * injects a base URL, so env has to win to be useful):
+ * SEARXNG_BASE_URL, SEARXNG_TIMEOUT_MS, SEARXNG_ENGINES (csv),
+ * SEARXNG_DISABLED_ENGINES (csv), AGC_WEB_PROFILE (=low_memory).
+ */
+function envOverrides(): Partial<WebSearchConfig> {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  if (!env) return {};
+  const out: Partial<WebSearchConfig> = {};
+  const list = (value?: string) => value?.split(',').map((s) => s.trim()).filter(Boolean) ?? [];
+  if (env.SEARXNG_BASE_URL?.trim()) out.searxngBaseUrl = env.SEARXNG_BASE_URL.trim();
+  const timeout = Number(env.SEARXNG_TIMEOUT_MS);
+  if (Number.isFinite(timeout) && timeout >= 1000 && timeout <= 120000) out.searxngTimeoutMs = Math.floor(timeout);
+  const engines = list(env.SEARXNG_ENGINES);
+  if (engines.length) out.searxngEngines = engines;
+  const disabled = list(env.SEARXNG_DISABLED_ENGINES);
+  if (disabled.length) out.searxngDisabledEngines = disabled;
+  if (env.AGC_WEB_PROFILE === 'low_memory') out.profile = 'low_memory';
+  return out;
+}
+
 export function createConfig(overrides?: Partial<WebSearchConfig>): WebSearchConfig {
-  const envProfile =
-    typeof (globalThis as { process?: { env?: Record<string, string | undefined> } }).process !== 'undefined' &&
-    (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.AGC_WEB_PROFILE === 'low_memory'
-      ? 'low_memory'
-      : undefined;
+  const env = envOverrides();
 
   const base: WebSearchConfig = {
     ...DEFAULT_CONFIG,
-    ...(envProfile ? { profile: 'low_memory' } : {}),
     ...overrides,
+    ...env,
   };
   // Merge nested settings without sharing mutable defaults between engine instances.
   for (const key of ['queries','fetch','chunking','retrieval','reranking','ranking','context','verification','cache','searchFallback'] as const) {
@@ -127,7 +149,7 @@ export function createConfig(overrides?: Partial<WebSearchConfig>): WebSearchCon
       maxConcurrentQueries: Math.min(base.maxConcurrentQueries, 2),
       fetch: {
         ...base.fetch,
-        fastPages: 3,
+        fastPages: 2,
         normalPages: 4,
         deepPages: 8,
         globalConcurrency: 4,

@@ -1,4 +1,16 @@
-use_default_settings: true
+use_default_settings:
+  engines:
+    keep_only:
+      - google cse
+      - yep
+      - wikipedia
+      - google news
+      - reuters
+      - wikinews
+      - stackoverflow
+      - github
+      - arxiv
+      - openstreetmap
 
 general:
   debug: false
@@ -27,26 +39,12 @@ outgoing:
   max_request_timeout: 12.0
   useragent_suffix: "LocalLM/1.0"
 
-# With use_default_settings the full upstream engine catalogue loads (~260
-# engines, many enabled by default). The client sends an `engines` whitelist
-# per query, so this section only pins overrides. General web results ride on
-# `google cse` (key-free, enabled by default) plus `duckduckgo` (intermittent
-# CAPTCHA), `google news`, `reuters`, `wikipedia`/`wikinews`, and the niche
-# engines. `mojeek`/`startpage` are `inactive` upstream (proof-of-work
-# CAPTCHA) and cannot be enabled here.
+# Keep engine selection on the server. Clients can use categories or explicitly
+# override engines without depending on this catalogue on every installation.
 engines:
   - name: yep
     disabled: false
-  - name: google
-    disabled: true
-  - name: bing
-    disabled: true
-  - name: yandex
-    disabled: true
-  - name: brave
-    disabled: true
-  - name: qwant
-    disabled: true
 
-enabled_plugins:
-  - 'Hash plugin'
+plugins:
+  searx.plugins.hash_plugin.SXNGPlugin:
+    active: true

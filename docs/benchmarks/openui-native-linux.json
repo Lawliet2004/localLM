@@ -1,0 +1,40 @@
+{
+  "nativeRenderer": true,
+  "quizScoring": true,
+  "binarySearchStep": true,
+  "sqliteState": true,
+  "restartRestoration": true,
+  "authoritativeAnswerUnchanged": true,
+  "browserUsed": false,
+  "fixture": "Manually authored deterministic component fixture; model benchmarks are separate.",
+  "actualModelChartRendered": true,
+  "actualNativeInference": {
+    "status": "complete",
+    "programChars": 196,
+    "sourceChars": 321,
+    "model": "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+    "cpuOnly": true,
+    "reasoningMode": "quick"
+  },
+  "actualModelChartRestoredAfterRestart": true,
+  "presentationEvents": [
+    {
+      "type": "presentation_start",
+      "payload": {
+        "libraryVersion": "locallm.openui/2",
+        "profile": "data"
+      }
+    },
+    {
+      "type": "presentation_end",
+      "payload": {
+        "durationMs": 14003,
+        "status": "complete"
+      }
+    }
+  ],
+  "rawProgram": "root = Response(\n  [\n    Chart(title: \"Sales Data\", kind: \"bar\", points: [\n      {label: \"January\", value: 10},\n      {label: \"February\", value: 15},\n      {label: \"March\", value: 25}\n    ])\n  ]\n)",
+  "authoritativeAnswer": "Based on the data you provided:\n\n*   **January:** 10 units\n*   **February:** 15 units\n*   **March:** 25 units\n\nHere is a visual representation of this data using a text-based bar chart:\n\n```\nJanuary: [==================] 10 units\nFebruary:    [===============] 15 units\nMarch:      [========================] 25 units\n```",
+  "limitations": "Single Linux CPU GGUF native case, Quick mode, 8192 context, 1024 output cap; raw named arguments required bounded local repair. Chart accessibility verified on restart with exact WebKit combo naming; no browser preview used. Earlier failed native attempts recorded separately.",
+  "firstTurnModeSelector": true
+}

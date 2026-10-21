@@ -1,0 +1,79 @@
+{
+  "node": "v22.22.1",
+  "host": {
+    "platform": "linux",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 5 7535HS with Radeon Graphics",
+    "logicalCpus": 12,
+    "totalMemoryBytes": 15916511232
+  },
+  "samples": 300,
+  "results": {
+    "core": {
+      "sourceChars": 73,
+      "validationP50Ms": 0.242087999999967,
+      "validationP95Ms": 0.364530000000002
+    },
+    "data": {
+      "sourceChars": 80,
+      "validationP50Ms": 0.16724699999997483,
+      "validationP95Ms": 0.29275399999994534
+    },
+    "coding": {
+      "sourceChars": 80,
+      "validationP50Ms": 0.14423299999998562,
+      "validationP95Ms": 0.20539899999994304
+    },
+    "invalid": {
+      "sourceChars": 41,
+      "validationP50Ms": 0.1506449999999404,
+      "validationP95Ms": 0.19397700000001805
+    }
+  },
+  "prompts": {
+    "full": {
+      "chars": 9186,
+      "bytes": 9268
+    },
+    "core": {
+      "chars": 5637,
+      "bytes": 5685
+    },
+    "data": {
+      "chars": 6710,
+      "bytes": 6768
+    },
+    "education": {
+      "chars": 7977,
+      "bytes": 8045
+    },
+    "coding": {
+      "chars": 6606,
+      "bytes": 6664
+    }
+  },
+  "chunks": [
+    {
+      "file": "GenUiBlock-85V__FeW.js",
+      "bytes": 2754,
+      "gzipBytes": 1209
+    },
+    {
+      "file": "GenUiSurface-BBza-Unn.js",
+      "bytes": 673,
+      "gzipBytes": 458
+    },
+    {
+      "file": "VisualAnswer-DGl97pdc.js",
+      "bytes": 5980,
+      "gzipBytes": 2651
+    },
+    {
+      "file": "actions-DvAqJcHP.js",
+      "bytes": 232032,
+      "gzipBytes": 71484
+    }
+  ],
+  "nodeProcessPeakRssKiB": 172608,
+  "limitations": "Warm Node CPU validation; excludes React/browser paint, native app RAM, tokenizer counts and inference. Chunks are current build size, not a measured incremental baseline."
+}

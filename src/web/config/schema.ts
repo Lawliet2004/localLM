@@ -87,6 +87,13 @@ export interface WebSearchConfig {
   localReranker?: { baseUrl: string; model: string };
   enabled: boolean;
   mode: ResearchMode;
+  /**
+   * Query planning strategy. `auto` keeps planning deterministic for fast and
+   * normal research and only spends a model call in deep mode; `rules` never
+   * calls the model; `model` always asks the planner model when one is
+   * configured. Deterministic planning remains the fallback on model failure.
+   */
+  planning: 'auto' | 'rules' | 'model';
   profile: 'standard' | 'low_memory';
   searxngBaseUrl: string;
   searxngTimeoutMs: number;

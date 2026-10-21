@@ -1,152 +1,70 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { expect, it } from 'vitest';
-import { ActivityTimeline } from './ActivityTimeline';
+import { ActivityTimeline, activityTools } from './ActivityTimeline';
 import type { Message, SessionEvent } from '../lib/types';
-
-it('keeps todo harness updates out of the activity feed', () => {
-  const event = (seq: number, eventType: string, payload: unknown, toolCallId?: string): SessionEvent => ({ id: String(seq), conversationId: 'chat', runId: 'run', seq, eventType, payload, toolCallId, createdAt: seq, ignorable: false });
-  const messages: Message[] = [{ id: 'answer', conversationId: 'chat', role: 'assistant', status: 'complete', content: 'Working.', reasoning: '', createdAt: 1 }];
-  const { container } = render(<ActivityTimeline messages={messages} events={[
-    event(1, 'tool_call', { name: 'todo_write', arguments: { todos: [{ text: 'Search', status: 'in_progress' }] } }, 'todo'),
-    event(2, 'tool_result', { name: 'todo_write', decision: 'allowed', result: { saved: 1 } }, 'todo'),
-    event(3, 'tool_call', { name: 'web_search', arguments: { question: 'fusion yield' } }, 'search'),
-    event(4, 'tool_result', { name: 'web_search', decision: 'allowed', result: { answer: 'ok' } }, 'search'),
-    event(5, 'model_response', { content: 'Working.' }),
-  ]} renderMessage={m => <p>{m.content}</p>} renderTool={m => <p>{JSON.parse(m.content).request.name}</p>} />);
-  expect(container.textContent).toContain('web_search');
-  expect(container.textContent).not.toContain('todo_write');
+const event = (seq: number, eventType: string, payload: unknown, toolCallId?: string, runId = 'run'): SessionEvent => ({ id: String(seq), conversationId: 'chat', runId, seq, eventType, payload, toolCallId, createdAt: seq, ignorable: false });
+const assistant = (status: Message['status'] = 'complete'): Message => ({ id: 'answer', conversationId: 'chat', role: 'assistant', status, content: 'Answer first.', reasoning: 'Private thought.', createdAt: 1 });
+const props = { renderMessage: (m: Message) => <p>{m.content}</p>, renderTool: (m: Message) => <p>{JSON.parse(m.content).request.name}</p> };
+it('puts collapsed reasoning and activity before the final answer', () => {
+  const { container } = render(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'tool_call', { name: 'web_search' }, 's'), event(2, 'tool_result', { name: 'web_search', result: {} }, 's')]} />);
+  expect(container.textContent).toMatch(/Reasoning.*1 tool used.*Answer first/s);
+  expect(screen.getByTestId('turn-reasoning')).not.toHaveAttribute('open');
+  expect(screen.getByText('1 tool used').closest('details')).not.toHaveAttribute('open');
+});
+it('keeps one reasoning disclosure mounted across streaming and completed replay', () => {
+  const view = render(<ActivityTimeline {...props} messages={[assistant('streaming')]} events={[]} />);
+  const disclosure = screen.getByTestId('turn-reasoning');
+  fireEvent.click(screen.getByText('Reasoning'));
+  view.rerender(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'reasoning', { text: 'Private thought.', durationMs: 1234 })]} />);
+  expect(screen.getByTestId('turn-reasoning')).toBe(disclosure);
+  expect(screen.getByText('Reasoning · 1.2s')).toBeInTheDocument();
+});
+it('does not fabricate durations or replay per-round text', () => {
+  const { container } = render(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'reasoning', { text: 'Thought' }), event(2, 'model_response', { content: 'Earlier commentary' })]} />);
+  expect(container.textContent).not.toMatch(/8s|Thought for|Earlier commentary/);
+  expect(screen.getAllByText('Answer first.')).toHaveLength(1);
+});
+it('keeps pending approvals and errors outside collapsed activity', () => {
+  render(<ActivityTimeline {...props} messages={[assistant('streaming')]} events={[event(1, 'tool_call', { name: 'execute_command' }, 'c')]} />);
+  expect(screen.getByText('execute_command').closest('details')).toBeNull();
+});
+it('retains message-only history and filters plan updates', () => {
+  const tool = (name: string): Message => ({ ...assistant(), id: name, role: 'tool', content: JSON.stringify({ request: { name }, result: {} }) });
+  const result = activityTools([], [tool('todo_write'), tool('view_file')]);
+  expect(result.map(m => m.id)).toEqual(['view_file']);
+});
+it('joins by run and tool id without crossing repeated tool ids', () => {
+  const tools = activityTools([event(1, 'tool_call', { name: 'one' }, 'same'), event(2, 'tool_call', { name: 'two' }, 'same', 'other'), event(3, 'tool_result', { name: 'two', result: { value: 2 } }, 'same', 'other')], []);
+  expect(tools[0].status).toBe('streaming');
+  expect(JSON.parse(tools[1].content).result.value).toBe(2);
 });
 
-it('interleaves commentary, tool results, compaction and final text without replaying aggregate text', () => {
-  const event = (seq: number, eventType: string, payload: unknown, toolCallId?: string): SessionEvent => ({ id: String(seq), conversationId: 'chat', runId: 'run', seq, eventType, payload, toolCallId, createdAt: seq, ignorable: false });
-  const messages: Message[] = [{ id: 'answer', conversationId: 'chat', role: 'assistant', status: 'complete', content: 'Checking.Done.', reasoning: '', createdAt: 1 }];
-  const { container } = render(<ActivityTimeline messages={messages} events={[
-    event(1, 'model_response', { content: 'Checking.' }),
-    event(2, 'tool_call', { name: 'execute_command', arguments: { command: 'echo test' } }, 'call'),
-    event(3, 'tool_result', { name: 'execute_command', decision: 'allowed', result: { stdout: 'test', exitCode: 0 } }, 'call'),
-    event(4, 'compaction', { artifact: 'art-one' }),
-    event(5, 'model_response', { content: 'Done.', final: true }),
-  ]} renderMessage={m => <p>{m.content}</p>} renderTool={m => <p>{JSON.parse(m.content).result.stdout}</p>} />);
-  expect(container.textContent).toMatch(/Checking\..*test.*Context compacted.*Done\./s);
-  expect(screen.getAllByText('Done.')).toHaveLength(1);
-  expect(container.textContent).not.toContain('Checking.Done.');
-});
-
-it('groups exploration actions and formats clean trace items matching reference style', () => {
-  const event = (seq: number, eventType: string, payload: unknown, toolCallId?: string): SessionEvent => ({
-    id: String(seq), conversationId: 'chat', runId: 'run', seq, eventType, payload, toolCallId, createdAt: seq, ignorable: false,
-  });
-
-  const messages: Message[] = [{ id: 'answer', conversationId: 'chat', role: 'assistant', status: 'complete', content: 'Here is the result.', reasoning: '', createdAt: 1 }];
-
-  const events: SessionEvent[] = [
-    event(1, 'reasoning', { text: 'Analyzing file contents and permissions.' }),
-    event(2, 'tool_call', { name: 'view_file', arguments: { path: 'src/components/ToolControls.tsx', StartLine: 1, EndLine: 60 } }, 'call1'),
-    event(3, 'tool_result', { name: 'view_file', decision: 'allowed', result: { stdout: 'line 1\nline 2' } }, 'call1'),
-    event(4, 'tool_call', { name: 'grep_search', arguments: { Query: 'PermissionSelector' } }, 'call2'),
-    event(5, 'tool_result', { name: 'grep_search', decision: 'allowed', result: { totalResults: 3, stdout: 'match 1\nmatch 2\nmatch 3' } }, 'call2'),
-    event(6, 'tool_call', { name: 'edit_file', arguments: { path: 'src/components/Chat.tsx' } }, 'call3'),
-    event(7, 'tool_result', { name: 'edit_file', decision: 'allowed', result: { diff: '--- a/Chat.tsx\n+++ b/Chat.tsx\n@@ -1,1 +1,2 @@\n-old\n+new\n+another' } }, 'call3'),
-    event(8, 'model_response', { content: 'Here is the result.' }),
+it('interleaves recorded commentary and tool groups without repeating the cumulative answer', () => {
+  const message = { ...assistant(), content: 'I will inspect it.Confirmed the cause.Fixed it.', reasoning: '' };
+  const events = [
+    event(1, 'model_response', { content: 'I will inspect it.', final: false }),
+    event(2, 'tool_call', { name: 'read_file', arguments: { path: 'app.ts' } }, 'read'),
+    event(3, 'tool_result', { name: 'read_file', result: {} }, 'read'),
+    event(4, 'model_response', { content: 'Confirmed the cause.', final: false }),
+    event(5, 'tool_call', { name: 'edit_file', arguments: { path: 'app.ts' } }, 'edit'),
+    event(6, 'tool_result', { name: 'edit_file', result: {} }, 'edit'),
+    event(7, 'model_response', { content: 'Fixed it.', final: true }),
   ];
-
-  render(
-    <ActivityTimeline
-      messages={messages}
-      events={events}
-      renderMessage={m => <p>{m.content}</p>}
-      renderTool={m => {
-        const data = JSON.parse(m.content);
-        const name = data.request.arguments?.path ? data.request.arguments.path.split('/').pop() : data.request.arguments?.Query;
-        return <div data-testid={`tool-${m.id}`}>{data.request.name}: {name}</div>;
-      }}
-    />
-  );
-
-  // Group summary
-  expect(screen.getByText('Explored 1 file, 1 search')).toBeInTheDocument();
-  // Thought pill
-  expect(screen.getByText(/Thought for/)).toBeInTheDocument();
-  // Tool outputs are rendered inside the trace
-  expect(screen.getByTestId('tool-2')).toHaveTextContent('view_file: ToolControls.tsx');
-  expect(screen.getByTestId('tool-4')).toHaveTextContent('grep_search: PermissionSelector');
-  expect(screen.getByTestId('tool-6')).toHaveTextContent('edit_file: Chat.tsx');
-  // Final response
-  expect(screen.getByText('Here is the result.')).toBeInTheDocument();
+  const { container } = render(<ActivityTimeline {...props} messages={[message]} events={events} />);
+  expect(container.textContent).toMatch(/I will inspect it.*Read files.*Confirmed the cause.*Edited files.*Fixed it/s);
+  expect(screen.getAllByText('I will inspect it.')).toHaveLength(1);
+  expect(screen.getAllByText('Confirmed the cause.')).toHaveLength(1);
+  expect(screen.getAllByText('Fixed it.')).toHaveLength(1);
 });
 
-it('uses Explored for completed groups and Exploring only for the active streaming trailing group', () => {
-  const event = (seq: number, eventType: string, payload: unknown, toolCallId?: string): SessionEvent => ({
-    id: String(seq), conversationId: 'chat', runId: 'run', seq, eventType, payload, toolCallId, createdAt: seq * 1000, ignorable: false,
-  });
-
-  const messages: Message[] = [
-    { id: 'assistant-live', conversationId: 'chat', role: 'assistant', status: 'streaming', content: '', reasoning: '', createdAt: 1 },
-  ];
-
-  const events: SessionEvent[] = [
-    // Group 1: 2 files explored
-    event(1, 'tool_call', { name: 'view_file', arguments: { path: 'file1.ts' } }, 'c1'),
-    event(2, 'tool_result', { name: 'view_file', result: {} }, 'c1'),
-    event(3, 'tool_call', { name: 'view_file', arguments: { path: 'file2.ts' } }, 'c2'),
-    event(4, 'tool_result', { name: 'view_file', result: {} }, 'c2'),
-    // Standalone edit
-    event(5, 'tool_call', { name: 'edit_file', arguments: { path: 'file1.ts' } }, 'c3'),
-    event(6, 'tool_result', { name: 'edit_file', result: { diff: '--- a/file1.ts\n+++ b/file1.ts\n@@ -1 +1 @@\n-old\n+new' } }, 'c3'),
-    // Group 2: active in-progress exploration (1 file currently being analyzed)
-    event(7, 'tool_call', { name: 'view_file', arguments: { path: 'Chat.tsx', StartLine: 250, EndLine: 285 } }, 'c4'),
-  ];
-
-  render(
-    <ActivityTimeline
-      messages={messages}
-      events={events}
-      renderMessage={m => <p>{m.content}</p>}
-      renderTool={m => <div data-testid={`tool-${m.id}`}>{m.id}</div>}
-    />
-  );
-
-  // Completed group before edit must be "Explored 2 files", NOT "Exploring 2 files"
-  expect(screen.getByText('Explored 2 files')).toBeInTheDocument();
-  // Standalone edit is rendered
-  expect(screen.getByTestId('tool-5')).toBeInTheDocument();
-  // Trailing active group must be "Exploring 1 file"
-  expect(screen.getByText('Exploring 1 file')).toBeInTheDocument();
+it('preserves the complete answer when journal commentary does not match', () => {
+  render(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'model_response', { content: 'Stale commentary', final: false })]} />);
+  expect(screen.getAllByText('Answer first.')).toHaveLength(1);
+  expect(screen.queryByText('Stale commentary')).not.toBeInTheDocument();
 });
 
-it('synthesizes activity groups and edits from messages when events array is empty', () => {
-  const user: Message = { id: 'u1', conversationId: 'chat', role: 'user', content: 'Inspect', reasoning: '', status: 'complete', createdAt: 1 };
-  const tool1: Message = {
-    id: 't1', conversationId: 'chat', role: 'tool', status: 'complete', reasoning: '', createdAt: 2,
-    content: JSON.stringify({ request: { name: 'view_file', arguments: { path: 'src/components/ToolControls.tsx' } }, result: {} }),
-  };
-  const tool2: Message = {
-    id: 't2', conversationId: 'chat', role: 'tool', status: 'complete', reasoning: '', createdAt: 3,
-    content: JSON.stringify({ request: { name: 'grep_search', arguments: { Query: 'branch' } }, result: {} }),
-  };
-  const editTool: Message = {
-    id: 't3', conversationId: 'chat', role: 'tool', status: 'complete', reasoning: '', createdAt: 4,
-    content: JSON.stringify({ request: { name: 'edit_file', arguments: { path: 'src/components/Chat.tsx' } }, result: { diff: '--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b' } }),
-  };
-  const assistant: Message = {
-    id: 'a1', conversationId: 'chat', role: 'assistant', status: 'complete', content: 'Inspection finished.', reasoning: 'Found the definition.', createdAt: 5,
-  };
-
-  render(
-    <ActivityTimeline
-      messages={[user, tool1, tool2, editTool, assistant]}
-      events={[]}
-      renderMessage={m => <p>{m.content}</p>}
-      renderTool={m => <div data-testid={`tool-${m.id}`}>{m.id}</div>}
-    />
-  );
-
-  // Synthesized group for the 2 exploration tools
-  expect(screen.getByText('Explored 1 file, 1 search')).toBeInTheDocument();
-  // Thought pill synthesized from assistant reasoning
-  expect(screen.getByText(/Thought/)).toBeInTheDocument();
-  // Edit is rendered
-  expect(screen.getByTestId('tool-t3')).toBeInTheDocument();
-  // Assistant response
-  expect(screen.getByText('Inspection finished.')).toBeInTheDocument();
+it('keeps envelope failures visible outside the collapsed group', () => {
+  const tool: Message = { ...assistant(), role: 'tool', content: JSON.stringify({ request: { name: 'execute_command' }, result: { status: 'failure' } }) };
+  render(<ActivityTimeline {...props} messages={[tool]} events={[]} />);
+  expect(screen.getByText('execute_command').closest('details')).toBeNull();
 });

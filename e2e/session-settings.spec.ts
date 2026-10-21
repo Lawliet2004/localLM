@@ -41,6 +41,15 @@ test('permission choice survives a new chat and page restart', async ({ page }) 
     await page.reload();
     await expect(page.getByRole('button', { name: `Permission mode: ${mode}`, exact: true })).toBeEnabled();
   }
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await page.getByRole('radio', { name: 'Full access' }).click();
+  await expect(page.getByRole('radio', { name: 'Full access' })).toBeEnabled();
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('test-remembered-tools')!).accessMode)).toBe('fullAccess');
+  await page.reload();
+  await page.getByRole('button', { name: 'Open settings', exact: true }).click();
+  await expect(page.getByRole('radio', { name: 'Full access' })).toBeChecked();
+  await page.getByRole('button', { name: 'Close settings', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Permission mode: Full access', exact: true })).toBeVisible();
   await page.screenshot({ path: 'test-results/session-settings.png' });
   await page.getByRole('button', { name: 'Connectors', exact: true }).click();
   await page.locator('.catalog-item summary').filter({ hasText: 'Deepwiki' }).click();

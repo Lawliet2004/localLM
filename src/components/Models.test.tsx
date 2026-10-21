@@ -4,8 +4,9 @@ import { expect, it, vi } from 'vitest';
 import { Models } from './Models';
 import { defaultRuntimeConfig } from '../lib/types';
 
-const apiMocks = vi.hoisted(() => ({ modelDownloadInfo: vi.fn() }));
+const apiMocks = vi.hoisted(() => ({ modelDownloadInfo: vi.fn(), open: vi.fn() }));
 vi.mock('../lib/api', () => ({ api: apiMocks, nativeAvailable: false, errorMessage: String }));
+vi.mock('@tauri-apps/plugin-dialog', () => ({ open: apiMocks.open }));
 
 vi.mock('./HardwareStatus', () => ({ HardwareStatus: () => null }));
 vi.mock('./ModelDownload', () => ({ ModelDownload: () => null }));
@@ -25,6 +26,21 @@ it('saves a vision projector path with the model files', async () => {
   expect(onSavePreferences.mock.calls[0][0].projectorPath).toBe('C:\\models\\mmproj.gguf');
 });
 
+it('allows browsing and saving an extensionless native Linux runtime', async () => {
+  apiMocks.open.mockResolvedValueOnce('/usr/local/bin/llama-server');
+  const onSavePreferences = vi.fn().mockResolvedValue(undefined);
+  render(<Models config={defaultRuntimeConfig}
+    preferences={{ runtimePath: '', modelPath: 'model.gguf', temperature: 1, topP: 0.95, maxTokens: 2048, systemPrompt: '' }}
+    runtime={{ phase: 'stopped', message: 'No model loaded', modelPath: null }}
+    busy={false} onSaveConfig={vi.fn()} onSavePreferences={onSavePreferences} onLoad={vi.fn()} onUnload={vi.fn()} />);
+  await userEvent.click(screen.getByRole('tab', { name: 'Model files' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Browse runtime…' }));
+  await vi.waitFor(() => expect(screen.getByLabelText('llama-server executable')).toHaveValue('/usr/local/bin/llama-server'));
+  expect(apiMocks.open).toHaveBeenLastCalledWith(expect.objectContaining({ filters: undefined }));
+  await userEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+  await vi.waitFor(() => expect(onSavePreferences).toHaveBeenCalledWith(expect.objectContaining({ runtimePath: '/usr/local/bin/llama-server' })));
+});
+
 it('reloads a loaded model after saving runtime configuration', async () => {
   const onLoad = vi.fn();
   const onSaveConfig = vi.fn().mockResolvedValue(undefined);
@@ -39,13 +55,43 @@ it('reloads a loaded model after saving runtime configuration', async () => {
   expect(onLoad).toHaveBeenCalledOnce();
 });
 
-it('warns when the response reserve uses the entire context window', async () => {
+it('reloads a loaded model with vision disabled while retaining its projector file', async () => {
+  const onLoad = vi.fn();
+  const onSaveConfig = vi.fn().mockResolvedValue(undefined);
+  const onSavePreferences = vi.fn();
   render(<Models config={{ ...defaultRuntimeConfig, contextLength: 8192 }}
+    preferences={{ runtimePath: 'server.exe', modelPath: 'model.gguf', projectorPath: 'mmproj-model-F16.gguf', temperature: 1, topP: 0.95, maxTokens: 2048, systemPrompt: '' }}
+    runtime={{ phase: 'ready', message: 'Model ready', modelPath: 'model.gguf', loadedConfig: { ...defaultRuntimeConfig, contextLength: 8192 } }}
+    busy={false} onSaveConfig={onSaveConfig} onSavePreferences={onSavePreferences} onLoad={onLoad} onUnload={vi.fn()} />);
+  await userEvent.click(screen.getByRole('tab', { name: 'Runtime' }));
+  await userEvent.click(screen.getByLabelText('Load vision projector'));
+  await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }));
+  await vi.waitFor(() => expect(onLoad).toHaveBeenCalledOnce());
+  expect(onSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ visionEnabled: false }));
+  expect(onSavePreferences).not.toHaveBeenCalled();
+});
+
+it('chooses a projector directly from Runtime and waits for configuration save to reload', async () => {
+  apiMocks.open.mockResolvedValueOnce('/models/mmproj-new-F16.gguf');
+  const onSavePreferences = vi.fn().mockResolvedValue(undefined);
+  const onLoad = vi.fn();
+  render(<Models config={{ ...defaultRuntimeConfig, contextLength: 8192 }}
+    preferences={{ runtimePath: 'server', modelPath: 'model.gguf', projectorPath: '', temperature: 1, topP: 0.95, maxTokens: 2048, systemPrompt: '' }}
+    runtime={{ phase: 'ready', message: 'Model ready', modelPath: 'model.gguf' }}
+    busy={false} onSaveConfig={vi.fn()} onSavePreferences={onSavePreferences} onLoad={onLoad} onUnload={vi.fn()} />);
+  await userEvent.click(screen.getByRole('tab', { name: 'Runtime' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Choose projector file…' }));
+  await vi.waitFor(() => expect(onSavePreferences).toHaveBeenCalledWith(expect.objectContaining({ modelPath: 'model.gguf', projectorPath: '/models/mmproj-new-F16.gguf' })));
+  expect(onLoad).not.toHaveBeenCalled();
+  expect(screen.getByRole('tab', { name: 'Runtime' })).toHaveAttribute('aria-selected', 'true');
+});
+
+it('warns when the response reserve uses the entire context window', async () => {
+  render(<Models initialTab="generation" config={{ ...defaultRuntimeConfig, contextLength: 8192 }}
     preferences={{ runtimePath: 'server.exe', modelPath: 'model.gguf', temperature: 1, topP: 0.95, maxTokens: 8192, systemPrompt: '' }}
     runtime={{ phase: 'ready', message: 'Model ready', modelPath: 'model.gguf', loadedConfig: { ...defaultRuntimeConfig, contextLength: 8192 } }}
     onSaveSelection={vi.fn()}
     busy={false} onSaveConfig={vi.fn()} onSavePreferences={vi.fn()} onLoad={vi.fn()} onUnload={vi.fn()} />);
-  await userEvent.click(screen.getByRole('tab', { name: 'Generation' }));
   expect(screen.getByRole('alert')).toHaveTextContent('entire');
 });
 
@@ -70,6 +116,24 @@ it('does not show a switch prompt when Windows canonicalization added a device p
     busy={false} onSaveConfig={vi.fn()} onSavePreferences={vi.fn()} onLoad={vi.fn()} onUnload={vi.fn()} />);
   expect(screen.queryByRole('button', { name: /Switch to/ })).not.toBeInTheDocument();
   expect(screen.queryByText(/A different model file is saved/)).not.toBeInTheDocument();
+});
+
+it('keeps the same action button element across loading and ready phases', () => {
+  const props = {
+    config: defaultRuntimeConfig,
+    preferences: { runtimePath: 'server', modelPath: 'model.gguf', projectorPath: '', temperature: 1, topP: 0.95, maxTokens: 2048, systemPrompt: '' },
+    onSaveSelection: vi.fn(), busy: false, onSaveConfig: vi.fn(), onSavePreferences: vi.fn(), onLoad: vi.fn(), onUnload: vi.fn(),
+  };
+  const { container, rerender } = render(<Models {...props} runtime={{ phase: 'stopped', message: 'No model loaded', modelPath: null }} />);
+  const stopped = container.querySelector('.model-status > button:last-child');
+  expect(stopped).toHaveTextContent('Load model');
+  rerender(<Models {...props} busy runtime={{ phase: 'loading', message: 'Loading model into memory', modelPath: 'model.gguf' }} />);
+  expect(container.querySelector('.model-status > button:last-child')).toBe(stopped);
+  rerender(<Models {...props} runtime={{ phase: 'ready', message: 'Model ready', modelPath: 'model.gguf' }} />);
+  const ready = container.querySelector('.model-status > button:last-child');
+  expect(ready).toBe(stopped);
+  expect(ready).toHaveTextContent('Unload');
+  expect(ready).toHaveClass('secondary');
 });
 
 it('consumes a chat model request once and saves the requested file', async () => {

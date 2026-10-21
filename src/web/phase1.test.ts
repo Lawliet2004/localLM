@@ -9,7 +9,7 @@ it('uses only separate planning and synthesis calls with compressed, cited evide
   const calls: GenerationRequest[] = [];
   const fact = 'React 19 is now the stable release available on npm.';
   const engine = new WebSearchEngine({
-    config: { cache: { ...DEFAULT_CONFIG.cache, enabled: false } },
+    config: { planning: 'model', cache: { ...DEFAULT_CONFIG.cache, enabled: false } },
     llmProvider: { generate: async request => {
       calls.push(request);
       return { text: request.responseSchema
@@ -30,6 +30,26 @@ it('uses only separate planning and synthesis calls with compressed, cited evide
   expect(session.answer).toContain('https://react.dev/blog/release');
   expect(session.trace.finalEvidenceTokens).toBeLessThanOrEqual(2500);
   expect(session.trace.finalPromptTokens).toBeLessThanOrEqual(6000);
+});
+
+it('skips the planner model call on fast/normal under auto planning', async () => {
+  const calls: GenerationRequest[] = [];
+  const engine = new WebSearchEngine({
+    config: { cache: { ...DEFAULT_CONFIG.cache, enabled: false } },
+    llmProvider: { generate: async request => {
+      calls.push(request);
+      return { text: 'React 19 is stable. [S1]' };
+    } },
+    searchProvider: { search: async () => [{ id: 'r1', queryId: 'q1', title: 'React release',
+      url: 'https://react.dev/blog/release', domain: 'react.dev', rank: 1, snippet: 'React 19 is stable.' }] },
+    fetcher: { fetch: async url => ({ url, finalUrl: url, success: true, status: 200, durationMs: 0,
+      body: '<html><article><p>React 19 is stable.</p></article></html>' }) },
+  });
+  const session = await engine.research('What is the latest stable release of React?', { mode: 'normal' });
+  // auto planning: only the grounded synthesis call reaches the model.
+  expect(calls).toHaveLength(1);
+  expect(calls[0].systemPrompt).toContain('grounded answer synthesizer');
+  expect(session.queries.length).toBeGreaterThanOrEqual(1);
 });
 
 it('injects SearXNG infoboxes as evidence so small models see structured facts first', async () => {

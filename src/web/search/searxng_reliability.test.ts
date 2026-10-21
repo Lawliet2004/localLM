@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { SearXNGProvider, KEYFREE_CREDENTIAL_ENGINES } from './searxng_provider';
+import { SearXNGProvider } from './searxng_provider';
 import { SearchService } from './search_service';
 import { ttlForFreshness } from '../cache/search_cache';
 import type { SearchResult } from '../types';
@@ -11,32 +11,28 @@ function result(id: string, url: string, title = `Title ${id}`): SearchResult {
 }
 
 describe('SearXNG reliability', () => {
-  it('sends pageno plus key-free engine selection', async () => {
+  it('sends pageno and respects the instance engine configuration by default', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('{"results":[]}'));
     vi.stubGlobal('fetch', fetchMock);
     await new SearXNGProvider().search({ query: 'release', page: 2 });
-    const url = String(fetchMock.mock.calls[0][0]);
-    expect(url).toContain('pageno=2');
-    expect(url).toContain('engines=');
-    expect(url).toContain('disabled_engines=');
-    expect(url).not.toContain('engines=duckduckgo%2Cwikipedia%2Cstackoverflow%2Cgithub%2Carxiv%2Copenstreetmap%2Cgoogle');
-    for (const engine of KEYFREE_CREDENTIAL_ENGINES) {
-      expect(url).toContain(engine);
-    }
+    const url = new URL(String(fetchMock.mock.calls[0][0]));
+    expect(url.searchParams.get('pageno')).toBe('2');
+    expect(url.searchParams.has('engines')).toBe(false);
+    expect(url.searchParams.has('disabled_engines')).toBe(false);
   });
 
   it('keeps per-engine diagnostics and distinguishes empty from failure', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      results: [],
+      results: [{ title: 'Release', url: 'https://example.com/release' }],
       engines: { duckduckgo: { error: 'timeout' } },
       unresponsive_engines: ['wikipedia'],
     })));
     vi.stubGlobal('fetch', fetchMock);
     const provider = new SearXNGProvider();
     const hits = await provider.search({ query: 'release' });
-    expect(hits).toEqual([]);
-    expect(provider.lastDiagnostics?.engines).toEqual({ duckduckgo: 'timeout' });
-    expect(provider.lastDiagnostics?.unresponsiveEngines).toEqual(['wikipedia']);
+    expect(hits).toHaveLength(1);
+    expect(provider.lastDiagnostics?.engines).toEqual({ duckduckgo: 'timeout', wikipedia: 'unresponsive' });
+    expect(provider.lastDiagnostics?.unresponsiveEngines).toEqual(['duckduckgo', 'wikipedia']);
   });
 
   it('recovers page-two results absent from page one within budget', async () => {
@@ -86,6 +82,16 @@ describe('SearXNG reliability', () => {
     expect(outcome.failureCount).toBe(1);
   });
 
+  it('does not retry a permanent SearXNG configuration error', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 403 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const service = new SearchService(new SearXNGProvider(), { retries: 3, retryDelayMs: 0 });
+    const outcome = await service.executeSearches([{ query: 'release', purpose: 'p', freshness: 'any' }]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(outcome.failureCount).toBe(1);
+    expect(outcome.failures[0].error).toContain('search.formats');
+  });
+
   it('uses freshness-aware cache TTLs', () => {
     expect(ttlForFreshness('realtime', 86400)).toBe(300);
     expect(ttlForFreshness('day', 86400)).toBe(3600);
@@ -104,7 +110,7 @@ describe('SearXNG reliability', () => {
   it('verifies engine availability instead of assuming it', async () => {
     const fetchMock = vi.fn().mockImplementation(async (input: any) => {
       const url = String(input);
-      if (url.includes('engines=duckduckgo')) return new Response('{}');
+      if (url.includes('engines=duckduckgo')) return Response.json({ results: [{ url: 'https://example.com', title: 'SearXNG' }] });
       return new Response('', { status: 500 });
     });
     vi.stubGlobal('fetch', fetchMock);

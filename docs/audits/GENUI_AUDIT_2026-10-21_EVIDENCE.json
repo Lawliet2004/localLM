@@ -1,0 +1,108 @@
+{
+  "cases": [
+    {
+      "id": "chart-label-value-swap",
+      "source": "Jan sales: 10; Feb sales: 15.",
+      "program": "root = Response([Chart(\"Sales\",\"bar\",[{label:\"Jan\",value:15},{label:\"Feb\",value:10}])])",
+      "validation": {
+        "valid": true
+      },
+      "grounded": true
+    },
+    {
+      "id": "invented-table-data",
+      "source": "Jan sales: 10; Feb sales: 15.",
+      "program": "root = Response([Table([\"Month\",\"Sales\"],[[\"Jan\",999999]])])",
+      "validation": {
+        "valid": true
+      },
+      "grounded": true
+    },
+    {
+      "id": "invented-metric",
+      "source": "Jan sales: 10.",
+      "program": "root = Response([Stat(\"Jan revenue\",\"999999 dollars\")])",
+      "validation": {
+        "valid": true
+      },
+      "grounded": true
+    },
+    {
+      "id": "unsupported-file-content",
+      "source": "No file was created.",
+      "program": "root = Response([FilePreview(\"secret-report.py\",\"print(999)\",\"python\")])",
+      "validation": {
+        "valid": true
+      },
+      "grounded": true
+    }
+  ],
+  "streaming": [
+    {
+      "program": "root = Response([Text(\"First\")",
+      "validation": {
+        "valid": true
+      }
+    },
+    {
+      "program": "root = Response([Text(\"First\"), Chart(\"Sales\",\"bar\",[",
+      "validation": {
+        "valid": false,
+        "diagnostic": "Invalid or oversized Chart properties."
+      }
+    }
+  ],
+  "calculator": {
+    "program": "root = Response([Calculator(\"c\",\"Power\",\"power\",2,101)])",
+    "validation": {
+      "valid": true
+    },
+    "expected": 2.535301200456459e+30,
+    "html": "<div aria-busy=\"false\" style=\"position:relative\"><div style=\"opacity:1;transition:opacity 0.2s ease\"><main><fieldset class=\"genui-exercise\"><legend>Power</legend><label class=\"genui-control\">First value <input type=\"number\" min=\"-1000000000000\" max=\"1000000000000\" value=\"2\"/></label><label class=\"genui-control\">Second value <input type=\"number\" min=\"-1000000000000\" max=\"1000000000000\" value=\"101\"/></label><output>power: 1.26765060023e+30</output><p class=\"genui-muted\">Computed locally using JavaScript finite-precision arithmetic.</p></fieldset></main></div></div>"
+  },
+  "renderErrors": [],
+  "radioIsolation": {
+    "sameNames": [
+      "joins-0",
+      "joins-0"
+    ],
+    "firstMessageStillChecked": false,
+    "secondMessageChecked": true,
+    "method": "Actual Quiz component rendered through official Renderer twice; JSDOM native radio grouping, not native-app execution."
+  },
+  "scatter": {
+    "circleXs": [
+      40,
+      45.2,
+      560
+    ],
+    "labelXs": [
+      {
+        "label": "A",
+        "x": 40
+      },
+      {
+        "label": "B",
+        "x": 300
+      },
+      {
+        "label": "C",
+        "x": 560
+      }
+    ],
+    "legendHeaders": [
+      "Label",
+      "Value"
+    ]
+  },
+  "repair": {
+    "namedStreaming": {
+      "valid": false,
+      "diagnostic": "Dynamic expressions are unavailable in this library version."
+    },
+    "namedComplete": {
+      "program": "root = Response([Text(\"First\")])",
+      "repaired": true
+    }
+  }
+}

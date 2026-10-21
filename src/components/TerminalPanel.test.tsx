@@ -8,8 +8,9 @@ const mocks = vi.hoisted(() => ({
   terminalClose: vi.fn(),
   terminalInput: vi.fn(),
   terminalResize: vi.fn(),
-  attachHandlers: new Map<string, (e: { type: string; data?: string }) => void>(),
-  instances: [] as { write: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }[],
+  terminalAck: vi.fn(),
+  attachHandlers: new Map<string, (e: { type: string; data?: string; seq?: number }) => void>(),
+  instances: [] as { write: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn>; options: Record<string, unknown> }[],
 }));
 
 vi.mock('../lib/api', () => ({
@@ -21,6 +22,7 @@ vi.mock('../lib/api', () => ({
     terminalClose: mocks.terminalClose,
     terminalInput: mocks.terminalInput,
     terminalResize: mocks.terminalResize,
+    terminalAck: mocks.terminalAck,
   },
 }));
 
@@ -30,12 +32,15 @@ vi.mock('@xterm/xterm', () => ({
   Terminal: class {
     cols = 80;
     rows = 24;
+    options: Record<string, unknown>;
     write = vi.fn();
     open = vi.fn();
+    focus = vi.fn();
+    clear = vi.fn();
     dispose = vi.fn();
     loadAddon = vi.fn();
     onData = vi.fn(() => ({ dispose: vi.fn() }));
-    constructor() { mocks.instances.push(this); }
+    constructor(options: Record<string, unknown>) { this.options = options; mocks.instances.push(this); }
   },
 }));
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); } }));
@@ -62,6 +67,17 @@ describe('TerminalPanel', () => {
     mocks.terminalClose.mockResolvedValue(undefined);
     mocks.terminalInput.mockResolvedValue(undefined);
     mocks.terminalResize.mockResolvedValue(undefined);
+    mocks.terminalAck.mockResolvedValue(undefined);
+  });
+  it('acknowledges a native chunk only when xterm has parsed it', async () => {
+    render(<TerminalPanel tabKey="backpressure-tab" />);
+    await waitFor(() => expect(mocks.terminalAttach).toHaveBeenCalled());
+    act(() => mocks.attachHandlers.get('pty-1')?.({ type: 'output', data: 'parsed later', seq: 42 }));
+    expect(mocks.terminalAck).not.toHaveBeenCalled();
+    const calls = mocks.instances[0].write.mock.calls;
+    const callback = calls[calls.length - 1]?.[1] as () => void;
+    callback();
+    expect(mocks.terminalAck).toHaveBeenCalledWith('pty-1', 42);
   });
 
   it('attaches the new session when tabKey changes and drops the old channel\'s events', async () => {
@@ -76,7 +92,7 @@ describe('TerminalPanel', () => {
     act(() => mocks.attachHandlers.get('pty-1')!({ type: 'output', data: 'stale' }));
     act(() => mocks.attachHandlers.get('pty-2')!({ type: 'output', data: 'fresh' }));
     expect(mocks.instances[0].write).not.toHaveBeenCalled();
-    expect(mocks.instances[1].write).toHaveBeenCalledWith('fresh');
+    expect(mocks.instances[1].write).toHaveBeenCalledWith('fresh', expect.any(Function));
     expect(mocks.instances[1].write).not.toHaveBeenCalledWith('stale');
   });
 
@@ -115,5 +131,23 @@ describe('TerminalPanel', () => {
     await waitFor(() => expect(mocks.terminalClose).toHaveBeenCalledWith('pty-1'));
     render(<TerminalPanel tabKey="tab-close" />);
     await waitFor(() => expect(mocks.terminalAttach).toHaveBeenCalledWith('pty-2', expect.any(Function)));
+  });
+
+  it('updates appearance without restarting a running shell', async () => {
+    render(<TerminalPanel tabKey="tab-appearance" />);
+    await waitFor(() => expect(mocks.terminalAttach).toHaveBeenCalledTimes(1));
+    act(() => {
+      document.documentElement.style.setProperty('--code-font-size', '17px');
+      document.documentElement.style.setProperty('--text', '#aabbcc');
+      document.documentElement.dataset.motion = 'reduced';
+    });
+    await waitFor(() => expect(mocks.instances[0].options.fontSize).toBe(17));
+    expect(mocks.instances[0].options.theme).toMatchObject({ foreground: '#aabbcc' });
+    expect(mocks.instances[0].options.cursorBlink).toBe(false);
+    expect(mocks.terminalOpen).toHaveBeenCalledTimes(1);
+    expect(mocks.instances[0].dispose).not.toHaveBeenCalled();
+    document.documentElement.style.removeProperty('--code-font-size');
+    document.documentElement.style.removeProperty('--text');
+    delete document.documentElement.dataset.motion;
   });
 });

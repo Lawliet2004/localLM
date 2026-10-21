@@ -1,0 +1,187 @@
+{
+  "model": "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+  "cpuOnly": true,
+  "contextLength": 8192,
+  "maxOutputTokens": 512,
+  "cases": [
+    {
+      "name": "markdown",
+      "profile": null,
+      "promptTokens": 7,
+      "timeToFirstTokenMs": 1041.7433000002347,
+      "totalMs": 5612.37136300042,
+      "finishReason": "stop",
+      "source": "DNS is like a phonebook for the internet, translating human-readable website names (like google.com) into the specific numerical addresses computers need to find them. It acts as a global address book that directs your browser to the correct server.",
+      "usage": null,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 16,
+        "prompt_ms": 1030.495,
+        "prompt_per_token_ms": 64.4059375,
+        "prompt_per_second": 15.526518808921928,
+        "predicted_n": 50,
+        "predicted_ms": 4571.94,
+        "predicted_per_token_ms": 93.30489795918366,
+        "predicted_per_second": 10.717550973984787
+      },
+      "runtimePeakRssKiB": 3318884
+    },
+    {
+      "name": "core",
+      "profile": "core",
+      "promptTokens": 1375,
+      "timeToFirstTokenMs": 4373.4731810000085,
+      "totalMs": 9873.010511000757,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response(\n  [\n    Heading(text: \"TCP Handshake Simulation\", level: \"h2\"),\n    Text(text: \"Client sends SYN to server; server sends SYN-ACK to client; client sends ACK to server.\")\n  ]\n)\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 1,
+        "prompt_n": 1383,
+        "prompt_ms": 4362.659,
+        "prompt_per_token_ms": 3.1544895155459143,
+        "prompt_per_second": 317.0085033003955,
+        "predicted_n": 64,
+        "predicted_ms": 5482.048,
+        "predicted_per_token_ms": 87.01663492063491,
+        "predicted_per_second": 11.492055523775058
+      },
+      "runtimePeakRssKiB": 3456888,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "The UI program is incomplete or has missing references."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n    Heading(\"TCP Handshake Simulation\", \"h2\"),\n    Text(\"Client sends SYN to server; server sends SYN-ACK to client; client sends ACK to server.\")\n  ])",
+      "validation": {
+        "valid": true
+      }
+    },
+    {
+      "name": "data",
+      "profile": "data",
+      "promptTokens": 1649,
+      "timeToFirstTokenMs": 5006.02662899837,
+      "totalMs": 10819.561582997267,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response(\n  Chart(title: \"Sales Performance\", kind: \"bar\", points: [{label: \"Jan\", value: 10}, {label: \"Feb\", value: 15}, {label: \"Mar\", value: 25}])\n)\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 1,
+        "prompt_n": 1657,
+        "prompt_ms": 4942.241,
+        "prompt_per_token_ms": 2.9826439348219673,
+        "prompt_per_second": 335.27300671901673,
+        "predicted_n": 67,
+        "predicted_ms": 5811.951,
+        "predicted_per_token_ms": 88.05986363636363,
+        "predicted_per_second": 11.355911293815106
+      },
+      "runtimePeakRssKiB": 3550112,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([Chart(\"Sales Performance\", \"bar\", [{label: \"Jan\", value: 10}, {label: \"Feb\", value: 15}, {label: \"Mar\", value: 25}])])",
+      "validation": {
+        "valid": true
+      }
+    },
+    {
+      "name": "education",
+      "profile": "education",
+      "promptTokens": 1895,
+      "timeToFirstTokenMs": 5727.357433999714,
+      "totalMs": 12314.289472000382,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  InteractiveExample(id: \"search\", kind: \"binary-search\", values: [2, 4, 6, 8, 10], target: 8)\n])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 1,
+        "prompt_n": 1903,
+        "prompt_ms": 5661.531,
+        "prompt_per_token_ms": 2.9750557015239094,
+        "prompt_per_second": 336.1281603862983,
+        "predicted_n": 53,
+        "predicted_ms": 6583.677,
+        "predicted_per_token_ms": 126.60917307692307,
+        "predicted_per_second": 7.8983218648180955
+      },
+      "runtimePeakRssKiB": 3640864,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "Dynamic expressions are unavailable in this library version."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  InteractiveExample(\"search\", \"binary-search\", [2, 4, 6, 8, 10], 8)\n])",
+      "validation": {
+        "valid": true
+      }
+    },
+    {
+      "name": "quiz",
+      "profile": "education",
+      "promptTokens": 1901,
+      "timeToFirstTokenMs": 757.1921320013644,
+      "totalMs": 6952.759396001056,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  Quiz(id: \"joins\", title: \"SQL joins\", questions: {question: \"Which join preserves unmatched left rows?\", options: [\"Inner\", \"Left\"], answer: 1, explanation: \"LEFT JOIN keeps all left rows.\"})\n])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 1865,
+        "prompt_n": 45,
+        "prompt_ms": 744.066,
+        "prompt_per_token_ms": 16.5348,
+        "prompt_per_second": 60.47850593898929,
+        "predicted_n": 65,
+        "predicted_ms": 6194.84,
+        "predicted_per_token_ms": 96.794375,
+        "predicted_per_second": 10.33117885207689
+      },
+      "runtimePeakRssKiB": 3640864,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "The UI program is incomplete or has missing references."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  Quiz(\"joins\", \"SQL joins\", [{question: \"Which join preserves unmatched left rows?\", options: [\"Inner\", \"Left\"], answer: 1, explanation: \"LEFT JOIN keeps all left rows.\"}])\n])",
+      "validation": {
+        "valid": true
+      }
+    },
+    {
+      "name": "execution-result-fixture",
+      "profile": "coding",
+      "promptTokens": 1631,
+      "timeToFirstTokenMs": 5443.067768999754,
+      "totalMs": 10781.232501998602,
+      "finishReason": "stop",
+      "source": "```openui\nroot = Response([\n  FilePreview(path: \"example.py\", code: \"print(1+1)\", language: \"python\"),\n  Text(\"Observed stdout: 2\")\n])\n```",
+      "usage": null,
+      "timings": {
+        "cache_n": 1,
+        "prompt_n": 1639,
+        "prompt_ms": 5366.983,
+        "prompt_per_token_ms": 3.2745472849298354,
+        "prompt_per_second": 305.385726021491,
+        "predicted_n": 50,
+        "predicted_ms": 5337.06,
+        "predicted_per_token_ms": 108.9195918367347,
+        "predicted_per_second": 9.181084717053958
+      },
+      "runtimePeakRssKiB": 3677584,
+      "rawValidation": {
+        "valid": false,
+        "diagnostic": "The UI program is incomplete or has missing references."
+      },
+      "repairApplied": true,
+      "renderProgram": "root = Response([\n  FilePreview(\"example.py\", \"print(1+1)\", \"python\"),\n  Text(\"Observed stdout: 2\")\n])",
+      "validation": {
+        "valid": true
+      }
+    }
+  ],
+  "limitations": "One sample per case, isolated CPU runtime; no browser/native UI paint or remote provider benchmark. Execution result is an explicit fixture, not a tool execution.",
+  "loadSeconds": 13.578079835999233
+}

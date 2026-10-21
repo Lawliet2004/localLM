@@ -8,6 +8,7 @@ pub enum AccessMode {
     AutoApprove,
     FullAccess,
 }
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionClass {
     PublicWebRead,
@@ -17,6 +18,7 @@ pub enum PermissionClass {
     ShellExecution,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Grant {
     Deny,
@@ -27,6 +29,7 @@ pub enum Grant {
 /// Migration does not widen access. Ask stays ask. Auto-approve reads grants
 /// workspace read for the task only. Full access keeps the previous breadth
 /// and still cannot be granted by model output.
+#[cfg(test)]
 pub fn grants_for(mode: AccessMode) -> [(PermissionClass, Grant); 5] {
     let read = match mode {
         AccessMode::Ask => Grant::Ask,
@@ -47,6 +50,7 @@ pub fn grants_for(mode: AccessMode) -> [(PermissionClass, Grant); 5] {
 }
 
 /// The backend decides. A model-written allow never grants a permission.
+#[cfg(test)]
 pub fn backend_allows(grant: Grant, model_claimed_allow: bool) -> bool {
     if model_claimed_allow {
         return false;
@@ -97,8 +101,17 @@ mod tests {
         let ask = super::grants_for(AccessMode::Ask);
         assert!(ask.iter().all(|(_, grant)| *grant == super::Grant::Ask));
         let auto = super::grants_for(AccessMode::AutoApprove);
-        assert_eq!(auto[1], (super::PermissionClass::WorkspaceRead, super::Grant::AllowForTask));
-        assert!(auto.iter().filter(|(class, _)| *class != super::PermissionClass::WorkspaceRead).all(|(_, grant)| *grant == super::Grant::Ask));
+        assert_eq!(
+            auto[1],
+            (
+                super::PermissionClass::WorkspaceRead,
+                super::Grant::AllowForTask
+            )
+        );
+        assert!(auto
+            .iter()
+            .filter(|(class, _)| *class != super::PermissionClass::WorkspaceRead)
+            .all(|(_, grant)| *grant == super::Grant::Ask));
         assert!(!super::backend_allows(super::Grant::Ask, true));
         assert!(!super::backend_allows(super::Grant::Deny, true));
         assert!(!super::backend_allows(super::Grant::AllowForTask, true));

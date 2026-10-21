@@ -1,5 +1,5 @@
-import { render, screen, fireEvent } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Trajectory } from './Trajectory';
 import type { SessionEvent } from '../lib/types';
 
@@ -17,7 +17,44 @@ vi.mock('../lib/api', () => ({
   },
 }));
 
+function makeEvents(conversationId: string, fromSeq: number, count: number): SessionEvent[] {
+  return Array.from({ length: count }, (_, i) => {
+    const seq = fromSeq + i;
+    return {
+      id: `${conversationId}-ev-${seq}`,
+      conversationId,
+      runId: 'r1',
+      seq,
+      stepId: null,
+      toolCallId: null,
+      eventType: 'user_msg',
+      payload: `${conversationId} private content ${seq}`,
+      ignorable: false,
+      createdAt: seq,
+    };
+  });
+}
+
 describe('trajectory viewer', () => {
+  it('does not navigate to an older fork after the user switches conversations', async () => {
+    let resolveFork!: (value: unknown) => void;
+    apiMocks.getSessionEvents.mockImplementation((id: string) => Promise.resolve(makeEvents(id, 1, 1)));
+    apiMocks.forkSession.mockImplementationOnce(() => new Promise(resolve => { resolveFork = resolve; }));
+    const onFork = vi.fn();
+    const { rerender } = render(<Trajectory conversationId="A" onFork={onFork} />);
+    fireEvent.click(screen.getByText(/Trajectory/));
+    fireEvent.click(await screen.findByRole('button', { name: /Fork from here/ }));
+    rerender(<Trajectory conversationId="B" onFork={onFork} />);
+    await screen.findByText('B private content 1');
+    await act(async () => { resolveFork({ newConversation: { id: 'old-fork' } }); });
+    expect(onFork).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: /Fork from here/ })).toBeEnabled();
+  });
+  beforeEach(() => {
+    apiMocks.getSessionEvents.mockReset();
+    apiMocks.forkSession.mockReset();
+  });
+
   const sampleEvents: SessionEvent[] = [
     {
       id: 'ev-1',
@@ -178,4 +215,68 @@ describe('trajectory viewer', () => {
     fireEvent.click(screen.getByText(/Trajectory/));
     expect(screen.getByText('Start a conversation to see its run trajectory.')).toBeInTheDocument();
   });
+
+  it('drops a stale response when the conversation changes mid-load (A08)', async () => {
+    let resolveA: (events: SessionEvent[]) => void = () => {};
+    apiMocks.getSessionEvents.mockImplementation((id: string) =>
+      id === 'conversation-A'
+        ? new Promise<SessionEvent[]>(resolve => { resolveA = resolve; })
+        : Promise.resolve(makeEvents('conversation-B', 1, 1)));
+
+    const { rerender } = render(<Trajectory conversationId="conversation-A" />);
+    fireEvent.click(screen.getByText(/Trajectory/));
+    await waitFor(() => expect(apiMocks.getSessionEvents).toHaveBeenCalledWith('conversation-A', null, 500));
+
+    rerender(<Trajectory conversationId="conversation-B" />);
+    // B's load is not blocked by A's in-flight request.
+    await screen.findByText('conversation-B private content 1');
+    expect(apiMocks.getSessionEvents).toHaveBeenCalledWith('conversation-B', null, 500);
+
+    // A's late response must not write rows, errors, or loading state for B.
+    await act(async () => { resolveA(makeEvents('conversation-A', 900, 1)); });
+    expect(screen.queryByText('conversation-A private content 900')).not.toBeInTheDocument();
+    expect(screen.queryByText('#900')).not.toBeInTheDocument();
+    expect(screen.getByText('conversation-B private content 1')).toBeInTheDocument();
+  });
+
+  it('does not surface a stale error from a previous conversation (A08)', async () => {
+    let rejectA: (e: Error) => void = () => {};
+    apiMocks.getSessionEvents.mockImplementation((id: string) =>
+      id === 'conversation-A'
+        ? new Promise<SessionEvent[]>((_, reject) => { rejectA = reject; })
+        : Promise.resolve(makeEvents('conversation-B', 1, 1)));
+
+    const { rerender } = render(<Trajectory conversationId="conversation-A" />);
+    fireEvent.click(screen.getByText(/Trajectory/));
+    rerender(<Trajectory conversationId="conversation-B" />);
+    await screen.findByText('conversation-B private content 1');
+
+    await act(async () => { rejectA(new Error('conversation-A failed')); });
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByText('conversation-B private content 1')).toBeInTheDocument();
+  });
+
+  it('forks the conversation that owns the rendered event after switching (A08)', async () => {
+    apiMocks.getSessionEvents.mockImplementation((id: string) => Promise.resolve(makeEvents(id, 1, 2)));
+    apiMocks.forkSession.mockResolvedValue({
+      newConversation: { id: 'forked-conv', title: 'Fork', updatedAt: 0, providerId: null, modelId: null, providerSelectionRequired: false },
+      copiedEventsCount: 1,
+    });
+    const onFork = vi.fn();
+
+    const { rerender } = render(<Trajectory conversationId="conversation-A" onFork={onFork} />);
+    fireEvent.click(screen.getByText(/Trajectory/));
+    await screen.findByText('conversation-A private content 1');
+
+    rerender(<Trajectory conversationId="conversation-B" onFork={onFork} />);
+    await screen.findByText('conversation-B private content 1');
+    expect(screen.queryByText('conversation-A private content 1')).not.toBeInTheDocument();
+
+    const forkButtons = screen.getAllByRole('button', { name: /Fork from here/i });
+    expect(forkButtons.length).toBe(2);
+    fireEvent.click(forkButtons[0]);
+    expect(apiMocks.forkSession).toHaveBeenCalledWith('conversation-B', 1);
+    await waitFor(() => expect(onFork).toHaveBeenCalledWith('forked-conv'));
+  });
+
 });

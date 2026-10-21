@@ -12,6 +12,19 @@ The reader consumes one of the 32 tool slots regardless of active skill count. T
 
 Reading script source does not execute it or install dependencies. Package script execution and update workflows remain incomplete; dependency *status* is implemented below. Current local code execution is a separate selected tool and is not sandboxed.
 
+## Model-facing skills
+
+Skills are not only a user-side toggle. The model can reach them directly:
+
+| Tool | What it does |
+| --- | --- |
+| `skill_list` | Lists the skills available in this workspace with their id, name and description. Use it before `skill_load` when you are unsure which skill fits the task. |
+| `skill_load` | Loads one skill's instructions into the conversation. Omit `path` to load the skill's main instruction file. |
+
+A skill's body is project text, not a permission grant: loading a skill does
+not widen access to any tool. The loaded content is bounded, and a skill that
+is not installed reports that it must be installed first.
+
 ## Dependencies
 
 Every installed skill reports its runtime dependencies through `skill_dependencies` and the Skills page **Check dependencies** button. Dependencies are statically declared from each skill's `SKILL.md` workflow at its pinned revision plus the packaged script inventory; the check only reports status and never installs anything or changes configuration.

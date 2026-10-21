@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { installWebFixtures } from './test-fixtures';
-import { WebSearchEngine } from './index';
+import { WebSearchEngine, DEFAULT_CONFIG } from './index';
 import { MockSearchProvider } from './search/provider';
 import { formatDiagnosticReport } from './observability/metrics';
 import type { SearchResult } from './types';
@@ -308,6 +308,27 @@ describe('WebSearchEngine End-to-End Integration Suite', () => {
     const session = await engine.research('find Model X parameters and benchmark details');
     expect(session.answer).toBeDefined();
     expect(session.verification).toBeDefined();
+  });
+
+  // In-flight dedup: concurrent requests for one URL share a single fetch.
+  it('deduplicates concurrent fetches of the same URL', async () => {
+    let calls = 0;
+    const engine = new WebSearchEngine({
+      config: { cache: { ...DEFAULT_CONFIG.cache, enabled: false } },
+      fetcher: { fetch: async url => {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return { url, finalUrl: url, success: true, status: 200, durationMs: 0,
+          body: `<html><article><h1>Shared</h1><p>${'Shared content for dedup testing. '.repeat(40)}</p></article></html>` };
+      } },
+    });
+    const [a, b] = await Promise.all([
+      engine.fetchUrl('https://example.com/shared'),
+      engine.fetchUrl('https://example.com/shared'),
+    ]);
+    expect(calls).toBe(1);
+    expect(a.text).toContain('Shared content');
+    expect(b.text).toContain('Shared content');
   });
 
   // Section 142: Diagnostic Report output

@@ -6,6 +6,12 @@ use std::{
 };
 use tokio::sync::watch;
 
+pub const MANAGED_RUNTIME_MESSAGE: &str = "The pinned CUDA runtime installer is for Windows. On Linux or macOS, select a native llama-server executable using Browse runtime in Model files. GGUF model and projector downloads are supported independently.";
+
+pub fn managed_runtime_supported() -> bool {
+    cfg!(windows)
+}
+
 pub fn required_bytes(assets: &[runtime_archive::RuntimeAsset]) -> Result<u64, String> {
     let total = assets.iter().try_fold(0_u64, |total, asset| {
         asset.files.iter().try_fold(
@@ -31,6 +37,9 @@ pub async fn install(
 ) -> Result<PathBuf, String> {
     if *cancel.borrow() {
         return Err("Runtime installation cancelled.".into());
+    }
+    if !managed_runtime_supported() {
+        return Err(MANAGED_RUNTIME_MESSAGE.into());
     }
     let assets = runtime_archive::catalog()?;
     tokio::fs::create_dir_all(root)
@@ -111,6 +120,19 @@ pub async fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn unsupported_runtime_install_does_not_download_windows_binaries() {
+        let root = tempfile::tempdir().unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let error = install(root.path(), cancel, |_, _, _| {
+            panic!("No Windows runtime download expected")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error, MANAGED_RUNTIME_MESSAGE);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
     #[tokio::test]
     async fn cancellation_before_download_leaves_no_installation() {
         let root = tempfile::tempdir().unwrap();

@@ -53,7 +53,8 @@ pub async fn fork_session(
     from_seq: u64,
 ) -> Result<ForkSessionResult, String> {
     let store = state.database()?;
-    let (new_conversation, copied_events_count) = store.fork_session_events(&conversation_id, from_seq)?;
+    let (new_conversation, copied_events_count) =
+        store.fork_session_events(&conversation_id, from_seq)?;
     crate::workspace_ui::inherit_task_meta(&store, &conversation_id, &new_conversation.id)?;
     Ok(ForkSessionResult {
         new_conversation,

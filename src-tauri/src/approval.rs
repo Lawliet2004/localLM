@@ -3,7 +3,22 @@ use tokio::sync::oneshot;
 
 #[derive(Default)]
 pub struct Approvals(Mutex<HashMap<String, oneshot::Sender<bool>>>);
+pub struct PendingApproval<'a> {
+    approvals: &'a Approvals,
+    id: String,
+}
+impl Drop for PendingApproval<'_> {
+    fn drop(&mut self) {
+        self.approvals.remove(&self.id);
+    }
+}
 impl Approvals {
+    pub fn guard(&self, id: &str) -> PendingApproval<'_> {
+        PendingApproval {
+            approvals: self,
+            id: id.to_string(),
+        }
+    }
     pub fn request(&self) -> Result<(String, oneshot::Receiver<bool>), String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
@@ -57,6 +72,14 @@ impl ChoiceApprovals {
             .send(choice)
             .map_err(|_| "The question has already ended.".into())
     }
+    /// Pending request ids, for tests that resolve approvals without a UI.
+    #[cfg(test)]
+    pub(crate) fn pending_ids(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .map(|pending| pending.keys().cloned().collect())
+            .unwrap_or_default()
+    }
     pub fn remove(&self, id: &str) {
         if let Ok(mut pending) = self.0.lock() {
             pending.remove(id);
@@ -84,6 +107,15 @@ pub fn resolve_ask_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dropping_an_approval_scope_removes_the_pending_request() {
+        let approvals = Approvals::default();
+        let (id, _receiver) = approvals.request().unwrap();
+        {
+            let _pending = approvals.guard(&id);
+        }
+        assert!(approvals.resolve(&id, true).is_err());
+    }
     #[tokio::test]
     async fn decisions_are_single_use_and_bound_to_request() {
         let approvals = Approvals::default();

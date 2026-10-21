@@ -38,11 +38,16 @@ fn read_u64(file: &mut impl Read) -> std::io::Result<u64> {
 fn read_string(file: &mut impl Read) -> std::io::Result<String> {
     let length = read_u64(file)?;
     if length > MAX_HEADER_BYTES {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "GGUF string exceeds header budget"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "GGUF string exceeds header budget",
+        ));
     }
     let mut buffer = vec![0u8; length as usize];
     file.read_exact(&mut buffer)?;
-    String::from_utf8(buffer).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "GGUF string is not UTF-8"))
+    String::from_utf8(buffer).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "GGUF string is not UTF-8")
+    })
 }
 
 /// Skip one metadata value of `value_type`, tracking the header budget.
@@ -58,10 +63,18 @@ fn skip_value(file: &mut impl Read, value_type: u32, budget: &mut u64) -> std::i
         }
         TYPE_ARRAY => {
             let element_type = read_u32(file)?;
-            if element_type == TYPE_ARRAY { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Nested GGUF arrays are not supported")); }
+            if element_type == TYPE_ARRAY {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Nested GGUF arrays are not supported",
+                ));
+            }
             let count = read_u64(file)?;
             if count > MAX_HEADER_BYTES {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "GGUF array exceeds header budget"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "GGUF array exceeds header budget",
+                ));
             }
             for _ in 0..count {
                 skip_value(file, element_type, budget)?;
@@ -87,65 +100,120 @@ pub struct ModelMetadata {
     pub key_length: Option<u32>,
     pub value_length: Option<u32>,
     pub file_bytes: u64,
+    /// Which chat-template reasoning control the template understands, if any
+    /// (`enable_thinking` or `reasoning_effort`). Drives the kwargs sent on
+    /// finalizing rounds so thinking never competes with the answer budget.
+    pub thinking_control: Option<String>,
 }
 
 pub fn model_metadata(path: &Path) -> Result<ModelMetadata, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut bytes = file.metadata().map_err(|e| e.to_string())?.len();
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".gguf")) {
+    if let Some(name) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".gguf"))
+    {
         if let Some((left, total)) = name.rsplit_once("-of-") {
             if let (Some((base, _)), Ok(count)) = (left.rsplit_once('-'), total.parse::<usize>()) {
                 if (1..=999).contains(&count) {
                     bytes = 0;
                     for i in 1..=count {
                         let part = path.with_file_name(format!("{base}-{i:05}-of-{count:05}.gguf"));
-                        bytes = bytes.checked_add(std::fs::metadata(part).map_err(|_| "Model has missing shards.")?.len()).ok_or("Model size overflow.")?;
+                        bytes = bytes
+                            .checked_add(
+                                std::fs::metadata(part)
+                                    .map_err(|_| "Model has missing shards.")?
+                                    .len(),
+                            )
+                            .ok_or("Model size overflow.")?;
                     }
                 }
             }
         }
     }
-    parse_metadata(&mut file.take(MAX_HEADER_BYTES), bytes).map_err(|e| format!("Cannot read model metadata: {e}"))
+    parse_metadata(&mut file.take(MAX_HEADER_BYTES), bytes)
+        .map_err(|e| format!("Cannot read model metadata: {e}"))
 }
 fn parse_metadata(file: &mut impl Read, file_bytes: u64) -> std::io::Result<ModelMetadata> {
     let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid GGUF header");
-    let mut magic = [0; 4]; file.read_exact(&mut magic)?;
-    if &magic != b"GGUF" || !(2..=3).contains(&read_u32(file)?) { return Err(invalid()); }
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic)?;
+    if &magic != b"GGUF" || !(2..=3).contains(&read_u32(file)?) {
+        return Err(invalid());
+    }
     let _tensors = read_u64(file)?;
     let count = read_u64(file)?;
-    if count > 1_000_000 { return Err(invalid()); }
+    if count > 1_000_000 {
+        return Err(invalid());
+    }
     let mut numbers = std::collections::HashMap::new();
-    let mut result = ModelMetadata { file_bytes, ..Default::default() };
+    let mut result = ModelMetadata {
+        file_bytes,
+        ..Default::default()
+    };
     let mut budget = MAX_HEADER_BYTES;
     for _ in 0..count {
         let key = read_string(file)?;
         let kind = read_u32(file)?;
-        if key == "general.architecture" && kind == TYPE_STRING { result.architecture = Some(read_string(file)?); }
-        else if kind == TYPE_U32 { numbers.insert(key, read_u32(file)?); }
-        else if kind == TYPE_U64 { let value = read_u64(file)?; if let Ok(value) = u32::try_from(value) { numbers.insert(key, value); } }
-        else { skip_value(file, kind, &mut budget)?; }
+        if key == "general.architecture" && kind == TYPE_STRING {
+            result.architecture = Some(read_string(file)?);
+        } else if key == "tokenizer.chat_template" && kind == TYPE_STRING {
+            let template = read_string(file)?;
+            if template.contains("reasoning_effort") {
+                result.thinking_control = Some("reasoning_effort".into());
+            } else if template.contains("enable_thinking") {
+                result.thinking_control = Some("enable_thinking".into());
+            }
+        } else if kind == TYPE_U32 {
+            numbers.insert(key, read_u32(file)?);
+        } else if kind == TYPE_U64 {
+            let value = read_u64(file)?;
+            if let Ok(value) = u32::try_from(value) {
+                numbers.insert(key, value);
+            }
+        } else {
+            skip_value(file, kind, &mut budget)?;
+        }
     }
     if let Some(architecture) = &result.architecture {
-        let number = |suffix: &str| numbers.get(&format!("{architecture}.{suffix}")).copied().filter(|n| *n > 0);
-        result.context_length = number("context_length"); result.block_count = number("block_count");
-        result.embedding_length = number("embedding_length"); result.head_count = number("attention.head_count");
-        result.head_count_kv = number("attention.head_count_kv"); result.key_length = number("attention.key_length"); result.value_length = number("attention.value_length");
+        let number = |suffix: &str| {
+            numbers
+                .get(&format!("{architecture}.{suffix}"))
+                .copied()
+                .filter(|n| *n > 0)
+        };
+        result.context_length = number("context_length");
+        result.block_count = number("block_count");
+        result.embedding_length = number("embedding_length");
+        result.head_count = number("attention.head_count");
+        result.head_count_kv = number("attention.head_count_kv");
+        result.key_length = number("attention.key_length");
+        result.value_length = number("attention.value_length");
     }
     Ok(result)
 }
 
 #[tauri::command]
 pub async fn read_model_metadata(path: String) -> Result<ModelMetadata, String> {
-    tauri::async_runtime::spawn_blocking(move || model_metadata(Path::new(&path))).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || model_metadata(Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn consume(file: &mut impl Read, bytes: u64, budget: &mut u64) -> std::io::Result<()> {
     if bytes > *budget {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "GGUF header exceeds its size budget"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "GGUF header exceeds its size budget",
+        ));
     }
     *budget -= bytes;
     if std::io::copy(&mut file.take(bytes), &mut std::io::sink())? != bytes {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Truncated GGUF metadata"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Truncated GGUF metadata",
+        ));
     }
     Ok(())
 }
@@ -155,20 +223,25 @@ fn consume(file: &mut impl Read, bytes: u64, budget: &mut u64) -> std::io::Resul
 /// remains responsible for reporting that; this check only refuses what it
 /// can positively identify.
 pub fn read_architecture(path: &Path) -> Result<Option<String>, String> {
-    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?.take(MAX_HEADER_BYTES);
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(MAX_HEADER_BYTES);
     let mut budget = MAX_HEADER_BYTES;
     let mut magic = [0u8; 4];
     if file.read_exact(&mut magic).is_err() || &magic != b"GGUF" {
         return Ok(None);
     }
     budget -= 4;
-    let version = read_u32(&mut file).map_err(|_| "Could not read the GGUF version.".to_string())?;
+    let version =
+        read_u32(&mut file).map_err(|_| "Could not read the GGUF version.".to_string())?;
     budget -= 4;
     if !(2..=3).contains(&version) {
         return Ok(None);
     }
-    let _tensor_count = read_u64(&mut file).map_err(|_| "Could not read the GGUF tensor count.".to_string())?;
-    let kv_count = read_u64(&mut file).map_err(|_| "Could not read the GGUF metadata count.".to_string())?;
+    let _tensor_count =
+        read_u64(&mut file).map_err(|_| "Could not read the GGUF tensor count.".to_string())?;
+    let kv_count =
+        read_u64(&mut file).map_err(|_| "Could not read the GGUF metadata count.".to_string())?;
     budget -= 16;
     if kv_count > MAX_HEADER_BYTES {
         return Ok(None);
@@ -179,10 +252,14 @@ pub fn read_architecture(path: &Path) -> Result<Option<String>, String> {
             return Ok(None);
         }
         budget -= key.len() as u64;
-        let value_type = read_u32(&mut file).map_err(|_| "Malformed GGUF metadata value type.".to_string())?;
-        budget = budget.checked_sub(4).ok_or("GGUF header exceeds its size budget.")?;
+        let value_type =
+            read_u32(&mut file).map_err(|_| "Malformed GGUF metadata value type.".to_string())?;
+        budget = budget
+            .checked_sub(4)
+            .ok_or("GGUF header exceeds its size budget.")?;
         if key == "general.architecture" && value_type == TYPE_STRING {
-            let architecture = read_string(&mut file).map_err(|_| "Malformed GGUF architecture value.".to_string())?;
+            let architecture = read_string(&mut file)
+                .map_err(|_| "Malformed GGUF architecture value.".to_string())?;
             return Ok(Some(architecture));
         }
         skip_value(&mut file, value_type, &mut budget).map_err(|error| error.to_string())?;
@@ -197,15 +274,23 @@ mod tests {
     #[test]
     fn reads_model_limits_even_when_architecture_follows_numeric_fields() {
         let mut kvs = Vec::new();
-        for (key, value) in [("llama.context_length", 262144u32), ("llama.block_count", 32), ("llama.attention.head_count_kv", 8)] {
-            kvs.extend_from_slice(&(key.len() as u64).to_le_bytes()); kvs.extend_from_slice(key.as_bytes());
-            kvs.extend_from_slice(&TYPE_U32.to_le_bytes()); kvs.extend_from_slice(&value.to_le_bytes());
+        for (key, value) in [
+            ("llama.context_length", 262144u32),
+            ("llama.block_count", 32),
+            ("llama.attention.head_count_kv", 8),
+        ] {
+            kvs.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            kvs.extend_from_slice(key.as_bytes());
+            kvs.extend_from_slice(&TYPE_U32.to_le_bytes());
+            kvs.extend_from_slice(&value.to_le_bytes());
         }
         kvs.extend_from_slice(&string_kv("general.architecture", "llama"));
         let bytes = header(kvs, 4, 3);
         let metadata = parse_metadata(&mut bytes.as_slice(), 100).unwrap();
-        assert_eq!(metadata.context_length, Some(262144)); assert_eq!(metadata.block_count, Some(32)); assert_eq!(metadata.head_count_kv, Some(8));
-        assert!(parse_metadata(&mut &bytes[..bytes.len()-1], 100).is_err());
+        assert_eq!(metadata.context_length, Some(262144));
+        assert_eq!(metadata.block_count, Some(32));
+        assert_eq!(metadata.head_count_kv, Some(8));
+        assert!(parse_metadata(&mut &bytes[..bytes.len() - 1], 100).is_err());
     }
 
     fn string_kv(key: &str, value: &str) -> Vec<u8> {
@@ -273,11 +358,61 @@ mod tests {
     }
 
     #[test]
+    fn detects_thinking_controls_in_the_chat_template() {
+        let kvs = vec![
+            string_kv("general.architecture", "minicpm"),
+            string_kv(
+                "tokenizer.chat_template",
+                "{%- if enable_thinking is defined and enable_thinking is false %}{% endif %}",
+            ),
+        ];
+        let mut flat = Vec::new();
+        for kv in kvs {
+            flat.extend_from_slice(&kv);
+        }
+        let metadata = parse_metadata(&mut flat_header(flat, 2).as_slice(), 100).unwrap();
+        assert_eq!(
+            metadata.thinking_control.as_deref(),
+            Some("enable_thinking")
+        );
+
+        let mut flat = Vec::new();
+        flat.extend_from_slice(&string_kv(
+            "tokenizer.chat_template",
+            "{{ reasoning_effort }}",
+        ));
+        let metadata = parse_metadata(&mut flat_header(flat, 1).as_slice(), 100).unwrap();
+        assert_eq!(
+            metadata.thinking_control.as_deref(),
+            Some("reasoning_effort")
+        );
+
+        let mut flat = Vec::new();
+        flat.extend_from_slice(&string_kv("tokenizer.chat_template", "plain template"));
+        let metadata = parse_metadata(&mut flat_header(flat, 1).as_slice(), 100).unwrap();
+        assert_eq!(metadata.thinking_control, None);
+    }
+
+    fn flat_header(kvs: Vec<u8>, count: u64) -> Vec<u8> {
+        header(kvs, count, 3)
+    }
+
+    #[test]
     fn unparseable_and_non_gguf_files_are_not_refused() {
         let directory = write_temp("model.gguf", b"not a gguf file at all");
-        assert_eq!(read_architecture(&directory.path().join("model.gguf")).unwrap(), None);
-        let directory = write_temp("model.gguf", &header(string_kv("general.architecture", "testarch"), 1, 9));
-        assert_eq!(read_architecture(&directory.path().join("model.gguf")).unwrap(), None, "unsupported GGUF version is left to the runtime");
+        assert_eq!(
+            read_architecture(&directory.path().join("model.gguf")).unwrap(),
+            None
+        );
+        let directory = write_temp(
+            "model.gguf",
+            &header(string_kv("general.architecture", "testarch"), 1, 9),
+        );
+        assert_eq!(
+            read_architecture(&directory.path().join("model.gguf")).unwrap(),
+            None,
+            "unsupported GGUF version is left to the runtime"
+        );
         assert!(read_architecture(Path::new("Z:/missing/model.gguf")).is_err());
     }
 }

@@ -1,0 +1,198 @@
+{
+  "root": "Response",
+  "components": {
+    "SourceChart": {
+      "signature": "SourceChart(id: string, tableIndex: number, kind: \"bar\" | \"line\" | \"pie\" | \"donut\" | \"scatter\")",
+      "description": "Chart exact host-bound values from a numeric two-column table in the authoritative answer; never transcribe or invent values."
+    },
+    "Heading": {
+      "signature": "Heading(text: string, level?: \"h2\" | \"h3\" | \"h4\")",
+      "description": "A section heading."
+    },
+    "Text": {
+      "signature": "Text(text: string)",
+      "description": "Plain text, no Markdown."
+    },
+    "Callout": {
+      "signature": "Callout(text: string, tone?: \"info\" | \"success\" | \"warning\" | \"error\")",
+      "description": "A highlighted note for a warning, tip, success or error the user should notice."
+    },
+    "Response": {
+      "signature": "Response(children: (SourceChart | Heading | Text | Callout)[])",
+      "description": "Root container of every UI block. Assign it to `root` and pass content as children."
+    }
+  },
+  "componentGroups": [
+    {
+      "name": "Visual data",
+      "components": [
+        "SourceChart"
+      ]
+    },
+    {
+      "name": "Content",
+      "components": [
+        "Heading",
+        "Text",
+        "Callout"
+      ]
+    },
+    {
+      "name": "Layout",
+      "components": [
+        "Response"
+      ]
+    }
+  ],
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "SourceChart": {
+        "$ref": "#/$defs/SourceChart"
+      },
+      "Heading": {
+        "$ref": "#/$defs/Heading"
+      },
+      "Text": {
+        "$ref": "#/$defs/Text"
+      },
+      "Callout": {
+        "$ref": "#/$defs/Callout"
+      },
+      "Response": {
+        "$ref": "#/$defs/Response"
+      }
+    },
+    "required": [
+      "SourceChart",
+      "Heading",
+      "Text",
+      "Callout",
+      "Response"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "SourceChart": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+          },
+          "tableIndex": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 7
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "bar",
+              "line",
+              "pie",
+              "donut",
+              "scatter"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "tableIndex",
+          "kind"
+        ],
+        "additionalProperties": false,
+        "description": "Chart exact host-bound values from a numeric two-column table in the authoritative answer; never transcribe or invent values."
+      },
+      "Heading": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "h2",
+              "h3",
+              "h4"
+            ]
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "description": "A section heading."
+      },
+      "Text": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 16384
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "description": "Plain text, no Markdown."
+      },
+      "Callout": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 16384
+          },
+          "tone": {
+            "type": "string",
+            "enum": [
+              "info",
+              "success",
+              "warning",
+              "error"
+            ]
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "description": "A highlighted note for a warning, tip, success or error the user should notice."
+      },
+      "Response": {
+        "type": "object",
+        "properties": {
+          "children": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourceChart"
+                },
+                {
+                  "$ref": "#/$defs/Heading"
+                },
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "$ref": "#/$defs/Callout"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "children"
+        ],
+        "additionalProperties": false,
+        "description": "Root container of every UI block. Assign it to `root` and pass content as children."
+      }
+    }
+  }
+}

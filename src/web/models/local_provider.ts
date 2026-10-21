@@ -19,6 +19,34 @@ export class LocalOpenAICompatibleProvider implements LLMProvider {
   private timeoutMs: number;
   private apiKey?: string;
   private maxInputTokens: number;
+  /** Cached /props probe: which reasoning kwarg the chat template honors. */
+  private reasoningControl?: Promise<{ enableThinking: boolean; reasoningEffort: boolean }>;
+
+  /**
+   * llama.cpp exposes the loaded model's chat template at `/props`. Probe it
+   * once (2s budget, cached) — models that never mention reasoning controls
+   * simply keep their default sampling.
+   */
+  private probeReasoningControls() {
+    this.reasoningControl ??= (async () => {
+      try {
+        const res = await fetch(new URL('/props', this.baseUrl), {
+          headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+          signal: AbortSignal.timeout(2000),
+          redirect: 'error',
+        });
+        if (!res.ok) return { enableThinking: false, reasoningEffort: false };
+        const template = String((await res.json())?.chat_template ?? '');
+        return {
+          enableThinking: template.includes('enable_thinking'),
+          reasoningEffort: template.includes('reasoning_effort'),
+        };
+      } catch {
+        return { enableThinking: false, reasoningEffort: false };
+      }
+    })();
+    return this.reasoningControl;
+  }
 
   constructor(options: LocalServerOptions = {}) {
     this.baseUrl = options.baseUrl ?? 'http://127.0.0.1:8080/v1';
@@ -69,6 +97,14 @@ export class LocalOpenAICompatibleProvider implements LLMProvider {
 
     if (request.stopSequences && request.stopSequences.length > 0) {
       body.stop = request.stopSequences;
+    }
+
+    // Low-effort calls (planning, extraction, verification) get the reasoning
+    // suppression the model's own template advertises — detected, not assumed.
+    if (request.reasoningEffort === 'low') {
+      const caps = await this.probeReasoningControls();
+      if (caps.reasoningEffort) body.chat_template_kwargs = { reasoning_effort: 'low' };
+      else if (caps.enableThinking) body.chat_template_kwargs = { enable_thinking: false };
     }
 
     const controller = new AbortController();

@@ -49,7 +49,10 @@ pub struct ModelDownloadInfo {
 }
 
 #[tauri::command]
-pub async fn model_download_info(app: tauri::AppHandle, filename: Option<String>) -> Result<ModelDownloadInfo, String> {
+pub async fn model_download_info(
+    app: tauri::AppHandle,
+    filename: Option<String>,
+) -> Result<ModelDownloadInfo, String> {
     let (filename, asset) = model(filename.as_deref())?;
     let directory = app
         .path()

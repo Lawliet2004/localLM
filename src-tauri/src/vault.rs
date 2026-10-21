@@ -17,11 +17,56 @@ impl Vault {
             refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
+    /// Presence is a UI fact, not authentication or decryption success. Do
+    /// not unlock the OS credential store just to list local conversations.
+    pub fn contains(&self, id: &str) -> Result<bool, String> {
+        validate_id(id)?;
+        match std::fs::metadata(self.directory.join(format!("{id}.sealed"))) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    // Unit tests use isolated process-memory keys per temporary vault. They
+    // still exercise authenticated encryption and never touch account secrets.
+    #[cfg(test)]
     fn cipher(&self) -> Result<Aes256Gcm, String> {
+        use std::{collections::HashMap, sync::OnceLock};
+        static KEYS: OnceLock<Mutex<HashMap<PathBuf, Vec<u8>>>> = OnceLock::new();
+        let mut keys = KEYS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let key = keys
+            .entry(self.directory.clone())
+            .or_insert_with(|| Aes256Gcm::generate_key(OsRng).to_vec());
+        Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())
+    }
+    #[cfg(not(test))]
+    fn cipher(&self) -> Result<Aes256Gcm, String> {
+        use base64::Engine as _;
+        if !cfg!(any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "macos"
+        )) {
+            return Err(
+                "Persistent native credential storage is not supported on this platform.".into(),
+            );
+        }
         let entry = keyring::Entry::new("app.locallm.desktop", "credential-encryption-key")
-            .map_err(|_| "Windows Credential Manager is unavailable.")?;
+            .map_err(|_| "The operating-system credential store is unavailable.")?;
         let key = match entry.get_secret() {
-            Ok(key) => key,
+            Ok(key) if key.len() == 32 => key,
+            Ok(key) => match std::str::from_utf8(&key)
+                .ok()
+                .and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok())
+            {
+                Some(key) if key.len() == 32 => key,
+                _ => {
+                    return Err("The protected credential encryption key is invalid. Clear the stored 'credential-encryption-key' entry in the operating-system credential store and try again.".into())
+                }
+            },
             Err(keyring::Error::NoEntry) => {
                 if self.directory.exists()
                     && std::fs::read_dir(&self.directory)
@@ -32,16 +77,16 @@ impl Vault {
                             })
                         })
                 {
-                    return Err("The credential encryption key is missing. Stored credentials cannot be recovered with this Windows account.".into());
+                    return Err("The credential encryption key is missing. Stored credentials cannot be recovered with this account's credential store.".into());
                 }
                 let key = Aes256Gcm::generate_key(OsRng);
-                entry.set_secret(&key).map_err(|_| {
-                    "Could not protect the credential encryption key in Windows Credential Manager."
+                entry.set_password(&base64::engine::general_purpose::STANDARD.encode(key)).map_err(|_| {
+                    "Could not protect the credential encryption key in the operating-system credential store. On Linux, start and unlock GNOME Keyring or KWallet (Secret Service)."
                 })?;
                 key.to_vec()
             }
             Err(_) => {
-                return Err("Could not access the protected credential encryption key.".into())
+                return Err("Could not access the protected credential encryption key. On Linux, start and unlock GNOME Keyring or KWallet (Secret Service).".into())
             }
         };
         Aes256Gcm::new_from_slice(&key)
@@ -91,6 +136,47 @@ impl Vault {
         }
         result
     }
+    /// Read a credential without blocking the async worker.
+    ///
+    /// The keyring call is a D-Bus round trip to the platform credential
+    /// store. On Linux that can block for seconds when the keyring is locked,
+    /// and it must never happen on a tokio worker thread.
+    pub async fn load_blocking(
+        self: &std::sync::Arc<Self>,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let vault = std::sync::Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || vault.load(&id))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
+    /// Store a credential without blocking the async worker.
+    pub async fn save_blocking(
+        self: &std::sync::Arc<Self>,
+        id: &str,
+        secret: Vec<u8>,
+    ) -> Result<(), String> {
+        let vault = std::sync::Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || vault.save(&id, &secret))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
+    /// Remove a credential without blocking the async worker.
+    pub async fn clear_blocking(
+        self: &std::sync::Arc<Self>,
+        id: &str,
+    ) -> Result<(), String> {
+        let vault = std::sync::Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || vault.clear(&id))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
     pub fn clear(&self, id: &str) -> Result<(), String> {
         validate_id(id)?;
         let _guard = self
@@ -154,6 +240,20 @@ fn unseal(cipher: &Aes256Gcm, id: &str, bytes: &[u8]) -> Result<Vec<u8>, String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credential_presence_does_not_require_unlocking_or_decrypting() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = super::Vault::new(directory.path().to_path_buf());
+        assert!(!vault.contains("saved-key").unwrap());
+        std::fs::write(
+            directory.path().join("saved-key.sealed"),
+            b"corrupt fixture",
+        )
+        .unwrap();
+        assert!(vault.contains("saved-key").unwrap());
+        assert!(vault.load("saved-key").is_err());
+        assert!(vault.contains("../outside").is_err());
+    }
     use super::*;
     use aes_gcm::{aead::OsRng, Aes256Gcm, KeyInit};
     #[test]

@@ -9,6 +9,9 @@ pub struct Info {
     required_bytes: u64,
     available_bytes: u64,
     destination: String,
+    supported: bool,
+    platform: &'static str,
+    message: Option<&'static str>,
 }
 
 #[tauri::command]
@@ -21,12 +24,24 @@ pub async fn runtime_download_info(app: tauri::AppHandle) -> Result<Info, String
     tokio::fs::create_dir_all(&root)
         .await
         .map_err(|error| error.to_string())?;
-    let assets = crate::runtime_archive::catalog()?;
+    let supported = crate::runtime_install::managed_runtime_supported();
+    let assets = if supported {
+        crate::runtime_archive::catalog()?
+    } else {
+        Vec::new()
+    };
     Ok(Info {
         bytes: assets.iter().map(|asset| asset.bytes).sum(),
-        required_bytes: crate::runtime_install::required_bytes(&assets)?,
+        required_bytes: if supported {
+            crate::runtime_install::required_bytes(&assets)?
+        } else {
+            0
+        },
         available_bytes: crate::download::available_space(&root)?,
         destination: root.to_string_lossy().into_owned(),
+        supported,
+        platform: std::env::consts::OS,
+        message: (!supported).then_some(crate::runtime_install::MANAGED_RUNTIME_MESSAGE),
     })
 }
 

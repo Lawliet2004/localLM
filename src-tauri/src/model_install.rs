@@ -157,8 +157,7 @@ pub async fn install_model(
             }
         };
         if exists {
-            crate::download::verify_file(&path, &asset, receiver, progress)
-                .await?;
+            crate::download::verify_file(&path, &asset, receiver, progress).await?;
         } else {
             crate::download::fetch(
                 &crate::download::client()?,

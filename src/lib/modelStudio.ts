@@ -25,7 +25,23 @@ export function quantLabel(filename: string) {
 }
 
 export function weightFiles(files: HubFile[]) {
-  return files.filter(file => !file.filename.toLowerCase().includes('mmproj') && (!file.filename.includes('-of-') || file.filename.includes('-00001-of-')));
+  return files.filter(file => isWeightFile(file.filename) && (!file.filename.includes('-of-') || file.filename.includes('-00001-of-')));
+}
+
+export function isWeightFile(filename: string) {
+  const lower = filename.replace(/\\/g, '/').toLowerCase();
+  // MTP heads and calibration/adapter files can also be GGUFs. A model that
+  // embeds MTP may still have an MTP suffix, so only exclude companion prefixes
+  // and directories, rather than every occurrence of "mtp".
+  return lower.endsWith('.gguf') && !lower.includes('mmproj')
+    && !/(^|\/)(mtp|imatrix|adapters?|lora|projectors?)(?=[/._-]|$)/.test(lower);
+}
+
+export function hubSize(bytes: number) {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(2)} MB`;
+  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(2)} kB`;
+  return `${bytes} B`;
 }
 
 export function projectorFiles(files: HubFile[]) {
@@ -70,22 +86,27 @@ export function preferredFile(files: HubFile[]) {
 
 export type FitKind = 'gpu' | 'ram' | 'large' | 'unknown';
 
-export function fitKind(bytes: number, hardware: HardwareStatus | null): FitKind {
-  if (!bytes) return 'unknown';
+export function fitKind(bytes: number, hardware: HardwareStatus | null, projectorBytes = 0): FitKind {
+  if (bytes <= 0 || !Number.isFinite(bytes) || projectorBytes < 0 || !Number.isFinite(projectorBytes)) return 'unknown';
+  // Discovery has file sizes, not the architecture/context metadata needed to
+  // predict the KV cache. Reserve runtime headroom and label results candidates.
+  const weights = bytes + projectorBytes;
+  const required = weights + Math.max(2 ** 30, weights * 0.1);
   const gpu = hardware?.gpus[0];
-  const vram = gpu?.memoryTotalMib != null ? gpu.memoryTotalMib * 2 ** 20 : null;
-  const ram = hardware?.memoryTotalBytes ?? null;
-  if (vram != null && bytes <= vram * 0.85) return 'gpu';
-  if (ram != null && bytes <= ram * 0.55) return 'ram';
+  const vram = gpu?.memoryTotalMib != null && gpu.memoryUsedMib != null
+    ? Math.max(0, gpu.memoryTotalMib - gpu.memoryUsedMib) * 2 ** 20 : null;
+  const ram = hardware?.memoryAvailableBytes ?? null;
+  if (vram != null && required <= vram) return 'gpu';
+  if (ram != null && required <= ram) return 'ram';
   if (vram == null && ram == null) return 'unknown';
   return 'large';
 }
 
 export function fitLabel(kind: FitKind) {
-  if (kind === 'gpu') return 'Fits GPU';
-  if (kind === 'ram') return 'Fits RAM';
-  if (kind === 'large') return 'May not fit';
-  return 'Size unknown';
+  if (kind === 'gpu') return 'GPU candidate';
+  if (kind === 'ram') return 'RAM candidate';
+  if (kind === 'large') return 'Memory tight';
+  return 'Memory unknown';
 }
 
 export function compactCount(value: number) {

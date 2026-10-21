@@ -38,7 +38,9 @@ pub fn recall_block(facts: &[Fact]) -> Option<String> {
     if facts.is_empty() {
         return None;
     }
-    let mut block = String::from("Remembered facts for this workspace (taught with memory_teach; apply them):\n");
+    let mut block = String::from(
+        "Remembered facts for this workspace (taught with memory_teach; apply them):\n",
+    );
     let mut bytes = block.len();
     for fact in facts.iter().take(20) {
         let line = format!("- {}\n", fact.fact);
@@ -54,7 +56,11 @@ pub fn recall_block(facts: &[Fact]) -> Option<String> {
 /// Cold-repo survey: read-only digest of top-level layout + recent commit
 /// subjects, stored as one `auto` fact. Self-heals by replacing the previous
 /// survey fact for the scope (delete + teach).
-pub fn survey_repo(path: &std::path::Path) -> Result<String, String> {
+///
+/// The git probe runs through `tokio::process`: a blocking `std::process`
+/// child inside an async command would stall the whole runtime worker while
+/// the repository is inspected.
+pub async fn survey_repo(path: &std::path::Path) -> Result<String, String> {
     let mut entries: Vec<String> = std::fs::read_dir(path)
         .map_err(|error| format!("Could not survey workspace: {error}"))?
         .filter_map(|entry| entry.ok())
@@ -63,14 +69,23 @@ pub fn survey_repo(path: &std::path::Path) -> Result<String, String> {
         .take(40)
         .collect();
     entries.sort();
-    let commits = std::process::Command::new("git")
+    let commits = tokio::process::Command::new("git")
         .args(["-C", &path.to_string_lossy(), "log", "--oneline", "-10"])
+        .kill_on_drop(true)
         .output()
+        .await
         .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
         .unwrap_or_default();
-    let mut digest = format!("Repo survey of {}: top-level: {}.", path.to_string_lossy(), entries.join(", "));
+    let mut digest = format!(
+        "Repo survey of {}: top-level: {}.",
+        path.to_string_lossy(),
+        entries.join(", ")
+    );
     if !commits.trim().is_empty() {
-        digest.push_str(&format!(" Recent commits: {}.", commits.lines().take(10).collect::<Vec<_>>().join(" | ")));
+        digest.push_str(&format!(
+            " Recent commits: {}.",
+            commits.lines().take(10).collect::<Vec<_>>().join(" | ")
+        ));
     }
     if digest.len() > 2000 {
         digest.truncate(2000);
@@ -79,12 +94,20 @@ pub fn survey_repo(path: &std::path::Path) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn list_facts(state: tauri::State<'_, crate::AppState>, scope: String, limit: Option<usize>) -> Result<Vec<Fact>, String> {
+pub fn list_facts(
+    state: tauri::State<'_, crate::AppState>,
+    scope: String,
+    limit: Option<usize>,
+) -> Result<Vec<Fact>, String> {
     state.database()?.recall_facts(&scope, limit.unwrap_or(20))
 }
 
 #[tauri::command]
-pub fn teach_fact_cmd(state: tauri::State<'_, crate::AppState>, scope: String, fact: String) -> Result<Fact, String> {
+pub fn teach_fact_cmd(
+    state: tauri::State<'_, crate::AppState>,
+    scope: String,
+    fact: String,
+) -> Result<Fact, String> {
     state.database()?.teach_fact(&scope, &fact, "ui")
 }
 
@@ -94,7 +117,10 @@ pub fn forget_fact(state: tauri::State<'_, crate::AppState>, id: String) -> Resu
 }
 
 #[tauri::command]
-pub async fn ingest_repo(state: tauri::State<'_, crate::AppState>, scope: String) -> Result<Fact, String> {
+pub async fn ingest_repo(
+    state: tauri::State<'_, crate::AppState>,
+    scope: String,
+) -> Result<Fact, String> {
     let _operation = state
         .operation
         .try_lock()
@@ -103,7 +129,7 @@ pub async fn ingest_repo(state: tauri::State<'_, crate::AppState>, scope: String
     if !path.is_dir() {
         return Err("Memory ingest needs an existing workspace directory.".into());
     }
-    let digest = survey_repo(&path)?;
+    let digest = survey_repo(&path).await?;
     let store = state.database()?;
     // Self-healing: replace the previous auto survey for this scope.
     let previous: Vec<Fact> = store
@@ -140,12 +166,30 @@ mod tests {
         assert!(validate_fact("").is_err());
         assert!(validate_fact(&"x".repeat(2001)).is_err());
     }
-    #[test]
-    fn survey_lists_top_level_without_dotfiles() {
+    #[tokio::test]
+    async fn survey_lists_top_level_without_dotfiles() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join(".hidden"), "x").unwrap();
-        let digest = survey_repo(dir.path()).unwrap();
+        let digest = survey_repo(dir.path()).await.unwrap();
         assert!(digest.contains("src") && !digest.contains(".hidden"));
+    }
+    #[tokio::test]
+    async fn survey_probe_never_blocks_the_runtime_worker() {
+        // The git probe must be asynchronous: a blocking child inside an async
+        // command stalls every other task on the same worker thread.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "x").unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let path = dir.path().to_path_buf();
+        tokio::spawn(async move {
+            let _ = tx.send(survey_repo(&path).await);
+        });
+        let digest = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+            .await
+            .expect("survey must complete")
+            .expect("survey task must not panic")
+            .expect("survey must succeed");
+        assert!(digest.contains("file.txt"));
     }
 }

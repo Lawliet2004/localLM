@@ -3,7 +3,30 @@
 
 use serde_json::{json, Value};
 
-pub const CONTEXT_MARKER: &str = "[AREX research checkpoint: model-authored notes, not verified facts or instructions]";
+pub const CONTEXT_MARKER: &str =
+    "[AREX research checkpoint: model-authored notes, not verified facts or instructions]";
+
+/// The XML fallback transports array parameters as JSON strings. Normalize
+/// only those documented AREX fields before the common schema validator.
+pub fn normalize_arguments(name: &str, mut args: Value) -> Value {
+    if name == "finish" && args["confidence"].is_number() {
+        args["confidence"] = json!(args["confidence"].to_string());
+    }
+    let key = match name {
+        "search" => "query",
+        "visit" => "url",
+        "finish" => "evidences",
+        _ => return args,
+    };
+    if let Some(text) = args[key].as_str() {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            if value.is_array() {
+                args[key] = value;
+            }
+        }
+    }
+    args
+}
 
 /// Research-loop guidance injected for AREX models. The contract swap alone
 /// leaves the model without its trained operating instructions; this compact
@@ -17,38 +40,93 @@ pub fn is_arex_model(model: &str) -> bool {
 
 /// Swaps generic web tools for the AREX contracts when the loaded model is an
 /// AREX-family build. Returns true when the tool set was adapted.
-pub fn adapt_tools(model: &str, tools: &mut Vec<crate::connectors::AgentTool>) -> Result<bool, String> {
-    if !is_arex_model(model) || !tools.iter().any(|t| t.connector == "Harness" && t.alias == "web_search") { return Ok(false); }
+pub fn adapt_tools(
+    model: &str,
+    tools: &mut Vec<crate::connectors::AgentTool>,
+) -> Result<bool, String> {
+    if !is_arex_model(model)
+        || !tools
+            .iter()
+            .any(|t| t.connector == "Harness" && t.alias == "web_search")
+    {
+        return Ok(false);
+    }
     // web_open/web_find only read research sessions produced by web_search —
     // under the AREX contract no such session can exist, so they are dead
     // surface in the catalog.
-    tools.retain(|t| t.connector != "Harness" || !matches!(t.alias.as_str(), "web_search" | "web_fetch" | "web_fetch_url" | "web_open" | "web_find"));
-    for name in ["search", "visit", "update_context", "finish", "artifact_read"] {
-        if !tools.iter().any(|t| t.alias == name) { tools.push(crate::connectors::AgentTool::harness(name)?); }
+    tools.retain(|t| {
+        t.connector != "Harness"
+            || !matches!(
+                t.alias.as_str(),
+                "web_search" | "web_fetch" | "web_fetch_url" | "web_open" | "web_find"
+            )
+    });
+    for name in [
+        "search",
+        "visit",
+        "update_context",
+        "finish",
+        "artifact_read",
+    ] {
+        if !tools.iter().any(|t| t.alias == name) {
+            tools.push(crate::connectors::AgentTool::harness(name)?);
+        }
     }
     Ok(true)
 }
 
 pub fn validate_batch(calls: &[crate::tool_calls::ToolCall]) -> Result<(), String> {
-    if calls.len() > 1 && calls.iter().any(|c| matches!(c.name.as_str(), "finish" | "update_context")) {
-        return Err("finish and update_context must each be called separately from other tools".into());
+    if calls.len() > 1
+        && calls
+            .iter()
+            .any(|c| matches!(c.name.as_str(), "finish" | "update_context"))
+    {
+        return Err(
+            "finish and update_context must each be called separately from other tools".into(),
+        );
     }
     Ok(())
 }
 
-pub fn apply_control(name: &str, result: &Value, store: &crate::store::Store, conversation: &str, run: &str, messages: &mut Vec<Value>) -> Result<Option<String>, String> {
-    if result["isError"] == true { return Ok(None); }
+pub fn apply_control(
+    name: &str,
+    result: &Value,
+    store: &crate::store::Store,
+    conversation: &str,
+    run: &str,
+    messages: &mut Vec<Value>,
+) -> Result<Option<String>, String> {
+    if result["isError"] == true {
+        return Ok(None);
+    }
+    // The result may already be a `locallm.tool-envelope/1` envelope — the
+    // finish path and the harness dispatch both produce one. Read the inner
+    // payload from `data` in that case, so a control tool works on the same
+    // result shape regardless of which path produced it.
+    let payload = if result.get("schemaVersion").and_then(Value::as_str)
+        == Some(crate::tool_envelope::SCHEMA_VERSION)
+    {
+        result.get("data").unwrap_or(result)
+    } else {
+        result
+    };
     match name {
-        "finish" => Ok(result["answer"].as_str().map(String::from)),
+        "finish" => Ok(payload["answer"].as_str().map(String::from)),
         "update_context" => {
-            checkpoint(store, conversation, run, messages, text(result, "context", 16000)?)?;
+            checkpoint(
+                store,
+                conversation,
+                run,
+                messages,
+                text(payload, "context", 16000)?,
+            )?;
             Ok(None)
         }
         _ => Ok(None),
     }
 }
 
-pub fn registry() -> Vec<(String, String, Value)> {
+pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     let schema = |properties, required: &[&str]| json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
     vec![
         ("search".into(), "Search the web for up to four complementary queries, returning up to ten results per query. Read key sources with visit; snippets alone do not verify a claim. Change approach when results repeat.".into(),
@@ -59,11 +137,13 @@ pub fn registry() -> Vec<(String, String, Value)> {
             schema(json!({"context":{"type":"string","maxLength":16000}}), &["context"])),
         ("finish".into(), "End this research turn and present the answer with evidence URLs. Verify critical claims first; explicitly acknowledge unresolved questions. Confidence is your estimate, not external verification. Call separately from all other tools.".into(),
             schema(json!({"answer":{"type":"string","maxLength":24000},"evidences":{"type":"array","maxItems":30,"items":{"type":"object","properties":{"evidence":{"type":"string"},"url":{"type":"string"}},"required":["evidence","url"],"additionalProperties":false}},"confidence":{"type":"string","description":"Score from 0% to 100%"}}), &["answer","evidences","confidence"])),
-    ]
+    ].into_iter().map(crate::tool_spec::ToolSpec::from).collect()
 }
 
 fn text<'a>(args: &'a Value, key: &str, max: usize) -> Result<&'a str, String> {
-    args[key].as_str().filter(|s| !s.trim().is_empty() && s.len() <= max)
+    args[key]
+        .as_str()
+        .filter(|s| !s.trim().is_empty() && s.len() <= max)
         .ok_or_else(|| format!("{key} must be a nonempty string of at most {max} bytes"))
 }
 
@@ -74,7 +154,9 @@ fn decoded(value: &Value) -> Value {
     if let Value::String(text) = value {
         let trimmed = text.trim();
         if trimmed.len() <= 64 * 1024 && (trimmed.starts_with('[') || trimmed.starts_with('{')) {
-            if let Ok(parsed) = serde_json::from_str(trimmed) { return parsed; }
+            if let Ok(parsed) = serde_json::from_str(trimmed) {
+                return parsed;
+            }
         }
     }
     value.clone()
@@ -92,15 +174,32 @@ fn confidence_text(args: &Value) -> String {
 pub fn strings(value: &Value, allow_single: bool) -> Result<Vec<String>, String> {
     let value = decoded(value);
     if allow_single {
-        if let Some(s) = value.as_str() { return Ok(vec![s.into()]); }
+        if let Some(s) = value.as_str() {
+            return Ok(vec![s.into()]);
+        }
     }
-    let items = value.as_array().filter(|a| !a.is_empty() && a.len() <= 4).ok_or("Expected 1-4 strings")?;
-    items.iter().map(|v| v.as_str().map(String::from).ok_or("Expected a string".into())).collect()
+    let items = value
+        .as_array()
+        .filter(|a| !a.is_empty() && a.len() <= 4)
+        .ok_or("Expected 1-4 strings")?;
+    items
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(String::from)
+                .ok_or("Expected a string".into())
+        })
+        .collect()
 }
 
 fn url(value: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(value).map_err(|_| "Invalid source URL")?;
-    if value.len() > 2048 || !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
+    if value.len() > 2048
+        || !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
         return Err("Only absolute HTTP(S) URLs without credentials are allowed".into());
     }
     Ok(())
@@ -108,24 +207,45 @@ fn url(value: &str) -> Result<(), String> {
 
 pub fn validate(name: &str, args: &Value) -> Result<(), String> {
     match name {
-        "search" => for q in strings(&args["query"], false)? {
-            if q.trim().is_empty() || q.len() > 8000 { return Err("Invalid search query".into()); }
-        },
+        "search" => {
+            for q in strings(&args["query"], false)? {
+                if q.trim().is_empty() || q.len() > 8000 {
+                    return Err("Invalid search query".into());
+                }
+            }
+        }
         "visit" => {
             text(args, "goal", 4000)?;
-            for item in strings(&args["url"], true)? { url(&item)?; }
+            for item in strings(&args["url"], true)? {
+                url(&item)?;
+            }
         }
-        "update_context" => { text(args, "context", 16000)?; }
+        "update_context" => {
+            text(args, "context", 16000)?;
+        }
         "finish" => {
             text(args, "answer", 24000)?;
             let raw_confidence = confidence_text(args);
-            if raw_confidence.is_empty() || raw_confidence.len() > 16 { return Err("Invalid confidence score".into()); }
-            let confidence = raw_confidence.trim().trim_end_matches('%').parse::<f64>().map_err(|_| "Invalid confidence score")?;
-            if !confidence.is_finite() || !(0.0..=100.0).contains(&confidence) { return Err("Confidence must be from 0% to 100%".into()); }
+            if raw_confidence.is_empty() || raw_confidence.len() > 16 {
+                return Err("Invalid confidence score".into());
+            }
+            let confidence = raw_confidence
+                .trim()
+                .trim_end_matches('%')
+                .parse::<f64>()
+                .map_err(|_| "Invalid confidence score")?;
+            if !confidence.is_finite() || !(0.0..=100.0).contains(&confidence) {
+                return Err("Confidence must be from 0% to 100%".into());
+            }
             let decoded_evidences = decoded(&args["evidences"]);
-            let evidences = decoded_evidences.as_array().filter(|a| a.len() <= 30).ok_or("Expected at most 30 evidences")?;
+            let evidences = decoded_evidences
+                .as_array()
+                .filter(|a| a.len() <= 30)
+                .ok_or("Expected at most 30 evidences")?;
             for evidence in evidences {
-                if evidence.as_object().is_none_or(|o| o.len() != 2) { return Err("Each evidence must contain evidence and url only".into()); }
+                if evidence.as_object().is_none_or(|o| o.len() != 2) {
+                    return Err("Each evidence must contain evidence and url only".into());
+                }
                 text(evidence, "evidence", 2000)?;
                 url(text(evidence, "url", 2048)?)?;
             }
@@ -142,10 +262,16 @@ pub fn validate(name: &str, args: &Value) -> Result<(), String> {
 pub fn collect_evidence(value: &Value, out: &mut Vec<(String, String)>) {
     const MAX_ITEMS: usize = 24;
     const MAX_CHARS: usize = 1200;
-    if out.len() >= MAX_ITEMS || result_is_error(value) { return; }
+    if out.len() >= MAX_ITEMS || result_is_error(value) {
+        return;
+    }
     match value {
         Value::Object(map) => {
-            let url = map.get("url").and_then(Value::as_str).unwrap_or("");
+            let url = map
+                .get("url")
+                .or_else(|| map.get("sourceUrl"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             for key in ["text", "snippet", "claim", "evidence"] {
                 if let Some(text) = map.get(key).and_then(Value::as_str) {
                     let text = text.trim();
@@ -158,9 +284,15 @@ pub fn collect_evidence(value: &Value, out: &mut Vec<(String, String)>) {
                     break;
                 }
             }
-            for value in map.values() { collect_evidence(value, out); }
+            for value in map.values() {
+                collect_evidence(value, out);
+            }
         }
-        Value::Array(items) => for item in items { collect_evidence(item, out); },
+        Value::Array(items) => {
+            for item in items {
+                collect_evidence(item, out);
+            }
+        }
         _ => {}
     }
 }
@@ -172,13 +304,21 @@ fn result_is_error(value: &Value) -> bool {
 /// Deterministic post-finish audit: check the answer's atomic claims against
 /// the evidence collected during the run plus the evidence the model cited.
 /// Never blocks the answer — failures surface as no report.
-pub async fn verify_finish(state: &crate::AppState, args: &Value, evidence: &[(String, String)]) -> Result<Option<Value>, String> {
+pub async fn verify_finish(
+    state: &crate::AppState,
+    args: &Value,
+    evidence: &[(String, String)],
+) -> Result<Option<Value>, String> {
     let answer = args["answer"].as_str().unwrap_or_default();
-    if answer.trim().is_empty() { return Ok(None); }
+    if answer.trim().is_empty() {
+        return Ok(None);
+    }
     // The worker reads a single stdin JSON document capped at 64 KiB; keep the
     // request comfortably under it so the audit never dies on size.
     let capped = |text: &str, max: usize| -> String { text.chars().take(max).collect() };
-    let mut items: Vec<Value> = evidence.iter().take(24)
+    let mut items: Vec<Value> = evidence
+        .iter()
+        .take(24)
         .map(|(url, text)| json!({"url": capped(url, 300), "claim": capped(text, 800)}))
         .collect();
     if let Some(evidences) = decoded(&args["evidences"]).as_array() {
@@ -189,9 +329,15 @@ pub async fn verify_finish(state: &crate::AppState, args: &Value, evidence: &[(S
             }));
         }
     }
-    if items.is_empty() { return Ok(None); }
-    let report = crate::web_search::run_worker(state, None,
-        json!({"action": "verify", "answer": capped(answer, 12000), "evidence": items})).await?;
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let report = crate::web_search::run_worker(
+        state,
+        None,
+        json!({"action": "verify", "answer": capped(answer, 12000), "evidence": items}),
+    )
+    .await?;
     Ok(Some(report))
 }
 
@@ -201,28 +347,47 @@ pub fn finish_answer(args: &Value) -> String {
     if let Some(evidences) = evidences.as_array().filter(|e| !e.is_empty()) {
         answer.push_str("\n\nSupporting sources:\n");
         for evidence in evidences {
-            answer.push_str(&format!("\n- {} ([source](<{}>))", evidence["evidence"].as_str().unwrap_or_default(), evidence["url"].as_str().unwrap_or_default()));
+            answer.push_str(&format!(
+                "\n- {} ([source](<{}>))",
+                evidence["evidence"].as_str().unwrap_or_default(),
+                evidence["url"].as_str().unwrap_or_default()
+            ));
         }
     }
     answer
 }
 
 /// Compact only model context; never delete transcript/audit rows or user instructions.
-pub fn checkpoint(store: &crate::store::Store, conversation: &str, run: &str, messages: &mut Vec<Value>, context: &str) -> Result<(), String> {
+pub fn checkpoint(
+    store: &crate::store::Store,
+    conversation: &str,
+    run: &str,
+    messages: &mut Vec<Value>,
+    context: &str,
+) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let tail = messages.len().saturating_sub(2); // the sole update_context call and its result
     let mut dropped = Vec::new();
     let mut kept = Vec::new();
     for (index, message) in messages.iter().enumerate() {
-        if index >= tail || message["role"] == "system" || message["role"] == "user" { kept.push(message.clone()); }
-        else { dropped.push(message.clone()); }
+        if index >= tail || message["role"] == "system" || message["role"] == "user" {
+            kept.push(message.clone());
+        } else {
+            dropped.push(message.clone());
+        }
     }
     let id = format!("art_{}", uuid::Uuid::new_v4().simple());
     let content = json!({"kind":"arex-context","messages":dropped}).to_string();
     store.save_artifact(&crate::artifacts::ArtifactRecord {
-        id: id.clone(), conversation_id: conversation.into(), run_id: Some(run.into()),
-        tool_name: "update_context".into(), mime_type: "application/json".into(), size_bytes: content.len(),
-        sha256: format!("{:x}", Sha256::digest(content.as_bytes())), content, created_at: crate::store::now(),
+        id: id.clone(),
+        conversation_id: conversation.into(),
+        run_id: Some(run.into()),
+        tool_name: "update_context".into(),
+        mime_type: "application/json".into(),
+        size_bytes: content.len(),
+        sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+        content,
+        created_at: crate::store::now(),
     })?;
     let insertion = kept.len().saturating_sub(2);
     if let Some(result) = kept.last_mut().filter(|m| m["role"] == "tool") {
@@ -235,6 +400,16 @@ pub fn checkpoint(store: &crate::store::Store, conversation: &str, run: &str, me
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_dispatch_normalizes_xml_array_parameters_before_schema_validation() {
+        use serde_json::json;
+        let tool = crate::connectors::AgentTool::harness("finish").unwrap();
+        let args = tool
+            .prepare_arguments(json!({"answer":"An answer", "evidences":"[]", "confidence":90}))
+            .unwrap();
+        assert_eq!(args["evidences"], json!([]));
+        assert_eq!(args["confidence"], "90");
+    }
     use super::*;
     use serde_json::json;
 
@@ -242,15 +417,39 @@ mod tests {
     fn arex_arguments_are_bounded_and_validated_before_execution() {
         assert!(validate("search", &json!({"query":[]})).is_err());
         assert!(validate("search", &json!({"query":["one", "two"]})).is_ok());
-        assert!(validate("visit", &json!({"url":["https://example.org", "file:///secret"],"goal":"verify"})).is_err());
-        assert!(validate("visit", &json!({"url":"https://example.org","goal":"verify"})).is_ok());
-        assert!(validate("finish", &json!({"answer":"answer","evidences":[],"confidence":"101%"})).is_err());
+        assert!(validate(
+            "visit",
+            &json!({"url":["https://example.org", "file:///secret"],"goal":"verify"})
+        )
+        .is_err());
+        assert!(validate(
+            "visit",
+            &json!({"url":"https://example.org","goal":"verify"})
+        )
+        .is_ok());
+        assert!(validate(
+            "finish",
+            &json!({"answer":"answer","evidences":[],"confidence":"101%"})
+        )
+        .is_err());
         assert!(validate("update_context", &json!({"context":" "})).is_err());
 
         // llama.cpp can pass AREX's structured XML parameters through as JSON
         // text inside a string; both wire forms must decode identically.
-        assert_eq!(strings(&json!("[\"https://a.example\",\"https://b.example\"]"), true).unwrap().len(), 2);
-        assert!(validate("visit", &json!({"url":"[\"https://a.example\"]","goal":"g"})).is_ok());
+        assert_eq!(
+            strings(
+                &json!("[\"https://a.example\",\"https://b.example\"]"),
+                true
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        assert!(validate(
+            "visit",
+            &json!({"url":"[\"https://a.example\"]","goal":"g"})
+        )
+        .is_ok());
         assert!(validate("search", &json!({"query":"[\"q1\",\"q2\"]"})).is_ok());
         assert!(validate("finish", &json!({"answer":"a","evidences":"[{\"evidence\":\"e\",\"url\":\"https://x.example\"}]","confidence":90})).is_ok());
     }
@@ -276,32 +475,80 @@ mod tests {
 
     #[test]
     fn arex_controls_are_exclusive_and_denied_finish_does_not_end_turn() {
-        let calls = vec![crate::tool_calls::ToolCall { id:"1".into(), name:"finish".into(), arguments:json!({}) }, crate::tool_calls::ToolCall { id:"2".into(), name:"search".into(), arguments:json!({}) }];
+        let calls = vec![
+            crate::tool_calls::ToolCall {
+                id: "1".into(),
+                name: "finish".into(),
+                arguments: json!({}),
+            },
+            crate::tool_calls::ToolCall {
+                id: "2".into(),
+                name: "search".into(),
+                arguments: json!({}),
+            },
+        ];
         assert!(validate_batch(&calls).is_err());
         let store = crate::store::Store::open_memory().unwrap();
-        assert!(apply_control("finish", &json!({"isError":true,"answer":"not authorized"}), &store, "", "", &mut vec![]).unwrap().is_none());
-        assert_eq!(apply_control("finish", &json!({"answer":"final"}), &store, "", "", &mut vec![]).unwrap(), Some("final".into()));
+        assert!(apply_control(
+            "finish",
+            &json!({"isError":true,"answer":"not authorized"}),
+            &store,
+            "",
+            "",
+            &mut vec![]
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            apply_control(
+                "finish",
+                &json!({"answer":"final"}),
+                &store,
+                "",
+                "",
+                &mut vec![]
+            )
+            .unwrap(),
+            Some("final".into())
+        );
     }
 
     #[test]
     fn arex_checkpoint_preserves_requests_tool_pairs_and_citations() {
         let store = crate::store::Store::open_memory().unwrap();
         let conversation = store.create_conversation().unwrap().id;
-        let mut messages = vec![json!({"role":"system","content":"instructions"}), json!({"role":"user","content":"original question"}),
-            json!({"role":"assistant","content":"old research"}), json!({"role":"user","content":"change approach"}),
+        let mut messages = vec![
+            json!({"role":"system","content":"instructions"}),
+            json!({"role":"user","content":"original question"}),
+            json!({"role":"assistant","content":"old research"}),
+            json!({"role":"user","content":"change approach"}),
             json!({"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"update_context","arguments":"{}"}}]}),
-            json!({"role":"tool","tool_call_id":"c","content":"checkpoint saved"})];
-        checkpoint(&store, &conversation, "run", &mut messages, "Fact: https://example.org. Still unresolved: date.").unwrap();
+            json!({"role":"tool","tool_call_id":"c","content":"checkpoint saved"}),
+        ];
+        checkpoint(
+            &store,
+            &conversation,
+            "run",
+            &mut messages,
+            "Fact: https://example.org. Still unresolved: date.",
+        )
+        .unwrap();
         assert!(messages.iter().any(|m| m["content"] == "original question"));
-        assert!(messages.iter().any(|m| m["content"].as_str().is_some_and(|s| s.starts_with(CONTEXT_MARKER) && s.contains("https://example.org"))));
+        assert!(messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|s| s.starts_with(CONTEXT_MARKER) && s.contains("https://example.org"))));
         assert_eq!(messages.last().unwrap()["tool_call_id"], "c");
         assert!(!messages.iter().any(|m| m["content"] == "old research"));
-        messages.push(json!({"role":"assistant","tool_calls":[{"id":"next"}],"content":"x".repeat(12000)}));
+        messages.push(
+            json!({"role":"assistant","tool_calls":[{"id":"next"}],"content":"x".repeat(12000)}),
+        );
         messages.push(json!({"role":"tool","tool_call_id":"next","content":"new reading"}));
         messages.push(json!({"role":"assistant","tool_calls":[{"id":"last"}]}));
         messages.push(json!({"role":"tool","tool_call_id":"last","content":"last result"}));
-        crate::compaction::compact_model_messages(&store, &conversation, &mut messages).unwrap();
-        assert!(messages.iter().any(|m| m["content"].as_str().is_some_and(|s| s.starts_with(CONTEXT_MARKER) && s.contains("https://example.org"))));
+        crate::compaction::compact_model_messages(&store, &conversation, &mut messages, 10).unwrap();
+        assert!(messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|s| s.starts_with(CONTEXT_MARKER) && s.contains("https://example.org"))));
     }
 
     #[test]
@@ -340,7 +587,9 @@ mod tests {
         assert!(!tools.iter().any(|t| t.alias == "web_search"));
         // web_open/web_find are dead under the contract — they only read
         // research sessions that web_search (now removed) would create.
-        assert!(!tools.iter().any(|t| t.alias == "web_open" || t.alias == "web_find"));
+        assert!(!tools
+            .iter()
+            .any(|t| t.alias == "web_open" || t.alias == "web_find"));
         assert!(tools.iter().any(|t| t.alias == "artifact_read"));
         let mut disabled = vec![];
         adapt_tools("AREX", &mut disabled).unwrap();

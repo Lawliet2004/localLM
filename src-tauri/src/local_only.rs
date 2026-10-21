@@ -1,5 +1,6 @@
-//! Local inference and local execution. Remote providers and Daytona stay
-//! unreachable. An OpenAI-compatible wire format on loopback is still local.
+//! Policy for operations that require local inference or execution, including
+//! account subscriptions and Daytona. Explicitly selected custom API providers
+//! use their validated endpoint instead. OpenAI-compatible loopback is local.
 
 pub const SEARXNG_IMAGE: &str = "searxng/searxng:2026.9.22-019460e07";
 
@@ -19,6 +20,34 @@ pub fn cloud_execution_allowed() -> Result<(), String> {
 /// unknown-network MCP is network-isolated unless a sandbox actually exists.
 pub fn retrieval_allowed(offline: bool) -> bool {
     !offline
+}
+
+pub fn check_retrieval_action(offline: bool, action: &str) -> Result<(), String> {
+    if offline && !matches!(action, "open" | "find" | "clear-cache") {
+        return Err("Offline mode: external retrieval is disabled.".into());
+    }
+    Ok(())
+}
+pub fn external_web_tool(alias: &str) -> bool {
+    matches!(
+        alias,
+        "web_search" | "web_fetch" | "web_fetch_url" | "search" | "visit"
+    )
+}
+#[tauri::command]
+pub fn get_offline_mode(state: tauri::State<'_, crate::AppState>) -> Result<bool, String> {
+    state.database()?.setting("offline_mode")
+}
+#[tauri::command]
+pub async fn set_offline_mode(
+    state: tauri::State<'_, crate::AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let _guard = state
+        .operation
+        .try_lock()
+        .map_err(|_| "Wait for the active operation before changing retrieval permissions.")?;
+    state.database()?.save_setting("offline_mode", &enabled)
 }
 
 pub fn execution_isolation_label(sandbox_enforced: bool) -> &'static str {
@@ -69,6 +98,36 @@ pub fn managed_node_detail(node_ok: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn offline_blocks_all_retrieval_but_preserves_saved_passages() {
+        for action in [
+            "search",
+            "fetch-url",
+            "fetch-urls",
+            "weather",
+            "health",
+            "",
+            "unknown",
+        ] {
+            assert!(check_retrieval_action(true, action).is_err(), "{action}");
+            assert!(check_retrieval_action(false, action).is_ok(), "{action}");
+        }
+        for action in ["open", "find", "clear-cache"] {
+            assert!(check_retrieval_action(true, action).is_ok());
+        }
+        for tool in [
+            "web_search",
+            "web_fetch",
+            "web_fetch_url",
+            "search",
+            "visit",
+        ] {
+            assert!(external_web_tool(tool));
+        }
+        for tool in ["web_open", "web_find", "web_read", "get_weather"] {
+            assert!(!external_web_tool(tool));
+        }
+    }
 
     #[test]
     fn loopback_openai_wire_is_local_and_remote_hosts_are_rejected() {
@@ -93,19 +152,53 @@ mod tests {
     #[test]
     fn fresh_install_names_each_missing_piece() {
         let facts = [
-            SetupFact { name: "runtime", ok: false, detail: "Managed llama.cpp is not installed.".into() },
-            SetupFact { name: "tool_probe", ok: false, detail: "Tool-call probe has not run.".into() },
-            SetupFact { name: "node", ok: false, detail: managed_node_detail(false) },
-            SetupFact { name: "python", ok: true, detail: "Python is available.".into() },
-            SetupFact { name: "searxng", ok: false, detail: format!("SearXNG is an explicit install of {SEARXNG_IMAGE}.") },
-            SetupFact { name: "public_page", ok: false, detail: "Public-page retrieval failed.".into() },
-            SetupFact { name: "pdf", ok: false, detail: "PDF parser failed on the fixture.".into() },
-            SetupFact { name: "browser", ok: false, detail: "Optional browser rendering did not start.".into() },
+            SetupFact {
+                name: "runtime",
+                ok: false,
+                detail: "Managed llama.cpp is not installed.".into(),
+            },
+            SetupFact {
+                name: "tool_probe",
+                ok: false,
+                detail: "Tool-call probe has not run.".into(),
+            },
+            SetupFact {
+                name: "node",
+                ok: false,
+                detail: managed_node_detail(false),
+            },
+            SetupFact {
+                name: "python",
+                ok: true,
+                detail: "Python is available.".into(),
+            },
+            SetupFact {
+                name: "searxng",
+                ok: false,
+                detail: format!("SearXNG is an explicit install of {SEARXNG_IMAGE}."),
+            },
+            SetupFact {
+                name: "public_page",
+                ok: false,
+                detail: "Public-page retrieval failed.".into(),
+            },
+            SetupFact {
+                name: "pdf",
+                ok: false,
+                detail: "PDF parser failed on the fixture.".into(),
+            },
+            SetupFact {
+                name: "browser",
+                ok: false,
+                detail: "Optional browser rendering did not start.".into(),
+            },
         ];
         let report = fresh_install_report(&facts);
         assert_eq!(report.len(), 7);
         assert!(report.iter().any(|line| line.starts_with("node:")));
-        assert!(report.iter().all(|line| !line.contains("hand-edit") || line.contains("Do not hand-edit")));
+        assert!(report
+            .iter()
+            .all(|line| !line.contains("hand-edit") || line.contains("Do not hand-edit")));
         assert!(!SEARXNG_IMAGE.ends_with(":latest"));
         assert!(report.iter().any(|line| line.contains(SEARXNG_IMAGE)));
     }

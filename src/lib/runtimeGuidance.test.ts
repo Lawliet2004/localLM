@@ -20,6 +20,30 @@ describe('runtime memory guidance', () => {
     expect(estimateMemory({ ...model, architecture: 'hybridnet' }, defaultRuntimeConfig).kvBytes).toBeNull();
     expect(estimateMemory({ ...model, headCountKv: null }, defaultRuntimeConfig).kvBytes).toBeNull();
   });
+  it('accounts for projector memory independently of language-model offload', () => {
+    const config = { ...defaultRuntimeConfig, contextLength: 4096 };
+    const bytes = 2 ** 30;
+    const base = estimateMemory(model, config);
+    const gpuProjector = estimateMemory(model, config, bytes);
+    expect(gpuProjector.gpuBytes).toBe(base.gpuBytes! + bytes);
+    expect(gpuProjector.ramBytes).toBe(base.ramBytes);
+    const cpuProjector = estimateMemory(model, { ...config, offloadProjector: false }, bytes);
+    expect(cpuProjector.gpuBytes).toBe(base.gpuBytes);
+    expect(cpuProjector.ramBytes).toBe(base.ramBytes! + bytes);
+    expect(estimateMemory(model, { ...config, gpuLayers: 0 }, bytes).gpuBytes).toBe(bytes);
+    expect(estimateMemory(model, { ...config, visionEnabled: false }, bytes)).toEqual(base);
+    expect(estimateMemory(model, config, null)).toMatchObject({ gpuBytes: null, partial: true });
+    expect(estimateMemory(model, { ...config, visionEnabled: false }, null)).toEqual(base);
+  });
+  it('reserves GPU projector weights when fitting layers and preserves vision choices in recommendations', () => {
+    const config = { ...defaultRuntimeConfig, contextLength: 4096 };
+    const machine = gpu(6 * 1024, 1024);
+    const without = fittingGpuLayers(model, machine, config);
+    expect(fittingGpuLayers(model, machine, config, 2 ** 30)).toBeLessThan(without!);
+    expect(fittingGpuLayers(model, machine, { ...config, offloadProjector: false }, 2 ** 30)).toBe(without);
+    expect(fittingGpuLayers(model, machine, { ...config, visionEnabled: false }, 2 ** 30)).toBe(without);
+    expect(recommendedConfig(model, machine, 2 ** 30, { visionEnabled: false, offloadProjector: false })).toMatchObject({ visionEnabled: false, offloadProjector: false });
+  });
   it('recommends bounded context and preserves special runtime requirements', () => {
     expect(recommendedConfig({ ...model, contextLength: 2048 }, null).contextLength).toBe(2048);
     expect(recommendedConfig({ ...model, architecture: 'hybridnet' }, null)).toMatchObject({ gpuLayers: 0 });

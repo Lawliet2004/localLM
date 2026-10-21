@@ -1,0 +1,151 @@
+{
+  "root": "Response",
+  "components": {
+    "SourceCode": {
+      "signature": "SourceCode(fenceIndex: number, path?: string)",
+      "description": "Read-only exact code from a closed fence in the authoritative answer. Never transcribe, edit or execute it."
+    },
+    "Heading": {
+      "signature": "Heading(text: string, level?: \"h2\" | \"h3\" | \"h4\")",
+      "description": "A section heading."
+    },
+    "Text": {
+      "signature": "Text(text: string)",
+      "description": "Plain text, no Markdown."
+    },
+    "Response": {
+      "signature": "Response(children: (SourceCode | Heading | Text)[])",
+      "description": "Root container of every UI block. Assign it to `root` and pass content as children."
+    }
+  },
+  "componentGroups": [
+    {
+      "name": "Coding",
+      "components": [
+        "SourceCode"
+      ]
+    },
+    {
+      "name": "Content",
+      "components": [
+        "Heading",
+        "Text"
+      ]
+    },
+    {
+      "name": "Layout",
+      "components": [
+        "Response"
+      ]
+    }
+  ],
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "SourceCode": {
+        "$ref": "#/$defs/SourceCode"
+      },
+      "Heading": {
+        "$ref": "#/$defs/Heading"
+      },
+      "Text": {
+        "$ref": "#/$defs/Text"
+      },
+      "Response": {
+        "$ref": "#/$defs/Response"
+      }
+    },
+    "required": [
+      "SourceCode",
+      "Heading",
+      "Text",
+      "Response"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "SourceCode": {
+        "type": "object",
+        "properties": {
+          "fenceIndex": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 15
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 240
+          }
+        },
+        "required": [
+          "fenceIndex"
+        ],
+        "additionalProperties": false,
+        "description": "Read-only exact code from a closed fence in the authoritative answer. Never transcribe, edit or execute it."
+      },
+      "Heading": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "h2",
+              "h3",
+              "h4"
+            ]
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "description": "A section heading."
+      },
+      "Text": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 16384
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "description": "Plain text, no Markdown."
+      },
+      "Response": {
+        "type": "object",
+        "properties": {
+          "children": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourceCode"
+                },
+                {
+                  "$ref": "#/$defs/Heading"
+                },
+                {
+                  "$ref": "#/$defs/Text"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "children"
+        ],
+        "additionalProperties": false,
+        "description": "Root container of every UI block. Assign it to `root` and pass content as children."
+      }
+    }
+  }
+}

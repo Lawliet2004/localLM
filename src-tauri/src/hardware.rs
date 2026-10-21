@@ -180,7 +180,10 @@ mod tests {
             gpu_status: "ok".into(),
             sampled_at: 0,
         };
-        assert_eq!(hardware.free_vram_bytes(), Some((4096 - 2047) * 1024 * 1024));
+        assert_eq!(
+            hardware.free_vram_bytes(),
+            Some((4096 - 2047) * 1024 * 1024)
+        );
     }
     #[test]
     fn rejects_invalid_or_inconsistent_driver_output() {

@@ -203,8 +203,10 @@ it('renders code tab and switches to inspect source code', () => {
   const codeTab = screen.getByRole('button', { name: 'Code' });
   expect(codeTab).toBeInTheDocument();
   fireEvent.click(codeTab);
-  expect(screen.getByTestId('code-viewport')).toBeInTheDocument();
-  expect(screen.getByText("print('running python snippet')")).toBeInTheDocument();
+  const viewport = screen.getByTestId('code-viewport');
+  expect(viewport).toHaveTextContent("print('running python snippet')");
+  // Syntax highlighting marks the builtins distinctly inside the block.
+  expect(viewport.querySelector('.hljs-built_in')).toHaveTextContent('print');
 });
 
 it('renders structured result separately from logs with outcome status', () => {
@@ -222,8 +224,9 @@ it('renders structured result separately from logs with outcome status', () => {
   );
   expect(screen.getByTestId('result-status')).toHaveTextContent('Structured result: ok');
   expect(screen.getByTestId('result-status')).toHaveTextContent('outcome success');
-  expect(screen.getByTestId('result-viewport')).toBeInTheDocument();
-  expect(screen.getByText(/"answer": 42/)).toBeInTheDocument();
+  const resultViewport = screen.getByTestId('result-viewport');
+  expect(resultViewport).toHaveTextContent('"answer": 42');
+  expect(resultViewport.querySelector('.hljs-attr')).toHaveTextContent('"answer"');
   fireEvent.click(screen.getByRole('button', { name: 'Output' }));
   expect(screen.getByText('log line')).toBeInTheDocument();
 });
@@ -241,3 +244,115 @@ it('truncates multiline command to first line in header title', () => {
   expect(screen.queryByText('git status\ngit diff\nnpm test')).not.toBeInTheDocument();
 });
 
+
+it('reports failed structured validation even when the process exited zero', () => {
+  render(<CommandRunCard toolName="execute_command" command="produce report" status="failed" isError exitCode={0} error="Expected result missing" />);
+  expect(screen.getByTestId('status-failed')).toHaveTextContent('Failed');
+  expect(screen.queryByText('finished')).not.toBeInTheDocument();
+  expect(screen.getByText('Exit 0')).toBeInTheDocument();
+});
+
+it('renders stderr as a separate labelled channel without implying failure', () => {
+  render(
+    <CommandRunCard
+      toolName="execute_command"
+      command="npm install"
+      status="completed"
+      exitCode={0}
+      stdout="added 3 packages"
+      stderr="npm warn deprecated pkg@1.0.0"
+    />
+  );
+  expect(screen.getByTestId('status-exit-0')).toBeInTheDocument();
+  const viewport = screen.getByTestId('terminal-viewport');
+  const channels = viewport.querySelectorAll('.output-channel');
+  expect(channels).toHaveLength(2);
+  expect(channels[0]).toHaveClass('channel-stdout');
+  expect(channels[1]).toHaveClass('channel-stderr');
+  expect(channels[1]).toHaveTextContent('npm warn deprecated pkg@1.0.0');
+  // stderr alone did not change the successful exit status.
+  expect(screen.queryByTestId('status-failed')).toBeNull();
+});
+
+it('shows only a stderr channel when the command produced no stdout', () => {
+  render(
+    <CommandRunCard
+      toolName="execute_command"
+      command="fail-check"
+      status="failed"
+      exitCode={2}
+      stderr="error: missing file"
+    />
+  );
+  const channels = screen.getByTestId('terminal-viewport').querySelectorAll('.output-channel');
+  expect(channels).toHaveLength(1);
+  expect(channels[0]).toHaveClass('channel-stderr');
+  expect(channels[0]).toHaveTextContent('error: missing file');
+});
+
+it('strips unsupported escape sequences instead of rendering them literally', () => {
+  render(
+    <CommandRunCard
+      toolName="execute_command"
+      command="cursor-app"
+      status="running"
+      stdout={'\x1b[?25lhidden cursor\x1b[2Jdone'}
+    />
+  );
+  const viewport = screen.getByTestId('terminal-viewport');
+  expect(viewport).toHaveTextContent('hidden cursordone');
+  expect(viewport.textContent).not.toContain('?25l');
+  expect(viewport.textContent).not.toContain('[2J');
+});
+
+it('keeps color state across lines and resolves progress rewrites', () => {
+  render(
+    <CommandRunCard
+      toolName="execute_command"
+      command="build"
+      status="running"
+      stdout={'Progress: 10%\rProgress: 80%\n\x1b[31merror summary'}
+    />
+  );
+  const viewport = screen.getByTestId('terminal-viewport');
+  expect(viewport).toHaveTextContent('Progress: 80%');
+  expect(viewport.textContent).not.toContain('10%');
+  const err = screen.getByText('error summary');
+  expect(err).toHaveStyle({ color: 'var(--terminal-red, #ef4444)' });
+});
+
+it('reveals a jump-to-latest button after the user scrolls away', () => {
+  const longOutput = Array.from({ length: 60 }, (_, i) => `line ${i}`).join('\n');
+  render(
+    <CommandRunCard
+      toolName="execute_command"
+      command="tail-log"
+      status="running"
+      stdout={longOutput}
+    />
+  );
+  const viewport = screen.getByTestId('terminal-viewport');
+  expect(screen.queryByRole('button', { name: 'Jump to latest output' })).toBeNull();
+  // Simulate the user scrolling up: jsdom defaults scrollHeight 0, so mock it.
+  Object.defineProperty(viewport, 'scrollHeight', { value: 2000, configurable: true });
+  Object.defineProperty(viewport, 'clientHeight', { value: 200, configurable: true });
+  viewport.scrollTop = 0;
+  fireEvent.scroll(viewport);
+  const jump = screen.getByRole('button', { name: 'Jump to latest output' });
+  fireEvent.click(jump);
+  expect(viewport.scrollTop).toBe(2000);
+  expect(screen.queryByRole('button', { name: 'Jump to latest output' })).toBeNull();
+});
+
+it('labels interrupted runs with a neutral badge', () => {
+  render(
+    <CommandRunCard
+      toolName="execute_command"
+      command="long-build"
+      status="interrupted"
+      stdout="partial output"
+    />
+  );
+  expect(screen.getByTestId('status-interrupted')).toBeInTheDocument();
+  expect(screen.getByText('Stopped · outcome unknown')).toBeInTheDocument();
+});
