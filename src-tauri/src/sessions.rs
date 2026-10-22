@@ -2,6 +2,34 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A lightweight invalidation, not a second copy of tool/model payloads.
+/// Readers fetch committed journal rows through the existing cursor command.
+static ACTIVITY_TARGET: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+pub fn initialize_activity_events(app: tauri::AppHandle) {
+    let _ = ACTIVITY_TARGET.set(app);
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityNotification<'a> {
+    conversation_id: &'a str,
+    seq: u64,
+}
+
+pub fn notify_activity(conversation_id: &str, seq: u64) {
+    use tauri::Emitter;
+    if let Some(app) = ACTIVITY_TARGET.get() {
+        let _ = app.emit(
+            "locallm://session-activity",
+            ActivityNotification {
+                conversation_id,
+                seq,
+            },
+        );
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Hit {
@@ -79,4 +107,19 @@ pub async fn search_sessions(
 ) -> Result<Vec<Hit>, String> {
     let store = state.database()?;
     store.search_sessions(&query, limit.unwrap_or(50))
+}
+
+#[cfg(test)]
+mod activity_notification_tests {
+    #[test]
+    fn invalidation_contains_only_committed_cursor_and_conversation() {
+        let value = serde_json::to_value(super::ActivityNotification {
+            conversation_id: "chat",
+            seq: 42,
+        })
+        .unwrap();
+        assert_eq!(value, serde_json::json!({"conversationId":"chat","seq":42}));
+        // Store-only/test environments have no app handle and remain supported.
+        super::notify_activity("chat", 42);
+    }
 }

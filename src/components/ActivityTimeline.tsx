@@ -40,49 +40,91 @@ export function useSessionActivity(conversationId: string, generating: boolean) 
       }
     }
     reload.current = () => void load();
+    let unlisten: (() => void) | undefined;
+    // Subscribe before recovery loading. Both paths read the same committed
+    // journal; polling also covers missed notifications and older backends.
+    if (api.onSessionActivity) void api.onSessionActivity(conversationId, seq => {
+      if (!disposed && seq >= cursor) void load();
+    }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { /* Polling remains available. */ });
     void load();
-    return () => { disposed = true; clearTimeout(timer); reload.current = null; };
+    return () => { disposed = true; unlisten?.(); clearTimeout(timer); reload.current = null; };
   }, [conversationId]);
   useEffect(() => { reload.current?.(); }, [generating]);
   return events;
 }
 
-/** Join each event once. Run id prevents reused tool ids crossing turns. */
+/** Duplicate delivery must not duplicate an operation or move it in the log. */
+function toolCalls(events: SessionEvent[]) {
+  const seen = new Set<string>();
+  return [...events].sort((a, b) => a.seq - b.seq).filter(event => {
+    if (event.eventType !== 'tool_call' || isPlanStateTool(String((event.payload as { name?: string }).name ?? ''))) return false;
+    const key = `${event.runId}:${event.toolCallId ?? event.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+}
+
+const records = new WeakMap<Message, Record<string, any>>();
+function toolRecord(message: Message): Record<string, any> {
+  const cached = records.get(message);
+  if (cached) return cached;
+  let record: Record<string, any> = {};
+  try { const value = JSON.parse(message.content); if (value && typeof value === 'object' && !Array.isArray(value)) record = value; } catch { /* Legacy tool text. */ }
+  records.set(message, record); return record;
+}
+const replay = new WeakMap<SessionEvent, { result?: SessionEvent; ended: boolean; message: Message }>();
+
+/** Run identity and call intervals prevent reused provider IDs crossing runs.
+ * Immutable event objects also let completed replay rows retain their identity. */
 export function activityTools(events: SessionEvent[], messages: Message[]): Message[] {
-  const results = new Map(events.filter(e => e.eventType === 'tool_result').map(e => [`${e.runId}:${e.toolCallId}`, e.payload as Record<string, any>]));
-  const ended = new Set(events.filter(e => e.eventType === 'turn_end').map(e => e.runId));
-  const live = new Map(messages.map(m => [m.id, m]));
+  const calls = toolCalls(events);
+  if (!calls.length) return messages.filter(message => message.role === 'tool' && !isPlanMessage(message));
+  const results = new Map([...events].sort((a, b) => a.seq - b.seq).filter(event => event.eventType === 'tool_result').map(event => [JSON.stringify([event.runId, event.toolCallId]), event]));
+  const ended = new Set(events.filter(event => event.eventType === 'turn_end').map(event => event.runId));
+  const candidates = new Map<string, Message[]>();
   for (const message of messages) if (message.role === 'tool') {
-    try { const parsed = JSON.parse(message.content); if (typeof parsed.request?.callId === 'string') live.set(`tool-${parsed.request.callId}`, message); } catch { /* Legacy tool text. */ }
+    const request = toolRecord(message).request;
+    for (const key of new Set([message.id, typeof request?.callId === 'string' ? `tool-${request.callId}` : message.id])) {
+      const list = candidates.get(key) ?? []; list.push(message); candidates.set(key, list);
+    }
   }
-  const base: Message = { id: '', conversationId: '', role: 'tool', content: '', reasoning: '', createdAt: 0, status: 'complete' };
-  if (!events.some(e => e.eventType === 'tool_call')) return messages.filter(m => m.role === 'tool' && !isPlanMessage(m));
-  return events.filter(e => e.eventType === 'tool_call').flatMap(event => {
+  const callsById = new Map<string | null | undefined, SessionEvent[]>();
+  for (const call of calls) { const list = callsById.get(call.toolCallId) ?? []; list.push(call); callsById.set(call.toolCallId, list); }
+  return calls.map(event => {
+    const siblings = callsById.get(event.toolCallId)!;
+    const next = siblings[siblings.indexOf(event) + 1];
+    const persisted = candidates.get(`tool-${event.toolCallId}`)?.find(message => {
+      const runId = toolRecord(message).request?.runId;
+      if (runId) return runId === event.runId;
+      return siblings.length === 1 || message.createdAt >= event.createdAt && (!next || message.createdAt < next.createdAt);
+    });
+    const resultEvent = results.get(JSON.stringify([event.runId, event.toolCallId]));
+    if (persisted && (persisted.status !== 'streaming' || !resultEvent)) return persisted;
+    const finished = ended.has(event.runId);
+    const cached = replay.get(event);
+    if (cached && cached.result === resultEvent && cached.ended === finished) return cached.message;
     const call = event.payload as Record<string, any>;
-    if (isPlanStateTool(String(call.name ?? ''))) return [];
-    const result = results.get(`${event.runId}:${event.toolCallId}`);
-    const persisted = live.get(`tool-${event.toolCallId}`);
-    if (persisted && (persisted.status !== 'streaming' || !result)) return [persisted];
-    return [result ? { ...base, id: event.id, conversationId: event.conversationId, createdAt: event.createdAt, content: JSON.stringify({ request: { ...call, name: result.name ?? call.name, arguments: call.arguments, decision: result.decision ?? call.decision }, result: result.result ?? result }) } : live.get(`tool-${event.toolCallId}`) ?? { ...base, id: event.id, status: ended.has(event.runId) ? 'interrupted' as const : 'streaming' as const, content: JSON.stringify({ request: { name: call.name, arguments: call.arguments, decision: ended.has(event.runId) ? undefined : 'pending' }, result: {} }) }];
+    const result = resultEvent?.payload as Record<string, any> | undefined;
+    const message: Message = {
+      id: event.id, conversationId: event.conversationId, role: 'tool', reasoning: '', createdAt: event.createdAt,
+      status: result ? 'complete' : finished ? 'interrupted' : 'streaming',
+      content: JSON.stringify({ request: { ...call, callId: event.toolCallId, runId: event.runId, name: result?.name ?? call.name, arguments: call.arguments, decision: result?.decision ?? (finished ? undefined : call.decision) }, result: result ? result.result ?? result : {} }),
+    };
+    replay.set(event, { result: resultEvent, ended: finished, message });
+    return message;
   });
 }
 function isPlanMessage(message: Message) {
-  try { const value = JSON.parse(message.content); return isPlanStateTool(value.request?.name ?? value.name ?? ''); } catch { return false; }
+  const value = toolRecord(message); return isPlanStateTool(value.request?.name ?? value.name ?? '');
 }
 function needsAttention(message: Message) {
   if (['streaming', 'error', 'interrupted'].includes(message.status)) return true;
-  try { const value = JSON.parse(message.content); return Boolean(value.result?.error || value.result?.isError || ['error', 'failed', 'failure', 'denied', 'interrupted', 'cancelled', 'unknown', 'partial'].includes(value.result?.status) || value.request?.decision === 'denied'); } catch { return false; }
+  const value = toolRecord(message);
+  return Boolean(value.result?.error || value.result?.isError || ['error', 'failed', 'failure', 'denied', 'interrupted', 'cancelled', 'unknown', 'partial'].includes(value.result?.status) || ['denied', 'pending'].includes(value.request?.decision));
 }
-
 function toolMeta(message: Message): { name: string; args: Record<string, unknown> } {
-  try {
-    const value = JSON.parse(message.content);
-    const request = value.request ?? value;
-    return {
-      name: typeof request.name === 'string' ? request.name : '',
-      args: request.arguments && typeof request.arguments === 'object' ? request.arguments as Record<string, unknown> : {},
-    };
-  } catch { return { name: '', args: {} }; }
+  const value = toolRecord(message), request = value.request ?? value;
+  return { name: typeof request.name === 'string' ? request.name : '', args: request.arguments && typeof request.arguments === 'object' ? request.arguments : {} };
 }
 
 export function activityLabel(tools: Message[]): string {
@@ -97,17 +139,34 @@ export function activityLabel(tools: Message[]): string {
   return labels.map((label, index) => index ? label.toLowerCase() : label).join(', ');
 }
 
-function ActivityGroup({ tools, renderTool, live }: { tools: Message[]; renderTool: (message: Message) => ReactNode; live: boolean }) {
-  const completed = tools.filter(tool => !needsAttention(tool));
-  const attention = tools.filter(needsAttention);
-  const kinds = completed.map(tool => { const meta = toolMeta(tool); return toolKindOf(meta.name, meta.args); });
-  return <>
-    {completed.length > 0 && <details className="activity-summary" open={live || undefined}>
-      <summary className="card-header"><TraceIcon kind={groupKindOf(kinds)} size={16} /><span className="activity-summary-label">{activityLabel(completed)}</span><ChevronRight size={14} className="trace-chevron" aria-hidden="true" /><span className="sr-only">{completed.length} {completed.length === 1 ? 'tool used' : 'tools used'}</span></summary>
-      <div className="activity-summary-rows">{completed.map(tool => <Fragment key={tool.id}>{renderTool(tool)}</Fragment>)}</div>
-    </details>}
-    {attention.map(tool => <Fragment key={tool.id}>{renderTool(tool)}</Fragment>)}
-  </>;
+/** Only adjacent successful exploration can fold. Consequential work and
+ * attention states form hard boundaries, so chronology survives collapsing. */
+function ActivityGroup({ tools, renderTool }: { tools: Message[]; renderTool: (message: Message) => ReactNode; live: boolean }) {
+  const rows: ReactNode[] = [];
+  let exploration: Message[] = [];
+  const flush = () => {
+    if (!exploration.length) return;
+    const group = exploration;
+    exploration = [];
+    if (group.length === 1) { rows.push(<Fragment key={group[0].id}>{renderTool(group[0])}</Fragment>); return; }
+    const kinds = group.map(tool => { const meta = toolMeta(tool); return toolKindOf(meta.name, meta.args); });
+    const paths = group.map(tool => toolMeta(tool).args.path);
+    const fileCount = new Set(paths).size;
+    const label = paths.every(path => typeof path === 'string') && kinds.every(kind => kind === 'read')
+      ? `Read ${fileCount} ${fileCount === 1 ? 'file' : 'files'}`
+      : `${activityLabel(group)} · ${group.length} actions`;
+    rows.push(<details className="activity-summary" key={group[0].id}>
+      <summary className="card-header"><TraceIcon kind={groupKindOf(kinds)} size={14} /><span className="activity-summary-label">{label}</span><ChevronRight size={14} className="trace-chevron" aria-hidden="true" /><span className="sr-only">{group.length} tools used</span></summary>
+      <div className="activity-summary-rows">{group.map(tool => <Fragment key={tool.id}>{renderTool(tool)}</Fragment>)}</div>
+    </details>);
+  };
+  for (const tool of tools) {
+    const meta = toolMeta(tool);
+    if (!needsAttention(tool) && ['read', 'search', 'folder', 'explore'].includes(toolKindOf(meta.name, meta.args))) exploration.push(tool);
+    else { flush(); rows.push(<Fragment key={tool.id}>{renderTool(tool)}</Fragment>); }
+  }
+  flush();
+  return <>{rows}</>;
 }
 
 /** Only split journal commentary when it is an exact prefix of the saved answer.
@@ -152,7 +211,7 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
   const segments = assistant && assistants.length === 1 && assistant.presentation?.format !== 'openui' ? activitySegments(events, assistant.content) : [];
   let remaining = assistant?.content ?? '';
   let lastSeq = -Infinity;
-  const toolEvents = events.filter(event => event.eventType === 'tool_call' && !isPlanStateTool(String((event.payload as { name?: string }).name ?? '')));
+  const toolEvents = toolCalls(events);
   const groups: ReactNode[] = [];
   for (const segment of segments) {
     const before = tools.filter((_, index) => toolEvents[index] && toolEvents[index].seq > lastSeq && toolEvents[index].seq < segment.seq);

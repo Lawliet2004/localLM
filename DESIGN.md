@@ -83,3 +83,44 @@ preferences, shared diff/code tokens, detailed tool inspection and Settings-only
 response presentation remain authoritative. `responses.css` owns this extension.
 No native visual comparison was available in this pass; localhost browser
 preview remains excluded by repository instructions.
+
+## Inline work log refinement — 22 October 2026
+
+This extension retains the existing paper/forest palette, semantic tokens,
+IBM Plex typography, shared primitives and Settings-only response presentation.
+The established reading width remains 744px (the 824px column less 80px of
+horizontal padding). It introduces no new theme, token system or packages.
+
+Tools use compact inline chronological disclosure rows. Only adjacent successful
+reads, searches and exploration can share a collapsed group; commands, edits and
+anything running or needing attention remain separate rows in sequence.
+Category icons and labelled status keep their distinct meanings. Detailed output
+opens inside the existing code frame. The edited-files summary stays compact,
+with recorded totals, full paths and shared diff review.
+
+Terminal channels follow a folded 30-line live tail, with expanded output
+browsable in pages of up to 500 lines and full-source Copy retained. Reading
+earlier output, browsing pages or opening a chat disclosure pauses following.
+Resize-aware chat following accommodates growing content while following is
+active; Latest resumes following and remains available after completion.
+Markdown component identities survive streaming updates, artifact Markdown uses
+the shared renderer, and diffs retain syntax colors plus old/new source line
+coordinates.
+
+The review disposition is **ship at CODE-ONLY scope**, after the regression for
+Latest after completion was fixed. The mechanical detector returned `[]`.
+This is not visual approval: no new screenshots, native/browser inspection or
+zoom/accessibility visual acceptance are available, and localhost preview remains
+prohibited. Overall UI performance and model latency were not measured. Earlier
+visual evidence above applies to its recorded scope, not this extension.
+
+The follow-up retains this same visual system and reading width. Conservative
+incremental Markdown blocks use the canonical shared renderer, with stable keys
+and first/last margins and caret placement preserving user-bubble rhythm.
+Completed command, file and raw details defer their contents until inspection,
+then retain local state. Long unchanged diff context folds behind a labelled
+toggle that preserves keyboard focus and source coordinates. Replay caches and
+optional committed-journal notifications support the same chronological rows;
+polling remains available for recovery. These changes add no dependencies.
+The reviewer accepted the final fixes at CODE-ONLY scope, with detector `[]`;
+screenshots and native interaction approval remain unavailable.

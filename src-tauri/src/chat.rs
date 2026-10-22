@@ -902,7 +902,9 @@ pub fn emit_session_event(
         ignorable,
         created_at: crate::store::now(),
     };
-    let _ = store.append_session_event(&ev);
+    if let Ok(seq) = store.append_session_event(&ev) {
+        crate::sessions::notify_activity(conversation_id, seq);
+    }
 }
 
 /// One assembled chat turn: everything the model will see, rendered exactly

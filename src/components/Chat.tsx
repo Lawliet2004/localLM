@@ -1,3 +1,4 @@
+import { useToolOutput } from '../lib/toolOutput';
 import { FileResult } from './FileResult';
 import { partitionActivity } from '../lib/activity';
 import { WorkSummary } from './WorkSummary';
@@ -67,7 +68,8 @@ interface Props {
   projectName?: string;
 }
 
-function ToolMessage({ message, onStop }: { message: Message; onStop?: () => void }) {
+const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Message; onStop?: () => void }) {
+  const output = useToolOutput(message.conversationId, message.id);
   let record: Record<string, unknown> = {};
   try {
     const value: unknown = JSON.parse(message.content);
@@ -96,17 +98,17 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
     ? resultRecord
     : undefined;
   const resultStatus = dataRecord && typeof dataRecord.resultStatus === 'string' ? dataRecord.resultStatus : undefined;
-  const diff = resultRecord && typeof resultRecord.diff === 'string' ? (resultRecord.diff as string) : null;
-  const stdout = typeof logsRecord?.stdout === 'string' ? logsRecord.stdout : resultRecord && typeof resultRecord.stdout === 'string' ? resultRecord.stdout : '';
-  const stderr = typeof logsRecord?.stderr === 'string' ? logsRecord.stderr : resultRecord && typeof resultRecord.stderr === 'string' ? resultRecord.stderr : '';
+  const diff = typeof dataRecord?.diff === 'string' ? dataRecord.diff : typeof resultRecord?.diff === 'string' ? resultRecord.diff : null;
+  const stdout = message.status === 'streaming' && output.stdout ? output.stdout : typeof logsRecord?.stdout === 'string' ? logsRecord.stdout : resultRecord && typeof resultRecord.stdout === 'string' ? resultRecord.stdout : '';
+  const stderr = message.status === 'streaming' && output.stderr ? output.stderr : typeof logsRecord?.stderr === 'string' ? logsRecord.stderr : resultRecord && typeof resultRecord.stderr === 'string' ? resultRecord.stderr : '';
   const exitCode = dataRecord && typeof dataRecord.exitCode === 'number' ? dataRecord.exitCode : resultRecord && typeof resultRecord.exitCode === 'number' ? resultRecord.exitCode : null;
-  const durationMs = resultRecord && typeof resultRecord.durationMs === 'number' ? resultRecord.durationMs : undefined;
+  const durationMs = typeof dataRecord?.durationMs === 'number' ? dataRecord.durationMs : resultRecord && typeof resultRecord.durationMs === 'number' ? resultRecord.durationMs : undefined;
   const errorRecord = resultRecord && resultRecord.error && typeof resultRecord.error === 'object' && !Array.isArray(resultRecord.error) ? (resultRecord.error as Record<string, unknown>) : null;
   const error = typeof errorRecord?.message === 'string' ? errorRecord.message : resultRecord && typeof resultRecord.error === 'string' ? resultRecord.error : null;
   const errorCode = typeof errorRecord?.code === 'string' ? errorRecord.code : undefined;
   const envelopeStatus = resultRecord && typeof resultRecord.status === 'string' ? resultRecord.status : undefined;
   const isError = resultRecord !== null && resultRecord.isError === true;
-  const failed = message.status === 'error' || isError;
+  const failed = message.status === 'error' || isError || Boolean(error) || (exitCode !== null && exitCode !== 0) || ['error', 'failed', 'failure', 'denied', 'cancelled', 'unknown', 'partial'].includes(envelopeStatus ?? '');
   const decision = typeof request.decision === 'string' ? request.decision : undefined;
   const status = message.status === 'interrupted'
     ? 'interrupted'
@@ -135,7 +137,7 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
   const originalBytes = resultRecord && typeof resultRecord._originalBytes === 'number' ? resultRecord._originalBytes : null;
   const authorization = typeof request.authorization === 'string' ? request.authorization : undefined;
 
-  const fallbackStdout = stdout || (!resultRecord && typeof result === 'string' ? result : (structuredResult ? '' : (resultRecord ? JSON.stringify(resultRecord, null, 2) : message.content)));
+  const fallbackStdout = message.status === 'streaming' ? stdout : stdout || (!resultRecord && typeof result === 'string' ? result : (structuredResult ? '' : (resultRecord ? JSON.stringify(resultRecord, null, 2) : message.content)));
   const structuredJson = structuredResult !== undefined && structuredResult !== null
     ? (() => { try { return JSON.stringify(structuredResult, null, 2); } catch { return String(structuredResult); } })()
     : null;
@@ -177,7 +179,7 @@ function ToolMessage({ message, onStop }: { message: Message; onStop?: () => voi
       {Array.isArray(resultRecord?._screenshotArtifactIds) && resultRecord._screenshotArtifactIds.filter((id): id is string => typeof id === 'string' && /^art_[a-f0-9]{32}$/.test(id)).slice(0, 2).map(id => <ScreenshotPreview key={id} id={id} conversationId={message.conversationId} />)}
     </article>
   );
-}
+});
 
 const MessageBody = memo(function MessageBody({ message, suppressReasoning = false, sourceLinks = '{}', onSendPrompt, onOpenCanvas }: { message: Message; suppressReasoning?: boolean; sourceLinks?: string; onSendPrompt?: (text: string) => void; onOpenCanvas?: (code: string, language: string) => void }) {
   let attached: { name: string; imageUrl?: string; content?: string }[] = [];
@@ -454,6 +456,21 @@ export function Chat({
   }, [messages, generating, liveActivity?.activity]);
 
   useEffect(() => {
+    follow.current = true;
+    setShowJumpToLatest(false);
+  }, [conversationKey]);
+
+  useEffect(() => {
+    const content = scroll.current?.querySelector('.messages');
+    if (!content || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight;
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [conversationKey, loading, messages.length > 0]);
+
+  useEffect(() => {
     const el = input.current;
     if (!el) return;
     el.style.height = 'auto';
@@ -507,6 +524,14 @@ export function Chat({
       <div
         className="chat-scroll"
         ref={scroll}
+        onClickCapture={event => {
+          const target = event.target as HTMLElement;
+          const summary = target.closest('summary');
+          if (summary && !summary.closest('details')?.open) {
+            follow.current = false;
+            setShowJumpToLatest(true);
+          }
+        }}
         onScroll={() => {
           const element = scroll.current;
           if (element) {

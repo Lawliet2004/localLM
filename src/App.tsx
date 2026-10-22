@@ -1,6 +1,7 @@
+import { toolOutput } from './lib/toolOutput';
 import { CommandPalette } from './components/CommandPalette';
 import { useEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, Download, PanelLeftOpen, Pencil, Trash2, X, ArrowLeft, ArrowRight, Folder, MoreHorizontal } from 'lucide-react';
+import { Check, ChevronDown, Download, Pencil, Trash2, X, ArrowLeft, ArrowRight, Folder, MoreHorizontal } from 'lucide-react';
 
 import { confirm, save } from '@tauri-apps/plugin-dialog';
 
@@ -614,6 +615,7 @@ export default function App() {
     setChatNotice('');
 
     let id = activeId;
+    const streamedTools = new Set<string>();
 
     // Chats live under a folder: a brand-new conversation needs one up front.
     const folderId = id ? projectId
@@ -697,6 +699,7 @@ export default function App() {
           const stream = event.toolStream;
 
           const toolMsgId = `tool-${stream.toolCallId}`;
+          streamedTools.add(toolMsgId);
 
           if (stream.type === 'started') {
 
@@ -765,42 +768,12 @@ export default function App() {
           }
 
           if (stream.type === 'outputChunk') {
-
-            setMessages(current =>
-
-              current.map(m => {
-
-                if (m.id !== toolMsgId) return m;
-
-                let record: Record<string, unknown> = {};
-
-                try { record = JSON.parse(m.content); } catch { /* ignore */ }
-
-                const res = (record.result && typeof record.result === 'object' && !Array.isArray(record.result))
-
-                  ? { ...(record.result as Record<string, unknown>) }
-
-                  : {};
-
-                const streamKey = stream.stream === 'stderr' ? 'stderr' : 'stdout';
-
-                const prevText = typeof res[streamKey] === 'string' ? (res[streamKey] as string) : '';
-
-                res[streamKey] = prevText + stream.chunk;
-
-                record.result = res;
-
-                return { ...m, content: JSON.stringify(record) };
-
-              })
-
-            );
-
+            toolOutput.append(conversationId, toolMsgId, stream.stream === 'stderr' ? 'stderr' : 'stdout', stream.chunk ?? '');
             return;
-
           }
 
           if (stream.type === 'finished') {
+            const output = toolOutput.read(conversationId, toolMsgId);
 
             setMessages(current =>
 
@@ -818,6 +791,8 @@ export default function App() {
 
                   : {};
 
+                res.stdout = output.stdout;
+                res.stderr = output.stderr;
                 res.exitCode = stream.exitCode;
 
                 res.durationMs = stream.durationMs;
@@ -893,16 +868,23 @@ export default function App() {
 
         // show perpetual spinners when the backend died mid-turn.
 
-        setMessages(current => current.map(m =>
-
-          m.status === 'streaming' ? { ...m, status: 'error' } : m
-
-        ));
+        setMessages(current => current.map(message => {
+          if (message.status !== 'streaming') return message;
+          let content = message.content;
+          if (message.role === 'tool') {
+            try {
+              const record = JSON.parse(content);
+              content = JSON.stringify({ ...record, result: { ...record.result, ...toolOutput.read(message.conversationId, message.id) } });
+            } catch { /* Preserve legacy tool text on recovery failure. */ }
+          }
+          return { ...message, content, status: 'error' };
+        }));
 
         setChatError(errorMessage(e));
 
       }
 
+      if (id) for (const toolId of streamedTools) toolOutput.clear(id, toolId);
       if (pendingSend.current === request) pendingSend.current = null;
       setApproval(null);
       setGenerating(false);
@@ -1093,7 +1075,7 @@ export default function App() {
 
 
       <div className="workspace-split"><div className="workspace-conversation">
-      <header className={`workspace-header ${!messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead">{collapsed && <button className="icon-button" aria-label="Expand sidebar" onClick={() => setCollapsed(false)}><PanelLeftOpen size={18} /></button>}{<><button className="icon-button" aria-label="Back" disabled={busy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={busy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</>}</div><div className="header-actions">{page === 'chat' && allProjects(workspaceIndex).length > 0 && <select aria-label="Task project" value={projectId ?? allProjects(workspaceIndex)[0]?.id} disabled={busy} onChange={e => void selectProject(e.target.value)}>{allProjects(workspaceIndex).map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}<WorkspacePanel host={workspacePanelHost} reviewRequest={reviewRequest} onChooseWorkspace={chooseTaskWorkspace} busy={busy} revision={`${projectId}:${activeId}`} visible={page === 'chat'} onReveal={() => navigate('chat')} /><button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header>
+      <header className={`workspace-header ${!messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead"><button className="icon-button" aria-label="Back" disabled={busy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={busy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</div><div className="header-actions">{page === 'chat' && allProjects(workspaceIndex).length > 0 && <select aria-label="Task project" value={projectId ?? allProjects(workspaceIndex)[0]?.id} disabled={busy} onChange={e => void selectProject(e.target.value)}>{allProjects(workspaceIndex).map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}<WorkspacePanel host={workspacePanelHost} reviewRequest={reviewRequest} onChooseWorkspace={chooseTaskWorkspace} busy={busy} revision={`${projectId}:${activeId}`} visible={page === 'chat'} onReveal={() => navigate('chat')} /><button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header>
       {!nativeAvailable && <div className="preview-banner">Browser preview · Open the desktop application to load models and save conversations.</div>}
 
       {exportedPath && <div className="preview-banner" role="status">Saved conversation to {exportedPath}<button className="icon-button" aria-label="Dismiss export confirmation" onClick={() => setExportedPath('')}><X size={16} /></button></div>}

@@ -109,8 +109,8 @@ it('renders unified diff view with add and delete lines highlighted', async () =
     />
   );
   expect(screen.getByTestId('diff-viewport')).toBeInTheDocument();
-  expect(screen.getByText('-old line')).toBeInTheDocument();
-  expect(screen.getByText('+new line')).toBeInTheDocument();
+  expect(screen.getByTestId('diff-viewport').querySelector('.diff-line.del .diff-content')).toHaveTextContent('-old line');
+  expect(screen.getByTestId('diff-viewport').querySelector('.diff-line.add .diff-content')).toHaveTextContent('+new line');
 });
 
 it('supports folding long outputs exceeding 30 lines', () => {
@@ -119,10 +119,11 @@ it('supports folding long outputs exceeding 30 lines', () => {
     <CommandRunCard
       toolName="execute_command"
       command="dump-logs"
-      status="running"
+      status="completed"
       stdout={longOutput}
     />
   );
+  fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
   expect(screen.getByText('Show all 45 lines')).toBeInTheDocument();
   expect(screen.getByText('log line 1')).toBeInTheDocument();
   expect(screen.queryByText('log line 35')).not.toBeInTheDocument();
@@ -177,6 +178,7 @@ it('inspects bounded artifact content on demand', async () => {
     />
   );
 
+  fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
   expect(screen.getByText(/Full result captured in artifact/)).toBeInTheDocument();
   expect(screen.getByText('art-cmd-1')).toBeInTheDocument();
   expect(screen.getByText('(2.0 KB)')).toBeInTheDocument();
@@ -200,6 +202,7 @@ it('renders code tab and switches to inspect source code', () => {
       stdout="running python snippet"
     />
   );
+  fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
   const codeTab = screen.getByRole('button', { name: 'Code' });
   expect(codeTab).toBeInTheDocument();
   fireEvent.click(codeTab);
@@ -222,6 +225,7 @@ it('renders structured result separately from logs with outcome status', () => {
       structuredResult={'{\n  "answer": 42\n}'}
     />
   );
+  fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
   expect(screen.getByTestId('result-status')).toHaveTextContent('Structured result: ok');
   expect(screen.getByTestId('result-status')).toHaveTextContent('outcome success');
   const resultViewport = screen.getByTestId('result-viewport');
@@ -264,6 +268,7 @@ it('renders stderr as a separate labelled channel without implying failure', () 
     />
   );
   expect(screen.getByTestId('status-exit-0')).toBeInTheDocument();
+  fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
   const viewport = screen.getByTestId('terminal-viewport');
   const channels = viewport.querySelectorAll('.output-channel');
   expect(channels).toHaveLength(2);
@@ -355,4 +360,62 @@ it('labels interrupted runs with a neutral badge', () => {
   );
   expect(screen.getByTestId('status-interrupted')).toBeInTheDocument();
   expect(screen.getByText('Stopped · outcome unknown')).toBeInTheDocument();
+});
+
+it('bounds a large log to 500 DOM lines while keeping every page and full copy available', () => {
+  const output = Array.from({ length: 1600 }, (_, i) => `record ${i + 1}`).join('\n');
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.assign(navigator, { clipboard: { writeText } });
+  const { container } = render(<CommandRunCard toolName="execute_command" status="running" stdout={output} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Browse all 1600 lines' }));
+  expect(container.querySelectorAll('.terminal-line').length).toBeLessThanOrEqual(500);
+  expect(screen.getByText('record 1600')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Previous lines' }));
+  expect(screen.getByText('record 1001')).toBeInTheDocument();
+  expect(container.querySelectorAll('.terminal-line')).toHaveLength(500);
+  fireEvent.click(screen.getByTitle('Copy terminal output'));
+  expect(writeText).toHaveBeenCalledWith(output);
+});
+it('reveals failures after a running row was collapsed and keeps stop actionable', () => {
+  const stop = vi.fn();
+  const view = render(<CommandRunCard toolName="execute_command" command="test" status="running" onStop={stop} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Stop command' })); expect(stop).toHaveBeenCalledOnce();
+  const row = screen.getByTestId('command-run-card');
+  (row as HTMLDetailsElement).open = false;
+  fireEvent(row, new Event('toggle'));
+  view.rerender(<CommandRunCard toolName="execute_command" command="test" status="failed" exitCode={2} error="Test failed" />);
+  expect(row).toHaveAttribute('open'); expect(screen.getByRole('alert')).toHaveTextContent('Test failed');
+});
+it('does not infer a search count from arbitrary log lines', () => {
+  render(<CommandRunCard toolName="search_files" status="completed" stdout="Scanning…\nDone" />);
+  expect(screen.queryByText('2 results')).toBeNull();
+});
+
+it('shows the live tail and freezes the visible lines while reading older output', () => {
+  const output = Array.from({ length: 60 }, (_, i) => `entry ${i + 1}`).join('\n');
+  const view = render(<CommandRunCard toolName="execute_command" status="running" stdout={output} />);
+  expect(screen.getByText('entry 60')).toBeInTheDocument();
+  expect(screen.queryByText('entry 1')).toBeNull();
+  const viewport = screen.getByTestId('terminal-viewport');
+  Object.defineProperty(viewport, 'scrollHeight', { configurable: true, value: 2000 });
+  Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 200 });
+  viewport.scrollTop = 100; fireEvent.scroll(viewport);
+  view.rerender(<CommandRunCard toolName="execute_command" status="running" stdout={`${output}\nentry 61`} />);
+  expect(screen.queryByText('entry 61')).toBeNull();
+  expect(viewport.scrollTop).toBe(100);
+  // Completion must not strand the frozen window when Latest resumes following.
+  view.rerender(<CommandRunCard toolName="execute_command" status="completed" stdout={`${output}\nentry 61`} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Jump to latest output' }));
+  expect(screen.getByText('entry 61')).toBeInTheDocument();
+});
+
+it('defers completed command contents until inspection and preserves them on collapse', () => {
+  const view = render(<CommandRunCard toolName="execute_command" command="cargo test" status="completed" stdout={'record\n'.repeat(3000)} />);
+  expect(screen.queryByTestId('terminal-viewport')).toBeNull();
+  const summary = screen.getByTestId('command-run-card').querySelector('summary')!;
+  fireEvent.click(summary);
+  const viewport = screen.getByTestId('terminal-viewport');
+  fireEvent.click(summary);
+  view.rerender(<CommandRunCard toolName="execute_command" command="cargo test" status="completed" stdout={'record\n'.repeat(3000)} />);
+  expect(screen.getByTestId('terminal-viewport')).toBe(viewport);
 });

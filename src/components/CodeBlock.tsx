@@ -53,7 +53,8 @@ export const CodeBlock = memo(function CodeBlock({ code, language, actions, stre
   };
 
   const label = languageLabel(language);
-  const hasLongLine = code.split('\n').some(line => line.length > 120);
+  const lines = useMemo(() => code.split('\n'), [code]);
+  const hasLongLine = lines.some(line => line.length > 120);
 
   return (
     <div className={`code-block-wrapper${wrap ? ' is-wrap' : ''}${className ? ` ${className}` : ''}`} aria-label={ariaLabel ?? `${label} code block`}>
@@ -88,7 +89,7 @@ export const CodeBlock = memo(function CodeBlock({ code, language, actions, stre
       </div>
       {copyError && <p className="code-block-copy-error" role="alert">Could not copy. Select the code and copy it manually.</p>}
       <div className={lineNumbers ? "code-block-numbered" : undefined}>
-      {lineNumbers && code.split('\n').length <= 2000 && <pre className="code-block-line-numbers" aria-hidden="true">{code.split('\n').map((_,i)=>i+1).join('\n')}</pre>}
+      {lineNumbers && lines.length <= 2000 && <pre className="code-block-line-numbers" aria-hidden="true">{lines.map((_,i)=>i+1).join('\n')}</pre>}
       <pre className="code-block-pre" tabIndex={0} aria-label={`${label} source`}>
         <code className={highlighted.language ? `hljs language-${highlighted.language}` : 'hljs'} dangerouslySetInnerHTML={{ __html: highlighted.html }} />
       </pre>

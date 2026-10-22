@@ -67,3 +67,16 @@ describe('answer rendering', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close preview', hidden: true }));
   });
 });
+
+it('preserves a code block node and wrap preference when later prose streams', () => {
+  const content = `\`\`\`ts\nconst longLine = "${'a'.repeat(150)}";\n\`\`\`\n\nLater`;
+  const view = render(<MarkdownView content={content} streaming />);
+  const source = screen.getByLabelText('typescript source');
+  fireEvent.click(screen.getByRole('button', { name: 'Wrap long lines' }));
+  view.rerender(<MarkdownView content={`${content} text`} streaming />);
+  expect(screen.getByLabelText('typescript source')).toBe(source);
+  expect(screen.getByRole('button', { name: 'Disable line wrap' })).toHaveAttribute('aria-pressed', 'true');
+  view.rerender(<MarkdownView content={`${content} text`} streaming={false} />);
+  expect(screen.getByLabelText('typescript source')).toBe(source);
+  expect(screen.getByRole('button', { name: 'Disable line wrap' })).toHaveAttribute('aria-pressed', 'true');
+});

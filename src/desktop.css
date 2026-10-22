@@ -16,8 +16,6 @@
 .desktop-app .sidebar { grid-column: 1; grid-row: 2; border: 1px solid var(--border); border-radius: 14px; background: var(--sidebar); padding: 20px 14px 14px; }
 .desktop-app .workspace-header { background: var(--surface); padding: 0 24px; min-height: 54px; border-bottom-color: var(--border); }
 .desktop-app .workspace-header-minimal { min-height: 54px; border-bottom-color: transparent; }
-.desktop-app .workspace-header-minimal .workspace-lead { display: flex; }
-.desktop-app .workspace-header-minimal .workspace-lead > :not([aria-label="Expand sidebar"]) { display: none; }
 .desktop-app .preview-banner { background: var(--surface); color: var(--secondary); font-size: 11px; border: 0; padding: 8px 20px; flex-shrink: 0; }
 .desktop-app .error-banner { flex-shrink: 0; }
 .desktop-app :is(input, textarea) { caret-color: var(--accent); }

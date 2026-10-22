@@ -1,10 +1,13 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({ isMaximized: async () => false, onResized: async () => () => {} }) }));
+import type { ChatEvent, Message } from './lib/types';
+import { toolOutput } from './lib/toolOutput';
 import { defaultRuntimeConfig } from './lib/types';
 const mocks = vi.hoisted(() => ({
+  messages: vi.fn(), sendMessage: vi.fn(),
   save: vi.fn(), exportConversation: vi.fn(), bootstrap: vi.fn(),
   saveRememberedTools: vi.fn(), saveConversationTools: vi.fn(), conversationTools: vi.fn(),
   setWorkspace: vi.fn(), workspaceIndex: vi.fn(), removeProject: vi.fn(), confirm: vi.fn(),
@@ -21,13 +24,15 @@ vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) 
   getPreset: mocks.getPreset, setPreset: mocks.setPreset,
   listConnectors: async () => [{ id: 'example', description: 'Example service', url: '', authType: 'apiKey', connected: true, hasCredential: true, tools: [{ name: 'kept_tool', description: 'Kept for new chats', inputSchema: {} }] }],
   listSkills: async () => [], getWorkspace: async () => ({ path: 'C:/workspace' }), hasDaytonaKey: async () => false,
-  messages: async () => [{ id: 'message', conversationId: 'chat', role: 'user', content: 'Export this message', reasoning: '', status: 'complete', createdAt: 0 }],
+  messages: mocks.messages, sendMessage: mocks.sendMessage,
+  contextPreflight: async () => ({ available: false }),
 } }));
 const baseBootstrap = { conversations: [{ id: 'chat', title: 'Saved chat', updatedAt: 0 }], config: defaultRuntimeConfig,
   preferences: { runtimePath: '', modelPath: '', projectorPath: '', temperature: 1, topP: 0.95, maxTokens: 100, systemPrompt: '' }, runtime: { phase: 'stopped', message: '', modelPath: null },
   providers: [], preferredModel: { providerId: null, modelId: '' } };
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.messages.mockResolvedValue([{ id: 'message', conversationId: 'chat', role: 'user', content: 'Export this message', reasoning: '', status: 'complete', createdAt: 0 }]);
   localStorage.removeItem('locallm-appearance');
   mocks.confirm.mockResolvedValue(true);
   mocks.workspaceIndex.mockResolvedValue({ projects: [], tasks: {} });
@@ -431,4 +436,36 @@ it('restores focus to the opener when the settings modal closes', async () => {
   fireEvent.keyDown(dialog, { key: 'Escape' });
   expect(dialog).not.toBeInTheDocument();
   expect(trigger).toHaveFocus();
+});
+
+
+it('streams tool-local channels and reconciles completion to persisted history', async () => {
+  mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, runtime: { phase: 'ready', message: '', modelPath: 'fixture.gguf' }, rememberedTools: { sources: [], tools: [] } });
+  let receive!: (event: ChatEvent) => void;
+  let finish!: () => void;
+  mocks.sendMessage.mockImplementation((_id: string, _content: string, callback: (event: ChatEvent) => void) => {
+    receive = callback;
+    return new Promise<void>(resolve => { finish = resolve; });
+  });
+  await openChat();
+  fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Run checks' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+  await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledOnce());
+  const emit = (toolStream: NonNullable<ChatEvent['toolStream']>) => receive({ messageId: '', content: '', reasoning: '', toolStream });
+  await act(async () => {
+    emit({ type: 'started', toolCallId: 'fixture', toolName: 'execute_command', command: 'npm test' });
+    emit({ type: 'outputChunk', toolCallId: 'fixture', stream: 'stdout', chunk: 'test passed' });
+    emit({ type: 'outputChunk', toolCallId: 'fixture', stream: 'stderr', chunk: 'warning only' });
+  });
+  await waitFor(() => expect(screen.getByTestId('terminal-viewport')).toHaveTextContent('test passed'));
+  expect(screen.getByTestId('terminal-viewport')).toHaveTextContent('warning only');
+  await act(async () => { emit({ type: 'finished', toolCallId: 'fixture', exitCode: 0, durationMs: 123 }); });
+  expect(screen.getByTestId('status-exit-0')).toBeInTheDocument();
+  expect(screen.getByTestId('terminal-viewport')).toHaveTextContent('test passed');
+  const saved: Message = { id: 'saved-tool', conversationId: 'chat', role: 'tool', content: JSON.stringify({ request: { name: 'execute_command', arguments: { command: 'npm test' } }, result: { stdout: 'test passed', stderr: 'warning only', exitCode: 0, durationMs: 123 } }), status: 'complete', reasoning: '', createdAt: 1 };
+  mocks.messages.mockResolvedValue([saved]);
+  await act(async () => { finish(); });
+  expect(toolOutput.read('chat', 'tool-fixture')).toEqual({ stdout: '', stderr: '' });
+  expect(screen.getAllByTestId('command-run-card')).toHaveLength(1);
+  expect(screen.getByTestId('status-exit-0')).toBeInTheDocument();
 });

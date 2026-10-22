@@ -1,8 +1,7 @@
 /**
  * Incremental ANSI text parser for captured command output.
  *
- * Terminal output arrives as one accumulated string per render, so the parser
- * is deterministic over the whole buffer: SGR state carries across line
+ * Both accumulated history and incremental live output use one parser: SGR state carries across line
  * boundaries, carriage-return rewrites resolve to their final visible text,
  * non-SGR control sequences are removed instead of shown as literal junk, and
  * an escape sequence truncated by a split stream chunk is dropped rather than
@@ -95,96 +94,88 @@ function pushSpan(spans: AnsiSpan[], text: string, style: Style): void {
   });
 }
 
-/**
- * Parse terminal output into display lines. Returns one entry per line.
- * Control bytes other than \t are removed; \r rewrites collapse to the text
- * after the last carriage return in each line; ESC-initiated sequences that
- * are not SGR color/style codes are stripped.
- */
-export function parseAnsi(input: string): AnsiLine[] {
-  const text = input.replace(/\r\n/g, '\n');
-  const lines: AnsiLine[] = [];
-  const style: Style = { ...PLAIN };
-  let spans: AnsiSpan[] = [];
-  let buffer = '';
-  let i = 0;
+/** One parser per output channel. Completed lines retain their identities;
+ * only newly appended bytes and the unfinished line are processed. */
+export class AnsiStreamParser {
+  private style: Style = { ...PLAIN };
+  private completed: AnsiLine[] = [];
+  private spans: AnsiSpan[] = [];
+  private buffer = '';
+  private pending = '';
+  processedChars = 0;
 
-  const flushLine = () => {
-    pushSpan(spans, buffer, style);
-    if (!spans.length) spans.push({ text: '' });
-    lines.push({ spans });
-    spans = [];
-    buffer = '';
-  };
-
-  while (i < text.length) {
-    const char = text[i];
-    if (char === '\x1b') {
-      // CSI: ESC [ parameter/intermediate bytes, one final byte. Private
-      // markers (? >) are part of the parameter bytes so e.g. ESC[?25l is
-      // recognised as one sequence.
-      const csi = /^\x1b\[([0-9;:?>]*)([@-~])/.exec(text.slice(i, i + 32));
-      if (csi) {
-        if (csi[2] === 'm') {
-          const codes = csi[1] ? csi[1].split(';').map(part => Number(part.split(':')[0] || 0)) : [0];
-          pushSpan(spans, buffer, style);
-          buffer = '';
-          for (const code of codes) applySgr(style, code);
+  append(chunk: string): AnsiLine[] {
+    this.processedChars += chunk.length;
+    const text = (this.pending + chunk).replace(/\r\n/g, '\n');
+    this.pending = '';
+    let i = 0;
+    while (i < text.length) {
+      const char = text[i];
+      if (char === '\x1b') {
+        const rest = text.slice(i);
+        const csi = /^\x1b\[([0-9;:?>]*)([@-~])/.exec(rest.slice(0, 32));
+        if (csi) {
+          if (csi[2] === 'm') {
+            pushSpan(this.spans, this.buffer, this.style); this.buffer = '';
+            for (const code of csi[1] ? csi[1].split(';').map(part => Number(part.split(':')[0] || 0)) : [0]) applySgr(this.style, code);
+          }
+          i += csi[0].length; continue;
         }
-        // Non-SGR CSI (cursor movement, erase, scroll) drops silently.
-        i += csi[0].length;
+        const osc = /^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/.exec(rest);
+        if (osc) { i += osc[0].length; continue; }
+        if (rest === '\x1b' || /^\x1b[\[(][0-9;:?>]*$/.test(rest) || /^\x1b\][^\x07\x1b]*(?:\x1b)?$/.test(rest)) {
+          this.pending = rest; break;
+        }
+        i += text[i + 1] === '(' || text[i + 1] === ')' || text[i + 1] === '#' ? 3 : 2;
         continue;
       }
-      // OSC: ESC ] ... terminated by BEL or ST. Strip hyperlink/title noise.
-      const osc = /^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/.exec(text.slice(i));
-      if (osc) { i += osc[0].length; continue; }
-      // A sequence truncated by a split stream chunk (CSI params or OSC body
-      // reaching the end of the buffer with no final byte) drops whole.
-      if (/^\x1b[\[(][0-9;:?>]*$/.test(text.slice(i)) || /^\x1b\][^\x07\x1b]*$/.test(text.slice(i))) {
-        break;
+      if (char === '\n') {
+        pushSpan(this.spans, this.buffer, this.style);
+        this.completed.push({ spans: this.spans.length ? this.spans : [{ text: '' }] });
+        this.spans = []; this.buffer = '';
+      } else if (char === '\r') {
+        if (i === text.length - 1) { this.pending = char; break; }
+        this.buffer = ''; this.spans = [];
+      } else if (char === '\x08') {
+        if (this.buffer) this.buffer = this.buffer.slice(0, -1);
+        else if (this.spans.length) {
+          const last = this.spans[this.spans.length - 1];
+          last.text = last.text.slice(0, -1); if (!last.text) this.spans.pop();
+        }
+      } else if (char === '\t' || char.charCodeAt(0) >= 32 && char !== '\x7f') {
+        this.buffer += char;
       }
-      // Remaining two-byte escapes (ESC letter / ESC ( charset) drop the
-      // introducer and one payload byte; a bare trailing ESC drops alone.
-      i += text[i + 1] === '(' || text[i + 1] === ')' || text[i + 1] === '#' ? 3 : text[i + 1] ? 2 : 1;
-      continue;
+      i++;
     }
-    if (char === '\n') {
-      flushLine();
-      i += 1;
-      continue;
-    }
-    if (char === '\r') {
-      // Progress-bar style rewrite: the next segment replaces the visible
-      // prefix of this line rather than appending.
-      buffer = '';
-      spans = [];
-      i += 1;
-      continue;
-    }
-    if (char === '\x08') {
-      // Backspace deletes the previously emitted character when one exists.
-      if (buffer) buffer = buffer.slice(0, -1);
-      else if (spans.length) {
-        const last = spans[spans.length - 1];
-        last.text = last.text.slice(0, -1);
-        if (!last.text) spans.pop();
-      }
-      i += 1;
-      continue;
-    }
-    if (char === '\x07' || char === '\x0b' || char === '\x0c' || char === '\x0e' || char === '\x0f') {
-      i += 1;
-      continue;
-    }
-    buffer += char;
-    i += 1;
+    return this.snapshot();
   }
-  // Trailing content with no newline still forms a line.
-  flushLine();
-  return lines;
+
+  snapshot(): AnsiLine[] {
+    const tail = this.pending === '\r' ? [] : this.spans.map(span => ({ ...span }));
+    if (this.pending !== '\r') pushSpan(tail, this.buffer, this.style);
+    return [...this.completed, { spans: tail.length ? tail : [{ text: '' }] }];
+  }
 }
 
-/** Convenience helper: styled spans for a single line of output. */
+/** Adapter for accumulated React props; replacements/replays reset safely. */
+export class AccumulatedAnsiParser {
+  private source = '';
+  private parser = new AnsiStreamParser();
+  private lines: AnsiLine[] = [];
+  update(source: string): AnsiLine[] {
+    if (!source) { this.source = ''; this.parser = new AnsiStreamParser(); this.lines = []; return this.lines; }
+    if (source === this.source) return this.lines;
+    if (!source.startsWith(this.source)) { this.parser = new AnsiStreamParser(); this.source = ''; }
+    this.lines = this.parser.append(source.slice(this.source.length));
+    this.source = source;
+    return this.lines;
+  }
+}
+
+export function parseAnsi(input: string): AnsiLine[] {
+  return new AnsiStreamParser().append(input);
+}
+
 export function parseAnsiLine(line: string): AnsiSpan[] {
   return parseAnsi(line)[0]?.spans ?? [{ text: '' }];
 }

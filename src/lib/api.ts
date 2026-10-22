@@ -1,3 +1,4 @@
+import { listen } from '@tauri-apps/api/event';
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import type {
   Project, TaskMeta, WorkspaceIndex,
@@ -253,6 +254,10 @@ export const api = {
   getTodos: (conversationId: string) => invoke<TodoItem[]>('get_todos', { conversationId }),
   getGoal: (conversationId: string) => invoke<string | null>('get_goal', { conversationId }),
   clearTodos: (conversationId: string) => invoke<void>('clear_todos', { conversationId }),
+  onSessionActivity: (conversationId: string, onActivity: (seq: number) => void) =>
+    listen<{ conversationId: string; seq: number }>('locallm://session-activity', event => {
+      if (event.payload.conversationId === conversationId && Number.isSafeInteger(event.payload.seq)) onActivity(event.payload.seq);
+    }),
   getSessionEvents: (conversationId: string, fromSeq?: number | null, limit?: number | null) =>
     invoke<SessionEvent[]>('get_session_events', { conversationId, fromSeq, limit }),
   forkSession: (conversationId: string, fromSeq: number) =>

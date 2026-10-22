@@ -219,7 +219,6 @@ describe('chat action reporting and submission', () => {
     const message: Message = { id:'tool', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'local-stable-id',localServerName:'Research server',name:'lookup',arguments:{query:'example'},authorization:'user approval decision'},result:{isError:false}}) };
     const { rerender } = render(<Chat {...props} messages={[message]} />);
     expect(screen.getByText('Research server · lookup')).toBeInTheDocument();
-    fireEvent.click(screen.getByText('1 tool used'));
     fireEvent.click(screen.getByText('Research server · lookup'));
     expect(screen.getByText('local-stable-id')).toBeVisible();
     expect(screen.getByText('Authorization: user approval decision')).toBeVisible();
@@ -245,7 +244,6 @@ describe('chat action reporting and submission', () => {
   it('shows a reviewable unified diff for workspace edits', () => {
     const message: Message = { id:'edit', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'note.txt'},decision:'allowed'},result:{replacements:1,diff:'--- a/note.txt\n+++ b/note.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n'}}) };
     render(<Chat {...props} messages={[message]} />);
-    fireEvent.click(screen.getByText('1 tool used'));
     fireEvent.click(screen.getAllByText('note.txt')[0]);
     expect(screen.getByText('Diff')).toBeVisible();
     expect(screen.getAllByText(/--- a\/note\.txt/, { exact: false })[0]).toBeVisible();
@@ -379,6 +377,7 @@ it('inspects bounded tool output artifact on demand', async () => {
   };
 
   render(<Chat {...props} messages={[toolMsg]} />);
+  fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
   expect(screen.getByText(/Full result captured in artifact/)).toBeInTheDocument();
   expect(screen.getByText('art-xyz')).toBeInTheDocument();
   expect(screen.getByText('(10.0 KB)')).toBeInTheDocument();

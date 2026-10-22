@@ -1,16 +1,16 @@
 # Conversation rendering
 
 How LocalLM renders model output, tool activity, terminal output, code and
-file changes. Everything here is frontend presentation: provider and harness
-boundaries stay unchanged, and live events and persisted history share the
-same components.
+file changes. Rendering stays in the frontend, with optional Rust journal
+notifications supplying lightweight invalidation. Provider and harness boundaries
+stay unchanged, and live events and persisted history share the same components.
 
 ## Layers
 
 | Layer | Files | Job |
 |---|---|---|
 | Semantic tokens | `src/tokens.css` | Activity, syntax, code-surface, diff and terminal colors for both themes. |
-| Parsers | `src/lib/highlight.ts`, `src/lib/ansi.ts` | highlight.js wrapper with aliases + LRU cache; stateful ANSI-to-spans parser. |
+| Parsers | `src/lib/highlight.ts`, `src/lib/ansi.ts`, `src/lib/markdownBlocks.ts` | highlight.js wrapper with aliases + LRU cache; stateful ANSI-to-spans parser; conservative Markdown block boundaries. |
 | Shared primitives | `src/components/CodeBlock.tsx`, `DiffView.tsx`, `MarkdownView.tsx` | One code frame, one diff renderer, one Markdown renderer. |
 | Surfaces | `Chat.tsx`, `ActivityTimeline.tsx`, `CommandRunCard.tsx`, `FileResult.tsx`, `ArtifactViewer.tsx`, `WorkSummary.tsx` | Map structured records to the primitives. |
 
@@ -75,6 +75,17 @@ plugin; code fences map to `CodeBlock` and `openui` fences keep the lazy
 code to end of input, so incomplete Markdown needs no rewriting. Tables are
 wrapped in a horizontal scroller so narrow windows do not overflow.
 
+`MarkdownBlockBuffer` uses the existing `mdast-util-from-markdown` dependency
+only to find conservative blank-line block boundaries. Rendering still uses
+memoized blocks through the canonical ReactMarkdown pipeline. A safe prefix can
+be reused while the two trailing AST nodes remain mutable for continuations,
+lists and setext headings. Source-offset keys preserve component identity.
+Global reference definitions, including multiline or escaped labels, footnotes,
+math and HTML conservatively fall back to whole-document rendering so later
+content can still affect earlier content. Source replacement resets the buffer.
+Generic first/last block margins and streaming-caret placement preserve the
+existing prose and user-message bubble rhythm across block wrappers.
+
 Visual-answer prose uses this same renderer, with its existing evidence-only
 link policy and image restrictions. Malformed citation metadata falls back to
 plain answer text. Table scrollers and code viewports are keyboard focusable.
@@ -101,11 +112,18 @@ use `--code-*` in desktop overrides as well as shared primitives.
 - collapses `\r` progress rewrites to the final segment and applies `\x08`;
 - strips non-SGR sequences — CSI cursor/erase/private modes (incl. `?25l`),
   OSC hyperlinks/titles, charset and two-byte escapes;
-- drops escape sequences truncated by a split stream chunk;
+- buffers incomplete escape sequences across live chunks and omits unfinished
+  sequences from displayed output;
 - preserves tabs, removes other control bytes.
 
 ANSI colors resolve through `--terminal-*` tokens tuned per theme, so output
 stays readable on both surfaces.
+
+`AnsiStreamParser` is the shared incremental parser for live and accumulated
+output. Each channel owns its parser state. `AccumulatedAnsiParser` feeds only
+new bytes when source grows and resets when source is replaced or replayed;
+completed line objects retain their identities. `parseAnsi` uses the same core
+for one-shot history parsing.
 
 `CommandRunCard` renders stdout and stderr as separate labelled channels
 (stderr is a channel, not a failure — status comes from the envelope:
@@ -117,23 +135,66 @@ open in a highlighted JSON result tab; diffs use the shared `DiffView`.
 `_artifactId`/`_originalBytes`/`_truncated` markers keep the artifact
 inspect affordance.
 
+Folded output shows at most 30 lines; streamed output follows the latest tail
+while following is active. Expanded channels expose up to 500 lines per page
+with Previous/Next controls and source line numbers. Browsing pauses following;
+Copy retains the full source rather than just the visible page. stdout and
+stderr remain independent channels.
+
+Completed command details mount on first inspection and retain local state
+afterward. ANSI parsing runs only when the terminal tab is expanded, so collapsed
+or nonterminal channels do not process output merely because a row rerenders.
+
 ## Diffs and file results
 
 `DiffView` (`DiffLines` + `diffCounts`) is shared by `CommandRunCard`'s diff
 tab and `WorkSummary`'s file-change review. Added/deleted/hunk lines use the
-`--diff-*` tokens. `FileResult` shows path, total lines, SHA-256, a copy
+`--diff-*` tokens. Hunk rows carry old/new source coordinates; additions and
+deletions keep their literal markers and use path-inferred syntax highlighting
+within the existing size limit. `FileResult` shows path, total lines, SHA-256, a copy
 action, highlighted content from `languageFromPath`, and raw request/result
 under nested details.
+
+Unchanged-context runs longer than eight lines keep three lines at each edge
+and fold the middle behind a labelled Show/Collapse toggle. Expanding retains
+old/new source coordinates, and the toggle keeps its DOM identity so keyboard
+focus survives the change. File contents and raw request/result details defer
+mounting until first inspection, then retain state across closing and reopening.
 
 ## Streaming behaviour
 
 - `MessageBody`/`MarkdownView` are memoized; `highlightCode` caches, so
   historical blocks do not re-highlight per token.
+- Markdown element component identities are stable across updates and the
+  live-to-complete transition, preserving code wrap and disclosure state.
+  `ArtifactViewer` uses `MarkdownView` for Markdown previews as well.
+- `src/lib/toolOutput.ts` holds transient stdout/stderr buffers with subscriptions
+  scoped to one conversation/tool. Output notifications batch at 32ms; chunk
+  delivery avoids rewriting the message array and parsing/serializing tool JSON.
+  Lifecycle metadata still updates immediately. Completed messages and persisted
+  journals remain authoritative; transient buffers are cleared at turn cleanup.
 - `ActivityTimeline` keeps one reasoning disclosure per turn; expansion
   state survives streaming and live→persisted replays; durations display
   only from recorded event data.
+- WeakMap caches reuse parsed immutable tool records and normalized replay rows.
+  Matching uses run identity or call timestamp intervals to keep reused provider
+  call IDs from crossing runs; duplicate journal delivery keeps row order.
 - Terminal follow/auto-scroll honors scroll-up intent; disclosures are
   native `<details>` elements preserving their open state.
+- Chat observes content resizing while following. Scrolling up or opening a
+  disclosure pauses following for reading; Latest resumes it and stays available
+  after generation completes. A conversation change resets following.
+
+## Journal delivery
+
+Rust may emit `locallm://session-activity` after a journal append succeeds.
+Its payload contains only `conversationId` and the committed `seq` cursor,
+without duplicating model/tool payloads. `api.onSessionActivity` filters by
+conversation and triggers the existing cursor loader; the journal remains the
+authority. Subscription precedes recovery loading, and cursor reads merge and
+deduplicate events in sequence. Polling remains for missed notifications and
+older binaries. Teardown handles a listener registration resolving after the
+conversation has changed; the teardown race has a regression test.
 
 ## Accessibility and safety
 
@@ -145,8 +206,10 @@ under nested details.
 - Model/tool output is untrusted: Markdown renders via react-markdown (no
   raw HTML), code markup is escaped, source URLs pass `safeSourceUrl`,
   generated HTML/SVG is shown literally and never executed for display.
-- Long lists are bounded: terminal viewport, code viewport and the
-  completed-activity group cap DOM growth; full output lives in artifacts.
+- Terminal DOM is bounded by the 30-line fold or 500-line channel page; code
+  viewports remain scrollable. Exploration groups preserve their individual
+  rows without a second nested scroll cap. Large backend results retain the
+  existing artifact capture and inspection contract.
 
 ## Dependencies
 
@@ -158,6 +221,8 @@ duplicate what the token system already provides. Math adds `remark-math`,
 `rehype-katex`, `katex` and a direct `mdast-util-from-markdown` dependency.
 Scoped package overrides keep both math plugins on the direct patched KaTeX
 version instead of their older transitive version.
+The 22 October incremental-rendering follow-up reuses these dependencies and
+adds none.
 
 ## Tests
 
@@ -182,11 +247,12 @@ version instead of their older transitive version.
 ## Inline work log — 21 October 2026
 
 The Codex screenshot references supersede the earlier answer-first card layout.
-Completed activity now uses neutral, borderless disclosure rows with action
-labels. Groups open during generation and remain inspectable afterward; pending
-approvals, failures, cancellations and unknown outcomes stay outside collapsed
-groups. Detailed code, terminal output, artifacts and raw results retain their
-existing renderers and semantic colors.
+Completed activity uses neutral, borderless disclosure rows with action labels.
+The 22 October refinement groups only adjacent successful reads, searches and
+exploration, collapsed by default and inspectable afterward. Commands and edits
+always retain separate chronological rows, as do running work, pending approvals,
+failures, cancellations and unknown outcomes. Detailed code, terminal output,
+artifacts and raw results retain their shared renderers and semantic colors.
 
 When non-final `model_response` events exactly match the saved answer prefix,
 `ActivityTimeline` interleaves commentary and tool groups in journal sequence.
@@ -205,3 +271,24 @@ Verification: focused conversation tests, the frontend suite, TypeScript and a
 production build. Computer-use inventory exposed no native LocalLM window;
 localhost browser preview remains excluded by repository instructions. Exact
 pixel matching and native runtime appearance are therefore unverified.
+
+## Refinement evidence — 22 October 2026
+
+The existing visual system and 744px reading width are retained; this extension
+adds no packages or palette/theme changes. The work summary uses a smaller icon,
+tighter file rows and compact totals, keeping full paths and recorded-diff counts.
+The mechanical detector returned `[]`. Review disposition: **ship at CODE-ONLY
+scope** after fixing the Latest-after-completion regression, without visual
+approval. No new screenshots, native/browser inspection or zoom/accessibility
+visual acceptance are available; localhost preview remains prohibited. Synthetic
+parser checks do not establish overall UI performance or model latency. Final
+test outcomes and implementation measurements belong to the implementation
+report rather than an inferred visual acceptance here.
+
+The follow-up adds incremental Markdown boundaries, deferred inspected details,
+unchanged diff context folding, replay caches and optional committed-journal
+notifications. The reviewer accepted the final fixes at CODE-ONLY scope and the
+detector again returned `[]`. Screenshots and native interaction approval remain
+unavailable. Exact measurements, test failures and build outcomes are recorded
+separately in the implementation report; earlier pinned source references remain
+evidence for their initial-pass scope.

@@ -1,12 +1,13 @@
-import { Children, isValidElement, lazy, memo, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createContext, useContext, Fragment, Children, isValidElement, lazy, memo, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { PanelRight, X } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { type Components } from 'react-markdown';
 import type { PluggableList } from 'unified';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
 import { citationPlugin } from '../lib/sources';
+import { MarkdownBlockBuffer } from '../lib/markdownBlocks';
 import { mathMarkdown } from '../lib/mathMarkdown';
 import { CodeBlock } from './CodeBlock';
 
@@ -44,6 +45,13 @@ function ImageLightbox({ src, alt }: { src?: string; alt?: string }) {
   );
 }
 
+const MarkdownCode = memo(function MarkdownCode({ code, language, streaming, onOpenCanvas }: {
+  code: string; language: string; streaming: boolean; onOpenCanvas?: (code: string, language: string) => void;
+}) {
+  return <CodeBlock code={code} language={language} streaming={streaming} actions={onOpenCanvas ?
+    <button type="button" className="code-block-copy-btn" onClick={() => onOpenCanvas(code, language)} aria-label="Open in canvas" title="Open in canvas"><PanelRight size={12} /><span>Canvas</span></button> : undefined} />;
+});
+
 export interface MarkdownViewProps {
   content: string;
   /** Assistant messages may render interactive blocks (OpenUI, Canvas). */
@@ -59,13 +67,52 @@ export interface MarkdownViewProps {
   allowImages?: boolean;
 }
 
+// Component identities are module-stable, including the live → complete transition.
+const MarkdownContext = createContext<Omit<MarkdownViewProps, 'content'>>({});
+const MARKDOWN_COMPONENTS: Components = {
+  a: function Link({ children, href }) { const { allowedLinkUrls } = useContext(MarkdownContext); return !href || (allowedLinkUrls && !allowedLinkUrls.includes(href)) ? <span>{children}</span> : <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>; },
+  img: function Image({ src, alt }) { const { allowImages } = useContext(MarkdownContext); return allowImages ? <ImageLightbox src={src} alt={alt} /> : <span>{alt || 'Image reference'}</span>; },
+  table: ({ children }) => <div className="markdown-table-scroll" role="region" aria-label="Table" tabIndex={0}><table>{children}</table></div>,
+  pre: function Fence({ children }) {
+    const { assistant, streaming, onSendPrompt, onOpenCanvas } = useContext(MarkdownContext);
+    const child = Children.toArray(children)[0];
+    if (isValidElement<{ className?: string; children?: ReactNode }>(child)) {
+      const language = /language-(\S+)/.exec(child.props.className || '')?.[1] ?? '';
+      const code = String(child.props.children ?? '').replace(/\n$/, '');
+      if (assistant && (language === 'openui' || language === 'openui-lang')) {
+        return (
+          <Suspense fallback={<div className="genui-block"><div className="genui-block-header"><span>Generative UI</span></div><p className="genui-block-note">Rendering UI…</p></div>}>
+            <GenUiBlock code={code} streaming={streaming} onFollowUp={onSendPrompt} onOpenCanvas={onOpenCanvas ? () => onOpenCanvas(code, language) : undefined} />
+          </Suspense>
+        );
+      }
+      return <MarkdownCode code={code} language={language} streaming={Boolean(streaming)} onOpenCanvas={assistant ? onOpenCanvas : undefined} />;
+    }
+    return <pre>{children}</pre>;
+  },
+  code: ({ className, children, ...rest }) => <code className={className} {...rest}>{children}</code>,
+};
+
 /**
  * The one markdown renderer for assistant prose, user messages and exposed
  * reasoning. Unclosed fences from a still-streaming block already parse as
  * code, so incomplete markdown stays readable without rewriting the source.
  */
-export const MarkdownView = memo(function MarkdownView({ content, assistant = false, streaming = false, sourceLinks = '{}', onSendPrompt, onOpenCanvas, allowedLinkUrls, allowImages = true }: MarkdownViewProps) {
+const MarkdownBlockView = memo(function MarkdownBlockView({ content, context, plugins }: {
+  content: string;
+  context: Omit<MarkdownViewProps, 'content'>;
+  plugins: PluggableList;
+}) {
   const renderedContent = useMemo(() => mathMarkdown(content), [content]);
+  return <MarkdownContext.Provider value={context}><div className="markdown-block">
+    <ReactMarkdown remarkPlugins={plugins} rehypePlugins={KATEX_PLUGINS} components={MARKDOWN_COMPONENTS}>{renderedContent}</ReactMarkdown>
+  </div></MarkdownContext.Provider>;
+});
+const KATEX_PLUGINS: PluggableList = [[rehypeKatex, { trust: false, strict: 'ignore', throwOnError: false, maxSize: 20, maxExpand: 1000 }]];
+
+export const MarkdownView = memo(function MarkdownView({ content, assistant = false, streaming = false, sourceLinks = '{}', onSendPrompt, onOpenCanvas, allowedLinkUrls, allowImages = true }: MarkdownViewProps) {
+  const buffer = useRef(new MarkdownBlockBuffer());
+  const blocks = useMemo(() => buffer.current.update(content), [content]);
   const plugins = useMemo<PluggableList>(() => {
     let links: Record<string, string> = {};
     try {
@@ -76,54 +123,9 @@ export const MarkdownView = memo(function MarkdownView({ content, assistant = fa
     } catch { /* A corrupt citation map must not hide the answer. */ }
     return [remarkGfm, [remarkMath, { singleDollarTextMath: false }], citationPlugin(links)];
   }, [sourceLinks]);
-  return (
-    <div className={`markdown${streaming && content ? ' is-streaming' : ''}`}>
-      <ReactMarkdown
-        remarkPlugins={plugins}
-        rehypePlugins={[[rehypeKatex, { trust: false, strict: 'ignore', throwOnError: false, maxSize: 20, maxExpand: 1000 }]]}
-        components={{
-          a: ({ children, href }) => !href || (allowedLinkUrls && !allowedLinkUrls.includes(href)) ? <span>{children}</span> : <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
-          img: ({ src, alt }) => allowImages ? <ImageLightbox src={src} alt={alt} /> : <span>{alt || 'Image reference'}</span>,
-          table: ({ children }) => <div className="markdown-table-scroll" role="region" aria-label="Table" tabIndex={0}><table>{children}</table></div>,
-          pre: ({ children }) => {
-            const child = Children.toArray(children)[0];
-            if (isValidElement<{ className?: string; children?: ReactNode }>(child)) {
-              const language = /language-(\S+)/.exec(child.props.className || '')?.[1] ?? '';
-              const code = String(child.props.children ?? '').replace(/\n$/, '');
-              if (assistant && (language === 'openui' || language === 'openui-lang')) {
-                return (
-                  <Suspense fallback={<div className="genui-block"><div className="genui-block-header"><span>Generative UI</span></div><p className="genui-block-note">Rendering UI…</p></div>}>
-                    <GenUiBlock code={code} streaming={streaming} onFollowUp={onSendPrompt} onOpenCanvas={onOpenCanvas ? () => onOpenCanvas(code, language) : undefined} />
-                  </Suspense>
-                );
-              }
-              return (
-                <CodeBlock
-                  language={language}
-                  code={code}
-                  streaming={streaming}
-                  actions={assistant && onOpenCanvas ? (
-                    <button
-                      type="button"
-                      className="code-block-copy-btn"
-                      onClick={() => onOpenCanvas(code, language)}
-                      aria-label="Open in canvas"
-                      title="Open in canvas"
-                    >
-                      <PanelRight size={12} />
-                      <span>Canvas</span>
-                    </button>
-                  ) : undefined}
-                />
-              );
-            }
-            return <pre>{children}</pre>;
-          },
-          code: ({ className, children, ...rest }) => <code className={className} {...rest}>{children}</code>,
-        }}
-      >
-        {renderedContent}
-      </ReactMarkdown>
-    </div>
-  );
+  const stableContext = useMemo(() => ({ assistant, streaming: false, onSendPrompt, onOpenCanvas, allowedLinkUrls, allowImages }), [assistant, onSendPrompt, onOpenCanvas, allowedLinkUrls, allowImages]);
+  const liveContext = useMemo(() => ({ ...stableContext, streaming }), [stableContext, streaming]);
+  return <div className={`markdown${streaming && content ? ' is-streaming' : ''}`}>
+    {blocks.map((block, index) => <Fragment key={block.offset}>{index > 0 ? '\n' : null}<MarkdownBlockView content={block.content} context={block.stable ? stableContext : liveContext} plugins={plugins} /></Fragment>)}
+  </div>;
 });

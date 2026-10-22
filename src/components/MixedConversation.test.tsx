@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { Chat } from './Chat';
 import type { Message } from '../lib/types';
@@ -88,20 +88,23 @@ describe('mixed conversation fixture', () => {
     expect(screen.getByTestId('status-exit-101')).toBeInTheDocument();
     expect(screen.getByText('error[E0308]: mismatched types')).toBeInTheDocument();
 
-    // Completed tools collapse into the shared activity summary group.
-    expect(screen.getByText(/7 tools used|6 tools used|5 tools used/)).toBeInTheDocument();
+    // Consequential commands and edits remain individually inspectable.
+    expect(document.querySelector('.command-run-card[data-kind=command]')?.closest('.activity-summary')).toBeNull();
+    expect(document.querySelector('.command-run-card[data-kind=edit]')?.closest('.activity-summary')).toBeNull();
   });
 
   it('surfaces file reads, diffs, artifacts and unknown tools deterministically', () => {
     render(<Chat {...props} messages={fixture} />);
 
     // File read renders through the dedicated path card.
-    expect(screen.getByText(/Read src\/timer\.ts/)).toBeInTheDocument();
+    expect(document.querySelector('.file-result > summary')).toHaveTextContent('Read src/timer.ts');
     expect(screen.getAllByText('src/timer.ts').length).toBeGreaterThanOrEqual(1);
 
     // Diff counts appear on the work summary and the edit card header.
     expect(screen.getAllByText('+1').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('−1').length).toBeGreaterThanOrEqual(1);
+
+    for (const row of document.querySelectorAll<HTMLDetailsElement>('.command-run-card')) if (!row.open) { const title = row.querySelector('summary')!; const event = new MouseEvent('click', { bubbles: true, cancelable: true }); fireEvent(title, event); }
 
     // Artifact-captured output exposes the artifact identity and size.
     expect(screen.getByText(/art_a{32}/)).toBeInTheDocument();

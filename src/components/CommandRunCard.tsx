@@ -1,8 +1,8 @@
 import { safeSourceUrl, sourceIdentity } from '../lib/sources';
-import { useState, useEffect, useMemo, useRef, type ReactNode } from 'react';
+import { memo, useCallback, useState, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import { ArrowDown, Check, Copy, ChevronRight, FileCode, FileText, AlertCircle, XCircle, Atom, ExternalLink, LoaderCircle } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
-import { parseAnsi, type AnsiLine } from '../lib/ansi';
+import { AccumulatedAnsiParser, type AnsiLine } from '../lib/ansi';
 import { TRACE_ICONS, toolKindOf, type TraceKind } from './TraceIcon';
 import { CodeBlock } from './CodeBlock';
 import { DiffLines, diffCounts } from './DiffView';
@@ -79,17 +79,27 @@ function domainOf(url?: string): string | undefined {
 }
 
 /** One terminal channel (stdout or stderr) with its own gutter and fold. */
-function OutputChannel({ name, lines }: { name?: 'stdout' | 'stderr'; lines: AnsiLine[] }) {
+const OutputChannel = memo(function OutputChannel({ name, lines, live, following, onBrowse }: { name?: 'stdout' | 'stderr'; lines: AnsiLine[]; live: boolean; following: boolean; onBrowse: () => void }) {
   const [folded, setFolded] = useState(true);
   const foldable = lines.length > 30;
-  const visible = foldable && folded ? lines.slice(0, 30) : lines;
+  const pageSize = 500;
+  const [page, setPage] = useState<number | null>(null);
+  const pageCount = Math.ceil(lines.length / pageSize);
+  const currentPage = Math.min(page ?? pageCount - 1, pageCount - 1);
+  const tail = useRef(0);
+  const hasStreamed = useRef(live);
+  if (live) hasStreamed.current = true;
+  if (hasStreamed.current && following) tail.current = Math.max(0, lines.length - 30);
+  const offset = foldable && folded ? Math.min(tail.current, Math.max(0, lines.length - 30)) : pageCount > 1 ? currentPage * pageSize : 0;
+  const visible = lines.slice(offset, offset + (foldable && folded ? 30 : pageSize));
+  useEffect(() => { if (following) setPage(null); }, [following]);
   return (
     <div className={name ? `output-channel channel-${name}` : 'output-channel'}>
       {name && <p className="channel-label">{name}</p>}
-      <div className="terminal-lines">
+      <div className="terminal-lines" role="region" aria-label={name ? `${name} output` : 'Command output'} tabIndex={0}>
         {visible.map((line, idx) => (
-          <div key={idx} className="terminal-line">
-            <span className="terminal-gutter">{idx + 1}</span>
+          <div key={offset + idx} className="terminal-line">
+            <span className="terminal-gutter">{offset + idx + 1}</span>
             <span className="terminal-content">
               {line.spans.map((span, spanIdx) => (
                 <span
@@ -109,16 +119,21 @@ function OutputChannel({ name, lines }: { name?: 'stdout' | 'stderr'; lines: Ans
           </div>
         ))}
       </div>
+      {!folded && pageCount > 1 && <nav className="terminal-pages" aria-label={`${name ?? 'Command'} output pages`}>
+        <button type="button" disabled={currentPage === 0} onClick={() => { onBrowse(); setPage(currentPage - 1); }}>Previous lines</button>
+        <span>{offset + 1}–{Math.min(offset + pageSize, lines.length)} of {lines.length} lines</span>
+        <button type="button" disabled={currentPage === pageCount - 1} onClick={() => { onBrowse(); setPage(currentPage + 1); }}>Next lines</button>
+      </nav>}
       {foldable && (
         <div className="terminal-folding-bar">
           <button type="button" className="fold-toggle-btn" onClick={() => setFolded(previous => !previous)}>
-            {folded ? `Show all ${lines.length} lines` : 'Show fewer lines'}
+            {folded ? lines.length > pageSize ? `Browse all ${lines.length} lines` : `Show all ${lines.length} lines` : 'Show fewer lines'}
           </button>
         </div>
       )}
     </div>
   );
-}
+});
 
 export function webSourcesFrom(result: Record<string, unknown> | null): WebSource[] {
   const raw = result?.sources;
@@ -165,11 +180,18 @@ export function CommandRunCard({
 }: CommandRunCardProps) {
   const [activeTab, setActiveTab] = useState<'terminal' | 'diff' | 'code' | 'raw' | 'result'>(diff ? 'diff' : structuredResult ? 'result' : 'terminal');
   const [copied, setCopied] = useState(false);
-  const [expanded, setExpanded] = useState(status === 'running');
+  const [copyError, setCopyError] = useState(false);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(copyTimer.current), []);
+  const [expanded, setExpanded] = useState(status === 'running' || status === 'failed' || status === 'awaiting_approval');
+  const [inspected, setInspected] = useState(expanded);
   const [artifactContent, setArtifactContent] = useState<string | null>(null);
   const [loadingArtifact, setLoadingArtifact] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const [scrolledUp, setScrolledUp] = useState(false);
+  const pauseFollowing = useCallback(() => setScrolledUp(true), []);
+
+  useEffect(() => { if (status === 'failed' || status === 'awaiting_approval') setExpanded(true); }, [status]);
 
   const path = typeof args?.path === 'string'
     ? args.path
@@ -222,7 +244,7 @@ export function CommandRunCard({
     const action = typeof args?.Action === 'string' ? args.Action : '';
     displayVerb = action === 'status' || action === 'check' || !action ? 'Checked task' : 'Task';
   } else if (isCommand) {
-    displayVerb = 'Ran';
+    displayVerb = status === 'running' ? 'Running' : status === 'awaiting_approval' ? 'Run' : 'Ran';
   }
 
   const firstLine = command ? command.split(/\r?\n/)[0].trim() : '';
@@ -270,18 +292,13 @@ export function CommandRunCard({
         else if (Array.isArray(parsed)) searchResultCount = parsed.length;
       } catch { /* ignore */ }
     }
-    if (searchResultCount === undefined && stdout && !isWeb) {
-      const trimmedLines = stdout.trim().split(/\r?\n/).filter(Boolean);
-      if (trimmedLines.length > 0 && !stdout.includes('"totalResults": 0')) {
-        searchResultCount = trimmedLines.length;
-      }
-    }
+
   }
 
   const resultObject = parseObjectJson(structuredResult) ?? parseObjectJson(stdout);
   const webSources = isWeb ? webSourcesFrom(resultObject) : [];
   const webAnswer = isWeb && resultObject && typeof resultObject.answer === 'string' ? resultObject.answer.trim() : '';
-  if (isWeb) searchResultCount = webSources.length;
+  if (isWeb && resultObject?.sources) searchResultCount = webSources.length;
 
   const traceKind: TraceKind = toolKindOf(toolName, args ?? {}, { diff });
   const HeaderGlyph = TRACE_ICONS[traceKind];
@@ -296,8 +313,12 @@ export function CommandRunCard({
   const combinedOutput = stdout + (stderr ? (stdout ? '\n' : '') + stderr : '');
   const hasOutput = stdout.length > 0 || stderr.length > 0;
   // Channels parse independently so ANSI state never bleeds across streams.
-  const stdoutLines = useMemo(() => (stdout ? parseAnsi(stdout) : []), [stdout]);
-  const stderrLines = useMemo(() => (stderr ? parseAnsi(stderr) : []), [stderr]);
+  const stdoutParser = useRef(new AccumulatedAnsiParser());
+  const stderrParser = useRef(new AccumulatedAnsiParser());
+  const stdoutSnapshot = useRef<AnsiLine[]>([]);
+  const stderrSnapshot = useRef<AnsiLine[]>([]);
+  const stdoutLines = useMemo(() => { if (expanded && activeTab === 'terminal') stdoutSnapshot.current = stdoutParser.current.update(stdout); return stdoutSnapshot.current; }, [stdout, expanded, activeTab]);
+  const stderrLines = useMemo(() => { if (expanded && activeTab === 'terminal') stderrSnapshot.current = stderrParser.current.update(stderr); return stderrSnapshot.current; }, [stderr, expanded, activeTab]);
 
   useEffect(() => {
     if (diff && !combinedOutput && !structuredResult) {
@@ -305,13 +326,13 @@ export function CommandRunCard({
     } else if (structuredResult) {
       setActiveTab('result');
     }
-  }, [diff, combinedOutput, structuredResult]);
+  }, [diff, structuredResult]);
 
   useEffect(() => {
-    if (status === 'running' && viewportRef.current && !scrolledUp) {
+    if (viewportRef.current && !scrolledUp) {
       viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
     }
-  }, [combinedOutput, status, scrolledUp]);
+  }, [combinedOutput, status, scrolledUp, expanded, activeTab]);
 
   const handleScroll = () => {
     if (!viewportRef.current) return;
@@ -328,10 +349,11 @@ export function CommandRunCard({
   const copyOutput = async () => {
     try {
       await navigator.clipboard.writeText(combinedOutput || code || '');
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      setCopyError(false); setCopied(true);
+      clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopied(false), 2000);
     } catch {
-      /* ignore */
+      setCopyError(true);
     }
   };
 
@@ -349,7 +371,7 @@ export function CommandRunCard({
   };
 
   const formatDuration = (ms?: number) => {
-    if (ms === undefined || ms === null) return null;
+    if (ms === undefined || ms === null || !Number.isFinite(ms) || ms < 0) return null;
     if (ms < 1000) return `${ms}ms`;
     return `${(ms / 1000).toFixed(1)}s`;
   };
@@ -433,10 +455,13 @@ export function CommandRunCard({
       data-testid="command-run-card"
       data-kind={traceKind}
       open={expanded}
-      onToggle={e => setExpanded((e.currentTarget as HTMLDetailsElement).open)}
+      onToggle={e => { const open = e.currentTarget.open; setExpanded(open); if (open) setInspected(true); }}
     >
       {/* Title Bar */}
-      <summary className="card-header">
+      <summary className="card-header" onClick={event => {
+        if ((event.target as Element).closest('button')) return;
+        event.preventDefault(); setInspected(true); setExpanded(open => !open);
+      }}>
         <div className="header-left">
           {headerIcon}
           <strong className="activity-kind">{displayVerb}</strong>
@@ -450,7 +475,7 @@ export function CommandRunCard({
               <span className="diff-removed">−{removedCount}</span>
             </span>
           )}
-          {isSearch && searchResultCount !== undefined && searchResultCount > 0 && (
+          {isSearch && searchResultCount !== undefined && searchResultCount >= 0 && (
             <span className="trace-badge">
               {searchResultCount} {searchResultCount === 1 ? 'result' : 'results'}
             </span>
@@ -473,7 +498,7 @@ export function CommandRunCard({
         <ChevronRight size={14} className="trace-chevron" aria-hidden="true" />
       </summary>
 
-      <div className="card-body">
+      {(expanded || inspected) && <div className="card-body">
         {path && path !== displayTitle && <p className="muted">{path}</p>}
         {(cwd || (command && environment) || localServerId || authorization) && (
           <p className="tool-meta">
@@ -485,6 +510,7 @@ export function CommandRunCard({
             ].filter(Boolean).reduce<ReactNode[]>((items, item) => items.length ? [...items, <span key={`sep-${items.length}`} aria-hidden="true">·</span>, item] : [item], [])}
           </p>
         )}
+        {copyError && <p role="alert" className="code-block-copy-error">Could not copy output. Select the output and copy it manually.</p>}
         {error && <p className="error-banner" role="alert">{error}</p>}
         {(resultStatus || envelopeStatus) && (
           <p className="muted" data-testid="result-status">
@@ -616,8 +642,8 @@ export function CommandRunCard({
               </div>
             ) : (
               <>
-                {stdoutLines.length > 0 && <OutputChannel name={stderrLines.length ? 'stdout' : undefined} lines={stdoutLines} />}
-                {stderrLines.length > 0 && <OutputChannel name="stderr" lines={stderrLines} />}
+                {stdoutLines.length > 0 && <OutputChannel name={stderrLines.length ? 'stdout' : undefined} lines={stdoutLines} live={status === 'running'} following={!scrolledUp} onBrowse={pauseFollowing} />}
+                {stderrLines.length > 0 && <OutputChannel name="stderr" lines={stderrLines} live={status === 'running'} following={!scrolledUp} onBrowse={pauseFollowing} />}
               </>
             )}
             {scrolledUp && hasOutput && (
@@ -638,7 +664,7 @@ export function CommandRunCard({
         {/* Tab 2: Diff View */}
         {activeTab === 'diff' && diff && (
           <div className="diff-viewport" data-testid="diff-viewport">
-            <DiffLines diff={diff} />
+            <DiffLines diff={diff} path={path} />
           </div>
         )}
 
@@ -688,7 +714,7 @@ export function CommandRunCard({
           </div>
         )}
         </ResultDetails>
-      </div>
+      </div>}
     </details>
   );
 }

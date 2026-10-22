@@ -48,7 +48,7 @@ export function WorkSummary({ messages, events = [], run, children, showActivity
         return <div className="file-change-card" key={edit.path}>
           <details className="file-change-review" open={reviewOpen || undefined}>
             <summary className="file-change-heading"><span className="file-change-path" title={edit.path}><span>{edit.path.slice(0, split)}</span><strong>{edit.path.slice(split)}</strong></span><span className="file-change-counts"><span className="diff-added">+{edit.added}</span> <span className="diff-removed">−{edit.removed}</span></span></summary>
-            <div className="diff-viewport file-change-diff">{edit.diffs.map(diff => <DiffLines key={diff.id} diff={diff.diff} />)}</div>
+            <div className="diff-viewport file-change-diff">{edit.diffs.map(diff => <DiffLines key={diff.id} diff={diff.diff} path={edit.path} />)}</div>
           </details>
         </div>;
       })}</div>}

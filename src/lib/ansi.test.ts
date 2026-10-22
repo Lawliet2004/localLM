@@ -109,3 +109,18 @@ describe('parseAnsiLine', () => {
     expect(parseAnsiLine('')).toEqual([{ text: '' }]);
   });
 });
+
+it('incremental parsing matches replay at every split, including CRLF and OSC terminators', async () => {
+  const { AnsiStreamParser, AccumulatedAnsiParser } = await import('./ansi');
+  const text = 'start\r\n\x1b[31mred\nnext\x1b[0m\n10%\r90%\n\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\tend\b!';
+  for (let split = 0; split <= text.length; split++) {
+    const parser = new AnsiStreamParser(); parser.append(text.slice(0, split));
+    expect(parser.append(text.slice(split)), `split at ${split}`).toEqual(parseAnsi(text));
+    expect(parser.processedChars).toBe(text.length);
+  }
+  const accumulated = new AccumulatedAnsiParser();
+  const before = accumulated.update('done\npartial');
+  expect(accumulated.update('done\npartial output')[0]).toBe(before[0]);
+  expect(accumulated.update('replacement')).toEqual(parseAnsi('replacement'));
+  expect(accumulated.update('')).toEqual([]);
+});
