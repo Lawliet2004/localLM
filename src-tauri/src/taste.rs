@@ -232,25 +232,23 @@ pub fn profile(signals: &[TasteSignal]) -> TasteProfile {
         .filter(|(_, entry)| entry.kept() > 0)
         .map(|(tool, entry)| (tool.clone(), entry.kept()))
         .collect();
-    preferred.sort_by(|left, right| {
-        right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
-    });
+    preferred.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 
     let mut rejected: Vec<(String, u64)> = counts
         .iter()
         .filter(|(_, entry)| entry.rejected > 0)
         .map(|(tool, entry)| (tool.clone(), entry.rejected))
         .collect();
-    rejected.sort_by(|left, right| {
-        right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
-    });
+    rejected.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 
     // Observations are sentences built from the counts above. A tool with no
     // rejections is reported as accepted; the edit rate is reported only
     // when there was something to keep.
     let mut ranked: Vec<(&String, &ToolCounts)> = counts.iter().collect();
     ranked.sort_by(|left, right| {
-        right.1.proposals()
+        right
+            .1
+            .proposals()
             .cmp(&left.1.proposals())
             .then_with(|| left.0.cmp(right.0))
     });
@@ -265,7 +263,9 @@ pub fn profile(signals: &[TasteSignal]) -> TasteProfile {
         } else {
             observations.push(format!(
                 "accepts {} of {} {} proposals",
-                entry.kept(), proposals, tool
+                entry.kept(),
+                proposals,
+                tool
             ));
         }
     }
@@ -327,7 +327,9 @@ fn is_secret_key(key: &str) -> bool {
         return true;
     }
     // Compound spellings: `auth_token`, `db_password`, `x-api-key`.
-    normalized.split('_').any(|segment| SECRET_KEYS.contains(&segment))
+    normalized
+        .split('_')
+        .any(|segment| SECRET_KEYS.contains(&segment))
         || SECRET_KEYS
             .iter()
             .filter(|term| term.contains('_'))
@@ -352,7 +354,9 @@ fn bound_payload(value: &Value) -> Value {
 }
 
 fn serialized_len(value: &Value) -> usize {
-    serde_json::to_string(value).map(|text| text.len()).unwrap_or(usize::MAX)
+    serde_json::to_string(value)
+        .map(|text| text.len())
+        .unwrap_or(usize::MAX)
 }
 
 /// Clip a string to a byte budget without splitting a character.
@@ -764,15 +768,24 @@ mod tests {
         let one_edit = profile(std::slice::from_ref(&edited));
         assert_eq!(one_edit.edit_rate, 1.0);
         assert_eq!(one_edit.sample_size, 1);
-        assert_eq!(one_edit.preferred_tools, vec![("file_write".to_string(), 1)]);
+        assert_eq!(
+            one_edit.preferred_tools,
+            vec![("file_write".to_string(), 1)]
+        );
 
         let one_accepted = profile(std::slice::from_ref(&accepted));
         assert_eq!(one_accepted.edit_rate, 0.0);
-        assert_eq!(one_accepted.preferred_tools, vec![("file_read".to_string(), 1)]);
+        assert_eq!(
+            one_accepted.preferred_tools,
+            vec![("file_read".to_string(), 1)]
+        );
 
         let one_rejected = profile(std::slice::from_ref(&rejected));
         assert_eq!(one_rejected.edit_rate, 0.0);
-        assert_eq!(one_rejected.rejected_tools, vec![("shell_run".to_string(), 1)]);
+        assert_eq!(
+            one_rejected.rejected_tools,
+            vec![("shell_run".to_string(), 1)]
+        );
         assert!(one_rejected.preferred_tools.is_empty());
 
         let both = profile(&[accepted.clone(), rejected.clone()]);
@@ -832,7 +845,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = crate::test_support::app_state(directory.path());
         let ctx = context(&state, directory.path());
-        let taught = execute(&ctx, "taste_teach", json!({"note":"prefer pnpm over npm"})).await.unwrap();
+        let taught = execute(&ctx, "taste_teach", json!({"note":"prefer pnpm over npm"}))
+            .await
+            .unwrap();
         assert_eq!(taught["recorded"], json!(true));
         assert_eq!(taught["note"], json!("prefer pnpm over npm"));
         let contract = registry()
@@ -860,10 +875,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = crate::test_support::app_state(directory.path());
         let ctx = context(&state, directory.path());
-        assert!(execute(&ctx, "taste_recall", json!({"scope":"x".repeat(257)}))
+        assert!(
+            execute(&ctx, "taste_recall", json!({"scope":"x".repeat(257)}))
+                .await
+                .is_err()
+        );
+        assert!(execute(&ctx, "taste_teach", json!({"note":""}))
             .await
             .is_err());
-        assert!(execute(&ctx, "taste_teach", json!({"note":""})).await.is_err());
         assert!(execute(&ctx, "taste_teach", json!({})).await.is_err());
     }
 
@@ -871,9 +890,15 @@ mod tests {
     fn the_registry_declares_both_tools_with_their_contracts() {
         let specs = registry();
         assert_eq!(specs.len(), 2);
-        let recall = specs.iter().find(|spec| spec.name == "taste_recall").unwrap();
+        let recall = specs
+            .iter()
+            .find(|spec| spec.name == "taste_recall")
+            .unwrap();
         assert!(recall.has_output_contract());
-        let teach = specs.iter().find(|spec| spec.name == "taste_teach").unwrap();
+        let teach = specs
+            .iter()
+            .find(|spec| spec.name == "taste_teach")
+            .unwrap();
         assert!(teach.has_output_contract());
         assert!(owns("taste_recall") && owns("taste_teach"));
         assert!(!owns("memory_recall"));

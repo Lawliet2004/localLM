@@ -414,12 +414,8 @@ pub fn registry(root: &Path) -> Vec<crate::tool_spec::ToolSpec> {
             let mut input = plugin.arguments.clone();
             // A plugin runs with the user's privileges: it always asks.
             input["x-locallm-always-ask"] = json!(true);
-            crate::tool_spec::ToolSpec::new(
-                plugin.name.clone(),
-                plugin.description.clone(),
-                input,
-            )
-            .with_output(output_contract())
+            crate::tool_spec::ToolSpec::new(plugin.name.clone(), plugin.description.clone(), input)
+                .with_output(output_contract())
         })
         .collect()
 }
@@ -429,10 +425,7 @@ pub fn owns(root: &Path, alias: &str) -> bool {
     if !valid_name(alias) {
         return false;
     }
-    load(root)
-        .0
-        .into_iter()
-        .any(|plugin| plugin.name == alias)
+    load(root).0.into_iter().any(|plugin| plugin.name == alias)
 }
 
 /// Execute a plugin tool.
@@ -449,11 +442,19 @@ pub async fn execute(root: &Path, name: &str, args: &Value) -> Result<Value, Str
         .ok_or_else(|| format!("Unknown plugin '{name}'."))?;
     crate::tool_validation::validate(&plugin.arguments, args)?;
 
-    let program = resolve_program(root, &plugin.command[0])
-        .ok_or_else(|| format!("The plugin command '{}' is not executable.", plugin.command[0]))?;
+    let program = resolve_program(root, &plugin.command[0]).ok_or_else(|| {
+        format!(
+            "The plugin command '{}' is not executable.",
+            plugin.command[0]
+        )
+    })?;
     let mut command = tokio::process::Command::new(program);
     command.args(&plugin.command[1..]);
-    if let Some(properties) = plugin.arguments.get("properties").and_then(Value::as_object) {
+    if let Some(properties) = plugin
+        .arguments
+        .get("properties")
+        .and_then(Value::as_object)
+    {
         if let Some(fields) = args.as_object() {
             for (key, value) in fields {
                 if !properties.contains_key(key) {
@@ -486,11 +487,8 @@ pub async fn execute(root: &Path, name: &str, args: &Value) -> Result<Value, Str
     let out_task = tokio::spawn(read_bounded(stdout));
     let err_task = tokio::spawn(read_bounded(stderr));
 
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(plugin.timeout_seconds),
-        child.wait(),
-    )
-    .await;
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(plugin.timeout_seconds), child.wait()).await;
     let status = match outcome {
         Ok(result) => result.map_err(|error| format!("The plugin failed: {error}"))?,
         Err(_) => {
@@ -577,7 +575,9 @@ fn reserved_name(name: &str) -> bool {
     {
         return true;
     }
-    crate::harness::registry().iter().any(|spec| spec.name == name)
+    crate::harness::registry()
+        .iter()
+        .any(|spec| spec.name == name)
 }
 
 /// Turn the declared arguments into one object schema.
@@ -624,7 +624,11 @@ fn resolve_program(root: &Path, program: &str) -> Option<PathBuf> {
         } else {
             root.join(candidate)
         };
-        return if is_executable(&path) { Some(path) } else { None };
+        return if is_executable(&path) {
+            Some(path)
+        } else {
+            None
+        };
     }
     std::env::var_os("PATH")
         .into_iter()
@@ -641,8 +645,7 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     true
@@ -655,7 +658,11 @@ pub fn list_plugins(state: tauri::State<'_, crate::AppState>) -> Result<Vec<Plug
     let (plugins, errors) = load(&root);
     let mut views: Vec<PluginView> = plugins.iter().map(PluginView::of).collect();
     for (name, error) in errors {
-        views.push(PluginView::failed(&name, &root.join(format!("{name}.json")), error));
+        views.push(PluginView::failed(
+            &name,
+            &root.join(format!("{name}.json")),
+            error,
+        ));
     }
     Ok(views)
 }
@@ -890,7 +897,10 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "deploy");
-        assert_eq!(plugins[0].description, "Deploy the current build to staging.");
+        assert_eq!(
+            plugins[0].description,
+            "Deploy the current build to staging."
+        );
         assert_eq!(plugins[0].timeout_seconds, 60);
         assert_eq!(plugins[0].command, command);
         assert_eq!(plugins[0].required, vec!["environment".to_string()]);
@@ -971,9 +981,13 @@ mod tests {
             "runner",
             &plugin_file("runner", json!(command), r#","timeout_seconds":20"#),
         );
-        let result = execute(directory.path(), "runner", &json!({"environment":"staging"}))
-            .await
-            .unwrap();
+        let result = execute(
+            directory.path(),
+            "runner",
+            &json!({"environment":"staging"}),
+        )
+        .await
+        .unwrap();
         assert_eq!(result["exit"], json!(0));
         assert!(result["stdout"].as_str().unwrap().contains("out"));
         assert!(result["stderr"].as_str().unwrap().contains("err"));
@@ -994,9 +1008,13 @@ mod tests {
             "echoer",
             &plugin_file("echoer", json!(command), r#","timeout_seconds":20"#),
         );
-        let result = execute(directory.path(), "echoer", &json!({"environment":"staging"}))
-            .await
-            .unwrap();
+        let result = execute(
+            directory.path(),
+            "echoer",
+            &json!({"environment":"staging"}),
+        )
+        .await
+        .unwrap();
         assert_eq!(result["exit"], json!(0));
         assert!(result["stdout"].as_str().unwrap().contains("--environment"));
         assert!(result["stdout"].as_str().unwrap().contains("staging"));
@@ -1013,9 +1031,13 @@ mod tests {
             "failing",
             &plugin_file("failing", json!(command), r#","timeout_seconds":20"#),
         );
-        let result = execute(directory.path(), "failing", &json!({"environment":"staging"}))
-            .await
-            .unwrap();
+        let result = execute(
+            directory.path(),
+            "failing",
+            &json!({"environment":"staging"}),
+        )
+        .await
+        .unwrap();
         assert_eq!(result["exit"], json!(3));
     }
 
@@ -1039,9 +1061,13 @@ mod tests {
         .await
         .is_err());
         // A missing required argument is rejected.
-        assert!(execute(directory.path(), "strict", &json!({})).await.is_err());
+        assert!(execute(directory.path(), "strict", &json!({}))
+            .await
+            .is_err());
         // An unknown plugin is rejected.
-        assert!(execute(directory.path(), "missing", &json!({})).await.is_err());
+        assert!(execute(directory.path(), "missing", &json!({}))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

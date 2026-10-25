@@ -77,7 +77,8 @@ impl MatchReport {
         match self.kind {
             MatchKind::Exact => "exact match".to_string(),
             MatchKind::Normalized => {
-                "normalized match: smart quotes, dash variants and exotic spaces were folded".to_string()
+                "normalized match: smart quotes, dash variants and exotic spaces were folded"
+                    .to_string()
             }
             MatchKind::LineTrimmed => {
                 "line-trimmed match: trailing whitespace on each line was ignored".to_string()
@@ -100,7 +101,10 @@ pub fn find_matches(source: &str, old_text: &str) -> MatchReport {
     if !exact.is_empty() {
         return MatchReport {
             kind: MatchKind::Exact,
-            matches: exact.into_iter().map(|(start, end)| Match { start, end }).collect(),
+            matches: exact
+                .into_iter()
+                .map(|(start, end)| Match { start, end })
+                .collect(),
         };
     }
     // Tiers 2 and 3 work on a folded view of the source: line endings are
@@ -149,7 +153,8 @@ pub fn replace(
 ) -> Result<(String, usize, MatchKind), String> {
     if old_text.is_empty() {
         return Err(
-            "The text to replace must not be empty. Use write to create or overwrite a file.".into(),
+            "The text to replace must not be empty. Use write to create or overwrite a file."
+                .into(),
         );
     }
     if old_text == new_text {
@@ -232,8 +237,8 @@ const DASH_VARIANTS: [char; 7] = [
     '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}',
 ];
 const EXOTIC_SPACES: [char; 13] = [
-    '\u{00A0}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}',
-    '\u{2008}', '\u{2009}', '\u{200A}', '\u{202F}', '\u{205F}', '\u{3000}',
+    '\u{00A0}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}',
+    '\u{2009}', '\u{200A}', '\u{202F}', '\u{205F}', '\u{3000}',
 ];
 
 /// Fold one character onto its plain ASCII equivalent.
@@ -412,7 +417,10 @@ fn split_lines(text: &str) -> Vec<Line<'_>> {
         } else {
             (&text[start..newline], "\n")
         };
-        lines.push(Line { content, terminator });
+        lines.push(Line {
+            content,
+            terminator,
+        });
         start = newline + 1;
     }
     lines
@@ -539,10 +547,7 @@ enum Block {
 
 /// Longest-common-subsequence alignment over trimmed line content.
 fn align_lines(region: &[Line<'_>], replacement: &[Line<'_>]) -> Vec<Block> {
-    let left: Vec<&str> = region
-        .iter()
-        .map(|line| line.content.trim_end())
-        .collect();
+    let left: Vec<&str> = region.iter().map(|line| line.content.trim_end()).collect();
     let right: Vec<&str> = replacement
         .iter()
         .map(|line| line.content.trim_end())
@@ -631,7 +636,10 @@ fn build_replacement(region: &str, replacement: &str, dominant: &str) -> String 
             }
         })
         .unwrap_or(dominant);
-    let tail = region_lines.last().map(|line| line.terminator).unwrap_or("");
+    let tail = region_lines
+        .last()
+        .map(|line| line.terminator)
+        .unwrap_or("");
     let mut out: Vec<(String, String)> = Vec::new();
     for block in blocks {
         match block {
@@ -661,7 +669,9 @@ fn build_replacement(region: &str, replacement: &str, dominant: &str) -> String 
                     };
                     if step < replacement_indices.len() {
                         out.push((
-                            replacement_lines[replacement_indices[step]].content.to_string(),
+                            replacement_lines[replacement_indices[step]]
+                                .content
+                                .to_string(),
                             terminator.to_string(),
                         ));
                     }
@@ -790,8 +800,13 @@ mod tests {
         let report = find_matches(source, "let a = 1;\nlet b = 2;");
         assert_eq!(report.kind, MatchKind::Normalized);
         assert_eq!(report.count(), 1);
-        let (updated, _, _) =
-            replace(source, "let a = 1;\nlet b = 2;", "let a = 1;\nlet b = 3;", false).unwrap();
+        let (updated, _, _) = replace(
+            source,
+            "let a = 1;\nlet b = 2;",
+            "let a = 1;\nlet b = 3;",
+            false,
+        )
+        .unwrap();
         assert_eq!(updated, "let a = 1;\r\nlet b = 3;\r\n");
         assert!(!updated.contains('\n') || updated.matches('\n').count() == 2);
         assert_eq!(updated.matches("\r\n").count(), 2);
@@ -876,10 +891,7 @@ mod tests {
     #[test]
     fn replace_at_rewrites_only_the_located_region() {
         let source = "one\r\ntwo\r\nthree\r\n";
-        let located = Match {
-            start: 5,
-            end: 8,
-        };
+        let located = Match { start: 5, end: 8 };
         assert_eq!(&source[located.start..located.end], "two");
         let updated = replace_at(source, &located, "TWO", dominant_terminator(source));
         assert_eq!(updated, "one\r\nTWO\r\nthree\r\n");

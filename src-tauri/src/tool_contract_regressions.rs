@@ -444,8 +444,10 @@ fn every_frontend_invoke_resolves_to_a_registered_command() {
 #[test]
 fn declared_output_contracts_match_real_tool_results() {
     let catalog = crate::harness::registry();
-    let contracted: Vec<&crate::tool_spec::ToolSpec> =
-        catalog.iter().filter(|spec| spec.has_output_contract()).collect();
+    let contracted: Vec<&crate::tool_spec::ToolSpec> = catalog
+        .iter()
+        .filter(|spec| spec.has_output_contract())
+        .collect();
     assert!(
         !contracted.is_empty(),
         "The harness must declare at least one result contract"

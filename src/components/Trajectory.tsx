@@ -181,7 +181,9 @@ export function Trajectory({
       }}
     >
       <summary className="trajectory-summary">
-        <span>Trajectory{conversationId ? ` · ${ownedEvents.length}${moreAvailable ? '+' : ''} events` : ''}</span>
+        {/* Events load lazily on first open; without `ownerCurrent` a fresh
+            conversation would forever advertise a misleading "0 events". */}
+        <span>Trajectory{conversationId && ownerCurrent ? ` · ${ownedEvents.length}${moreAvailable ? '+' : ''} events` : ''}</span>
       </summary>
 
       <div className="trajectory-body">

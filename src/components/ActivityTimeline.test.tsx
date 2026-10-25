@@ -100,3 +100,19 @@ it('keeps replay row identity and never attaches a later result to a reused call
   expect(JSON.parse(first[0].content).result.value).toBe('old');
   expect(first[1]).toBe(persisted); expect(second[0]).toBe(first[0]);
 });
+it('mutes intermediate round commentary while the final round keeps answer styling', () => {
+  const message = { ...assistant(), content: 'I will inspect it.Confirmed the cause.Fixed it.', reasoning: '' };
+  const events = [
+    event(1, 'model_response', { content: 'I will inspect it.', final: false }),
+    event(2, 'model_response', { content: 'Confirmed the cause.', final: false }),
+    event(3, 'model_response', { content: 'Fixed it.', final: true }),
+  ];
+  const { container } = render(<ActivityTimeline {...props} messages={[message]} events={events} />);
+  const commentary = container.querySelectorAll('.activity-commentary');
+  expect(commentary).toHaveLength(2);
+  expect(commentary[0].textContent).toBe('I will inspect it.');
+  expect(commentary[1].textContent).toBe('Confirmed the cause.');
+  // The final round renders outside the commentary wrapper.
+  const final = screen.getByText('Fixed it.');
+  expect(final.closest('.activity-commentary')).toBeNull();
+});

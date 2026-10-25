@@ -142,7 +142,14 @@ export function AutomationSettings({ mode, onConfigureExecution }: { mode: 'brow
     {error && <p role="alert" className="error-banner">{error}</p>}
     {notice && <p role="status">{notice}</p>}
     {diagnostics && <div className="automation-diagnostics" role="status">
-      {browser ? <p>{diagnostics.browser.message}</p> : <>
+      {browser ? diagnostics.package && diagnostics.node && diagnostics.selectedBrowser ? <>
+        <p>{diagnostics.browser.available ? 'Browser prerequisites found.' : 'Browser setup needs attention.'}</p>
+        <dl>
+          <dt>Browser engine</dt><dd>{diagnostics.package.message}</dd>
+          <dt>Node.js</dt><dd>{diagnostics.node.message}</dd>
+          <dt>Selected browser</dt><dd>{diagnostics.selectedBrowser.message}</dd>
+        </dl>
+      </> : <p>{diagnostics.browser.message}</p> : <>
         <p>Computer setup check complete. Expand desktop diagnostics for input and screen capture availability.</p>
         <details><summary>Desktop diagnostics</summary><pre>{JSON.stringify(diagnostics.computer, null, 2)}</pre></details>
       </>}

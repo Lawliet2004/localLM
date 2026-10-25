@@ -1419,7 +1419,9 @@ impl Store {
     pub fn task_dependencies(&self, task_id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
-            .prepare("SELECT depends_on FROM task_dependencies WHERE task_id=?1 ORDER BY depends_on")
+            .prepare(
+                "SELECT depends_on FROM task_dependencies WHERE task_id=?1 ORDER BY depends_on",
+            )
             .map_err(db_error)?;
         let rows = statement
             .query_map([task_id], |row| row.get::<_, String>(0))
@@ -1442,10 +1444,7 @@ impl Store {
     /// Replace the dependency set of one task.
     pub fn set_task_dependencies(&self, task_id: &str, depends_on: &[String]) -> Result<()> {
         self.connection
-            .execute(
-                "DELETE FROM task_dependencies WHERE task_id=?1",
-                [task_id],
-            )
+            .execute("DELETE FROM task_dependencies WHERE task_id=?1", [task_id])
             .map_err(db_error)?;
         for dependency in depends_on {
             self.connection
@@ -1855,11 +1854,7 @@ impl Store {
         transaction.commit().map_err(db_error)?;
         Ok(seq)
     }
-    fn insert_session_event(
-        &self,
-        event: &crate::sessions::SessionEvent,
-        seq: u64,
-    ) -> Result<u64> {
+    fn insert_session_event(&self, event: &crate::sessions::SessionEvent, seq: u64) -> Result<u64> {
         let payload_str = serde_json::to_string(&event.payload).map_err(|e| e.to_string())?;
         self.connection
             .execute(
@@ -2528,6 +2523,37 @@ impl Store {
         self.connection.execute("INSERT INTO message_inference(message_id,metrics_json) VALUES(?1,?2) ON CONFLICT(message_id) DO UPDATE SET metrics_json=excluded.metrics_json", params![message_id, value]).map_err(db_error)?;
         Ok(())
     }
+    /// Prompt-cache sums (Σ cached tokens, Σ input tokens) over every recorded
+    /// inference round in a conversation, for the token-weighted average cache
+    /// hit rate. Rounds without measured input tokens contribute nothing.
+    pub fn conversation_cache_sums(&self, conversation_id: &str) -> Result<(u64, u64)> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT mi.metrics_json FROM message_inference mi
+                 JOIN messages m ON m.id = mi.message_id WHERE m.conversation_id = ?1",
+            )
+            .map_err(db_error)?;
+        let mut cached = 0u64;
+        let mut input = 0u64;
+        let mut rows = statement
+            .query(params![conversation_id])
+            .map_err(db_error)?;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let json: String = row.get(0).map_err(db_error)?;
+            let Ok(metrics) = serde_json::from_str::<crate::inference::ResponseMetrics>(&json)
+            else {
+                continue;
+            };
+            for round in &metrics.rounds {
+                if let Some(tokens) = round.usage.input_tokens {
+                    input += tokens;
+                    cached += round.usage.cached_tokens.unwrap_or(0).min(tokens);
+                }
+            }
+        }
+        Ok((cached, input))
+    }
     pub fn append_message(
         &self,
         conversation_id: &str,
@@ -3130,10 +3156,7 @@ mod tests {
         // dispatch, language servers and subagents.
         let second = super::Store::open(&path).unwrap();
         assert_eq!(
-            second
-                .message_status(&audit.id)
-                .unwrap()
-                .as_deref(),
+            second.message_status(&audit.id).unwrap().as_deref(),
             Some("streaming"),
             "a second connection must not mark a running tool's audit as interrupted"
         );
@@ -3378,6 +3401,71 @@ mod tests {
             assert_eq!(recorded.approval_ms, Some(300.0));
             assert_eq!(recorded.rounds[0].usage.output_tokens, Some(123));
         }
+    }
+    #[test]
+    fn conversation_cache_sums_weight_and_scope_per_conversation() {
+        fn round(input: u64, cached: u64) -> crate::inference::InferenceRound {
+            crate::inference::InferenceRound {
+                phase: None,
+                complete: true,
+                usage: serde_json::from_value(serde_json::json!({
+                    "inputTokens": input, "outputTokens": 5, "cachedTokens": cached
+                }))
+                .unwrap(),
+                ..Default::default()
+            }
+        }
+        fn metrics(
+            rounds: Vec<crate::inference::InferenceRound>,
+        ) -> crate::inference::ResponseMetrics {
+            crate::inference::ResponseMetrics {
+                model: "fixture.gguf".into(),
+                rounds,
+                ..Default::default()
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("cache.sqlite")).unwrap();
+        let conversation = store.create_conversation().unwrap();
+        let other = store.create_conversation().unwrap();
+
+        assert_eq!(
+            store.conversation_cache_sums(&conversation.id).unwrap(),
+            (0, 0)
+        );
+
+        for (input, cached) in [(1000u64, 800u64), (2000, 1800)] {
+            let message = store
+                .append_message(&conversation.id, "assistant", "round", "complete")
+                .unwrap();
+            store
+                .save_message_metrics(&message.id, &metrics(vec![round(input, cached)]))
+                .unwrap();
+        }
+        // A second conversation must not bleed into the first.
+        let stranger = store
+            .append_message(&other.id, "assistant", "elsewhere", "complete")
+            .unwrap();
+        store
+            .save_message_metrics(&stranger.id, &metrics(vec![round(9000, 9000)]))
+            .unwrap();
+        // Cached tokens are clamped to the round's input: a corrupt row
+        // cannot inflate the hit rate past 100%.
+        let clamped = store
+            .append_message(&conversation.id, "assistant", "clamped", "complete")
+            .unwrap();
+        store
+            .save_message_metrics(&clamped.id, &metrics(vec![round(500, 5000)]))
+            .unwrap();
+
+        assert_eq!(
+            store.conversation_cache_sums(&conversation.id).unwrap(),
+            (3100, 3500)
+        );
+        assert_eq!(
+            store.conversation_cache_sums(&other.id).unwrap(),
+            (9000, 9000)
+        );
     }
     #[test]
     fn conversation_tools_are_isolated_durable_and_deleted_with_chat() {

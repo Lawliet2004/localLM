@@ -31,16 +31,8 @@ fn regular(directory: &Dir, name: &str) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
-/// A partial download left behind by an interrupted install.
-///
-/// The downloader writes `<name>.part` next to its destination: either
-/// directly inside `<models>/` or inside a model's `<64-hex-digest>/`
-/// directory. The startup collector must recognise those names, or an
-/// interrupted multi-gigabyte download is never reclaimed and the app-data
-/// directory grows without bound.
-fn partial(name: &str) -> bool {
-    name.ends_with(".part") && name.len() > ".part".len()
-}
+/// Model partials are durable recovery data. Only explicit model deletion may
+/// remove them; unknown/orphan files are retained for manual recovery.
 pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
     if !root.exists() {
         return Ok(0);
@@ -50,30 +42,6 @@ pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
     let mut removed = 0;
     for name in entries(&directory)? {
         if !runtime {
-            if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
-                let metadata = directory
-                    .symlink_metadata(&name)
-                    .map_err(|e| e.to_string())?;
-                if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                    let model = directory.open_dir(&name).map_err(|e| e.to_string())?;
-                    for file in entries(&model)? {
-                        if (owned(&file, ".locallm-download-", ".part") || partial(&file))
-                            && regular(&model, &file)
-                        {
-                            model.remove_file(&file).map_err(|e| e.to_string())?;
-                            removed += 1;
-                        }
-                    }
-                }
-            }
-            if (owned(&name, ".locallm-download-", ".part") || partial(&name))
-                && regular(&directory, &name)
-            {
-                directory
-                    .remove_file(&name)
-                    .map_err(|error| error.to_string())?;
-                removed += 1;
-            }
             continue;
         }
         if !owned(&name, ".locallm-runtime-", "") {
@@ -109,6 +77,7 @@ pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
                             .iter()
                             .flat_map(|asset| &asset.files)
                             .any(|expected| expected.name == file)
+                            && file != "verified-files.json"
                     {
                         return Err("Unexpected runtime staging content; files retained.".into());
                     }
@@ -116,7 +85,9 @@ pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
                 }
                 has_bundle = true;
             } else if regular(&staging, &entry)
-                && (assets.iter().any(|asset| asset.name == entry)
+                && (assets
+                    .iter()
+                    .any(|asset| asset.name == entry || format!("{}.part", asset.name) == entry)
                     || owned(&entry, ".locallm-download-", ".part"))
             {
                 files.push(entry);
@@ -146,6 +117,29 @@ pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recognizes_runtime_archive_partial_but_refuses_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp
+            .path()
+            .join(format!(".locallm-runtime-{}", "a".repeat(32)));
+        std::fs::create_dir(&dir).unwrap();
+        let name = format!(
+            "{}.part",
+            crate::runtime_archive::catalog().unwrap()[0].name
+        );
+        std::fs::write(dir.join(&name), b"prefix").unwrap();
+        assert_eq!(clean(temp.path(), true).unwrap(), 1);
+        assert!(!dir.exists());
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(&dir).unwrap();
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.join(name)).unwrap();
+            assert!(clean(temp.path(), true).is_err());
+            assert!(outside.path().exists());
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn does_not_follow_a_bundle_junction() {
@@ -169,7 +163,7 @@ mod tests {
     /// The downloader writes `<name>.part`; the collector must reclaim those
     /// or an interrupted multi-gigabyte download is never reclaimed.
     #[test]
-    fn reclaims_the_partial_names_the_downloader_actually_writes() {
+    fn preserves_model_partials_across_restart() {
         let temp = tempfile::tempdir().unwrap();
         let digest = "a".repeat(64);
         let model_dir = temp.path().join(&digest);
@@ -179,11 +173,17 @@ mod tests {
         std::fs::write(temp.path().join("catalog-model.gguf.part"), b"partial").unwrap();
         std::fs::write(temp.path().join("notes.txt"), b"keep").unwrap();
 
-        assert_eq!(clean(temp.path(), false).unwrap(), 2);
-        assert!(!model_dir.join("model.gguf.part").exists());
-        assert!(!temp.path().join("catalog-model.gguf.part").exists());
-        assert_eq!(std::fs::read(model_dir.join("model.gguf")).unwrap(), b"keep");
-        assert_eq!(std::fs::read(temp.path().join("notes.txt")).unwrap(), b"keep");
+        assert_eq!(clean(temp.path(), false).unwrap(), 0);
+        assert!(model_dir.join("model.gguf.part").exists());
+        assert!(temp.path().join("catalog-model.gguf.part").exists());
+        assert_eq!(
+            std::fs::read(model_dir.join("model.gguf")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("notes.txt")).unwrap(),
+            b"keep"
+        );
     }
     #[test]
     fn removes_only_recognized_partial_layouts() {
@@ -191,7 +191,7 @@ mod tests {
         let partial = format!(".locallm-download-{}.part", "a".repeat(32));
         std::fs::write(temp.path().join(&partial), b"partial").unwrap();
         std::fs::write(temp.path().join("model.gguf"), b"keep").unwrap();
-        assert_eq!(clean(temp.path(), false).unwrap(), 1);
+        assert_eq!(clean(temp.path(), false).unwrap(), 0);
         assert_eq!(
             std::fs::read(temp.path().join("model.gguf")).unwrap(),
             b"keep"

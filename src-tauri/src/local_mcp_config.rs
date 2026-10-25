@@ -142,6 +142,23 @@ pub fn save(vault: &crate::vault::Vault, servers: &[LocalServer]) -> Result<(), 
     vault.save("local-mcp-configs", &bytes)
 }
 
+pub async fn load_blocking(vault: &crate::vault::Vault) -> Result<Vec<LocalServer>, String> {
+    let vault = vault.clone();
+    tokio::task::spawn_blocking(move || load(&vault))
+        .await
+        .map_err(|e| e.to_string())?
+}
+pub async fn save_blocking(
+    vault: &crate::vault::Vault,
+    servers: &[LocalServer],
+) -> Result<(), String> {
+    let vault = vault.clone();
+    let servers = servers.to_vec();
+    tokio::task::spawn_blocking(move || save(&vault, &servers))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

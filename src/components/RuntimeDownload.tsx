@@ -45,7 +45,7 @@ export function RuntimeDownload({ busy, onSelect }: { busy: boolean; onSelect: (
     <p>Use Browse runtime below to select your installed native llama-server, then save settings. Model search and GGUF downloads work on this platform.</p>
   </section>;
   return <section className="catalog-notice" aria-label="CUDA runtime download">
-    <h2>llama.cpp · CUDA 12.4</h2><p>Install the pinned b10855 Windows runtime and CUDA libraries. Each installation uses a new directory; existing runtimes are preserved.</p>
+    <h2>llama.cpp · CUDA 12.4</h2><p>Install the pinned b10855 Windows runtime and CUDA libraries. Verified installations are reused. To repair an incomplete runtime, remove it below and install again after unloading your model.</p>
     {info && <p>{gib(info.bytes)} download · {gib(info.requiredBytes)} required for download, extraction and reserve · {gib(info.availableBytes)} free</p>}
     {insufficient && !active && <p role="alert">Not enough disk space to install the runtime.</p>}
     {error && <p role="alert">{error}</p>}{status?.error && <p role={status.phase === 'cancelled' ? 'status' : 'alert'}>{status.phase === 'cancelled' ? 'Installation cancelled. You can try again when ready.' : status.error}</p>}
@@ -54,6 +54,6 @@ export function RuntimeDownload({ busy, onSelect }: { busy: boolean; onSelect: (
       {active && <button type="button" className="secondary" disabled={cancelling} onClick={async () => { setCancelling(true); try { await api.cancelRuntimeInstall(); } catch (e) { setError(errorMessage(e)); } finally { setCancelling(false); } }}>Cancel runtime installation</button>}
       {!active && status?.phase === 'ready' && status.path && <button type="button" className="primary" disabled={busy} onClick={() => onSelect(status.path!)}>Use installed runtime</button>}</div>
     {!active && status?.phase === 'ready' && <p role="status">Runtime installed. Select it, then save settings to use it.</p>}
-    {installed.length > 0 && <details><summary>Installed runtimes ({installed.length})</summary><p>Checks file presence and sizes; does not recheck file hashes.</p>{installed.map(item => <div key={item.id}><p className="download-path">{item.id}</p>{item.problem && <p>{item.problem}</p>}<button type="button" className="secondary" disabled={busy || active || !item.complete} onClick={() => onSelect(item.path)}>Select {item.id.slice(-8)}</button></div>)}</details>}
+    {installed.length > 0 && <details><summary>Installed runtimes ({installed.length})</summary><p>Checks file presence and sizes; does not recheck file hashes.</p>{installed.map(item => <div key={item.id}><p className="download-path">{item.id}</p>{item.problem && <p>{item.problem}</p>}<button type="button" className="secondary" disabled={busy || active || !item.complete} onClick={() => onSelect(item.path)}>Select {item.id.slice(-8)}</button><button type="button" className="secondary" disabled={busy || active} onClick={async () => { try { setError(''); await api.deleteInstalledRuntime(item.id); setRevision(v => v + 1); } catch (e) { setError(errorMessage(e)); } }}>Remove {item.id.slice(-8)}</button></div>)}</details>}
   </section>;
 }

@@ -11,7 +11,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {

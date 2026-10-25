@@ -24,7 +24,14 @@ pub struct Hardware {
 }
 
 impl Hardware {
+    pub fn single_gpu_name(&self) -> Option<&str> {
+        (self.gpus.len() == 1).then(|| self.gpus[0].name.as_str())
+    }
     pub fn free_vram_bytes(&self) -> Option<u64> {
+        // NVIDIA order does not identify llama.cpp's selected device.
+        if self.gpus.len() != 1 {
+            return None;
+        }
         let gpu = self.gpus.first()?;
         Some(gpu.memory_total_mib?.saturating_sub(gpu.memory_used_mib?) * 1024 * 1024)
     }
@@ -142,11 +149,78 @@ fn memory() -> (Option<u64>, Option<u64>) {
             return (Some(status.ullTotalPhys), Some(status.ullAvailPhys));
         }
     }
+    #[cfg(target_os = "linux")]
+    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+        return linux_memory(&text);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // vm_stat reports page counts; sysctl reports physical bytes. A command
+        // failure leaves telemetry unknown rather than pretending RAM is free.
+        let total = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let available = std::process::Command::new("/usr/bin/vm_stat")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|text| mac_available(&text));
+        return (total, available);
+    }
+    #[allow(unreachable_code)]
     (None, None)
+}
+#[cfg(any(target_os = "linux", test))]
+fn linux_memory(text: &str) -> (Option<u64>, Option<u64>) {
+    let read = |key: &str| {
+        text.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name != key {
+                return None;
+            }
+            let mut parts = value.split_whitespace();
+            let kib = parts.next()?.parse::<u64>().ok()?;
+            (parts.next()? == "kB")
+                .then(|| kib.checked_mul(1024))
+                .flatten()
+        })
+    };
+    (read("MemTotal"), read("MemAvailable"))
+}
+#[cfg(any(target_os = "macos", test))]
+fn mac_available(text: &str) -> Option<u64> {
+    let size = text
+        .lines()
+        .next()?
+        .split("page size of ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    let pages = |name: &str| {
+        text.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key == name)
+                .then(|| value.trim().trim_end_matches('.').parse::<u64>().ok())
+                .flatten()
+        })
+    };
+    // Exclude speculative/inactive pages to avoid overstating reclaimability.
+    pages("Pages free")?
+        .checked_add(pages("Pages inactive")?)?
+        .checked_mul(size)
 }
 #[tauri::command]
 pub async fn hardware_status() -> Hardware {
-    let (memory_total_bytes, memory_available_bytes) = memory();
+    let (memory_total_bytes, memory_available_bytes) = tokio::task::spawn_blocking(memory)
+        .await
+        .unwrap_or((None, None));
     let (gpus, gpu_status) = match query_gpu().await {
         Ok(gpus) => (gpus, "NVIDIA driver telemetry".into()),
         Err(error) => (Vec::new(), error),
@@ -180,10 +254,17 @@ mod tests {
             gpu_status: "ok".into(),
             sampled_at: 0,
         };
+        assert_eq!(hardware.free_vram_bytes(), None);
+    }
+    #[test]
+    fn parses_native_ram_samples_without_inventing_unknown_values() {
         assert_eq!(
-            hardware.free_vram_bytes(),
-            Some((4096 - 2047) * 1024 * 1024)
+            linux_memory("MemTotal: 8192 kB\nMemAvailable: 2048 kB"),
+            (Some(8192 * 1024), Some(2048 * 1024))
         );
+        assert_eq!(linux_memory("MemTotal: bad kB"), (None, None));
+        assert_eq!(mac_available("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 10.\nPages inactive: 20."), Some(30 * 16384));
+        assert_eq!(mac_available("bad"), None);
     }
     #[test]
     fn rejects_invalid_or_inconsistent_driver_output() {

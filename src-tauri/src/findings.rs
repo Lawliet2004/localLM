@@ -242,11 +242,7 @@ fn report(
 }
 
 /// List the findings of this conversation.
-fn list(
-    store: &crate::store::Store,
-    conversation_id: &str,
-    args: &Value,
-) -> Result<Value, String> {
+fn list(store: &crate::store::Store, conversation_id: &str, args: &Value) -> Result<Value, String> {
     let state = args
         .get("state")
         .and_then(Value::as_str)
@@ -484,11 +480,15 @@ mod tests {
         let (store, conversation) = conversation_store();
         let first = report(&store, &conversation, json!([one_finding()])).unwrap();
         let first_id = first["findings"][0]["id"].as_str().unwrap().to_string();
-        let second = report(&store, &conversation, json!([{
-            "file":"src/other.rs",
-            "summary":"Another issue",
-            "failure_scenario":"It panics on empty input."
-        }]))
+        let second = report(
+            &store,
+            &conversation,
+            json!([{
+                "file":"src/other.rs",
+                "summary":"Another issue",
+                "failure_scenario":"It panics on empty input."
+            }]),
+        )
         .unwrap();
         let second_id = second["findings"][0]["id"].as_str().unwrap().to_string();
 
@@ -567,7 +567,10 @@ mod tests {
             json!({"id":"fnd_00000000"}),
         )
         .unwrap_err();
-        assert!(error.contains("fnd_00000000") || !error.trim().is_empty(), "{error}");
+        assert!(
+            error.contains("fnd_00000000") || !error.trim().is_empty(),
+            "{error}"
+        );
     }
 
     #[test]
@@ -618,16 +621,22 @@ mod tests {
                 .clone()
                 .unwrap()
         };
-        let reported = execute(&ctx, "report_findings", json!({ "findings": [one_finding()] }))
-            .await
-            .unwrap();
+        let reported = execute(
+            &ctx,
+            "report_findings",
+            json!({ "findings": [one_finding()] }),
+        )
+        .await
+        .unwrap();
         crate::tool_validation::validate_value(&contract("report_findings"), &reported).unwrap();
         assert_eq!(reported["reported"], 1);
         let id = reported["findings"][0]["id"].as_str().unwrap().to_string();
         let listed = execute(&ctx, "list_findings", json!({})).await.unwrap();
         crate::tool_validation::validate_value(&contract("list_findings"), &listed).unwrap();
         assert_eq!(listed["findings"].as_array().unwrap().len(), 1);
-        let resolved = execute(&ctx, "resolve_finding", json!({ "id": id })).await.unwrap();
+        let resolved = execute(&ctx, "resolve_finding", json!({ "id": id }))
+            .await
+            .unwrap();
         crate::tool_validation::validate_value(&contract("resolve_finding"), &resolved).unwrap();
         assert_eq!(resolved["state"], "resolved");
         // An empty batch is not a verdict: it is refused.

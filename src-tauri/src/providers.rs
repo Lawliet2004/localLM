@@ -154,11 +154,18 @@ pub fn credential_id(provider_id: &str) -> String {
 }
 
 /// The caller holds AppState::operation while changing a connection or secret.
-pub fn save_connection(
+pub fn prepare_connection(
     store: &crate::store::Store,
     vault: &crate::vault::Vault,
     mut draft: ProviderDraft,
-) -> Result<ProviderConnection, String> {
+) -> Result<
+    (
+        ProviderConnection,
+        Option<ProviderConnection>,
+        Option<String>,
+    ),
+    String,
+> {
     if let Some(id) = draft.id.as_deref() {
         validate_provider_id(id)?;
     }
@@ -215,10 +222,22 @@ pub fn save_connection(
         models: draft.models,
         has_api_key,
     };
+    Ok((provider, existing, draft.api_key))
+}
+
+#[cfg(test)]
+pub fn save_connection(
+    store: &crate::store::Store,
+    vault: &crate::vault::Vault,
+    draft: ProviderDraft,
+) -> Result<ProviderConnection, String> {
+    let (provider, existing, key) = prepare_connection(store, vault, draft)?;
+    let id = provider.id.clone();
+    let credential = credential_id(&id);
     // Persist metadata first so a database failure cannot replace a working key.
     // If the protected vault refuses the new key, restore the prior metadata.
     store.save_provider(&provider)?;
-    if let Some(key) = draft.api_key {
+    if let Some(key) = key {
         if let Err(error) = vault.save(&credential, key.as_bytes()) {
             let restored = if let Some(previous) = existing {
                 store.save_provider(&previous)
@@ -234,6 +253,7 @@ pub fn save_connection(
     Ok(provider)
 }
 
+#[cfg(test)]
 pub fn delete_api_key(
     store: &crate::store::Store,
     vault: &crate::vault::Vault,
@@ -249,6 +269,7 @@ pub fn delete_api_key(
     vault.clear(&credential_id(id))
 }
 
+#[cfg(test)]
 pub fn delete_connection(
     store: &crate::store::Store,
     vault: &crate::vault::Vault,

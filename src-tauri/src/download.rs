@@ -452,22 +452,9 @@ fn install_verified(partial: &Path, destination: &Path) -> Result<(), String> {
             let _ = std::fs::remove_file(partial);
             Err("Could not install verified file; an existing destination is preserved.".into())
         }
-        Err(_error) => {
-            // Some volumes (FAT/exFAT, some network shares) cannot create hard
-            // links. Fall back to a rename there, but only when the
-            // destination is still absent.
-            if destination.exists() {
-                let _ = std::fs::remove_file(partial);
-                return Err(
-                    "Could not install verified file; an existing destination is preserved.".into(),
-                );
-            }
-            std::fs::rename(partial, destination).map_err(|error| {
-                format!(
-                    "Could not install verified file; an existing destination is preserved: {error}"
-                )
-            })
-        }
+        Err(error) => Err(format!(
+            "This storage volume cannot publish downloads without replacing existing files ({error}). The verified partial is retained. Choose a local volume supporting hard links and retry."
+        )),
     }
 }
 
@@ -477,6 +464,18 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     #[test]
+    fn unsupported_atomic_publication_retains_source_and_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("partial-directory");
+        std::fs::create_dir(&source).unwrap();
+        let destination = temp.path().join("model.gguf");
+        assert!(install_verified(&source, &destination)
+            .unwrap_err()
+            .contains("supporting hard links"));
+        assert!(source.exists());
+        assert!(!destination.exists());
+    }
+    #[test]
     fn installing_a_verified_file_never_replaces_an_existing_destination() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("model.gguf");
@@ -484,7 +483,10 @@ mod tests {
         std::fs::write(&partial, b"verified").unwrap();
         std::fs::write(&destination, b"existing").unwrap();
         let error = install_verified(&partial, &destination).unwrap_err();
-        assert!(error.contains("existing destination is preserved"), "{error}");
+        assert!(
+            error.contains("existing destination is preserved"),
+            "{error}"
+        );
         // The installed file is untouched: the verified bytes never replaced
         // it, and the partial download is discarded.
         assert_eq!(std::fs::read(&destination).unwrap(), b"existing");

@@ -111,10 +111,14 @@ export interface McpInputField {
 export interface McpInputForm { message: string; fields: McpInputField[] }
 export interface ToolApproval { purpose?: string | null; id: string; kind?: 'tool' | 'ask_user' | 'mcp_input' | 'plan_approval'; connector: string; localServerName?: string | null; name: string; arguments: Record<string, unknown>; form?: McpInputForm | null; closed?: boolean }
 export interface AskUserApproval extends ToolApproval { kind: 'ask_user'; }
+export interface ContextBreakdown {
+  messages: number; systemTools: number; mcpTools: number; systemPrompt: number; skills: number; metaContext: number;
+}
 export interface ContextUsage {
   inputTokens: number; responseReserve: number; contextLength: number; estimated?: boolean;
   cachedTokens?: number | null; cacheWriteTokens?: number | null; outputTokens?: number | null;
   cacheHitRate?: number | null; promptMs?: number | null; generationMs?: number | null;
+  breakdown?: ContextBreakdown; avgCacheHitRate?: number | null;
 }
 export interface PreflightBreakdown { presentation?: {profile:string;minimumInputTokens:number;separateRequest:boolean;estimated:boolean;contextLength:number;responseReserve:number}; offeredToolCount?: number; total: number; instructions: number; tools: number; history: number; scratchpad?: number; draft: number; responseReserve: number; contextLength: number; exact: boolean; fits: boolean; notice?: string; overflow?: string }
 export interface Preset {

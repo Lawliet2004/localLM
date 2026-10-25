@@ -264,8 +264,9 @@ pub fn format_file_detailed(
     let Some(formatter) = detect(&target, &root) else {
         return Ok(None);
     };
-    let metadata = std::fs::metadata(&target)
-        .map_err(|error| FormatFailure::InvalidTarget(format!("{relative} cannot be inspected: {error}")))?;
+    let metadata = std::fs::metadata(&target).map_err(|error| {
+        FormatFailure::InvalidTarget(format!("{relative} cannot be inspected: {error}"))
+    })?;
     if metadata.len() > MAX_FORMAT_BYTES {
         return Ok(Some(DetailedOutcome {
             outcome: FormatOutcome {
@@ -395,10 +396,9 @@ fn file_sha256(root: &Path, relative: &str) -> Result<String, FormatFailure> {
         })?;
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true);
-    let file = crate::workspace::open_file_no_links(&directory, relative, &mut options)
-        .map_err(|error| {
-            FormatFailure::InvalidTarget(format!("{relative} cannot be read: {error}"))
-        })?;
+    let file = crate::workspace::open_file_no_links(&directory, relative, &mut options).map_err(
+        |error| FormatFailure::InvalidTarget(format!("{relative} cannot be read: {error}")),
+    )?;
     let mut bytes = Vec::new();
     file.take(MAX_FORMAT_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -426,7 +426,12 @@ enum RunOutcome {
 }
 
 /// Run one formatter over one file, with a hard timeout.
-fn run_formatter(formatter: &Formatter, root: &Path, target: &Path, timeout: Duration) -> RunOutcome {
+fn run_formatter(
+    formatter: &Formatter,
+    root: &Path,
+    target: &Path,
+    timeout: Duration,
+) -> RunOutcome {
     let mut command = Command::new(formatter.command);
     command
         .args(formatter.args)
@@ -593,9 +598,14 @@ fn package_json_has_prettier(path: &Path) -> bool {
     let Ok(package) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
-    ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]
-        .iter()
-        .any(|section| package[section].get("prettier").is_some())
+    [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ]
+    .iter()
+    .any(|section| package[section].get("prettier").is_some())
 }
 
 /// Model-facing tool definitions.
@@ -670,9 +680,7 @@ pub async fn execute(
     // workspace fails the whole call rather than half-formatting a batch.
     let mut targets = Vec::with_capacity(paths.len());
     for path in paths {
-        let path = path
-            .as_str()
-            .ok_or("Every path must be a string.")?;
+        let path = path.as_str().ok_or("Every path must be a string.")?;
         if path.is_empty() || path.len() > 4096 {
             return Err("Every path must be 1–4096 bytes.".into());
         }
@@ -697,7 +705,12 @@ pub async fn execute(
         .await
         .map_err(|_| "The formatter run did not finish.".to_string())?;
         match outcome {
-            Ok(None) => skipped.push(outcome_json(&path, None, false, "No formatter applies to this file.")),
+            Ok(None) => skipped.push(outcome_json(
+                &path,
+                None,
+                false,
+                "No formatter applies to this file.",
+            )),
             Ok(Some(detailed)) if detailed.applied => {
                 formatted.push(outcome_json(
                     &path,
@@ -771,21 +784,36 @@ mod tests {
             "shfmt",
             "ruff-check-fix",
         ] {
-            assert!(table.iter().any(|formatter| formatter.name == name), "{name}");
+            assert!(
+                table.iter().any(|formatter| formatter.name == name),
+                "{name}"
+            );
         }
     }
 
     #[test]
     fn extensions_pick_the_expected_formatter() {
-        assert_eq!(candidate(Path::new("main.rs")).map(|f| f.name), Some("rustfmt"));
-        assert_eq!(candidate(Path::new("app.ts")).map(|f| f.name), Some("prettier"));
-        assert_eq!(candidate(Path::new("app.tsx")).map(|f| f.name), Some("prettier"));
+        assert_eq!(
+            candidate(Path::new("main.rs")).map(|f| f.name),
+            Some("rustfmt")
+        );
+        assert_eq!(
+            candidate(Path::new("app.ts")).map(|f| f.name),
+            Some("prettier")
+        );
+        assert_eq!(
+            candidate(Path::new("app.tsx")).map(|f| f.name),
+            Some("prettier")
+        );
         // ruff wins over black for python files.
         assert_eq!(candidate(Path::new("a.py")).map(|f| f.name), Some("ruff"));
         assert_eq!(candidate(Path::new("a.pyi")).map(|f| f.name), Some("ruff"));
         assert_eq!(candidate(Path::new("a.go")).map(|f| f.name), Some("gofmt"));
         assert_eq!(candidate(Path::new("a.sh")).map(|f| f.name), Some("shfmt"));
-        assert_eq!(candidate(Path::new("a.c")).map(|f| f.name), Some("clang-format"));
+        assert_eq!(
+            candidate(Path::new("a.c")).map(|f| f.name),
+            Some("clang-format")
+        );
         // Nothing claims a plain text file, and the match is case-sensitive.
         assert!(candidate(Path::new("notes.txt")).is_none());
         assert!(candidate(Path::new("main.RS")).is_none());
@@ -873,11 +901,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.rs"), "fn main() {}\n").unwrap();
-        for path in [
-            "../escape.rs",
-            "/etc/passwd",
-            "sub/../../escape.rs",
-        ] {
+        for path in ["../escape.rs", "/etc/passwd", "sub/../../escape.rs"] {
             assert!(
                 format_file_detailed(root.path(), path, 10).is_err(),
                 "{path} was not refused"
@@ -896,16 +920,17 @@ mod tests {
         symlink(&target, root.path().join("link.rs")).unwrap();
         let error = format_file_detailed(root.path(), "link.rs", 10).unwrap_err();
         let message = error.message();
-        assert!(message.contains("link") || message.contains("symbolic"), "{message}");
-        // The file outside the workspace is untouched.
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "fn main() {}\n"
+        assert!(
+            message.contains("link") || message.contains("symbolic"),
+            "{message}"
         );
+        // The file outside the workspace is untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn main() {}\n");
     }
 
     #[test]
-    fn the_tool_validates_its_arguments_and_its_result_contract() {        let spec = registry()
+    fn the_tool_validates_its_arguments_and_its_result_contract() {
+        let spec = registry()
             .into_iter()
             .find(|spec| spec.name == "format_paths")
             .unwrap();
@@ -913,7 +938,9 @@ mod tests {
         assert!(crate::tool_validation::validate(&spec.input, &json!({"paths":[]})).is_err());
         assert!(crate::tool_validation::validate(&spec.input, &json!({})).is_err());
         assert!(crate::tool_validation::validate(&spec.input, &json!({"paths":"a.rs"})).is_err());
-        assert!(crate::tool_validation::validate(&spec.input, &json!({"paths":[""],"x":1})).is_err());
+        assert!(
+            crate::tool_validation::validate(&spec.input, &json!({"paths":[""],"x":1})).is_err()
+        );
         let result = json!({
             "formatted":[{"path":"a.rs","formatter":"rustfmt","changed":true,"detail":"rewrote"}],
             "skipped":[{"path":"b.txt","formatter":null,"changed":false,"detail":"no formatter"}],
@@ -971,7 +998,9 @@ mod tests {
             .unwrap();
         assert!(spec.validate_output(&result).is_ok());
         // A path outside the workspace fails the whole call.
-        assert!(execute(&ctx, json!({"paths":["../escape.rs"]})).await.is_err());
+        assert!(execute(&ctx, json!({"paths":["../escape.rs"]}))
+            .await
+            .is_err());
         assert!(execute(&ctx, json!({"paths":[]})).await.is_err());
     }
 }

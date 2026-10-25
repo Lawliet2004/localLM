@@ -166,19 +166,28 @@
 .context-popover::before { content: ''; position: absolute; top: 0; left: 14px; right: 14px; height: 1px; background: linear-gradient(90deg, transparent, var(--accent-soft), rgba(34, 211, 238, 0.5), transparent); }
 .context-popover::after { content: ''; position: absolute; left: 0; right: 0; bottom: -13px; height: 13px; }
 .context-control:hover .context-popover, .context-control:focus-within .context-popover, .context-control.is-open .context-popover { opacity: 1; visibility: visible; transform: none; transition-delay: 0.06s; }
-.context-popover-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
-.context-popover-head strong { display: block; font-size: 12.5px; color: var(--text); }
-.context-popover-head small { display: block; margin-top: 3px; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.context-popover p { margin: 8px 0; line-height: 1.55; color: var(--secondary); }
-.context-popover .context-detail { font-variant-numeric: tabular-nums; }
-.context-popover .context-note { color: var(--muted); font-size: 11px; }
-.context-popover .context-auto { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin: 10px 0 6px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--text); cursor: pointer; transition: border-color 0.15s ease, transform 0.15s ease; }
-.context-popover .context-auto:hover { border-color: var(--border-strong); }
-.context-popover input, .management-page input[type=checkbox] { width: auto; accent-color: var(--accent); }
-.context-popover [role=alert] { color: var(--error); }
-.context-compact { width: 100%; padding: 7px 10px; margin: 6px 0 2px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 11.5px; cursor: pointer; transition: border-color 0.15s ease, transform 0.15s ease; }
-.context-compact:hover:not(:disabled) { border-color: var(--border-strong); }
-.context-compact:disabled { opacity: 0.5; cursor: default; }
+.context-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.context-head strong { font-size: 12.5px; color: var(--text); }
+.context-head small { font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.context-bar { height: 5px; border-radius: 999px; background: var(--border); overflow: hidden; margin-bottom: 10px; }
+.context-bar span { display: block; height: 100%; border-radius: 999px; background: var(--accent); transition: width 0.45s cubic-bezier(0.22, 1, 0.36, 1); }
+.context-mid .context-bar span { background: var(--warn); }
+.context-high .context-bar span { background: var(--error); }
+.context-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.context-row { display: flex; align-items: center; gap: 8px; min-height: 22px; }
+.context-label { color: var(--secondary); }
+.context-share { margin-left: auto; color: var(--text); font-variant-numeric: tabular-nums; }
+.context-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.dot-messages { background: var(--context-messages); }
+.dot-system-tools { background: var(--context-system-tools); }
+.dot-mcp-tools { background: var(--context-mcp-tools); }
+.dot-system-prompt { background: var(--context-system-prompt); }
+.dot-skills { background: var(--context-skills); }
+.dot-meta-context { background: var(--context-meta); }
+.context-footer { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+.context-empty { margin: 4px 0 0; color: var(--muted); }
+.context-popover .context-empty { line-height: 1.55; }
+.management-page input[type=checkbox] { width: auto; accent-color: var(--accent); }
 .context-overflow { color: var(--error); }
 .management-page { padding: 40px 36px 64px; overflow: auto; max-width: 1080px; width: 100%; margin: 0 auto; }
 .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 22px; }
@@ -1536,8 +1545,6 @@
 .composer-model-footer button:active:not(:disabled),
 .permission-trigger:active:not(:disabled),
 .context-trigger:active:not(:disabled),
-.context-compact:active:not(:disabled),
-.context-auto:active:not(:disabled),
 .add-project-btn:active:not(:disabled),
 .codex-folder-action-btn:active:not(:disabled),
 .codex-empty-add-btn:active:not(:disabled),
@@ -2017,3 +2024,25 @@ details.activity-summary > p { margin: 0; padding: 8px 14px; font-size: 12px; co
   .workspace-tab-actions .icon-button { width: 28px; }
   .workspace-tab-content { padding: 10px; }
 }
+
+/* Friendly structured tool results: scalars as parameter rows, entry lists as
+   tables. The raw JSON stays available one disclosure below. */
+.structured-result { margin: 0; }
+.structured-result-section { margin: 6px 0 10px; }
+.structured-result-heading { margin: 0 0 4px; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.structured-result-count { color: var(--muted); font-weight: 400; }
+.structured-result-table { overflow-x: auto; max-width: 100%; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.structured-result-table table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+.structured-result-table th, .structured-result-table td { border: 0; border-bottom: 1px solid var(--border); padding: 5px 10px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.structured-result-table thead th { background: var(--surface); font-weight: 600; position: sticky; top: 0; }
+.structured-result-table tbody tr:last-child td { border-bottom: 0; }
+.structured-result-more { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+.structured-result-scalar { font-family: var(--font-mono, Consolas, monospace); font-size: 12px; overflow-wrap: anywhere; }
+.structured-result-text { margin: 2px 0; max-height: 220px; overflow: auto; font-family: var(--font-mono, Consolas, monospace); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.raw-result-details { margin-top: 8px; }
+.raw-result-details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+
+/* Intermediate model-round commentary: working notes toward the answer, not
+   the answer itself. The final round keeps full answer styling. */
+.activity-commentary { color: var(--secondary); font-size: 13px; margin: 2px 0 10px; border-left: 2px solid var(--border); padding-left: 10px; }
+.activity-commentary .markdown p { margin: 4px 0; }

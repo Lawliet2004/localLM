@@ -156,7 +156,7 @@ function ActivityGroup({ tools, renderTool }: { tools: Message[]; renderTool: (m
       ? `Read ${fileCount} ${fileCount === 1 ? 'file' : 'files'}`
       : `${activityLabel(group)} · ${group.length} actions`;
     rows.push(<details className="activity-summary" key={group[0].id}>
-      <summary className="card-header"><TraceIcon kind={groupKindOf(kinds)} size={14} /><span className="activity-summary-label">{label}</span><ChevronRight size={14} className="trace-chevron" aria-hidden="true" /><span className="sr-only">{group.length} tools used</span></summary>
+      <summary className="card-header"><TraceIcon kind={groupKindOf(kinds)} /><span className="activity-summary-label">{label}</span><ChevronRight size={14} className="trace-chevron" aria-hidden="true" /><span className="sr-only">{group.length} tools used</span></summary>
       <div className="activity-summary-rows">{group.map(tool => <Fragment key={tool.id}>{renderTool(tool)}</Fragment>)}</div>
     </details>);
   };
@@ -216,13 +216,16 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
   for (const segment of segments) {
     const before = tools.filter((_, index) => toolEvents[index] && toolEvents[index].seq > lastSeq && toolEvents[index].seq < segment.seq);
     if (before.length) groups.push(<ActivityGroup key={`tools-${segment.seq}`} tools={before} renderTool={renderTool} live={false} />);
-    groups.push(<Fragment key={`commentary-${segment.seq}`}>{renderMessage({ ...assistant!, id: `${assistant!.id}-round-${segment.seq}`, content: segment.content, reasoning: '', status: 'complete', presentation: undefined, metrics: null, error: null })}</Fragment>);
+    // Intermediate rounds are working notes on the way to the answer; the
+    // final round below keeps the full answer styling. Muting the notes keeps
+    // a multi-round turn from reading as several equally-weighted answers.
+    groups.push(<Fragment key={`commentary-${segment.seq}`}><div className="activity-commentary">{renderMessage({ ...assistant!, id: `${assistant!.id}-round-${segment.seq}`, content: segment.content, reasoning: '', status: 'complete', presentation: undefined, metrics: null, error: null })}</div></Fragment>);
     remaining = remaining.trimStart().slice(segment.content.length);
     lastSeq = segment.seq;
   }
   const trailing = segments.length ? tools.filter((_, index) => !toolEvents[index] || toolEvents[index].seq > lastSeq) : tools;
   return <div className="activity-feed">
-    {reasoning && <details className="trace-thought-details" data-testid="turn-reasoning" open={thoughtOpen} onToggle={e => setThoughtOpen((e.currentTarget as HTMLDetailsElement).open)}><summary className="card-header trace-thought-pill"><TraceIcon kind="thought" size={14} /><span className={`trace-thought-label${thinking ? ' is-live' : ''}`}>{thinking ? 'Thinking…' : reasoningMs === undefined ? 'Reasoning' : `Reasoning · ${(reasoningMs / 1000).toFixed(1)}s`}</span><ChevronRight size={14} className="trace-chevron thought-chevron" aria-hidden="true" /></summary><div className="trace-thought-content" ref={thoughtContent}><MarkdownView content={reasoning} assistant streaming={thinking} /></div></details>}
+    {reasoning && <details className="trace-thought-details" data-testid="turn-reasoning" open={thoughtOpen} onToggle={e => setThoughtOpen((e.currentTarget as HTMLDetailsElement).open)}><summary className="card-header trace-thought-pill"><TraceIcon kind="thought" /><span className={`trace-thought-label${thinking ? ' is-live' : ''}`}>{thinking ? 'Thinking…' : reasoningMs === undefined ? 'Reasoning' : `Reasoning · ${(reasoningMs / 1000).toFixed(1)}s`}</span><ChevronRight size={14} className="trace-chevron thought-chevron" aria-hidden="true" /></summary><div className="trace-thought-content" ref={thoughtContent}><MarkdownView content={reasoning} assistant streaming={thinking} /></div></details>}
     {groups}
     <ActivityGroup tools={trailing} renderTool={renderTool} live={generating} />
     {assistants.map(message => <Fragment key={message.id}>{renderMessage(message === assistant && segments.length ? { ...message, content: remaining.trimStart() } : message)}</Fragment>)}

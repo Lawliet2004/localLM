@@ -92,3 +92,13 @@ describe('automation settings', () => {
     expect(f.get).not.toHaveBeenCalled();
   });
 });
+
+it('shows package, interpreter and selected-browser prerequisite failures separately', async () => {
+  f.check.mockResolvedValue({ browser: { available: false, message: 'Chrome 130' }, package: { available: true, message: 'Pinned package found' }, node: { available: false, message: 'Node 18 or newer required' }, selectedBrowser: { available: true, message: 'Chrome 130' }, computer: {} });
+  render(<AutomationSettings mode="browser" />); await act(async () => {});
+  fireEvent.click(screen.getByRole('button', { name: 'Check browser setup' }));
+  expect(await screen.findByText('Browser setup needs attention.')).toBeVisible();
+  expect(screen.getByText('Pinned package found')).toBeVisible();
+  expect(screen.getByText('Node 18 or newer required')).toBeVisible();
+  expect(screen.getByText('Chrome 130')).toBeVisible();
+});

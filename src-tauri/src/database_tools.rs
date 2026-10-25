@@ -236,7 +236,10 @@ pub fn execute(root: &str, alias: &str, args: Value) -> Result<Value, String> {
 pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     let path = json!({"type":"string","minLength":1,"maxLength":4096});
     let sql = json!({"type":"string","minLength":1,"maxLength":65536});
-    let mut tools: Vec<crate::tool_spec::ToolSpec> = vec![crate::database_rehearsal::definition()].into_iter().map(crate::tool_spec::ToolSpec::from).collect();
+    let mut tools: Vec<crate::tool_spec::ToolSpec> = vec![crate::database_rehearsal::definition()]
+        .into_iter()
+        .map(crate::tool_spec::ToolSpec::from)
+        .collect();
     for (alias,description) in [("database_schema","Inspect SQLite schema on a private snapshot; never modifies the original database."),("database_query","Run one read-only parameterized SQLite query on a private snapshot. External file access, extensions, writes and mutable PRAGMAs are denied."),("database_explain","Read EXPLAIN QUERY PLAN for a parameterized SQLite query on a private snapshot."),("database_rehearse","Rehearse SQLite migration SQL on a disposable private snapshot, then inspect schema, integrity and foreign keys. Never applies changes to the original. External attachments and extension/file access are denied.")] {
         let mut properties=json!({"profile_id":{"type":"string","minLength":1,"maxLength":128},"path":path,"limit":{"type":"integer","minimum":1,"maximum":200}});let mut required=vec![];
         if alias!="database_schema" {properties["sql"]=sql.clone();required.push("sql");}

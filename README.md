@@ -17,7 +17,7 @@ npm run tauri dev
 
 ## Load the model
 
-In **Models & runtime → Model files**, use **Download model** and **Install CUDA runtime** for managed setup. The app reports required disk space, verifies pinned SHA-256 hashes and supports cancellation. After each operation completes, select **Use verified model** or **Use installed runtime**, save settings, then load the model. Existing managed model files are verified rather than overwritten; runtime installations use new directories. Full model network-transfer and crash-recovery acceptance remain outstanding.
+In **Models & runtime → Model files**, use **Download model** and **Install CUDA runtime** for managed setup. The app reports required disk space, verifies pinned SHA-256 hashes and supports cancellation. After each operation completes, select **Use verified model** or **Use installed runtime**, save settings, then load the model. Existing managed model files are verified rather than overwritten; complete hash-matching runtime bundles are reused. Managed runtime downloads support Windows x64; other platforms/backends require a matching native executable. See [first-run setup and recovery](docs/FIRST_RUN_AND_RECOVERY.md) for storage migration, runtime alternatives and interrupted downloads. Full model network-transfer and crash-recovery acceptance remain outstanding.
 
 For development, the preparation script is also available:
 

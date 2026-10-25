@@ -23,7 +23,7 @@ pub struct Bootstrap {
 
 #[tauri::command]
 pub async fn bootstrap(state: State<'_, AppState>) -> Result<Bootstrap, String> {
-    let runtime = state.runtime.lock().await.inspect();
+    let runtime = current_runtime_status(&state).await?;
     let store = state.database()?;
     let providers = provider_views(&store, &state.daytona_vault)?;
     let saved_preferences = store.preferences()?;
@@ -79,7 +79,32 @@ pub async fn save_provider(
         .operation
         .try_lock()
         .map_err(|_| "Wait for the active operation before changing providers.")?;
-    providers::save_connection(&*state.database()?, &state.daytona_vault, draft)
+    save_provider_connection(&state, draft).await
+}
+
+async fn save_provider_connection(
+    state: &AppState,
+    draft: ProviderDraft,
+) -> Result<ProviderConnection, String> {
+    let (provider, previous, key) =
+        providers::prepare_connection(&*state.database()?, &state.daytona_vault, draft)?;
+    state.database()?.save_provider(&provider)?;
+    if let Some(key) = key {
+        if let Err(error) = state
+            .daytona_vault
+            .save_blocking(&providers::credential_id(&provider.id), key.into_bytes())
+            .await
+        {
+            let store = state.database()?;
+            if let Some(previous) = previous {
+                store.save_provider(&previous)?;
+            } else {
+                store.delete_provider(&provider.id)?;
+            }
+            return Err(error);
+        }
+    }
+    Ok(provider)
 }
 
 #[tauri::command]
@@ -94,7 +119,13 @@ pub async fn delete_provider(state: State<'_, AppState>, id: String) -> Result<(
         .operation
         .try_lock()
         .map_err(|_| "Stop the active operation before deleting a provider.")?;
-    providers::delete_connection(&*state.database()?, &state.daytona_vault, &id)
+    let provider = editable_provider(&state, &id)?;
+    state
+        .daytona_vault
+        .clear_blocking(&providers::credential_id(&provider.id))
+        .await?;
+    state.database()?.delete_provider(&id)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -103,7 +134,26 @@ pub async fn delete_provider_api_key(state: State<'_, AppState>, id: String) -> 
         .operation
         .try_lock()
         .map_err(|_| "Stop the active operation before deleting an API key.")?;
-    providers::delete_api_key(&*state.database()?, &state.daytona_vault, &id)
+    let provider = editable_provider(&state, &id)?;
+    state
+        .daytona_vault
+        .clear_blocking(&providers::credential_id(&provider.id))
+        .await?;
+    state
+        .database()?
+        .update_provider_test(&id, false, None, &provider.models)
+}
+
+fn editable_provider(state: &AppState, id: &str) -> Result<ProviderConnection, String> {
+    providers::validate_provider_id(id)?;
+    let provider = state
+        .database()?
+        .provider(id)?
+        .ok_or("Provider no longer exists.")?;
+    if providers::is_subscription_format(&provider.api_format) {
+        return Err("Account subscriptions are managed separately from API providers.".into());
+    }
+    Ok(provider)
 }
 
 async fn resolve_provider_key(
@@ -123,7 +173,8 @@ async fn resolve_provider_key(
             provider,
             state
                 .daytona_vault
-                .load(&providers::credential_id(&provider.id))?,
+                .load_blocking(&providers::credential_id(&provider.id))
+                .await?,
         )
     }
 }
@@ -396,7 +447,43 @@ pub(crate) async fn load_selected_model(state: &AppState) -> Result<RuntimeStatu
         store.save_runtime_config(&config)?;
     }
     crate::model_library::save_active_profile(state, &config)?;
-    state.runtime.lock().await.load(&preferences, &config).await
+    // Move the process owner out while awaiting startup. Status/cancellation
+    // remain independently available; the exclusive operation lease prevents use.
+    state.load_cancel.send_replace(false);
+    let mut cancel = state.load_cancel.subscribe();
+    let mut runtime = {
+        let mut slot = state.runtime.lock().await;
+        *state
+            .load_status
+            .lock()
+            .map_err(|_| "Load status unavailable")? = Some(RuntimeStatus {
+            phase: "loading".into(),
+            message: "Checking runtime and model compatibility".into(),
+            ..slot.inspect()
+        });
+        std::mem::replace(
+            &mut *slot,
+            crate::runtime::Runtime::new(state.data_dir.join("runtime.log")),
+        )
+    };
+    let result = tokio::select! {
+        result = runtime.load_observed(&preferences, &config, Some(state.load_status.clone())) => result,
+        _ = cancel.changed() => {
+            match runtime.stop().await {
+                Ok(_) => Err("Model loading cancelled.".into()),
+                Err(error) => Err(format!("Cancellation cleanup failed: {error}")),
+            }
+        }
+    };
+    {
+        let mut slot = state.runtime.lock().await;
+        *slot = runtime;
+        *state
+            .load_status
+            .lock()
+            .map_err(|_| "Load status unavailable")? = None;
+    }
+    result
 }
 
 fn find_standard_runtime(data_dir: &Path, project_root: &Path) -> Option<std::path::PathBuf> {
@@ -432,7 +519,10 @@ fn configure_local_model_runtime(
     let Some(project_root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() else {
         return Ok(());
     };
-    let Some(runtime) = find_standard_runtime(&state.data_dir, project_root) else {
+    let Some(runtime) = find_standard_runtime(
+        &crate::managed_storage::root(&state.data_dir)?,
+        project_root,
+    ) else {
         return Err("Select a native llama-server executable for your operating system using Browse runtime in Model files, save settings, then load the model.".into());
     };
     let canonical = std::fs::canonicalize(&runtime)
@@ -470,7 +560,25 @@ pub async fn unload_model(state: State<'_, AppState>) -> Result<RuntimeStatus, S
 }
 #[tauri::command]
 pub async fn runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
-    Ok(state.runtime.lock().await.inspect())
+    current_runtime_status(&state).await
+}
+
+pub(crate) async fn current_runtime_status(state: &AppState) -> Result<RuntimeStatus, String> {
+    // Read the owner and snapshot under the same short lease as load handoff.
+    let mut runtime = state.runtime.lock().await;
+    if let Some(status) = state
+        .load_status
+        .lock()
+        .map_err(|_| "Load status unavailable")?
+        .clone()
+    {
+        return Ok(status);
+    }
+    Ok(runtime.inspect())
+}
+#[tauri::command]
+pub fn cancel_model_load(state: State<'_, AppState>) {
+    state.load_cancel.send_replace(true);
 }
 
 #[tauri::command]
@@ -570,7 +678,7 @@ pub async fn import_subscription_cli(
         .operation
         .try_lock()
         .map_err(|_| "Wait for the active operation before syncing credentials.")?;
-    crate::subscription_auth::import_cli_session(&state.daytona_vault, &provider)?;
+    crate::subscription_auth::import_cli_session(&state.daytona_vault, &provider).await?;
     if let Ok(store) = state.database() {
         let provider_id = if provider == "chatgpt" {
             "chatgpt-subscription"
@@ -586,15 +694,15 @@ pub async fn import_subscription_cli(
             );
         }
     }
-    crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
+    crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider).await
 }
 
 #[tauri::command]
-pub fn get_subscription_status(
+pub async fn get_subscription_status(
     state: State<'_, AppState>,
     provider: String,
 ) -> Result<crate::subscription_auth::SubscriptionStatus, String> {
-    crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
+    crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider).await
 }
 
 #[tauri::command]
@@ -615,7 +723,8 @@ pub async fn save_manual_subscription_token(
         &token,
         refresh_token.as_deref(),
         account_id.as_deref(),
-    )?;
+    )
+    .await?;
     if let Ok(store) = state.database() {
         let provider_id = if provider == "chatgpt" {
             "chatgpt-subscription"
@@ -631,7 +740,7 @@ pub async fn save_manual_subscription_token(
             );
         }
     }
-    crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
+    crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider).await
 }
 
 #[tauri::command]
@@ -643,7 +752,7 @@ pub async fn disconnect_subscription(
         .operation
         .try_lock()
         .map_err(|_| "Wait for the active operation before disconnecting.")?;
-    crate::subscription_auth::clear_session(&state.daytona_vault, &provider)?;
+    crate::subscription_auth::clear_session(&state.daytona_vault, &provider).await?;
     if let Ok(store) = state.database() {
         let provider_id = if provider == "chatgpt" {
             "chatgpt-subscription"
@@ -690,10 +799,131 @@ pub async fn start_subscription_sign_in(
             );
         }
     }
-    crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider)
+    crate::subscription_auth::get_subscription_status(&state.daytona_vault, &provider).await
 }
 
 #[tauri::command]
 pub fn cancel_subscription_sign_in(state: State<'_, AppState>) {
     state.oauth_cancel.send_replace(true);
+}
+
+#[cfg(test)]
+mod first_run_regressions {
+    use super::*;
+    #[tokio::test]
+    async fn provider_vault_failure_restores_database_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(temp.path());
+        let draft = ProviderDraft {
+            id: None,
+            name: "Fixture".into(),
+            api_format: providers::OPENAI_CHAT_COMPLETIONS.into(),
+            base_url: "https://api.example.com/v1".into(),
+            api_key: Some("working-secret".into()),
+            models: vec![],
+        };
+        let saved = save_provider_connection(&state, draft.clone())
+            .await
+            .unwrap();
+        let before = state.database().unwrap().providers().unwrap().len();
+        state.daytona_vault.fail_writes_for_test();
+        let edited = ProviderDraft {
+            id: Some(saved.id.clone()),
+            name: "Replacement".into(),
+            api_key: Some("replacement-secret".into()),
+            ..draft.clone()
+        };
+        assert!(save_provider_connection(&state, edited).await.is_err());
+        assert_eq!(
+            state
+                .database()
+                .unwrap()
+                .provider(&saved.id)
+                .unwrap()
+                .unwrap()
+                .name,
+            "Fixture"
+        );
+        assert_eq!(
+            state
+                .daytona_vault
+                .load_blocking(&providers::credential_id(&saved.id))
+                .await
+                .unwrap()
+                .unwrap(),
+            b"working-secret"
+        );
+        assert!(save_provider_connection(&state, draft).await.is_err());
+        assert_eq!(state.database().unwrap().providers().unwrap().len(), before);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loading_can_be_cancelled_while_status_and_database_remain_available() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(temp.path());
+        let executable = temp.path().join("llama-server");
+        std::fs::write(
+            &executable,
+            r#"#!/usr/bin/env python3
+import os,sys,time,pathlib
+if '--help' in sys.argv:
+    print('--fit --no-agent --no-mmproj --list-devices')
+    sys.exit(0)
+pathlib.Path(__file__).with_suffix('.pid').write_text(str(os.getpid()))
+time.sleep(60)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let model = temp.path().join("model.gguf");
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3u32.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        std::fs::write(&model, bytes).unwrap();
+        let mut prefs = state.database().unwrap().preferences().unwrap();
+        prefs.runtime_path = executable.to_string_lossy().into_owned();
+        prefs.model_path = model.to_string_lossy().into_owned();
+        state.database().unwrap().save_preferences(&prefs).unwrap();
+        let load = load_selected_model(&state);
+        let observe = async {
+            for _ in 0..100 {
+                if executable.with_extension("pid").exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                executable.with_extension("pid").exists(),
+                "owned subprocess must have started"
+            );
+            let status = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                current_runtime_status(&state),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(status.phase, "loading");
+            assert!(state.database().is_ok());
+            assert!(state.runtime.try_lock().is_ok());
+            state.load_cancel.send_replace(true);
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(load, observe)
+        })
+        .await
+        .unwrap();
+        assert!(result.err().unwrap().contains("cancelled"));
+        assert_eq!(
+            current_runtime_status(&state).await.unwrap().phase,
+            "stopped"
+        );
+        let pid = std::fs::read_to_string(executable.with_extension("pid")).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
+    }
 }

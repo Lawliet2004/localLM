@@ -643,6 +643,22 @@ impl ProcessRegistry {
                     .await
                     .map_err(|_| "Process stop timed out; its outcome is unknown.")?
                     .map_err(|_| "Process supervisor stopped without a final acknowledgement.")?;
+                // The acknowledgement fires as soon as the tree is terminated,
+                // but the supervisor seals `phase` only after draining output
+                // and finishing observation. A snapshot taken between the two
+                // would report a just-stopped process as still "running".
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let settled = process
+                        .output
+                        .lock()
+                        .map(|state| state.phase != "running")
+                        .unwrap_or(true);
+                    if settled || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
             } else if process
                 .output
                 .lock()
@@ -813,10 +829,9 @@ mod tests {
         // as the process tree is terminated, not after that work.
         let watched = tempfile::tempdir().unwrap();
         let sealed = tempfile::tempdir().unwrap();
-        let pending = crate::verification_observer::Registry::begin(
-            watched.path().to_str().unwrap(),
-        )
-        .unwrap();
+        let pending =
+            crate::verification_observer::Registry::begin(watched.path().to_str().unwrap())
+                .unwrap();
         let completion = crate::verification_observer::Completion {
             pending,
             // The sealing root is not the watched directory, so the barrier
@@ -848,7 +863,9 @@ mod tests {
             .await
             .unwrap();
         let id = started["id"].as_str().unwrap().to_string();
-        let process = registry.owned("owner", directory.path().to_str().unwrap(), &id).unwrap();
+        let process = registry
+            .owned("owner", directory.path().to_str().unwrap(), &id)
+            .unwrap();
         let (reply, received) = oneshot::channel();
         process
             .control
@@ -927,10 +944,7 @@ mod tests {
                 crate::presets::CREATOR,
             ] {
                 assert!(
-                    crate::presets::get(preset)
-                        .unwrap()
-                        .harness
-                        .contains(alias),
+                    crate::presets::get(preset).unwrap().harness.contains(alias),
                     "{preset}: {alias}"
                 );
             }

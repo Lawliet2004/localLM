@@ -9,6 +9,7 @@ export function RuntimeDiagnostics() {
   const [error, setError] = useState('');
   const [probing, setProbing] = useState(false);
   const [probeResult, setProbeResult] = useState('');
+  const [devices, setDevices] = useState('');
   useEffect(() => {
     if (!nativeAvailable) return;
     let disposed = false;
@@ -20,6 +21,10 @@ export function RuntimeDiagnostics() {
   }, [revision]);
   return <section aria-label="Runtime diagnostics">
     <LatencyDiagnostic />
+    <h2>Selected runtime devices</h2>
+    <p>Queries the saved runtime directly. Hardware memory readings cover NVIDIA only; automatic placement and multi-GPU selection belong to the runtime. A missing reading does not mean CPU-only operation.</p>
+    <button type="button" className="secondary" disabled={!nativeAvailable || probing} onClick={() => { setProbing(true); setError(''); void api.runtimeDevices().then(setDevices).catch(e => setError(errorMessage(e))).finally(() => setProbing(false)); }}>Inspect runtime devices</button>
+    {devices && <pre tabIndex={0} aria-label="Selected runtime device output">{devices}</pre>}
     <div className="form-footer">
       <h2>Runtime log</h2>
       <div style={{ display: 'flex', gap: 8 }}>

@@ -18,7 +18,7 @@ pub fn list_http_credentials(
     state.database()?.setting(KEY)
 }
 #[tauri::command]
-pub fn save_http_credential(
+pub async fn save_http_credential(
     state: tauri::State<'_, crate::AppState>,
     name: String,
     header: String,
@@ -54,16 +54,18 @@ pub fn save_http_credential(
     };
     state
         .daytona_vault
-        .save(&credential.id, secret.as_bytes())?;
+        .save_blocking(&credential.id, secret.into_bytes())
+        .await?;
     items.push(credential.clone());
-    if let Err(e) = state.database()?.save_setting(KEY, &items) {
-        let _ = state.daytona_vault.clear(&credential.id);
+    let saved = state.database()?.save_setting(KEY, &items);
+    if let Err(e) = saved {
+        let _ = state.daytona_vault.clear_blocking(&credential.id).await;
         return Err(e);
     }
     Ok(credential)
 }
 #[tauri::command]
-pub fn delete_http_credential(
+pub async fn delete_http_credential(
     state: tauri::State<'_, crate::AppState>,
     id: String,
 ) -> Result<(), String> {
@@ -73,9 +75,9 @@ pub fn delete_http_credential(
     }
     items.retain(|v| v.id != id);
     state.database()?.save_setting(KEY, &items)?;
-    state.daytona_vault.clear(&id)
+    state.daytona_vault.clear_blocking(&id).await
 }
-pub fn resolve(
+pub async fn resolve(
     state: &crate::AppState,
     id: &str,
     target: &reqwest::Url,
@@ -93,7 +95,8 @@ pub fn resolve(
     }
     let bytes = state
         .daytona_vault
-        .load(&item.id)?
+        .load_blocking(&item.id)
+        .await?
         .ok_or("HTTP credential is unavailable in the vault.")?;
     Ok((
         item.header.clone(),
@@ -158,8 +161,8 @@ pub fn structural_diff(a: &Value, b: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
-    #[test]
-    fn opaque_credentials_roundtrip_in_the_vault_and_are_origin_bound() {
+    #[tokio::test]
+    async fn opaque_credentials_roundtrip_in_the_vault_and_are_origin_bound() {
         let t = tempfile::tempdir().unwrap();
         let state = crate::test_support::app_state(t.path());
         let item = HttpCredential {
@@ -183,6 +186,7 @@ mod tests {
                 &item.id,
                 &reqwest::Url::parse("https://api.example.com/path").unwrap()
             )
+            .await
             .unwrap()
             .1,
             "Bearer fixture-secret"
@@ -192,6 +196,7 @@ mod tests {
             &item.id,
             &reqwest::Url::parse("https://other.example.com/").unwrap()
         )
+        .await
         .is_err());
         assert!(!serde_json::to_string(&item)
             .unwrap()

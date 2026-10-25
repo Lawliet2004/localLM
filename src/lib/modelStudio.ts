@@ -1,3 +1,4 @@
+import { freshHardware } from './runtimeGuidance';
 import type { HardwareStatus, HubFile } from './types';
 
 export function parseHubQuery(query: string) {
@@ -90,9 +91,15 @@ export function fitKind(bytes: number, hardware: HardwareStatus | null, projecto
   if (bytes <= 0 || !Number.isFinite(bytes) || projectorBytes < 0 || !Number.isFinite(projectorBytes)) return 'unknown';
   // Discovery has file sizes, not the architecture/context metadata needed to
   // predict the KV cache. Reserve runtime headroom and label results candidates.
+  hardware = freshHardware(hardware);
   const weights = bytes + projectorBytes;
   const required = weights + Math.max(2 ** 30, weights * 0.1);
-  const gpu = hardware?.gpus[0];
+  // Candidate only: another runtime may select a different device.
+  const gpu = hardware?.gpus.reduce((best, item) => {
+    const free = (item.memoryTotalMib ?? 0) - (item.memoryUsedMib ?? 0);
+    const previous = (best?.memoryTotalMib ?? 0) - (best?.memoryUsedMib ?? 0);
+    return free > previous ? item : best;
+  }, hardware.gpus[0]);
   const vram = gpu?.memoryTotalMib != null && gpu.memoryUsedMib != null
     ? Math.max(0, gpu.memoryTotalMib - gpu.memoryUsedMib) * 2 ** 20 : null;
   const ram = hardware?.memoryAvailableBytes ?? null;

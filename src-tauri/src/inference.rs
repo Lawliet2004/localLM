@@ -390,16 +390,23 @@ impl Backend {
     /// Resolve per-request budgets without changing saved local preferences.
     /// Zero is internal-only: an unknown remote limit uses the provider default
     /// and reserves no invented output capacity during estimated preflight.
-    pub fn prepare_preferences(&self, preferences: &mut crate::store::Preferences) -> Result<(), String> {
+    pub fn prepare_preferences(
+        &self,
+        preferences: &mut crate::store::Preferences,
+    ) -> Result<(), String> {
         preferences.validate_generation_controls()?;
         preferences.max_tokens = match self {
             Self::Local { context_length, .. } => {
-                let budget = crate::context::fit_response_budget(preferences.max_tokens, *context_length);
+                let budget =
+                    crate::context::fit_response_budget(preferences.max_tokens, *context_length);
                 preferences.max_tokens = budget;
                 preferences.validate()?;
                 budget
             }
-            Self::Claude { max_output_tokens: None, .. } => {
+            Self::Claude {
+                max_output_tokens: None,
+                ..
+            } => {
                 return Err("Set this API model's maximum output tokens in Providers. The Anthropic Messages protocol requires an explicit output limit.".into());
             }
             _ => self.response_limit().unwrap_or(0),
@@ -1224,14 +1231,19 @@ mod tests {
             for limit in [512, 131_072, 262_144, 393_216] {
                 let mut connection = provider();
                 connection.api_format = format.into();
-                let backend = Backend::openai(&connection, "secret".into(), &RemoteModel {
-                    controls: None,
-                    id: "api-model".into(),
-                    context_length: Some(1_048_576),
-                    max_output_tokens: Some(limit),
-                    supports_images: false,
-                    tool_support: ToolSupport::Supported,
-                }).unwrap();
+                let backend = Backend::openai(
+                    &connection,
+                    "secret".into(),
+                    &RemoteModel {
+                        controls: None,
+                        id: "api-model".into(),
+                        context_length: Some(1_048_576),
+                        max_output_tokens: Some(limit),
+                        supports_images: false,
+                        tool_support: ToolSupport::Supported,
+                    },
+                )
+                .unwrap();
                 let saved = crate::store::Preferences::default();
                 let mut effective = saved.clone();
                 backend.prepare_preferences(&mut effective).unwrap();
@@ -1239,14 +1251,28 @@ mod tests {
                 assert_eq!(effective.max_tokens, limit, "{format}");
                 // Child snapshots can inherit an already resolved API budget.
                 backend.prepare_preferences(&mut effective).unwrap();
-                let payload = backend.payload(&json!({
-                    "messages":[{"role":"user","content":"hello"}],
-                    "max_tokens":effective.max_tokens,
-                })).unwrap();
-                let field = if format == OPENAI_RESPONSES { "max_output_tokens" } else { "max_tokens" };
+                let payload = backend
+                    .payload(&json!({
+                        "messages":[{"role":"user","content":"hello"}],
+                        "max_tokens":effective.max_tokens,
+                    }))
+                    .unwrap();
+                let field = if format == OPENAI_RESPONSES {
+                    "max_output_tokens"
+                } else {
+                    "max_tokens"
+                };
                 assert_eq!(payload[field], limit, "{format}");
-                assert!(crate::context::validate_budget(4096, limit, backend.context_capacity()).is_ok());
-                assert!(crate::context::validate_budget(1_048_576, limit, backend.context_capacity()).is_err());
+                assert!(
+                    crate::context::validate_budget(4096, limit, backend.context_capacity())
+                        .is_ok()
+                );
+                assert!(crate::context::validate_budget(
+                    1_048_576,
+                    limit,
+                    backend.context_capacity()
+                )
+                .is_err());
             }
         }
     }
@@ -1257,26 +1283,35 @@ mod tests {
         for format in [OPENAI_CHAT_COMPLETIONS, OPENAI_RESPONSES, CLAUDE_MESSAGES] {
             let mut connection = provider();
             connection.api_format = format.into();
-            let backend = Backend::openai(&connection, "secret".into(), &RemoteModel {
-                controls: None,
-                id: "api-model".into(),
-                context_length: Some(1_048_576),
-                max_output_tokens: None,
-                supports_images: false,
-                tool_support: ToolSupport::Supported,
-            }).unwrap();
+            let backend = Backend::openai(
+                &connection,
+                "secret".into(),
+                &RemoteModel {
+                    controls: None,
+                    id: "api-model".into(),
+                    context_length: Some(1_048_576),
+                    max_output_tokens: None,
+                    supports_images: false,
+                    tool_support: ToolSupport::Supported,
+                },
+            )
+            .unwrap();
             let mut effective = crate::store::Preferences::default();
             let result = backend.prepare_preferences(&mut effective);
             if format == CLAUDE_MESSAGES {
-                assert!(result.unwrap_err().contains("requires an explicit output limit"));
+                assert!(result
+                    .unwrap_err()
+                    .contains("requires an explicit output limit"));
                 continue;
             }
             result.unwrap();
             assert_eq!(effective.max_tokens, 0);
-            let payload = backend.payload(&json!({
-                "messages":[{"role":"user","content":"hello"}],
-                "max_tokens":effective.max_tokens,
-            })).unwrap();
+            let payload = backend
+                .payload(&json!({
+                    "messages":[{"role":"user","content":"hello"}],
+                    "max_tokens":effective.max_tokens,
+                }))
+                .unwrap();
             for field in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
                 assert!(payload.get(field).is_none(), "{format}: {field}");
             }
@@ -1285,7 +1320,8 @@ mod tests {
 
     #[test]
     fn local_response_budget_stays_within_runtime_preferences_and_context() {
-        let backend = Backend::local("http://127.0.0.1:1234".into(), "secret".into(), 8192).unwrap();
+        let backend =
+            Backend::local("http://127.0.0.1:1234".into(), "secret".into(), 8192).unwrap();
         let mut preferences = crate::store::Preferences::default();
         backend.prepare_preferences(&mut preferences).unwrap();
         assert_eq!(preferences.max_tokens, 2048);

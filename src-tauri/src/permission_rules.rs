@@ -570,9 +570,7 @@ fn glob_matches(
                         value_index += 1;
                         continue;
                     }
-                    Token::Any
-                        if separator.is_none_or(|barrier| value[value_index] != barrier) =>
-                    {
+                    Token::Any if separator.is_none_or(|barrier| value[value_index] != barrier) => {
                         pattern_index += 1;
                         value_index += 1;
                         continue;

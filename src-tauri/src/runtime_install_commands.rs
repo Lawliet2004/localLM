@@ -1,6 +1,5 @@
 use crate::model_install::{RunGuard, Status};
 use serde::Serialize;
-use tauri::Manager;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,12 +14,10 @@ pub struct Info {
 }
 
 #[tauri::command]
-pub async fn runtime_download_info(app: tauri::AppHandle) -> Result<Info, String> {
-    let root = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?
-        .join("runtimes");
+pub async fn runtime_download_info(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Info, String> {
+    let root = crate::managed_storage::root(&state.data_dir)?.join("runtimes");
     tokio::fs::create_dir_all(&root)
         .await
         .map_err(|error| error.to_string())?;
@@ -68,10 +65,7 @@ pub fn cancel_runtime_install(state: tauri::State<'_, crate::AppState>) -> Resul
     Ok(())
 }
 #[tauri::command]
-pub async fn install_runtime(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, crate::AppState>,
-) -> Result<Status, String> {
+pub async fn install_runtime(state: tauri::State<'_, crate::AppState>) -> Result<Status, String> {
     let _installation = state
         .installation_operation
         .try_lock()
@@ -93,11 +87,7 @@ pub async fn install_runtime(
     };
     let _guard = RunGuard(installer);
     let result = async {
-        let root = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| error.to_string())?
-            .join("runtimes");
+        let root = crate::managed_storage::root(&state.data_dir)?.join("runtimes");
         crate::runtime_install::install(&root, receiver, |phase, received, total| {
             if let Ok(mut inner) = installer.inner.lock() {
                 inner.0.phase = phase.into();

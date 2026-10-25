@@ -664,7 +664,8 @@ impl Manager {
         **guard = Some(session);
     }
 
-    fn slot(&self, key: String) -> Result<Slot, String> {        if !self.cleanup_started.swap(true, Ordering::SeqCst) {
+    fn slot(&self, key: String) -> Result<Slot, String> {
+        if !self.cleanup_started.swap(true, Ordering::SeqCst) {
             let weak = Arc::downgrade(&self.slots);
             tokio::spawn(async move {
                 loop {
@@ -893,12 +894,8 @@ mod tests {
             .acquire_owned()
             .await
             .expect("a permit is available");
-        let session = Session::spawn(
-            root.path().to_str().unwrap(),
-            &fixture_server(),
-            permit,
-        )
-        .expect("fixture language server starts");
+        let session = Session::spawn(root.path().to_str().unwrap(), &fixture_server(), permit)
+            .expect("fixture language server starts");
         let slot: Slot = Arc::new(tokio::sync::Mutex::new(Some(session)));
         manager
             .slots
@@ -933,12 +930,8 @@ mod tests {
             .acquire_owned()
             .await
             .expect("a permit is available");
-        let session = Session::spawn(
-            root.path().to_str().unwrap(),
-            &fixture_server(),
-            permit,
-        )
-        .expect("fixture language server starts");
+        let session = Session::spawn(root.path().to_str().unwrap(), &fixture_server(), permit)
+            .expect("fixture language server starts");
         let slot: Slot = Arc::new(tokio::sync::Mutex::new(None));
         // The request took the session out of its slot and is still running.
         let mut guard = slot.lock().await;

@@ -4,7 +4,7 @@ import type { HardwareStatus } from './types';
 
 const hardware = (vramMib: number, ramBytes: number): HardwareStatus => ({
   logicalCpus: 8, memoryTotalBytes: ramBytes, memoryAvailableBytes: ramBytes / 2,
-  gpuStatus: 'ok', sampledAt: 0,
+  gpuStatus: 'ok', sampledAt: Date.now(),
   gpus: [{ name: 'GPU', uuid: 'g', memoryUsedMib: 0, memoryTotalMib: vramMib, utilizationPercent: 0, driverVersion: '1' }],
 });
 

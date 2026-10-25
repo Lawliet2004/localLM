@@ -2,12 +2,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeMap,
-    path::Path,
-};
 #[cfg(test)]
 use std::path::PathBuf;
+use std::{collections::BTreeMap, path::Path};
 pub const ALIASES: [&str; 12] = [
     "lsp_diagnostics",
     "lsp_symbols",
@@ -604,8 +601,7 @@ pub async fn execute(
         if proposal.version != 1
             || proposal.server != request.server
             || proposal.server_fingerprint != crate::lsp_client::fingerprint(server)
-            || proposal.root
-                != std::fs::canonicalize(root).map_err(|e| e.to_string())?
+            || proposal.root != std::fs::canonicalize(root).map_err(|e| e.to_string())?
         {
             return Err("Rename proposal belongs to different workspace/settings; prepare a fresh proposal.".into());
         }

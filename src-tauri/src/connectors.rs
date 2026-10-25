@@ -197,10 +197,7 @@ pub async fn restore_connections(state: &crate::AppState) -> Result<(), String> 
 }
 
 /// Read a connector's stored API token from the vault.
-fn token_from(
-    vault: &crate::vault::Vault,
-    id: &str,
-) -> Result<Option<String>, String> {
+fn token_from(vault: &crate::vault::Vault, id: &str) -> Result<Option<String>, String> {
     vault
         .load(&format!("token-{id}"))?
         .map(|bytes| String::from_utf8(bytes).map_err(|_| "Invalid stored token encoding.".into()))
@@ -418,6 +415,21 @@ impl AgentTool {
             backend: ToolBackend::Harness { name: alias.into() },
         })
     }
+    /// Test fixture: an MCP-classified tool without a live session. Catalog
+    /// and classification tests never call it.
+    #[cfg(test)]
+    pub fn mcp_fixture(alias: &str, server: &str) -> Self {
+        Self {
+            connector: server.into(),
+            alias: alias.into(),
+            tool: ToolView {
+                name: alias.into(),
+                description: "Fixture connector tool.".into(),
+                input_schema: serde_json::json!({"type":"object","properties":{"query":{"type":"string"}}}),
+            },
+            backend: ToolBackend::DetachedMcp { local_name: None },
+        }
+    }
     /// A user-authored plugin tool. The schema comes from the plugin file;
     /// the call runs through the harness dispatcher like every other harness
     /// tool, so approval, audit and run states apply. Plugin tools are not
@@ -431,7 +443,9 @@ impl AgentTool {
                 description: spec.description.clone(),
                 input_schema: spec.input,
             },
-            backend: ToolBackend::Harness { name: spec.name.clone() },
+            backend: ToolBackend::Harness {
+                name: spec.name.clone(),
+            },
         }
     }
     /// Typed backend family for tool-envelope normalization — the dispatch
@@ -763,6 +777,27 @@ impl McpHub {
         Ok((self.selected_tools(&ids, &selections)?, unavailable))
     }
 
+    /// Explain, per omitted id, why a selected connector produced no tools.
+    /// A saved-but-not-started local server must not surface as a bare
+    /// `local-<uuid>` with generic advice: name the one action that helps —
+    /// start it with Connect in Connectors — because saving its
+    /// configuration never starts the process. Remote ids are readable
+    /// catalog slugs and only need the sign-in pointer.
+    pub async fn unavailable_connector_labels(&self, ids: &[String]) -> Vec<String> {
+        let local = crate::local_mcp_config::load_blocking(&self.vault)
+            .await
+            .unwrap_or_default();
+        ids.iter()
+            .map(|id| match local.iter().find(|server| &server.id == id) {
+                Some(server) => format!(
+                    "{} — local server saved but not started; start it with Connect in Connectors (saving a configuration never starts the process)",
+                    server.name
+                ),
+                None => format!("{id} — not connected; use Connect in Connectors to sign in"),
+            })
+            .collect()
+    }
+
     pub fn selected_tools(
         &self,
         ids: &[String],
@@ -838,9 +873,6 @@ impl McpHub {
             }
         }
     }
-    fn token(&self, id: &str) -> Result<Option<String>, String> {
-        token_from(&self.vault, id)
-    }
     /// Store a connector's API token in the vault.
     ///
     /// The keyring call blocks, so the async caller path uses
@@ -853,10 +885,11 @@ impl McpHub {
         validate_token(value)?;
         self.vault.save(&format!("token-{id}"), value.as_bytes())
     }
-    pub fn list(&self) -> Result<Vec<ConnectorView>, String> {
+    pub async fn list(&self) -> Result<Vec<ConnectorView>, String> {
         let mut items = presets();
         items.extend(
-            crate::local_mcp_config::load(&self.vault)?
+            crate::local_mcp_config::load_blocking(&self.vault)
+                .await?
                 .iter()
                 .map(local_view),
         );
@@ -865,9 +898,9 @@ impl McpHub {
             item.has_credential = if item.auth_type == "local" {
                 false
             } else if item.auth_type == "oauth" {
-                self.vault.load(&format!("oauth-{}", item.id))?.is_some()
+                self.vault.contains(&format!("oauth-{}", item.id))?
             } else {
-                self.token(&item.id)?.is_some()
+                self.vault.contains(&format!("token-{}", item.id))?
             };
             if let Some(connection) = self.connections.get(&item.id) {
                 item.connected = !connection.service.is_closed();
@@ -897,45 +930,55 @@ impl McpHub {
         ids.sort();
         ids
     }
-    pub fn list_local(&self) -> Result<Vec<crate::local_mcp_config::LocalServerSummary>, String> {
-        Ok(crate::local_mcp_config::load(&self.vault)?
+    pub async fn list_local(
+        &self,
+    ) -> Result<Vec<crate::local_mcp_config::LocalServerSummary>, String> {
+        Ok(crate::local_mcp_config::load_blocking(&self.vault)
+            .await?
             .iter()
             .map(Into::into)
             .collect())
     }
-    pub fn read_local(&self, id: &str) -> Result<crate::local_mcp_config::LocalServer, String> {
+    pub async fn read_local(
+        &self,
+        id: &str,
+    ) -> Result<crate::local_mcp_config::LocalServer, String> {
         if self.connections.contains_key(id) {
             return Err("Disconnect the local server before editing its configuration.".into());
         }
-        crate::local_mcp_config::load(&self.vault)?
+        crate::local_mcp_config::load_blocking(&self.vault)
+            .await?
             .into_iter()
             .find(|server| server.id == id)
             .ok_or("Unknown local connector.".into())
     }
-    pub fn save_local(&self, server: crate::local_mcp_config::LocalServer) -> Result<(), String> {
+    pub async fn save_local(
+        &self,
+        server: crate::local_mcp_config::LocalServer,
+    ) -> Result<(), String> {
         if self.connections.contains_key(&server.id) {
             return Err("Disconnect the local server before editing its configuration.".into());
         }
         server.validate()?;
-        let mut servers = crate::local_mcp_config::load(&self.vault)?;
+        let mut servers = crate::local_mcp_config::load_blocking(&self.vault).await?;
         if let Some(previous) = servers.iter_mut().find(|previous| previous.id == server.id) {
             *previous = server;
         } else {
             servers.push(server);
         }
-        crate::local_mcp_config::save(&self.vault, &servers)
+        crate::local_mcp_config::save_blocking(&self.vault, &servers).await
     }
-    pub fn remove_local(&self, id: &str) -> Result<(), String> {
+    pub async fn remove_local(&self, id: &str) -> Result<(), String> {
         if self.connections.contains_key(id) {
             return Err("Disconnect the local server before removing its configuration.".into());
         }
-        let mut servers = crate::local_mcp_config::load(&self.vault)?;
+        let mut servers = crate::local_mcp_config::load_blocking(&self.vault).await?;
         let index = servers
             .iter()
             .position(|server| server.id == id)
             .ok_or("Unknown local connector.")?;
         servers.remove(index);
-        crate::local_mcp_config::save(&self.vault, &servers)
+        crate::local_mcp_config::save_blocking(&self.vault, &servers).await
     }
     /// Establish a connector session and record it.
     ///
@@ -945,7 +988,8 @@ impl McpHub {
     /// HTTP request, a process spawn and a tool-catalog read would stall
     /// every turn until every connector finished.
     pub async fn connect(&mut self, id: &str) -> Result<ConnectorView, String> {
-        let local = crate::local_mcp_config::load(&self.vault)?
+        let local = crate::local_mcp_config::load_blocking(&self.vault)
+            .await?
             .into_iter()
             .any(|server| server.id == id);
         if local && self.connections.contains_key(id) {
@@ -965,7 +1009,8 @@ impl McpHub {
         vault: Arc<crate::vault::Vault>,
         id: &str,
     ) -> Result<(ConnectorView, Connection), String> {
-        let local = crate::local_mcp_config::load(&vault)?
+        let local = crate::local_mcp_config::load_blocking(&vault)
+            .await?
             .into_iter()
             .find(|server| server.id == id);
         let mut item = match &local {
@@ -999,7 +1044,8 @@ impl McpHub {
             // be able to reach a loopback, private or cloud-metadata
             // address, and the socket must not re-resolve the name to a
             // different answer than the vetted one.
-            let url = reqwest::Url::parse(&item.url).map_err(|_| "Connector endpoint is invalid.")?;
+            let url =
+                reqwest::Url::parse(&item.url).map_err(|_| "Connector endpoint is invalid.")?;
             let vetted = crate::sandbox::vet_fetch_target(&url, false)
                 .await
                 .map_err(|error| format!("Connector endpoint rejected: {error}"))?;
@@ -1189,7 +1235,8 @@ impl McpHub {
     }
     pub async fn disconnect(&mut self, id: &str, forget: bool) -> Result<(), String> {
         self.restore_errors.remove(id);
-        let local = crate::local_mcp_config::load(&self.vault)?
+        let local = crate::local_mcp_config::load_blocking(&self.vault)
+            .await?
             .iter()
             .any(|server| server.id == id);
         if !local {
@@ -1231,21 +1278,21 @@ impl McpHub {
 pub async fn list_connectors(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<ConnectorView>, String> {
-    state.connectors.lock().await.list()
+    state.connectors.lock().await.list().await
 }
 
 #[tauri::command]
 pub async fn list_local_connectors(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<crate::local_mcp_config::LocalServerSummary>, String> {
-    state.connectors.lock().await.list_local()
+    state.connectors.lock().await.list_local().await
 }
 #[tauri::command]
 pub async fn read_local_connector(
     state: tauri::State<'_, crate::AppState>,
     id: String,
 ) -> Result<crate::local_mcp_config::LocalServer, String> {
-    state.connectors.lock().await.read_local(&id)
+    state.connectors.lock().await.read_local(&id).await
 }
 #[tauri::command]
 pub async fn save_local_connector(
@@ -1256,7 +1303,7 @@ pub async fn save_local_connector(
         .operation
         .try_lock()
         .map_err(|_| "Wait for the current model operation before editing connectors.")?;
-    state.connectors.lock().await.save_local(server)
+    state.connectors.lock().await.save_local(server).await
 }
 #[tauri::command]
 pub async fn remove_local_connector(
@@ -1268,7 +1315,7 @@ pub async fn remove_local_connector(
         .try_lock()
         .map_err(|_| "Wait for the current model operation before editing connectors.")?;
     let hub = state.connectors.lock().await;
-    hub.remove_local(&id)?;
+    hub.remove_local(&id).await?;
     remember_connection(&*state.database()?, &id, false)
 }
 #[tauri::command]
@@ -1377,7 +1424,7 @@ mod tests {
                 working_directory: temp.path().to_string_lossy().into_owned(),
                 environment: Default::default(),
             };
-            hub.save_local(server.clone()).unwrap();
+            hub.save_local(server.clone()).await.unwrap();
             (temp, hub, server)
         }
         let (_temp, mut hub, server) = fixture(
@@ -1392,13 +1439,14 @@ mod tests {
         assert!(error.contains("handshake"), "unexpected error: {error}");
         assert!(
             !hub.list()
+                .await
                 .unwrap()
                 .iter()
                 .find(|item| item.id == server.id)
                 .unwrap()
                 .connected
         );
-        hub.remove_local(&server.id).unwrap();
+        hub.remove_local(&server.id).await.unwrap();
         let (_temp, mut hub, server) = fixture(
             "truncated",
             "process.stdout.write('{\"jsonrpc\":\"2.0\",\"id\":'); setInterval(()=>{},1000);\n",
@@ -1409,7 +1457,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("handshake"), "unexpected error: {error}");
-        hub.remove_local(&server.id).unwrap();
+        hub.remove_local(&server.id).await.unwrap();
         let (_temp, mut hub, server) = fixture("early-exit", "process.exit(3);\n").await;
         let error = match hub.connect(&server.id).await {
             Ok(_) => panic!("early exit unexpectedly connected"),
@@ -1418,13 +1466,14 @@ mod tests {
         assert!(error.contains("handshake"), "unexpected error: {error}");
         assert!(
             !hub.list()
+                .await
                 .unwrap()
                 .iter()
                 .find(|item| item.id == server.id)
                 .unwrap()
                 .connected
         );
-        hub.remove_local(&server.id).unwrap();
+        hub.remove_local(&server.id).await.unwrap();
         // A server that exits right after discovery leaves a closed transport;
         // selection must report it as disconnected instead of offering stale tools.
         let (_temp, mut hub, server) = fixture(
@@ -1452,7 +1501,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             )
             .is_err());
         hub.disconnect(&server.id, false).await.unwrap();
-        hub.remove_local(&server.id).unwrap();
+        hub.remove_local(&server.id).await.unwrap();
     }
     #[tokio::test]
     async fn local_server_discovery_selection_and_disconnect_use_the_hub() {
@@ -1480,9 +1529,10 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             working_directory: temp.path().to_string_lossy().into_owned(),
             environment: Default::default(),
         };
-        hub.save_local(server.clone()).unwrap();
+        hub.save_local(server.clone()).await.unwrap();
         assert!(
             !hub.list()
+                .await
                 .unwrap()
                 .iter()
                 .find(|item| item.id == server.id)
@@ -1517,11 +1567,12 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         assert_eq!(available[0].connector, server.id);
         assert_eq!(omitted, ["parallel-web", "deepwiki"]);
         assert_eq!(view.auth_type, "local");
-        assert!(hub.save_local(server.clone()).is_err());
-        assert!(hub.read_local(&server.id).is_err());
-        assert!(hub.remove_local(&server.id).is_err());
+        assert!(hub.save_local(server.clone()).await.is_err());
+        assert!(hub.read_local(&server.id).await.is_err());
+        assert!(hub.remove_local(&server.id).await.is_err());
         assert!(!hub
             .list()
+            .await
             .unwrap()
             .iter()
             .find(|item| item.id == server.id)
@@ -1576,6 +1627,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             .is_err());
         assert!(
             !hub.list()
+                .await
                 .unwrap()
                 .iter()
                 .find(|item| item.id == server.id)
@@ -1596,7 +1648,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         let mut hub = super::McpHub::new(vault.clone());
         hub.restore_saved(&super::remembered_connections(&store).unwrap())
             .await;
-        let views = hub.list().unwrap();
+        let views = hub.list().await.unwrap();
         let restored = views.iter().find(|item| item.id == server.id).unwrap();
         assert!(restored.connected);
         assert_eq!(restored.tools.len(), 1);
@@ -1621,10 +1673,10 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         assert!(saved.is_empty());
         hub.restore_saved(&saved).await;
         assert!(hub.active_connector_ids().is_empty());
-        hub.remove_local(&server.id).unwrap();
+        hub.remove_local(&server.id).await.unwrap();
     }
-    #[test]
-    fn local_configuration_crud_keeps_secrets_out_of_summaries() {
+    #[tokio::test]
+    async fn local_configuration_crud_keeps_secrets_out_of_summaries() {
         let temp = tempfile::tempdir().unwrap();
         let vault = std::sync::Arc::new(crate::vault::Vault::new(temp.path().join("credentials")));
         let hub = super::McpHub::new(vault.clone());
@@ -1639,28 +1691,28 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
             working_directory: temp.path().to_string_lossy().into_owned(),
             environment: [("API_KEY".into(), "secret-value-fixture".into())].into(),
         };
-        hub.save_local(server.clone()).unwrap();
-        let summaries = hub.list_local().unwrap();
-        let editable = hub.read_local(&server.id).unwrap();
+        hub.save_local(server.clone()).await.unwrap();
+        let summaries = hub.list_local().await.unwrap();
+        let editable = hub.read_local(&server.id).await.unwrap();
         assert_eq!(editable.arguments, server.arguments);
         assert_eq!(editable.environment, server.environment);
-        assert!(hub.read_local("unknown").is_err());
+        assert!(hub.read_local("unknown").await.is_err());
         assert_eq!(summaries.len(), 1);
         let text = serde_json::to_string(&summaries).unwrap();
         assert!(!text.contains("private-argument-fixture"));
         assert!(!text.contains("secret-value-fixture"));
         assert!(text.contains("API_KEY"));
         server.name = "Renamed".into();
-        hub.save_local(server.clone()).unwrap();
+        hub.save_local(server.clone()).await.unwrap();
         let reopened = super::McpHub::new(vault);
-        assert_eq!(reopened.list_local().unwrap()[0].name, "Renamed");
+        assert_eq!(reopened.list_local().await.unwrap()[0].name, "Renamed");
         let mut invalid = server.clone();
         invalid.executable = "relative.exe".into();
-        assert!(hub.save_local(invalid).is_err());
-        assert_eq!(hub.list_local().unwrap().len(), 1);
-        hub.remove_local(&server.id).unwrap();
-        assert!(hub.list_local().unwrap().is_empty());
-        assert!(hub.remove_local(&server.id).is_err());
+        assert!(hub.save_local(invalid).await.is_err());
+        assert_eq!(hub.list_local().await.unwrap().len(), 1);
+        hub.remove_local(&server.id).await.unwrap();
+        assert!(hub.list_local().await.unwrap().is_empty());
+        assert!(hub.remove_local(&server.id).await.is_err());
     }
     use super::*;
     #[test]
@@ -1852,5 +1904,41 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         let redacted = error.replace("fixture-token-abcdef", "[redacted]");
         assert!(!redacted.contains("fixture-token-abcdef"));
         assert!(redacted.contains("[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_labels_name_the_start_action_for_saved_local_servers() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fixture.cjs");
+        std::fs::write(&script, "setInterval(()=>{},1000);\n").unwrap();
+        let hub = super::McpHub::new(std::sync::Arc::new(crate::vault::Vault::new(
+            temp.path().join("vault"),
+        )));
+        let server = crate::local_mcp_config::LocalServer {
+            id: format!("local-{}", uuid::Uuid::new_v4()),
+            name: "Calculator".into(),
+            executable: crate::execution::ExecutionConfig::default().node_path,
+            arguments: vec![script.to_string_lossy().into_owned()],
+            working_directory: temp.path().to_string_lossy().into_owned(),
+            environment: Default::default(),
+        };
+        // Saved but never connected: the config exists, the process does not.
+        hub.save_local(server.clone()).await.unwrap();
+        let selection = vec![super::ToolSelection {
+            connector_id: server.id.clone(),
+            tool_name: "add".into(),
+        }];
+        let (tools, omitted) = hub.tools_for_turn(&[], &selection).unwrap();
+        assert!(tools.is_empty());
+        assert_eq!(omitted, [server.id.clone()]);
+        let labels = hub.unavailable_connector_labels(&omitted).await;
+        assert_eq!(labels.len(), 1);
+        assert!(labels[0].starts_with("Calculator — local server saved but not started"), "{}", labels[0]);
+        assert!(labels[0].contains("start it with Connect in Connectors"), "{}", labels[0]);
+        assert!(!labels[0].contains("local-"), "raw ids are not user-facing: {}", labels[0]);
+        let remote = hub
+            .unavailable_connector_labels(&["deepwiki".into()])
+            .await;
+        assert_eq!(remote, ["deepwiki — not connected; use Connect in Connectors to sign in"]);
     }
 }

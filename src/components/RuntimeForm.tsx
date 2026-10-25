@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Cpu, Layers, MemoryStick, Sparkles } from 'lucide-react';
 import type { CacheType, HardwareStatus, ModelMetadata, RuntimeConfig, RuntimeStatus } from '../lib/types';
 import { api, nativeAvailable } from '../lib/api';
-import { availableGpuBytes, contextSafetyLimit, estimateMemory, fittingGpuLayers, gib, gpuLayersLabel, modelMaxLayers, recommendedConfig } from '../lib/runtimeGuidance';
+import { availableGpuBytes, contextSafetyLimit, estimateMemory, fittingGpuLayers, gib, gpuLayersLabel, modelMaxLayers, recommendationIssue, recommendedConfig } from '../lib/runtimeGuidance';
 import { samePath } from '../lib/pathUtils';
 
 interface Props {
@@ -35,8 +35,9 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, projectorPath, o
     let disposed = false;
     setModel(null); setMetadataError('');
     void api.readModelMetadata(modelPath).then(value => { if (!disposed) setModel(value); }).catch(e => { if (!disposed) setMetadataError(String(e)); });
-    void api.hardwareStatus().then(value => { if (!disposed) setHardware(value); }).catch(() => {});
-    return () => { disposed = true; };
+    const refresh = () => { void api.hardwareStatus().then(value => { if (!disposed) setHardware(value); }).catch(() => { if (!disposed) setHardware(null); }); };
+    refresh(); const timer = setInterval(refresh, 15000);
+    return () => { disposed = true; clearInterval(timer); };
   }, [modelPath]);
   useEffect(() => {
     let disposed = false;
@@ -58,7 +59,7 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, projectorPath, o
     : config;
   const estimate = model ? estimateMemory(model, estimateConfig, projectorBytes) : null;
   const recommended = model ? recommendedConfig(model, hardware, projectorBytes, config) : null;
-  const gpu = hardware?.gpus[0];
+  const gpu = hardware?.gpus.length === 1 ? hardware.gpus[0] : null;
   const freeGpu = gpu?.memoryTotalMib != null && gpu?.memoryUsedMib != null ? (gpu.memoryTotalMib - gpu.memoryUsedMib) * 2 ** 20 : null;
   const planningGpu = availableGpuBytes(hardware);
   function update<K extends keyof RuntimeConfig>(key: K, value: RuntimeConfig[K]) {
@@ -85,7 +86,7 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, projectorPath, o
     onSave(config);
   }}>
     <section className="runtime-overview" aria-label="Selected model limits">
-      <div className="section-heading"><div><p className="eyebrow">TUNE YOUR MODEL</p><h2>Runtime</h2><p className="runtime-model-name">{modelPath?.split(/[\\/]/).pop() || 'Select a model in the Models tab to see its limits'}</p></div><Cpu size={24} /></div>
+      <div className="section-heading"><div><h2>Runtime</h2><p className="runtime-model-name">{modelPath?.split(/[\\/]/).pop() || 'Select a model in the Models tab to see its limits'}</p></div><Cpu size={24} /></div>
       {!modelPath && <p className="section-description">Use a downloaded model first. Runtime limits come from that file’s GGUF header and the GPU/RAM available right now.</p>}
       {metadataError && <p className="selection-warning">Model limits unavailable: {metadataError}</p>}
       <div className="runtime-dashboard">
@@ -120,7 +121,7 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, projectorPath, o
           <dl className="runtime-stats">
             <div><dt>Full model context</dt><dd>{model?.contextLength ? `${model.contextLength.toLocaleString()} tokens` : 'Unknown'}</dd></div>
             {model?.contextLength && model.contextLength > contextSafetyLimit && <div><dt>Harness safety cap</dt><dd>{contextSafetyLimit.toLocaleString()} tokens</dd></div>}
-            <div><dt>Recommended</dt><dd>{recommended ? `${recommended.contextLength.toLocaleString()} tokens` : 'Unknown'}</dd></div>
+            <div><dt>Recommended</dt><dd>{recommended && model && !recommendationIssue(model, hardware, recommended, projectorBytes) ? `${recommended.contextLength.toLocaleString()} tokens` : 'Unavailable'}</dd></div>
             <div><dt>Current setting</dt><dd>{config.contextLength.toLocaleString()} tokens</dd></div>
           </dl>
           <p className="runtime-help">Training context from the GGUF header. Larger windows need more attention-cache memory. Loading refuses a context beyond the known model or harness limit.</p>
@@ -174,8 +175,8 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, projectorPath, o
         </article>
       </div>
       {recommended && <div className="runtime-recommendation"><div>
-        <strong>Recommended for this model</strong>
-        <p>From the GGUF header and currently free VRAM, with about 1 GiB of GPU headroom. Automatic fill is the default when a GPU is present. Unknown cache layouts start on CPU.</p>
+        <strong>Suggested starting settings</strong>{model && recommendationIssue(model, hardware, recommended, projectorBytes) && <p role="status">{recommendationIssue(model, hardware, recommended, projectorBytes)}</p>}
+        <p>Uses a conservative RAM budget with room for cache, compute buffers and the operating system. GPU selection remains automatic when device capability is unknown.</p>
         <dl className="runtime-compare">
           <div><dt /><dd>Recommended</dd><dd>Current</dd></div>
           <div><dt>Context</dt><dd>{recommended.contextLength.toLocaleString()}</dd><dd>{config.contextLength.toLocaleString()}</dd></div>
@@ -184,7 +185,7 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, projectorPath, o
           <div><dt>K/V cache</dt><dd>{recommended.cacheTypeK.toUpperCase()} / {recommended.cacheTypeV.toUpperCase()}</dd><dd>{config.cacheTypeK.toUpperCase()} / {config.cacheTypeV.toUpperCase()}</dd></div>
           <div><dt>Flash Attention</dt><dd>{recommended.flashAttention ? 'On' : 'Off'}</dd><dd>{config.flashAttention ? 'On' : 'Off'}</dd></div>
         </dl>
-      </div><button type="button" className="secondary" disabled={busy} onClick={() => { setConfig(recommended); setError(''); }}>Use recommended settings</button></div>}
+      </div><button type="button" className="secondary" disabled={busy || Boolean(model && recommendationIssue(model, hardware, recommended, projectorBytes))} onClick={() => { setConfig(recommended); setError(''); }}>Use recommended settings</button></div>}
     </section>
     <details className="runtime-advanced">
       <summary>Advanced memory and batch settings</summary>

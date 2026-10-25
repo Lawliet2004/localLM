@@ -1126,13 +1126,8 @@ pub fn bound_tool_result(
                         }
                     }
                     inner = json!({"data": shrunk});
-                    wrapped_minimal = rewrap_envelope(
-                        &result,
-                        inner.clone(),
-                        &id,
-                        size_bytes,
-                        &sha256,
-                    );
+                    wrapped_minimal =
+                        rewrap_envelope(&result, inner.clone(), &id, size_bytes, &sha256);
                 }
                 wrapped_minimal
             } else {

@@ -500,7 +500,8 @@ pub async fn snapshot_for_conversation(
             let token =
                 crate::subscription_auth::get_valid_access_token(&state.daytona_vault, kind)
                     .await?;
-            let account_id = crate::subscription_auth::load_session(&state.daytona_vault, kind)?
+            let account_id = crate::subscription_auth::load_session(&state.daytona_vault, kind)
+                .await?
                 .and_then(|s| s.account_id);
             snapshot.kind = "subscription".into();
             snapshot.key = token;
@@ -522,7 +523,8 @@ pub async fn snapshot_for_conversation(
                 &provider,
                 state
                     .daytona_vault
-                    .load(&crate::providers::credential_id(&provider_id))?,
+                    .load_blocking(&crate::providers::credential_id(&provider_id))
+                    .await?,
             )?;
             snapshot.kind = "remote".into();
             snapshot.key = key;
@@ -661,7 +663,10 @@ impl SubagentRegistry {
     pub fn register(&self, child_run_id: &str) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
         let (cancel, _) = tokio::sync::watch::channel(false);
-        let mut cancels = self.cancels.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cancels = self
+            .cancels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.flags
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -680,7 +685,10 @@ impl SubagentRegistry {
     }
     pub fn interrupt(&self, child_run_id: &str) -> bool {
         let live = {
-            let flags = self.flags.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let flags = self
+                .flags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(flag) = flags.get(child_run_id) {
                 flag.store(true, Ordering::SeqCst);
                 true
@@ -894,7 +902,9 @@ const COMMAND_ALIASES: &[&str] = &["local_execute_command", "execute_command"];
 /// Aliases that can be rebuilt from a snapshot without the parent's live
 /// session: workspace, local execution, detached-safe harness, skills, clock.
 fn detached_reconstructable(alias: &str) -> bool {
-    if alias == "workspace_open_preview" { return false; }
+    if alias == "workspace_open_preview" {
+        return false;
+    }
     alias.starts_with("workspace_")
         || CODE_ALIASES.contains(&alias)
         || COMMAND_ALIASES.contains(&alias)
@@ -3291,7 +3301,10 @@ mod tests {
     fn workspace_preview_is_foreground_only_even_with_a_workspace_prefix() {
         assert!(!detached_reconstructable("workspace_open_preview"));
         assert!(!harness_detached_supported("workspace_open_preview"));
-        assert_eq!(detached_capability("workspace_open_preview"), Some("local_execution"));
+        assert_eq!(
+            detached_capability("workspace_open_preview"),
+            Some("local_execution")
+        );
     }
 
     #[test]

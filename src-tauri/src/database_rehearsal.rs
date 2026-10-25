@@ -24,7 +24,7 @@ async fn admin(state: &crate::AppState, p: &Profile, sql: &str) -> Result<(), St
     tokio::time::timeout(std::time::Duration::from_secs(30), admin_bounded(state, p, sql)).await.map_err(|_| "Scratch administration timed out; acknowledgement is uncertain; discover the rehearsal with database_cleanup.")?
 }
 async fn admin_bounded(state: &crate::AppState, p: &Profile, sql: &str) -> Result<(), String> {
-    let secret = crate::remote_database::password(state, p)?;
+    let secret = crate::remote_database::password(state, p).await?;
     if p.engine == "postgres" {
         let mut c = sqlx_postgres::PgConnection::connect_with(&crate::remote_database::pg_options(
             p, &secret,
@@ -66,7 +66,7 @@ async fn owned_resources(
         .ok_or("Missing generated database.")?;
     let role = ledger["role"].as_str().ok_or("Missing generated role.")?;
     let marker = ledger["ownershipMarker"].as_str().ok_or("Legacy rehearsal lacks a remote ownership marker; automatic destructive cleanup is refused.")?;
-    let secret = crate::remote_database::password(state, p)?;
+    let secret = crate::remote_database::password(state, p).await?;
     let operation = async {
         if p.engine == "postgres" {
             let mut c = sqlx_postgres::PgConnection::connect_with(
@@ -244,7 +244,7 @@ async fn cli(
     }
     let password = match override_secret {
         Some(value) => value.to_string(),
-        None => crate::remote_database::password(ctx.state, p)?,
+        None => crate::remote_database::password(ctx.state, p).await?,
     };
     let mut cmd = tokio::process::Command::new(executable);
     cmd.env_clear()

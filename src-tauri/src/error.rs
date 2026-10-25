@@ -109,8 +109,13 @@ impl From<AppError> for String {
 /// claims to be retryable or a refusal.
 pub fn kind_for_code(code: &str) -> ErrorKind {
     match code {
-        "denied" | "deny" | "tool-budget-blocked" | "hook-blocked" | "capability-disabled"
-        | "replay-blocked" | "policy-denied" => ErrorKind::Denied,
+        "denied"
+        | "deny"
+        | "tool-budget-blocked"
+        | "hook-blocked"
+        | "capability-disabled"
+        | "replay-blocked"
+        | "policy-denied" => ErrorKind::Denied,
         "cancelled" | "canceled" | "interrupted" | "aborted" => ErrorKind::Cancelled,
         "not-found" | "unknown-tool" | "unavailable-tool" | "missing-tool" => ErrorKind::NotFound,
         "timeout" | "timed-out" | "deadline" => ErrorKind::Timeout,
@@ -118,7 +123,10 @@ pub fn kind_for_code(code: &str) -> ErrorKind {
             ErrorKind::LimitExceeded
         }
         "network" | "connection-failed" | "unreachable" => ErrorKind::Network,
-        "invalid-arguments" | "invalid-request" | "validation-failed" | "schema-mismatch"
+        "invalid-arguments"
+        | "invalid-request"
+        | "validation-failed"
+        | "schema-mismatch"
         | "malformed-arguments" => ErrorKind::InvalidRequest,
         _ => ErrorKind::Internal,
     }

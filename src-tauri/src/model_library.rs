@@ -341,10 +341,12 @@ pub async fn download_hugging_face_model(
         };
         let files = selected_files(&catalog.files, &filename)?;
         let weight_bytes = files.iter().try_fold(0u64, |n, f| n.checked_add(f.bytes).ok_or("Model size overflow."))?;
-        let directory = state.data_dir.join("models").join(digest(&format!("{}/{}/{}", catalog.repo, catalog.revision, files[0].filename)));
+        let directory = crate::managed_storage::root(&state.data_dir)?.join("models").join(digest(&format!("{}/{}/{}", catalog.repo, catalog.revision, files[0].filename)));
         let previous = pending_download(&directory);
         let projector_name = projector_for_resume(&catalog.files, projector.as_deref(), previous.as_ref(), weight_bytes);
         let projector_file = select_projector(&catalog.files, &filename, projector_name.as_deref())?;
+        let runtime_path = state.database()?.preferences()?.runtime_path;
+        crate::runtime::preflight_download(&runtime_path, projector_file.is_some()).await?;
         let projector_in_weights = projector_file.is_some_and(|p| files.iter().any(|f| f.filename == p.filename));
         let total = if let Some(p) = projector_file.filter(|_| !projector_in_weights) {
             weight_bytes.checked_add(p.bytes).ok_or("Model size overflow.")?
@@ -352,7 +354,7 @@ pub async fn download_hugging_face_model(
             weight_bytes
         };
         std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-        let root = std::fs::canonicalize(state.data_dir.join("models")).map_err(|e| e.to_string())?;
+        let root = std::fs::canonicalize(crate::managed_storage::root(&state.data_dir)?.join("models")).map_err(|e| e.to_string())?;
         let directory = std::fs::canonicalize(&directory).map_err(|e| e.to_string())?;
         if !directory.starts_with(&root) { return Err("Model directory resolves outside managed storage.".into()); }
         let mut already = 0u64;
@@ -378,7 +380,7 @@ pub async fn download_hugging_face_model(
             repo: catalog.repo.clone(), revision: catalog.revision.clone(),
             filename: files[0].filename.clone(), bytes: total, sha256: files[0].sha256.clone(), received: already,
             projector: projector_file.map(|p| p.filename.clone()),
-        });
+        })?;
         { let mut inner = installer.inner.lock().map_err(|_| "Installer unavailable.")?;
           inner.0.path = Some(directory.join(files[0].filename.rsplit('/').next().unwrap()).to_string_lossy().into_owned());
           inner.0.total = total; inner.0.received = already; inner.0.phase = if already > 0 { "resuming".into() } else { "downloading".into() }; }
@@ -411,15 +413,14 @@ pub async fn download_hugging_face_model(
                     filename: files[0].filename.clone(), bytes: total, sha256: files[0].sha256.clone(),
                     received: finished + saved,
                     projector: projector_file.map(|p| p.filename.clone()),
-                });
+                }).map_err(|journal| format!("{error} Recovery metadata could not be saved: {journal}"))?;
                 return Err(error);
             }
             finished += file.bytes;
             paths.push(path.to_string_lossy().into_owned());
         }
         let projector_record = projector_file.map(|p| {
-            let name = p.filename.rsplit('/').next().unwrap_or(&p.filename).to_owned();
-            (name, directory.join(p.filename.rsplit('/').next().unwrap()).to_string_lossy().into_owned())
+            (p.filename.clone(), directory.join(p.filename.rsplit('/').next().unwrap()).to_string_lossy().into_owned())
         });
         let mut weight_paths = paths.clone();
         if let Some((_, ref projector_path)) = projector_record {
@@ -427,10 +428,9 @@ pub async fn download_hugging_face_model(
         }
         let weight_first = weight_paths.first().cloned().unwrap_or_else(|| paths[0].clone());
         let weight_bytes = total.saturating_sub(projector_file.map(|p| if projector_in_weights { 0 } else { p.bytes }).unwrap_or(0));
-        let model = InstalledModel { id: weight_first.clone(), path: weight_first, filename: files[0].filename.clone(), bytes: weight_bytes, repo: Some(catalog.repo.clone()), revision: Some(catalog.revision.clone()), files: weight_paths, complete: true, received: weight_bytes,
+        let model = InstalledModel { id: weight_first.clone(), path: weight_first, filename: files[0].filename.clone(), bytes: total, repo: Some(catalog.repo.clone()), revision: Some(catalog.revision.clone()), files: weight_paths, complete: true, received: weight_bytes,
             projector_filename: projector_record.as_ref().map(|(name, _)| name.clone()),
             projector_path: projector_record.as_ref().map(|(_, path)| path.clone()) };
-        let _ = std::fs::remove_file(directory.join("download.json"));
         crate::gguf::read_architecture(Path::new(&model.path))?.ok_or("Downloaded file is not a supported GGUF header.")?;
         if let Some(ref projector_path) = model.projector_path {
             // The projector is a vision encoder, not a language model; a GGUF
@@ -451,6 +451,8 @@ pub async fn download_hugging_face_model(
         manifest.write_all(&serde_json::to_vec_pretty(&model).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         manifest.as_file().sync_all().map_err(|e| e.to_string())?;
         manifest.persist(directory.join("model.json")).map_err(|e| e.to_string())?;
+        remove_if_present(&directory.join("download.json"))?;
+        remove_if_present(&directory.join("download.previous.json"))?;
         Ok::<_, String>(model.path)
     }.await;
     let mut inner = installer
@@ -508,9 +510,38 @@ fn projector_for_resume(
     }
     Some(projector.filename.clone())
 }
-fn write_download_state(directory: &Path, state: &DownloadState) {
-    if let Ok(body) = serde_json::to_vec_pretty(state) {
-        let _ = std::fs::write(directory.join("download.json"), body);
+fn atomic_json(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(path.parent().ok_or("Missing journal directory")?)
+            .map_err(|e| e.to_string())?;
+    temporary.write_all(bytes).map_err(|e| e.to_string())?;
+    temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+    temporary.persist(path).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().unwrap())
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+fn write_download_state(directory: &Path, state: &DownloadState) -> Result<(), String> {
+    // Retain the last valid identity if a legacy journal is torn or corrupted.
+    if let Some(previous) = pending_download(directory) {
+        atomic_json(
+            &directory.join("download.previous.json"),
+            &serde_json::to_vec(&previous).map_err(|e| e.to_string())?,
+        )?;
+    }
+    atomic_json(
+        &directory.join("download.json"),
+        &serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?,
+    )
+}
+fn remove_if_present(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Could not remove {}: {e}", path.display())),
     }
 }
 
@@ -531,9 +562,14 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
     let root = std::fs::canonicalize(directory).map_err(|e| e.to_string())?;
     let mut files = Vec::new();
     for item in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
-        let item = item.map_err(|e| e.to_string())?;
+        let Ok(item) = item else { continue };
+        if !item.file_type().is_ok_and(|kind| !kind.is_symlink()) {
+            continue;
+        }
         let path = item.path();
-        let canonical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+        let Ok(canonical) = std::fs::canonicalize(&path) else {
+            continue;
+        };
         if !canonical.starts_with(&root) {
             continue;
         }
@@ -541,21 +577,47 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
             continue;
         }
         if path.is_dir() && depth > 0 && !is_companion_path(&item.file_name().to_string_lossy()) {
-            scan(&path, depth - 1, result)?;
+            if let Err(error) = scan(&path, depth - 1, result) {
+                eprintln!("Skipping model directory {}: {error}", path.display());
+            }
         } else if path
             .extension()
             .is_some_and(|s| s.eq_ignore_ascii_case("gguf"))
             && path.is_file()
         {
-            files.push((
-                canonical,
-                std::fs::metadata(&path).map_err(|e| e.to_string())?.len(),
-            ));
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                files.push((canonical, metadata.len()));
+            }
         }
     }
-    let source = std::fs::read(directory.join("model.json"))
+    let mut source = std::fs::read(directory.join("model.json"))
         .ok()
         .and_then(|v| serde_json::from_slice::<InstalledModel>(&v).ok());
+    // Manifests copied by storage migration retain source paths. Inventory
+    // derives all managed file locations from the directory being scanned.
+    if let Some(manifest) = source.as_mut() {
+        manifest.path = root
+            .join(
+                manifest
+                    .filename
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&manifest.filename),
+            )
+            .to_string_lossy()
+            .into_owned();
+        if let Some(name) = manifest
+            .projector_filename
+            .as_deref()
+            .filter(|name| valid_filename(name))
+        {
+            manifest.projector_path = Some(
+                root.join(name.rsplit('/').next().unwrap())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
     let hub_files: Vec<_> = files
         .iter()
         .map(|(p, bytes)| HubFile {
@@ -576,7 +638,7 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit()));
-        let complete = group.is_ok() && (!managed || source.is_some());
+        let mut complete = group.is_ok() && (!managed || source.is_some());
         let group = group.unwrap_or_else(|_| {
             let base = file
                 .filename
@@ -594,11 +656,13 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
             .iter()
             .map(|f| root.join(&f.filename).to_string_lossy().into_owned())
             .collect();
-        let path = paths[0].clone();
+        let Some(path) = paths.first().cloned() else {
+            continue;
+        };
         if result.iter().any(|m| m.path == path) {
             continue;
         }
-        let bytes = group.iter().map(|f| f.bytes).sum();
+        let bytes: u64 = group.iter().map(|f| f.bytes).sum();
         let (projector_filename, projector_path) = match &source {
             Some(manifest) if manifest.path == path => (
                 manifest.projector_filename.clone(),
@@ -624,11 +688,30 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
                     .unwrap_or((None, None))
             }
         };
+        if source
+            .as_ref()
+            .is_some_and(|m| m.projector_filename.is_some())
+            && !projector_path.as_ref().is_some_and(|p| {
+                std::fs::symlink_metadata(p)
+                    .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+            })
+        {
+            complete = false;
+        }
         result.push(InstalledModel {
             id: path.clone(),
             path,
-            filename: file.filename.clone(),
-            bytes,
+            filename: source
+                .as_ref()
+                .map(|m| m.filename.clone())
+                .unwrap_or_else(|| file.filename.clone()),
+            bytes: bytes.saturating_add(
+                projector_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+            ),
             repo: source
                 .as_ref()
                 .and_then(|s| s.repo.clone())
@@ -647,33 +730,94 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
     }
     if let Some(state) = pending_download(directory).filter(|state| is_weight_file(&state.filename))
     {
-        let dest = root.join(state.filename.rsplit('/').next().unwrap_or(&state.filename));
+        let dest = root.join(state.filename.rsplit('/').next().unwrap());
         let part = download::partial_path(&dest);
-        let received = std::fs::metadata(&part)
+        // Sum actual owned bytes, including completed shards and projector prefixes.
+        let received = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file() && !t.is_symlink()))
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.ends_with(".gguf") || n.ends_with(".gguf.part")
+            })
+            .filter_map(|e| e.metadata().ok())
             .map(|m| m.len())
-            .unwrap_or(state.received);
-        if !result.iter().any(|m| {
-            m.filename == state.filename.rsplit('/').next().unwrap_or(&state.filename)
-                || Path::new(&m.path) == dest.as_path()
-        }) {
-            let path = if dest.exists() { dest } else { part.clone() };
+            .sum::<u64>()
+            .min(state.bytes);
+        if let Some(model) = result.iter_mut().find(|m| Path::new(&m.path) == dest) {
+            model.repo = Some(state.repo);
+            model.revision = Some(state.revision);
+            model.filename = state.filename;
+            model.projector_filename = state.projector;
+            model.complete = false;
+            model.bytes = state.bytes;
+            model.received = received;
+        } else {
+            let path = if dest.exists() { dest } else { part };
             let path_string = path.to_string_lossy().into_owned();
             result.push(InstalledModel {
                 id: path_string.clone(),
                 path: path_string.clone(),
-                filename: state
-                    .filename
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&state.filename)
-                    .to_owned(),
+                filename: state.filename,
                 bytes: state.bytes,
                 repo: Some(state.repo),
                 revision: Some(state.revision),
                 files: vec![path_string],
                 complete: false,
                 received,
-                projector_filename: state.projector.clone(),
+                projector_filename: state.projector,
+                projector_path: None,
+            });
+        }
+    }
+
+    // A legacy/torn journal must not make its bytes impossible to remove.
+    // Source identity remains unknown instead of guessing a remote revision.
+    if pending_download(directory).is_none() {
+        for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+            if !entry
+                .file_type()
+                .is_ok_and(|t| t.is_file() && !t.is_symlink())
+            {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(filename) = name.strip_suffix(".part").filter(|n| is_weight_file(n)) else {
+                continue;
+            };
+            if root.join(filename).exists()
+                || result.iter().any(|m| {
+                    Path::new(&m.path).parent() == Some(root.as_path())
+                        && !m.complete
+                        && (m.filename == filename
+                            || (filename.contains("-of-")
+                                && m.filename
+                                    .rsplit_once("-of-")
+                                    .and_then(|(p, _)| p.rsplit_once('-').map(|(b, _)| b))
+                                    == filename
+                                        .rsplit_once("-of-")
+                                        .and_then(|(p, _)| p.rsplit_once('-').map(|(b, _)| b))))
+                })
+            {
+                continue;
+            }
+            let received = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let path = entry.path().to_string_lossy().into_owned();
+            result.push(InstalledModel {
+                id: path.clone(),
+                path: path.clone(),
+                filename: filename.into(),
+                bytes: crate::model_catalog::model(Some(filename))
+                    .map(|(_, a)| a.bytes)
+                    .unwrap_or(received),
+                repo: known_source(filename),
+                revision: None,
+                files: vec![path],
+                complete: false,
+                received,
+                projector_filename: None,
                 projector_path: None,
             });
         }
@@ -681,11 +825,27 @@ fn scan(directory: &Path, depth: usize, result: &mut Vec<InstalledModel>) -> Res
     Ok(())
 }
 fn pending_download(directory: &Path) -> Option<DownloadState> {
-    serde_json::from_slice(&std::fs::read(directory.join("download.json")).ok()?).ok()
+    ["download.json", "download.previous.json"]
+        .iter()
+        .find_map(|name| {
+            let state: DownloadState =
+                serde_json::from_slice(&std::fs::read(directory.join(name)).ok()?).ok()?;
+            (validate_repo(&state.repo).is_ok()
+                && valid_filename(&state.filename)
+                && state.revision.len() == 40
+                && state.revision.bytes().all(|b| b.is_ascii_hexdigit())
+                && state.projector.as_deref().is_none_or(valid_filename))
+            .then_some(state)
+        })
 }
+
 fn inventory(state: &AppState) -> Result<Vec<InstalledModel>, String> {
     let mut result = Vec::new();
-    scan(&state.data_dir.join("models"), 1, &mut result)?;
+    scan(
+        &crate::managed_storage::root(&state.data_dir)?.join("models"),
+        1,
+        &mut result,
+    )?;
     if let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
         let mut legacy = Vec::new();
         scan(&root.join(".local/models"), 0, &mut legacy)?;
@@ -756,10 +916,8 @@ pub async fn delete_installed_model(
         .installation_operation
         .try_lock()
         .map_err(|_| "Wait for the download to finish before deleting a model.")?;
-    let model = inventory(&state)?
-        .into_iter()
-        .find(|m| m.id == id)
-        .ok_or("Model is no longer in the library.")?;
+    let model = inventory(&state)?.into_iter().find(|m| m.id == id);
+    let Some(model) = model else { return Ok(()) };
     let mut runtime = state.runtime.lock().await;
     if runtime
         .inspect()
@@ -775,7 +933,7 @@ pub async fn delete_installed_model(
         .ok()
         .is_some_and(|p| model.files.iter().any(|file| Path::new(file) == p));
     for path in &model.files {
-        std::fs::remove_file(path).map_err(|e| format!("Could not delete model: {e}"))?;
+        remove_if_present(Path::new(path))?;
     }
     cleanup_model_storage(&model, &state.data_dir)?;
     let store = state.database()?;
@@ -786,14 +944,25 @@ pub async fn delete_installed_model(
     Ok(())
 }
 
+fn profile_identity(path: &str) -> String {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let identity = canonical.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        identity.to_lowercase()
+    } else {
+        identity
+    }
+}
+
 fn profile_path_for(data_dir: &Path, path: &str) -> PathBuf {
     data_dir
         .join("model-profiles")
-        .join(format!("{}.json", digest(&path.to_lowercase())))
+        .join(format!("{}.json", digest(&profile_identity(path))))
 }
 
 fn cleanup_model_storage(model: &InstalledModel, data_dir: &Path) -> Result<(), String> {
-    let models_root = std::fs::canonicalize(data_dir.join("models")).ok();
+    let models_root =
+        std::fs::canonicalize(crate::managed_storage::root(data_dir)?.join("models")).ok();
     let mut parents = Vec::new();
     for path in &model.files {
         if let Some(parent) = Path::new(path).parent() {
@@ -820,8 +989,23 @@ fn cleanup_model_storage(model: &InstalledModel, data_dir: &Path) -> Result<(), 
         if !managed {
             continue;
         }
-        let _ = std::fs::remove_file(canonical.join("model.json"));
-        let _ = std::fs::remove_file(canonical.join("download.json"));
+        remove_if_present(&canonical.join("model.json"))?;
+        remove_if_present(&canonical.join("download.json"))?;
+        remove_if_present(&canonical.join("download.previous.json"))?;
+        // Managed companions are private to this source/destination digest. Never
+        // delete an external/shared projector selected in a user's profile.
+        if let Some(projector) = model.projector_path.as_ref().map(Path::new) {
+            if projector.parent() == Some(canonical.as_path()) {
+                remove_if_present(projector)?;
+            }
+        }
+        if let Some(name) = model
+            .projector_filename
+            .as_deref()
+            .filter(|n| valid_filename(n))
+        {
+            remove_if_present(&canonical.join(name.rsplit('/').next().unwrap()))?;
+        }
         if let Ok(entries) = std::fs::read_dir(&canonical) {
             for entry in entries.flatten() {
                 if entry.file_name().to_string_lossy().ends_with(".part") {
@@ -857,8 +1041,85 @@ fn profile_path(state: &AppState, path: &str) -> PathBuf {
     profile_path_for(&state.data_dir, path)
 }
 
+fn read_profile(state: &AppState, path: &str) -> Result<Option<Profile>, String> {
+    let current = profile_path(state, path);
+    match std::fs::read(&current) {
+        Ok(bytes) => {
+            return serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|_| "Saved model profile is invalid.".into())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let legacy = state
+        .data_dir
+        .join("model-profiles")
+        .join(format!("{}.json", digest(&path.to_lowercase())));
+    // A legacy folded profile has no original identity. On case-sensitive
+    // systems only migrate when there is exactly one matching sibling.
+    if !cfg!(windows) {
+        let selected = Path::new(path);
+        if let (Some(parent), Some(name)) = (selected.parent(), selected.file_name()) {
+            let count = std::fs::read_dir(parent)
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&name.to_string_lossy())
+                })
+                .count();
+            if count != 1 {
+                return Ok(None);
+            }
+        }
+    }
+    let Ok(bytes) = std::fs::read(&legacy) else {
+        return Ok(None);
+    };
+    let profile = serde_json::from_slice(&bytes).map_err(|_| "Legacy model profile is invalid.")?;
+    if current != legacy {
+        atomic_json(&current, &bytes)?;
+    }
+    Ok(Some(profile))
+}
+
+pub(crate) fn migrate_storage_profiles(
+    state: &AppState,
+    source: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    let remap = |value: &str| {
+        Path::new(value)
+            .strip_prefix(source)
+            .ok()
+            .map(|suffix| target.join(suffix).to_string_lossy().into_owned())
+            .unwrap_or_else(|| value.to_string())
+    };
+    let mut models = Vec::new();
+    scan(&source.join("models"), 1, &mut models)?;
+    for model in models {
+        if let Some(mut profile) = read_profile(state, &model.path)? {
+            profile.runtime_path = remap(&profile.runtime_path);
+            profile.projector_path = profile.projector_path.map(|p| remap(&p));
+            let path = profile_path(state, &remap(&model.path));
+            std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+            atomic_json(
+                &path,
+                &serde_json::to_vec(&profile).map_err(|e| e.to_string())?,
+            )?;
+        }
+    }
+    let mut preferences = state.database()?.preferences()?;
+    preferences.model_path = remap(&preferences.model_path);
+    preferences.runtime_path = remap(&preferences.runtime_path);
+    preferences.projector_path = remap(&preferences.projector_path);
+    state.database()?.save_preferences(&preferences)
+}
+
 fn paths_match(left: &str, right: &str) -> bool {
-    if left.eq_ignore_ascii_case(right) {
+    if left == right || (cfg!(windows) && left.eq_ignore_ascii_case(right)) {
         return true;
     }
     std::fs::canonicalize(left)
@@ -995,9 +1256,7 @@ pub async fn use_installed_model(
             // Re-using the active model must not reset a just-saved full
             // context back to the first-load 8,192-token default.
             current_config
-        } else if let Ok(bytes) = std::fs::read(profile_path(&state, &model.path)) {
-            let profile: Profile =
-                serde_json::from_slice(&bytes).map_err(|_| "Saved model profile is invalid.")?;
+        } else if let Some(profile) = read_profile(&state, &model.path)? {
             restore_model_profile(&mut preferences, model, Some(profile))
         } else {
             restore_model_profile(&mut preferences, model, None)
@@ -1081,6 +1340,127 @@ mod tests {
         );
     }
 
+    fn journal(filename: &str) -> DownloadState {
+        DownloadState {
+            repo: "owner/repo".into(),
+            revision: "a".repeat(40),
+            filename: filename.into(),
+            bytes: 20,
+            sha256: "b".repeat(64),
+            received: 999,
+            projector: Some("vision/mmproj.gguf".into()),
+        }
+    }
+    #[test]
+    fn restart_merges_completed_shards_nested_source_and_projector_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("a".repeat(64));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("model-00001-of-00002.gguf"), b"GGUF").unwrap();
+        std::fs::write(dir.join("model-00002-of-00002.gguf.part"), b"GG").unwrap();
+        write_download_state(&dir, &journal("nested/model-00001-of-00002.gguf")).unwrap();
+        crate::install_recovery::clean(temp.path(), false).unwrap();
+        let mut rows = Vec::new();
+        scan(temp.path(), 1, &mut rows).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(row.revision.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!(row.filename, "nested/model-00001-of-00002.gguf");
+        assert_eq!(
+            row.projector_filename.as_deref(),
+            Some("vision/mmproj.gguf")
+        );
+        assert_eq!(row.received, 6);
+        assert!(!row.complete);
+        // All shards can be ready while the projector still needs resuming.
+        std::fs::rename(
+            dir.join("model-00002-of-00002.gguf.part"),
+            dir.join("model-00002-of-00002.gguf"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("mmproj.gguf.part"), b"GG").unwrap();
+        rows.clear();
+        scan(temp.path(), 1, &mut rows).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].complete);
+        assert_eq!(rows[0].received, 8);
+        assert_eq!(
+            rows[0].projector_filename.as_deref(),
+            Some("vision/mmproj.gguf")
+        );
+    }
+    #[test]
+    fn independent_sources_with_identical_basenames_remain_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            let dir = temp.path().join(name.repeat(64));
+            std::fs::create_dir(&dir).unwrap();
+            write_download_state(&dir, &journal("nested/model.gguf")).unwrap();
+        }
+        let mut rows = Vec::new();
+        scan(temp.path(), 1, &mut rows).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].id, rows[1].id);
+        assert_eq!(rows[0].received, 0);
+    }
+    #[test]
+    fn journal_replacement_recovers_previous_identity_and_reports_write_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        write_download_state(temp.path(), &journal("nested/model.gguf")).unwrap();
+        write_download_state(temp.path(), &journal("nested/model.gguf")).unwrap();
+        std::fs::write(temp.path().join("download.json"), b"{torn").unwrap();
+        assert_eq!(
+            pending_download(temp.path()).unwrap().filename,
+            "nested/model.gguf"
+        );
+        assert!(
+            write_download_state(&temp.path().join("missing"), &journal("model.gguf")).is_err()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn broken_links_do_not_hide_valid_models_and_case_identities_are_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing"), temp.path().join("dangling"))
+            .unwrap();
+        std::fs::write(temp.path().join("A.gguf"), b"GGUF").unwrap();
+        std::fs::write(temp.path().join("a.gguf"), b"GGUF").unwrap();
+        let mut rows = Vec::new();
+        scan(temp.path(), 1, &mut rows).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(
+            profile_path_for(temp.path(), &rows[0].path),
+            profile_path_for(temp.path(), &rows[1].path)
+        );
+        assert!(!paths_match(&rows[0].path, &rows[1].path));
+    }
+    #[test]
+    fn deletion_tolerates_missing_weights_and_cleans_owned_projector_and_journals() {
+        let data = tempfile::tempdir().unwrap();
+        let dir = data.path().join("models").join("a".repeat(64));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mmproj.gguf"), b"GGUF").unwrap();
+        write_download_state(&dir, &journal("model.gguf")).unwrap();
+        let path = dir.join("model.gguf.part").to_string_lossy().into_owned();
+        let model = InstalledModel {
+            id: path.clone(),
+            path: path.clone(),
+            filename: "model.gguf".into(),
+            bytes: 20,
+            repo: None,
+            revision: None,
+            files: vec![path.clone()],
+            complete: false,
+            received: 0,
+            projector_filename: Some("vision/mmproj.gguf".into()),
+            projector_path: None,
+        };
+        remove_if_present(Path::new(&path)).unwrap();
+        cleanup_model_storage(&model, data.path()).unwrap();
+        cleanup_model_storage(&model, data.path()).unwrap();
+        assert!(!dir.exists());
+    }
     #[test]
     fn model_profiles_restore_projector_paths_and_modes_without_cross_model_leaks() {
         let mut model = InstalledModel {
@@ -1165,7 +1545,10 @@ mod tests {
             projector_path: None,
         };
         assert!(already_using_model(r"C:\models\model.gguf", &model));
-        assert!(already_using_model(r"c:\models\model.gguf", &model));
+        assert_eq!(
+            already_using_model(r"c:\models\model.gguf", &model),
+            cfg!(windows)
+        );
         assert!(!already_using_model(r"C:\models\other.gguf", &model));
     }
     #[test]
@@ -1318,7 +1701,8 @@ mod tests {
                 received: 4,
                 projector: Some("mmproj-model-f16.gguf".into()),
             },
-        );
+        )
+        .unwrap();
         let mut result = Vec::new();
         scan(dir.path(), 1, &mut result).unwrap();
         assert_eq!(result.len(), 1);

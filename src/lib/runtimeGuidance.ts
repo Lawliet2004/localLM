@@ -38,8 +38,14 @@ export function estimateMemory(model: ModelMetadata, config: RuntimeConfig, proj
   };
 }
 
+export function freshHardware(hardware: HardwareStatus | null) {
+  return hardware && Number.isFinite(hardware.sampledAt) && Date.now() - hardware.sampledAt <= 30000 && Date.now() >= hardware.sampledAt ? hardware : null;
+}
+
 export function availableGpuBytes(hardware: HardwareStatus | null) {
-  const gpu = hardware?.gpus[0];
+  hardware = freshHardware(hardware);
+  // Telemetry cannot identify the runtime's selected device on multi-GPU hosts.
+  const gpu = hardware?.gpus.length === 1 ? hardware.gpus[0] : null;
   if (!gpu || gpu.memoryTotalMib === null || gpu.memoryUsedMib === null) return null;
   return Math.max(0, (gpu.memoryTotalMib - gpu.memoryUsedMib) * 2 ** 20 - 1024 ** 3);
 }
@@ -49,28 +55,44 @@ export function fittingGpuLayers(model: ModelMetadata, hardware: HardwareStatus 
   if (max == null) return null;
   const free = availableGpuBytes(hardware);
   const projector = config.visionEnabled !== false && config.offloadProjector !== false ? projectorBytes : 0;
-  if (free === null || projector === null) return 0;
+  if (free === null || projector === null) return null;
   const available = Math.max(0, free - projector);
   const full = estimateMemory(model, { ...config, gpuLayers: -1 });
-  if (full.partial || full.gpuBytes == null || full.gpuBytes <= 0) return 0;
+  if (full.partial || full.gpuBytes == null || full.gpuBytes <= 0) return null;
   if (available >= full.gpuBytes) return max;
   return Math.max(0, Math.floor((available / full.gpuBytes) * max));
 }
 
 export function recommendedConfig(model: ModelMetadata, hardware: HardwareStatus | null, projectorBytes: number | null = 0, vision?: Pick<RuntimeConfig, 'visionEnabled' | 'offloadProjector'>): RuntimeConfig {
-  const config = { ...defaultRuntimeConfig, visionEnabled: vision?.visionEnabled ?? true, offloadProjector: vision?.offloadProjector ?? true, contextLength: Math.max(128, Math.min(model.contextLength ?? 131072, contextSafetyLimit)),
+  const config = { ...defaultRuntimeConfig, visionEnabled: vision?.visionEnabled ?? true, offloadProjector: vision?.offloadProjector ?? true, contextLength: Math.max(128, Math.min(model.contextLength ?? 4096, 8192, contextSafetyLimit)),
     cpuThreads: Math.max(1, Math.min(256, Math.floor((hardware?.logicalCpus ?? 12) / 2))), batchSize: 512, microBatchSize: 128 };
   const headSize = model.embeddingLength && model.headCount ? model.embeddingLength / model.headCount : null;
   const key = model.keyLength ?? headSize, value = model.valueLength ?? headSize;
   if (!key || !value || key % 32 !== 0 || value % 32 !== 0) {
     config.cacheTypeK = 'f16'; config.cacheTypeV = 'f16'; config.flashAttention = false;
   }
-  // Use currently available VRAM conservatively; leave room for compute buffers and the desktop.
-  const fitted = fittingGpuLayers(model, hardware, config, projectorBytes);
-  if (fitted === null || fitted === 0) {
-    return { ...config, gpuLayers: 0, offloadKvCache: false };
+  // Bound against host RAM too: mmap, staging and backend buffers can retain
+  // weights even with GPU offload. Unknown cache/projector estimates stay unknown.
+  const available = freshHardware(hardware)?.memoryAvailableBytes;
+  const reserve = Math.max(2 ** 30, model.fileBytes * 0.15);
+  while (available != null && config.contextLength > 128) {
+    const estimate = estimateMemory(model, { ...config, gpuLayers: 0, offloadKvCache: false, offloadProjector: false }, projectorBytes);
+    if (!estimate.partial && estimate.ramBytes != null && estimate.ramBytes + reserve <= available * 0.8) break;
+    config.contextLength = Math.max(128, Math.floor(config.contextLength / 2 / 128) * 128);
   }
+  // Driver telemetry cannot prove which backend/device the selected runtime uses.
+  // Leave placement automatic even when a separately sampled NVIDIA GPU is full.
   config.gpuLayers = -1;
   config.offloadKvCache = true;
   return config;
+}
+
+export function recommendationIssue(model: ModelMetadata, hardware: HardwareStatus | null, config: RuntimeConfig, projectorBytes: number | null = 0): string | null {
+  const estimate = estimateMemory(model, { ...config, gpuLayers: 0, offloadKvCache: false, offloadProjector: false }, projectorBytes);
+  hardware = freshHardware(hardware);
+  if (hardware?.memoryAvailableBytes == null || estimate.partial || estimate.ramBytes == null)
+    return 'Memory fit is unknown. Review the runtime and memory requirements before loading.';
+  if (estimate.ramBytes + Math.max(2 ** 30, model.fileBytes * 0.15) > hardware.memoryAvailableBytes * 0.8)
+    return 'This model exceeds the conservative memory budget even at minimum context. Choose a smaller model or free memory.';
+  return null;
 }

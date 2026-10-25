@@ -225,7 +225,9 @@ fn build_request(
             );
         }
         for file in files {
-            let path = file["path"].as_str().ok_or("Multipart file requires workspace path.")?;
+            let path = file["path"]
+                .as_str()
+                .ok_or("Multipart file requires workspace path.")?;
             let content = workspace.development_bytes(path, 8 * 1024 * 1024)?;
             bytes += content.len();
             if bytes > 8 * 1024 * 1024 {
@@ -277,15 +279,7 @@ async fn send(
     loop {
         let vetted = vetted(&current).await?;
         let client = pinned_client(&vetted, cookies.clone())?;
-        let request = build_request(
-            &client,
-            &method,
-            &current,
-            headers,
-            args,
-            root,
-            with_body,
-        )?;
+        let request = build_request(&client, &method, &current, headers, args, root, with_body)?;
         let response = request.send().await.map_err(|e| {
             format!(
                 "HTTP request failed; side effects may have occurred. {}",
@@ -346,7 +340,7 @@ impl Manager {
                 owner: owner.clone(),
                 root,
                 base: base.clone(),
-                headers: {let mut h=headers(&args["headers"])?;if let Some(id)=args["credential_id"].as_str(){let (key,value)=crate::development_credentials::resolve(ctx.state,id,&base)?;h.insert(key,value);}h},
+                headers: {let mut h=headers(&args["headers"])?;if let Some(id)=args["credential_id"].as_str(){let (key,value)=crate::development_credentials::resolve(ctx.state,id,&base).await?;h.insert(key,value);}h},
                 cookies: cookies.clone(),
                 follow,
             };
@@ -429,7 +423,7 @@ impl Manager {
             (target, args["follow_redirects"] == true, BTreeMap::new(), None)
         };
         request_headers.extend(headers(&args["headers"])?);
-        if let Some(id)=args["credential_id"].as_str(){let (key,value)=crate::development_credentials::resolve(ctx.state,id,&target)?;request_headers.insert(key,value);}
+        if let Some(id)=args["credential_id"].as_str(){let (key,value)=crate::development_credentials::resolve(ctx.state,id,&target).await?;request_headers.insert(key,value);}
         let method =
             reqwest::Method::from_bytes(args["method"].as_str().unwrap_or("GET").as_bytes())
                 .map_err(|e| e.to_string())?;
@@ -685,11 +679,10 @@ mod tests {
         // Traversal is refused before it is resolved.
         assert!(resolve_workspace_path(bound, "../secret.txt").is_err());
         // An absolute path outside the workspace is refused.
-        assert!(resolve_workspace_path(
-            bound,
-            outside.path().join("secret.txt").to_str().unwrap()
-        )
-        .is_err());
+        assert!(
+            resolve_workspace_path(bound, outside.path().join("secret.txt").to_str().unwrap())
+                .is_err()
+        );
         // A link that points outside the workspace is refused too.
         #[cfg(unix)]
         {

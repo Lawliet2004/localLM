@@ -7,10 +7,14 @@ pub async fn recover_at_startup(state: &crate::AppState) -> Result<(), String> {
     if operations.is_empty() {
         return Ok(());
     }
-    let credential = state.daytona_vault.load("daytona").and_then(|bytes| {
-        let bytes = bytes.ok_or("Save the Daytona credential to resume pending cleanup.")?;
-        String::from_utf8(bytes).map_err(|_| "Saved Daytona credential is invalid.".into())
-    });
+    let credential = state
+        .daytona_vault
+        .load_blocking("daytona")
+        .await
+        .and_then(|bytes| {
+            let bytes = bytes.ok_or("Save the Daytona credential to resume pending cleanup.")?;
+            String::from_utf8(bytes).map_err(|_| "Saved Daytona credential is invalid.".into())
+        });
     let (client, scope) = match credential
         .and_then(|key| Ok((crate::daytona::Client::new(&key)?, credential_scope(&key))))
     {
@@ -112,7 +116,11 @@ fn pending(
 }
 #[tauri::command]
 pub async fn has_daytona_key(state: tauri::State<'_, crate::AppState>) -> Result<bool, String> {
-    Ok(state.daytona_vault.load_blocking("daytona").await?.is_some())
+    Ok(state
+        .daytona_vault
+        .load_blocking("daytona")
+        .await?
+        .is_some())
 }
 #[tauri::command]
 pub async fn save_daytona_key(
@@ -170,7 +178,8 @@ pub async fn retry_daytona_cleanup(
         .map_err(|_| "Another cloud operation is in progress.")?;
     let bytes = state
         .daytona_vault
-        .load("daytona")?
+        .load_blocking("daytona")
+        .await?
         .ok_or("Save the Daytona credential for this operation first.")?;
     let key = String::from_utf8(bytes).map_err(|_| "Saved Daytona credential is invalid.")?;
     let client = crate::daytona::Client::new(&key)?;

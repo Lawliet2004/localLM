@@ -61,9 +61,12 @@ fn vault_id_for_provider(provider: &str) -> Result<&'static str, String> {
     }
 }
 
-pub fn load_session(vault: &Vault, provider: &str) -> Result<Option<SubscriptionSession>, String> {
+pub async fn load_session(
+    vault: &Vault,
+    provider: &str,
+) -> Result<Option<SubscriptionSession>, String> {
     let id = vault_id_for_provider(provider)?;
-    match vault.load(id)? {
+    match vault.load_blocking(id).await? {
         Some(bytes) => {
             let session: SubscriptionSession = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("Corrupted subscription session: {e}"))?;
@@ -73,16 +76,16 @@ pub fn load_session(vault: &Vault, provider: &str) -> Result<Option<Subscription
     }
 }
 
-pub fn save_session(vault: &Vault, session: &SubscriptionSession) -> Result<(), String> {
+pub async fn save_session(vault: &Vault, session: &SubscriptionSession) -> Result<(), String> {
     let id = vault_id_for_provider(&session.provider)?;
     let bytes = serde_json::to_vec(session)
         .map_err(|e| format!("Failed to serialize subscription session: {e}"))?;
-    vault.save(id, &bytes)
+    vault.save_blocking(id, bytes).await
 }
 
-pub fn clear_session(vault: &Vault, provider: &str) -> Result<(), String> {
+pub async fn clear_session(vault: &Vault, provider: &str) -> Result<(), String> {
     let id = vault_id_for_provider(provider)?;
-    vault.clear(id)
+    vault.clear_blocking(id).await
 }
 
 fn user_home_dir() -> Option<PathBuf> {
@@ -239,7 +242,10 @@ pub fn parse_grok_auth_content(content: &str) -> Result<SubscriptionSession, Str
     })
 }
 
-pub fn import_cli_session(vault: &Vault, provider: &str) -> Result<SubscriptionSession, String> {
+pub async fn import_cli_session(
+    vault: &Vault,
+    provider: &str,
+) -> Result<SubscriptionSession, String> {
     match provider {
         PROVIDER_CHATGPT | "chatgpt-subscription" => {
             let path = codex_auth_path()
@@ -247,7 +253,7 @@ pub fn import_cli_session(vault: &Vault, provider: &str) -> Result<SubscriptionS
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
             let session = parse_codex_auth_content(&content)?;
-            save_session(vault, &session)?;
+            save_session(vault, &session).await?;
             Ok(session)
         }
         PROVIDER_GROK | "grok-subscription" => {
@@ -257,14 +263,14 @@ pub fn import_cli_session(vault: &Vault, provider: &str) -> Result<SubscriptionS
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
             let session = parse_grok_auth_content(&content)?;
-            save_session(vault, &session)?;
+            save_session(vault, &session).await?;
             Ok(session)
         }
         _ => Err(format!("Unknown subscription provider: {provider}")),
     }
 }
 
-pub fn save_manual_token(
+pub async fn save_manual_token(
     vault: &Vault,
     provider: &str,
     token: &str,
@@ -293,11 +299,11 @@ pub fn save_manual_token(
         source: "manual".into(),
         updated_at: crate::store::now(),
     };
-    save_session(vault, &session)?;
+    save_session(vault, &session).await?;
     Ok(session)
 }
 
-pub fn get_subscription_status(
+pub async fn get_subscription_status(
     vault: &Vault,
     provider: &str,
 ) -> Result<SubscriptionStatus, String> {
@@ -306,7 +312,7 @@ pub fn get_subscription_status(
         PROVIDER_GROK | "grok-subscription" => PROVIDER_GROK,
         _ => return Err(format!("Unknown provider: {provider}")),
     };
-    let session = load_session(vault, canonical)?;
+    let session = load_session(vault, canonical).await?;
     let (cli_detected, cli_path) = match canonical {
         PROVIDER_CHATGPT => {
             let p = codex_auth_path();
@@ -389,7 +395,7 @@ pub async fn refresh_subscription_token(
                     session.expires_at = Some(now_sec + expires_in);
                 }
                 session.updated_at = crate::store::now();
-                let _ = save_session(vault, &session);
+                let _ = save_session(vault, &session).await;
             }
         }
         PROVIDER_GROK | "grok-subscription" => {
@@ -425,7 +431,7 @@ pub async fn refresh_subscription_token(
                     session.expires_at = Some(now_sec + expires_in);
                 }
                 session.updated_at = crate::store::now();
-                let _ = save_session(vault, &session);
+                let _ = save_session(vault, &session).await;
             }
         }
         _ => {}
@@ -435,7 +441,7 @@ pub async fn refresh_subscription_token(
 }
 
 pub async fn get_valid_access_token(vault: &Vault, provider: &str) -> Result<String, String> {
-    let session = load_session(vault, provider)?.ok_or_else(|| {
+    let session = load_session(vault, provider).await?.ok_or_else(|| {
         format!(
             "No active subscription session found for {provider}. Sign in or sync from CLI first."
         )
@@ -682,7 +688,7 @@ pub async fn sign_in_subscription(
         updated_at: crate::store::now(),
     };
 
-    save_session(&vault, &session)?;
+    save_session(&vault, &session).await?;
     Ok(session)
 }
 

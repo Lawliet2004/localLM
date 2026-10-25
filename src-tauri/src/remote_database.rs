@@ -60,7 +60,7 @@ pub fn list_database_profiles(
     state.database()?.setting(KEY)
 }
 #[tauri::command]
-pub fn save_database_profile(
+pub async fn save_database_profile(
     state: tauri::State<'_, crate::AppState>,
     mut profile: Profile,
     password: Option<String>,
@@ -82,7 +82,10 @@ pub fn save_database_profile(
         if password.len() > 8192 {
             return Err("Database password exceeds its bound.".into());
         }
-        state.daytona_vault.save(&profile.id, password.as_bytes())?;
+        state
+            .daytona_vault
+            .save_blocking(&profile.id, password.into_bytes())
+            .await?;
     }
     items.retain(|p| p.id != profile.id);
     items.push(profile.clone());
@@ -90,7 +93,7 @@ pub fn save_database_profile(
     Ok(profile)
 }
 #[tauri::command]
-pub fn delete_database_profile(
+pub async fn delete_database_profile(
     state: tauri::State<'_, crate::AppState>,
     id: String,
 ) -> Result<(), String> {
@@ -106,7 +109,7 @@ pub fn delete_database_profile(
     }
     items.retain(|p| p.id != id);
     state.database()?.save_setting(KEY, &items)?;
-    state.daytona_vault.clear(&id)
+    state.daytona_vault.clear_blocking(&id).await
 }
 pub fn load(state: &crate::AppState, id: &str) -> Result<Profile, String> {
     let items: Vec<Profile> = state.database()?.setting(KEY)?;
@@ -115,11 +118,12 @@ pub fn load(state: &crate::AppState, id: &str) -> Result<Profile, String> {
         .find(|p| p.id == id)
         .ok_or("Unknown database profile.".into())
 }
-pub(super) fn password(state: &crate::AppState, p: &Profile) -> Result<String, String> {
+pub(super) async fn password(state: &crate::AppState, p: &Profile) -> Result<String, String> {
     String::from_utf8(
         state
             .daytona_vault
-            .load(&p.id)?
+            .load_blocking(&p.id)
+            .await?
             .ok_or("Database profile password is unavailable in the vault.")?,
     )
     .map_err(|_| "Database password is invalid.".into())
@@ -252,7 +256,7 @@ pub async fn query(
     if state.database()?.setting::<bool>("offline_mode")? {
         return Err("Offline mode blocks remote database access.".into());
     }
-    let secret = password(state, p)?;
+    let secret = password(state, p).await?;
     let sql = if alias == "database_schema" {
         if p.engine == "postgres" {
             "SELECT table_schema,table_name,column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog','information_schema') ORDER BY table_schema,table_name,ordinal_position".into()

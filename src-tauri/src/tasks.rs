@@ -347,11 +347,7 @@ fn update(
 }
 
 /// Read one task of the graph.
-fn get(
-    store: &crate::store::Store,
-    conversation_id: &str,
-    args: &Value,
-) -> Result<Value, String> {
+fn get(store: &crate::store::Store, conversation_id: &str, args: &Value) -> Result<Value, String> {
     let id = task_id(args)?;
     let task = store
         .task(conversation_id, id)?
@@ -360,15 +356,13 @@ fn get(
 }
 
 /// List the tasks of the graph, optionally filtered by state.
-fn list(
-    store: &crate::store::Store,
-    conversation_id: &str,
-    args: &Value,
-) -> Result<Value, String> {
+fn list(store: &crate::store::Store, conversation_id: &str, args: &Value) -> Result<Value, String> {
     let wanted = match args.get("state") {
         None | Some(Value::Null) => None,
         Some(value) => {
-            let state = value.as_str().ok_or("task_list 'state' must be a string.")?;
+            let state = value
+                .as_str()
+                .ok_or("task_list 'state' must be a string.")?;
             if !STATES.contains(&state) {
                 return Err(format!(
                     "Unknown task state '{state}'. Use one of: {}.",
@@ -602,11 +596,19 @@ mod tests {
         (store, conversation)
     }
 
-    fn create(store: &crate::store::Store, conversation: &str, args: Value) -> Result<Value, String> {
+    fn create(
+        store: &crate::store::Store,
+        conversation: &str,
+        args: Value,
+    ) -> Result<Value, String> {
         dispatch(store, conversation, "task_create", args)
     }
 
-    fn update(store: &crate::store::Store, conversation: &str, args: Value) -> Result<Value, String> {
+    fn update(
+        store: &crate::store::Store,
+        conversation: &str,
+        args: Value,
+    ) -> Result<Value, String> {
         dispatch(store, conversation, "task_update", args)
     }
 
@@ -617,12 +619,7 @@ mod tests {
     #[test]
     fn a_new_task_is_pending_and_unblocked() {
         let (store, conversation) = conversation_store();
-        let task = create(
-            &store,
-            &conversation,
-            json!({"title":"Write the parser"}),
-        )
-        .unwrap();
+        let task = create(&store, &conversation, json!({"title":"Write the parser"})).unwrap();
         assert!(id_of(&task).starts_with("tsk_"), "{task}");
         assert_eq!(task["title"], "Write the parser");
         assert_eq!(task["state"], "pending");
@@ -789,10 +786,7 @@ mod tests {
         assert_eq!(deleted["deleted"], true);
         assert_eq!(deleted["id"], id_of(&first).as_str());
         assert!(store.task(&conversation, &id_of(&first)).unwrap().is_none());
-        assert!(store
-            .task_dependencies(&id_of(&second))
-            .unwrap()
-            .is_empty());
+        assert!(store.task_dependencies(&id_of(&second)).unwrap().is_empty());
         let error = dispatch(
             &store,
             &conversation,
@@ -895,13 +889,17 @@ mod tests {
         .unwrap();
         crate::tool_validation::validate_value(&contract("task_update"), &updated).unwrap();
         assert_eq!(updated["state"], "in_progress");
-        let read = execute(&ctx, "task_get", json!({ "id": id })).await.unwrap();
+        let read = execute(&ctx, "task_get", json!({ "id": id }))
+            .await
+            .unwrap();
         crate::tool_validation::validate_value(&contract("task_get"), &read).unwrap();
         assert_eq!(read["id"], id.as_str());
         let listed = execute(&ctx, "task_list", json!({})).await.unwrap();
         crate::tool_validation::validate_value(&contract("task_list"), &listed).unwrap();
         assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
-        let deleted = execute(&ctx, "task_delete", json!({ "id": id })).await.unwrap();
+        let deleted = execute(&ctx, "task_delete", json!({ "id": id }))
+            .await
+            .unwrap();
         crate::tool_validation::validate_value(&contract("task_delete"), &deleted).unwrap();
         assert_eq!(deleted["deleted"], true);
     }

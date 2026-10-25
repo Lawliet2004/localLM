@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::sync::Mutex;
-use tauri::Manager;
+
 use tokio::sync::watch;
 
 #[derive(Clone, Default, Serialize)]
@@ -103,7 +103,6 @@ pub fn cancel_model_install(state: tauri::State<'_, crate::AppState>) -> Result<
 }
 #[tauri::command]
 pub async fn install_model(
-    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     filename: Option<String>,
 ) -> Result<Status, String> {
@@ -133,11 +132,7 @@ pub async fn install_model(
     };
     let _guard = RunGuard(installer);
     let result = async {
-        let directory = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| error.to_string())?
-            .join("models");
+        let directory = crate::managed_storage::root(&state.data_dir)?.join("models");
         tokio::fs::create_dir_all(&directory)
             .await
             .map_err(|error| error.to_string())?;

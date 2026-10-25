@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Download, HardDrive, Heart, Search, Trash2, Play, RefreshCw, ExternalLink } from 'lucide-react';
 import { api, errorMessage, nativeAvailable, type ModelInstallStatus } from '../lib/api';
 import type { HardwareStatus, HubRepo, HubSearchHit, InstalledModel } from '../lib/types';
-import { modelLabel } from '../lib/localModels';
+import { localModels, modelLabel } from '../lib/localModels';
 import { compactCount, downloadSize, fitKind, fitLabel, hubSize, parseHubQuery, preferredFile, preferredProjector, projectorFiles, quantLabel, repoParts, weightFiles } from '../lib/modelStudio';
 import { gib } from '../lib/runtimeGuidance';
 import { samePath } from '../lib/pathUtils';
@@ -57,8 +57,10 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
       finally { if (!disposed) timer = setTimeout(() => void poll(), 1000); }
     }
     void poll();
-    void api.hardwareStatus().then(value => { if (!disposed) setHardware(value); }).catch(() => {});
-    return () => { disposed = true; clearTimeout(timer); };
+    const refreshHardware = () => { void api.hardwareStatus().then(value => { if (!disposed) setHardware(value); }).catch(() => { if (!disposed) setHardware(null); }); };
+    refreshHardware();
+    const hardwareTimer = setInterval(refreshHardware, 15000);
+    return () => { disposed = true; clearTimeout(timer); clearInterval(hardwareTimer); };
   }, [onRefresh]);
   useEffect(() => {
     if (!nativeAvailable) return;
@@ -195,6 +197,8 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
               <small>This GGUF package stores its multimodal encoder/projector weights separately. Native image support needs one matching projector; None keeps text-only chat. F16 and BF16 are 16-bit alternatives; F32 uses more space.</small>
             </label>
           </div>}
+          <p role="note">Compatibility is unverified: file hashes verify the download, but cannot establish support for this architecture, quantization or projector in your selected runtime. Install a matching native runtime first; check the model publisher’s requirements before a large download.</p>
+          {hardware && <p>Memory sampled {new Date(hardware.sampledAt).toLocaleTimeString()}. Fit labels are candidates for an available device; the runtime may select another GPU.</p>}
           {selected && <div className="quant-cta"><div><strong>{selected.quant} · {projector ? 'Image + text' : 'Text only'}</strong><p>{gib(selected.bytes)} weights{projector ? ` + ${gib(projectorBytes)} projector` : ''}</p><p>Total download: {gib(selected.bytes + projectorBytes)} ({hubSize(selected.bytes + projectorBytes)}) · {fitLabel(selected.kind)}</p></div><button type="button" className="primary" disabled={downloadLocked || !filename} onClick={() => void download(catalog.repo, catalog.revision, filename, projector || undefined)}><Download size={14} />Download model{projector ? ' + projector' : ''}</button></div>}
         </>}
 
@@ -227,12 +231,13 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
             <button className="primary" type="button" disabled={locked || !model.complete} onClick={() => void run(async () => { await onUse(model); setNotice(`${modelLabel(model.filename)} is ready to use.`); })}><Play size={14} />Use model</button>
             {!model.complete && <button type="button" className="secondary" disabled={downloadLocked} onClick={() => {
               if (model.repo && model.revision) void download(model.repo, model.revision, model.filename, model.projectorFilename ?? undefined);
+              else if (model.repo && localModels.some(item => item.filename === model.filename)) void run(async () => { const status = await api.installModel(model.filename); if (status.error) throw new Error(status.error); await onRefresh(); });
               else if (model.repo) void run(() => openRepo(model.repo!));
               else { setNotice('Enter the Hugging Face repository in Discover to finish this download.'); setView('discover'); }
             }}><Download size={14} />{activeDownload ? 'Downloading…' : downloadedBytes(model) > 0 ? 'Resume download' : 'Retry download'}</button>}
             <button type="button" className="secondary" aria-label={`Delete ${modelLabel(model.filename)}`} disabled={downloadLocked} onClick={() => setRemove(model.id)}><Trash2 size={14} />Delete</button>
           </div>
-          {remove === model.id && <div className="library-delete" role="group" aria-label="Confirm model deletion"><p>Delete {modelLabel(model.filename)} ({gib(model.bytes)}) from disk? Every listed copy will be removed. A running copy will be unloaded. Conversations are kept.</p><button type="button" className="secondary" disabled={locked} onClick={() => setRemove(null)}>Keep model</button><button type="button" className="primary" disabled={downloadLocked} onClick={() => void run(async () => { await api.deleteInstalledModel(model.id); setRemove(null); await onDeleted(); await onRefresh(); setNotice('Model deleted.'); })}>Delete from disk</button></div>}
+          {remove === model.id && <div className="library-delete" role="group" aria-label="Confirm model deletion"><p>Delete {modelLabel(model.filename)} ({gib(model.complete ? model.bytes : received)} on disk) from disk? Every listed copy will be removed. A running copy will be unloaded. Conversations are kept.</p><button type="button" className="secondary" disabled={locked} onClick={() => setRemove(null)}>Keep model</button><button type="button" className="primary" disabled={downloadLocked} onClick={() => void run(async () => { await api.deleteInstalledModel(model.id); setRemove(null); await onDeleted(); await onRefresh(); setNotice('Model deleted.'); })}>Delete from disk</button></div>}
         </article>;
       })}</div>
     </section>}

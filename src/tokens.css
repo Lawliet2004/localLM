@@ -90,6 +90,15 @@
   --permission-full-soft: var(--cat-edit-soft);
   --permission-full-border: var(--cat-edit-border);
 
+  /* Context window categories: the popover's per-category dots. Mapped onto
+     the activity hues so the same kind of thing keeps the same color. */
+  --context-messages: var(--cat-command);
+  --context-system-tools: var(--cat-tool);
+  --context-mcp-tools: var(--cat-web);
+  --context-system-prompt: var(--cat-read);
+  --context-skills: var(--cat-edit);
+  --context-meta: var(--cat-reasoning);
+
   /* Code surface: warm tint of the paper palette instead of a fixed dark. */
   --code-bg: #f4f4ec;
   --code-fg: #26382f;

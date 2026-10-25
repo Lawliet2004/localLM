@@ -27,7 +27,7 @@ it('renders web search as a compact searched-the-web card with sources', () => {
   );
   expect(screen.getByText('Searched the web')).toBeInTheDocument();
   expect(screen.getByText('fusion yield 2024')).toBeInTheDocument();
-  expect(screen.getByText('2 results')).toBeInTheDocument();
+  expect(screen.getByText('2 sources')).toBeInTheDocument();
   fireEvent.click(screen.getByText('fusion yield 2024'));
   expect(screen.getByRole('link', { name: 'NIF result' })).toHaveAttribute('href', 'https://example.com/nif');
   expect(document.querySelector('.web-answer-excerpt')).toHaveTextContent('scientific yield above one');
@@ -229,8 +229,12 @@ it('renders structured result separately from logs with outcome status', () => {
   expect(screen.getByTestId('result-status')).toHaveTextContent('Structured result: ok');
   expect(screen.getByTestId('result-status')).toHaveTextContent('outcome success');
   const resultViewport = screen.getByTestId('result-viewport');
-  expect(resultViewport).toHaveTextContent('"answer": 42');
-  expect(resultViewport.querySelector('.hljs-attr')).toHaveTextContent('"answer"');
+  // The friendly view renders the payload fields, not raw envelope JSON.
+  expect(resultViewport).toHaveTextContent('answer');
+  expect(resultViewport).toHaveTextContent('42');
+  expect(resultViewport.textContent).not.toContain('schemaVersion');
+  // Raw JSON stays one disclosure away.
+  expect(resultViewport.querySelector('.raw-result-details summary')).toHaveTextContent('Raw result JSON');
   fireEvent.click(screen.getByRole('button', { name: 'Output' }));
   expect(screen.getByText('log line')).toBeInTheDocument();
 });

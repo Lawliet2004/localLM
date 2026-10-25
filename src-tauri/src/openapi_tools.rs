@@ -396,7 +396,9 @@ fn reject_private_server(url: &str) -> Result<(), String> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("OpenAPI server URL must use HTTP or HTTPS.".into());
     }
-    let host = parsed.host_str().ok_or("OpenAPI server URL needs a host.")?;
+    let host = parsed
+        .host_str()
+        .ok_or("OpenAPI server URL needs a host.")?;
     let literal = host
         .strip_prefix('[')
         .and_then(|inner| inner.strip_suffix(']'))
@@ -411,7 +413,8 @@ fn reject_private_server(url: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn percent_decode(s: &str) -> Result<String, String> {    let mut bytes = Vec::new();
+fn percent_decode(s: &str) -> Result<String, String> {
+    let mut bytes = Vec::new();
     let mut i = 0;
     while i < s.len() {
         if s.as_bytes()[i] == b'%' {
@@ -964,12 +967,9 @@ mod tests {
         let state = crate::test_support::app_state(t.path());
         let owner = state.database().unwrap().create_conversation().unwrap().id;
         let ctx = crate::development_tools::tests::context(&state, t.path(), &owner, &[]);
-        let error = prepare(
-            &ctx,
-            json!({"path":"api.json","operation_id":"get"}),
-        )
-        .await
-        .unwrap_err();
+        let error = prepare(&ctx, json!({"path":"api.json","operation_id":"get"}))
+            .await
+            .unwrap_err();
         assert!(error.contains("private network"), "{error}");
     }
     #[test]

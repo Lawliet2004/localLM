@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 /// Display programs are data, including literal tool markup in code samples.
 /// Blank their bytes (preserving offsets) before text-call detection/parsing.
@@ -19,13 +19,19 @@ pub(crate) fn without_presentation_fences(text: &str) -> Cow<'_, str> {
             closing = run >= count && trimmed[run..].trim().is_empty();
         } else {
             for (index, marker) in line.bytes().enumerate() {
-                if marker != b'`' && marker != b'~' { continue; }
+                if marker != b'`' && marker != b'~' {
+                    continue;
+                }
                 // Inspect each marker run once; long backtick lines must not
                 // turn fence recognition into quadratic work.
-                if index > 0 && line.as_bytes()[index - 1] == marker { continue; }
+                if index > 0 && line.as_bytes()[index - 1] == marker {
+                    continue;
+                }
                 let rest = &line[index..];
                 let count = rest.bytes().take_while(|byte| *byte == marker).count();
-                if count < 3 { continue; }
+                if count < 3 {
+                    continue;
+                }
                 let language = rest[count..].split_whitespace().next().unwrap_or_default();
                 if matches!(language, "openui" | "openui-lang") {
                     fence = Some((marker, count));
@@ -36,10 +42,14 @@ pub(crate) fn without_presentation_fences(text: &str) -> Cow<'_, str> {
         if fence.is_some() {
             let bytes = masked.get_or_insert_with(|| text.as_bytes().to_vec());
             for byte in &mut bytes[offset..offset + line.len()] {
-                if *byte != b'\n' && *byte != b'\r' { *byte = b' '; }
+                if *byte != b'\n' && *byte != b'\r' {
+                    *byte = b' ';
+                }
             }
         }
-        if closing { fence = None; }
+        if closing {
+            fence = None;
+        }
         offset += line.len();
     }
     match masked {
@@ -407,10 +417,13 @@ pub fn strip_text_tool_calls(text: &str) -> String {
     let mut rest = text;
     while !rest.is_empty() {
         let visible_rest = &visible[text.len() - rest.len()..];
-        let next = [visible_rest.find("<tool_call>"), visible_rest.find("<function=")]
-            .into_iter()
-            .flatten()
-            .min();
+        let next = [
+            visible_rest.find("<tool_call>"),
+            visible_rest.find("<function="),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let Some(start) = next else {
             out.push_str(rest);
             break;
@@ -483,12 +496,16 @@ mod tests {
     fn repeated_call_identity_is_replaced_not_appended() {
         let mut calls = ToolCalls::default();
         calls
-            .push(&json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
-                "function":{"name":"read","arguments":"{\"path\":"}}]}))
+            .push(
+                &json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
+                "function":{"name":"read","arguments":"{\"path\":"}}]}),
+            )
             .unwrap();
         calls
-            .push(&json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
-                "function":{"name":"read","arguments":"\"a.txt\"}"}}]}))
+            .push(
+                &json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
+                "function":{"name":"read","arguments":"\"a.txt\"}"}}]}),
+            )
             .unwrap();
         let finished = calls.finish().unwrap();
         assert_eq!(finished.len(), 1);
@@ -503,8 +520,10 @@ mod tests {
     fn an_empty_repeated_identity_does_not_erase_the_call() {
         let mut calls = ToolCalls::default();
         calls
-            .push(&json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
-                "function":{"name":"read","arguments":"{}"}}]}))
+            .push(
+                &json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
+                "function":{"name":"read","arguments":"{}"}}]}),
+            )
             .unwrap();
         calls
             .push(&json!({"tool_calls":[{"index":0,"id":"","type":"function",
@@ -520,12 +539,16 @@ mod tests {
     fn a_conflicting_call_identity_is_rejected() {
         let mut calls = ToolCalls::default();
         calls
-            .push(&json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
-                "function":{"name":"read","arguments":"{}"}}]}))
+            .push(
+                &json!({"tool_calls":[{"index":0,"id":"call_abc","type":"function",
+                "function":{"name":"read","arguments":"{}"}}]}),
+            )
             .unwrap();
         assert!(calls
-            .push(&json!({"tool_calls":[{"index":0,"id":"call_other","type":"function",
-                "function":{"name":"read","arguments":""}}]}))
+            .push(
+                &json!({"tool_calls":[{"index":0,"id":"call_other","type":"function",
+                "function":{"name":"read","arguments":""}}]})
+            )
             .is_err());
     }
 
@@ -652,7 +675,13 @@ mod tests {
 
     #[test]
     fn presentation_fences_never_become_text_tool_calls() {
-        for opener in ["```openui", "```openui-lang", "~~~~openui", "> ```openui", "- ```openui"] {
+        for opener in [
+            "```openui",
+            "```openui-lang",
+            "~~~~openui",
+            "> ```openui",
+            "- ```openui",
+        ] {
             let code = format!("{opener}\nroot = Response([CodeBlock(\"<tool_call>{{\\\"name\\\":\\\"shell\\\",\\\"arguments\\\":{{}}}}</tool_call>\")])\n");
             // Literal legacy markup, plus Unicode to verify offset masking.
             let source = format!("{code}例 <function=shell>{{}}</function>\n");
@@ -660,7 +689,8 @@ mod tests {
             assert_eq!(strip_text_tool_calls(&source), source.trim());
         }
         let visual = "```openui\nroot = Response([Text(\"<function=shell>{}</function>\")])\n```";
-        let mixed = format!("{visual}\n<tool_call>{{\"name\":\"clock\",\"arguments\":{{}}}}</tool_call>");
+        let mixed =
+            format!("{visual}\n<tool_call>{{\"name\":\"clock\",\"arguments\":{{}}}}</tool_call>");
         let calls = parse_text_tool_calls(&mixed).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "clock");

@@ -96,6 +96,12 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
     ? dataRecord
     : isStructured(resultRecord)
     ? resultRecord
+    // Any remaining envelope payload (entries lists, tool catalogs, check
+    // verdicts, MCP content) is structured data too: rendering it as JSON in
+    // the terminal fallback is the raw-dump this card used to show. The
+    // friendly Result view renders it; the raw text stays one disclosure away.
+    : dataRecord && Object.keys(dataRecord).length > 0
+    ? dataRecord
     : undefined;
   const resultStatus = dataRecord && typeof dataRecord.resultStatus === 'string' ? dataRecord.resultStatus : undefined;
   const diff = typeof dataRecord?.diff === 'string' ? dataRecord.diff : typeof resultRecord?.diff === 'string' ? resultRecord.diff : null;
@@ -193,7 +199,7 @@ const MessageBody = memo(function MessageBody({ message, suppressReasoning = fal
   const [isOpen, setIsOpen] = useState(false);
   useEffect(() => () => clearTimeout(timer.current), []);
 
-  const thoughtSummary = message.status === 'streaming' ? 'Thinking…' : 'Thought';
+  const thoughtSummary = message.status === 'streaming' ? 'Thinking…' : 'Reasoning';
   const streaming = message.status === 'streaming';
 
   return (
@@ -207,12 +213,10 @@ const MessageBody = memo(function MessageBody({ message, suppressReasoning = fal
             setIsOpen((e.currentTarget as HTMLDetailsElement).open);
           }}
         >
-          <summary className="trace-thought-pill">
-            <TraceIcon kind="thought" size={12}>
-              {streaming ? <span className="thinking-pulsar" /> : undefined}
-            </TraceIcon>
-            <span className="trace-thought-label">{thoughtSummary}</span>
-            <ChevronRight size={13} className="thought-chevron" />
+          <summary className="card-header trace-thought-pill">
+            <TraceIcon kind="thought" />
+            <span className={`trace-thought-label${streaming ? ' is-live' : ''}`}>{thoughtSummary}</span>
+            <ChevronRight size={14} className="trace-chevron thought-chevron" aria-hidden="true" />
           </summary>
           <div className="reasoning-content trace-thought-content"><MarkdownView content={message.reasoning} assistant={false} streaming={streaming} /></div>
         </details>
@@ -371,29 +375,11 @@ export function Chat({
   const setDraft = onDraftChange ?? setLocalDraft;
   const [preflightIssue, setPreflightIssue] = useState('');
   const [preflight, setPreflight] = useState<{ breakdown: PreflightBreakdown; draft: string } | null>(null);
-  const [compacting, setCompacting] = useState(false);
-  const [compactionNotice, setCompactionNotice] = useState<string | null>(null);
-  const [preflightRevision, setPreflightRevision] = useState(0);
   const preflightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
   const input = useRef<HTMLTextAreaElement>(null);
   const submitting = useRef(false);
-
-  async function handleCompact() {
-    if (conversationKey === 'new' || compacting || loading || generating) return;
-    setCompacting(true);
-    setCompactionNotice(null);
-    try {
-      const outcome = await api.compactConversation(conversationKey);
-      setCompactionNotice(outcome.note);
-      setPreflightRevision(value => value + 1);
-    } catch (e) {
-      setCompactionNotice(errorMessage(e));
-    } finally {
-      setCompacting(false);
-    }
-  }
 
   const lastPrompt = [...messages].reverse().find(message => message.role === 'user');
   const lastResponse = [...messages].reverse().find(message => message.role === 'assistant');
@@ -489,7 +475,7 @@ export function Chat({
       }).catch(() => { if (!disposed) setPreflight(null); });
     }, 400);
     return () => { disposed = true; if (preflightTimer.current) clearTimeout(preflightTimer.current); };
-  }, [draft, attachments, ready, conversationKey, connectorIds, connectorTools, preset, planMode, reasoningMode, modelIdentity, preflightRevision, presentation.effectiveMode]);
+  }, [draft, attachments, ready, conversationKey, connectorIds, connectorTools, preset, planMode, reasoningMode, modelIdentity, presentation.effectiveMode]);
 
   async function submit() {
     if ((!draft.trim() && !attachments.length) || !ready || generating || loading || disabled || preflightIssue || reading.current || submitting.current) return;
@@ -614,7 +600,7 @@ export function Chat({
           </div>
         )}
         {canRetry && !generating && (
-          <div className="setup-hint">
+          <div className="setup-hint retry-hint">
             <span>Retry sends the last prompt as a new message. Enabled tool actions may run again.</span>
             <button disabled={!ready || loading || disabled} onClick={() => void retry()}>Retry last prompt</button>
           </div>
@@ -739,13 +725,7 @@ export function Chat({
               {composerPermissions}
             </div>
             <div className="composer-send" style={{ position: 'relative' }}>
-              {(!isHome || contextUsage) && <ContextControl
-                conversationId={conversationKey}
-                busy={generating || loading}
-                usage={contextUsage}
-                compacting={compacting}
-                onCompact={messages.length > 2 ? () => void handleCompact() : undefined}
-              />}
+              {(!isHome || contextUsage) && <ContextControl usage={contextUsage} />}
               <button
                 type="button"
                 ref={modelTrigger}
@@ -845,11 +825,6 @@ export function Chat({
           </div>
         </form>
         </div>
-        {compactionNotice && (
-          <p className="composer-note compaction-notice" role="status">
-            {compactionNotice}
-          </p>
-        )}
         {preflightIssue && <p className="composer-note" role="alert">{preflightIssue}</p>}
         {preflight?.breakdown.presentation && <details className="composer-note"><summary>Visual response budget</summary><p>Separate formatting request: at least {preflight.breakdown.presentation.minimumInputTokens.toLocaleString()} input tokens plus the original answer, with {preflight.breakdown.presentation.responseReserve.toLocaleString()} output tokens reserved. The full request is checked before generation; text remains available if it does not fit.</p></details>}
         {preflight?.breakdown.overflow && (

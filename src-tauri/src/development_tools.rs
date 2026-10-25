@@ -83,8 +83,7 @@ pub fn freshness(root: &str, snapshot: &Value) -> Value {
                         if t.as_ref()
                             .map(|s| json!(hash(s.as_bytes())))
                             .unwrap_or(Value::Null)
-                            == *sha =>
-                    {}
+                            == *sha => {}
                     Ok(_) => changed.push(p.clone()),
                     Err(_) => unavailable.push(p.clone()),
                 }
@@ -656,7 +655,9 @@ pub(crate) mod tests {
         let t = tempfile::tempdir().unwrap();
         let (state, owner, tools) = setup(t.path());
         let ctx = context(&state, t.path(), &owner, &tools);
-        let session=crate::harness::execute(&ctx,"http_session_create",json!({"base_url":"https://example.com/api/","headers":{"Authorization":"Bearer fixture-secret"}})).await.unwrap().value;
+        // Origin ownership/offline enforcement never sends a request. Use a
+        // public literal address so this regression does not depend on DNS.
+        let session=crate::harness::execute(&ctx,"http_session_create",json!({"base_url":"https://93.184.216.34/api/","headers":{"Authorization":"Bearer fixture-secret"}})).await.unwrap().value;
         let id = session["sessionId"].clone();
         let foreign = context(&state, t.path(), "other", &tools);
         assert!(

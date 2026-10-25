@@ -563,20 +563,42 @@ mod regressions {
     }
     #[tokio::test]
     async fn rich_profile_downgrades_to_core_without_expanding_the_context_budget() {
-        let sse=format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"root = Response([Text(\"Authoritative answer\")])"}}]}),json!({"choices":[{"delta":{},"finish_reason":"stop"}]}));
-        let (base,requests,server)=crate::test_support::scripted_sse(vec![sse]).await;
-        let (_root,state,mut plan,c,m)=fixture(&base).await;
-        plan.preferences.max_tokens=512;
-        let core_minimum=plan.backend.count_tokens(&json!({"messages":[{"role":"user","content":spec("core")}]})).await.unwrap();
-        let capacity=core_minimum as u32+1024;
-        if let crate::inference::Backend::OpenAi{context_length,..}=&mut plan.backend{*context_length=capacity;}
-        let (_sender,mut cancellation)=tokio::sync::watch::channel(false);
-        let mut input=final_answer(&c,&m);input.question="Compare the values";
-        let result=generate(&state,&plan,input,&Channel::new(|_|Ok(())),&mut cancellation).await.unwrap().unwrap();
-        server.await.unwrap();assert!(result.complete);assert_eq!(plan.backend.context_capacity(),capacity);
-        let store=state.database().unwrap();
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":"root = Response([Text(\"Authoritative answer\")])"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+        );
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![sse]).await;
+        let (_root, state, mut plan, c, m) = fixture(&base).await;
+        plan.preferences.max_tokens = 512;
+        let core_minimum = plan
+            .backend
+            .count_tokens(&json!({"messages":[{"role":"user","content":spec("core")}]}))
+            .await
+            .unwrap();
+        let capacity = core_minimum as u32 + 1024;
+        if let crate::inference::Backend::OpenAi { context_length, .. } = &mut plan.backend {
+            *context_length = capacity;
+        }
+        let (_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        let mut input = final_answer(&c, &m);
+        input.question = "Compare the values";
+        let result = generate(
+            &state,
+            &plan,
+            input,
+            &Channel::new(|_| Ok(())),
+            &mut cancellation,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert!(result.complete);
+        assert_eq!(plan.backend.context_capacity(), capacity);
+        let store = state.database().unwrap();
         let profile:String=store.connection.query_row("SELECT json_extract(payload,'$.profile') FROM session_events WHERE event_type='presentation_start'",[],|row|row.get(0)).unwrap();
-        assert_eq!(profile,"core");assert_eq!(requests.lock().unwrap().len(),1);
+        assert_eq!(profile, "core");
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
-
 }

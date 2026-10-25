@@ -382,24 +382,44 @@ impl Workspace {
         if path.split('/').any(|part| part.starts_with('.')) {
             return Err("Hidden preview resources are not served.".into());
         }
-        let extension = Path::new(path).extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase();
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|v| v.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let mime = match extension.as_str() {
             "html" | "htm" => "text/html; charset=utf-8",
             "css" => "text/css; charset=utf-8",
             "js" | "mjs" => "text/javascript; charset=utf-8",
             "json" => "application/json",
-            "png" => "image/png", "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif", "webp" => "image/webp", "svg" => "image/svg+xml",
-            "ico" => "image/x-icon", "woff" => "font/woff", "woff2" => "font/woff2",
-            "ttf" => "font/ttf", "wasm" => "application/wasm",
-            "mp3" => "audio/mpeg", "ogg" => "audio/ogg", "wav" => "audio/wav",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "ico" => "image/x-icon",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            "ttf" => "font/ttf",
+            "wasm" => "application/wasm",
+            "mp3" => "audio/mpeg",
+            "ogg" => "audio/ogg",
+            "wav" => "audio/wav",
             _ => return Err("Only static web assets can be previewed.".into()),
         };
-        let _guard = self.transaction_lock.read().map_err(|_| "Workspace transaction lock unavailable.")?;
-        let file = open_file_no_links(&self.directory, path, OpenOptions::new().read(true)).map_err(|e| e.to_string())?;
+        let _guard = self
+            .transaction_lock
+            .read()
+            .map_err(|_| "Workspace transaction lock unavailable.")?;
+        let file = open_file_no_links(&self.directory, path, OpenOptions::new().read(true))
+            .map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
-        file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        if bytes.len() > 4 * 1024 * 1024 { return Err("Preview resource exceeds 4 MiB.".into()); }
+        file.take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err("Preview resource exceeds 4 MiB.".into());
+        }
         Ok((bytes, mime))
     }
     /// Raw UTF-8 source for the configured language server, using the same
@@ -917,7 +937,10 @@ impl Workspace {
     /// `reformatted` says whether the formatter changed anything.
     fn apply_auto_format(&self, result: &mut Value, path: &str, pre_format_sha256: &str) {
         let outcome = self.auto_format(path);
-        let changed = outcome.as_ref().map(|outcome| outcome.changed).unwrap_or(false);
+        let changed = outcome
+            .as_ref()
+            .map(|outcome| outcome.changed)
+            .unwrap_or(false);
         let post_format_sha256 = self
             .current_sha256(path)
             .unwrap_or_else(|| pre_format_sha256.to_string());
@@ -942,8 +965,14 @@ impl Workspace {
             },
         );
         // Keep the per-change hash in step with the bytes on disk.
-        if let Some(changes) = object.get_mut("changes").and_then(|value| value.as_array_mut()) {
-            if let Some(change) = changes.first_mut().and_then(|change| change.as_object_mut()) {
+        if let Some(changes) = object
+            .get_mut("changes")
+            .and_then(|value| value.as_array_mut())
+        {
+            if let Some(change) = changes
+                .first_mut()
+                .and_then(|change| change.as_object_mut())
+            {
                 if change.get("path").and_then(|value| value.as_str()) == Some(path) {
                     change.insert("sha256".to_string(), json!(post_format_sha256));
                     if changed {

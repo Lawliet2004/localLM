@@ -27,32 +27,33 @@ mod development_credentials;
 mod development_tools;
 mod document_index;
 pub mod download;
+mod edit_match;
 mod editor;
 pub mod error;
-mod edit_match;
 mod execution;
 mod export;
+mod findings;
 mod formatter;
 pub mod gguf;
-mod findings;
 mod git_tools;
 mod hardware;
 pub mod harness;
 mod history;
 mod hooks;
 mod http_client;
-mod instructions;
 mod impact_tools;
 mod inference;
 mod inference_retry;
 mod inspector_browser;
 mod install_recovery;
+mod instructions;
 mod latency_diagnostics;
 pub mod local_mcp_config;
 pub mod local_mcp_process;
 pub mod local_only;
 mod lsp_client;
 mod lsp_tools;
+mod managed_storage;
 mod mcp_http;
 mod mcp_input;
 mod mcp_protocol;
@@ -62,18 +63,17 @@ mod model_install;
 mod model_library;
 mod oauth;
 mod openapi_tools;
-mod permission_rules;
 mod performance_tools;
+mod permission_rules;
 mod permissions;
 pub mod plans;
 mod plugins;
-mod presets;
-mod process_tools;
-mod workspace_preview;
-mod profile_tools;
-mod prompt;
 mod presentation;
 mod presentation_store;
+mod presets;
+mod process_tools;
+mod profile_tools;
+mod prompt;
 mod provider_capabilities;
 mod providers;
 mod ptc;
@@ -82,6 +82,7 @@ mod ptc_contract_regressions;
 mod remote_database;
 mod research_tasks;
 mod responses_adapter;
+mod rolling_window;
 mod runtime;
 pub mod runtime_archive;
 mod runtime_config;
@@ -92,9 +93,9 @@ mod runtime_log;
 pub mod sandbox;
 mod semantic_edits;
 mod semantic_impact;
+pub mod session_tools;
 pub mod sessions;
 pub mod skills;
-pub mod session_tools;
 pub mod snapshots;
 mod source_inventory;
 mod sse;
@@ -102,11 +103,11 @@ mod store;
 pub mod subagents;
 pub mod subscription_auth;
 pub mod system_tools;
+pub mod tasks;
+pub mod taste;
 mod terminal_ui;
 #[cfg(test)]
 mod test_support;
-pub mod tasks;
-pub mod taste;
 mod tool_calls;
 pub mod tool_compat;
 #[cfg(test)]
@@ -121,6 +122,7 @@ mod verification_tools;
 pub mod weather;
 pub mod web_search;
 mod workspace;
+mod workspace_preview;
 mod workspace_ui;
 
 use std::sync::Mutex;
@@ -173,7 +175,8 @@ impl Default for OperationGate {
 /// The per-conversation entry is removed when the turn ends, so the map does
 /// not grow with the number of conversations ever used.
 pub struct TurnLocks {
-    locks: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    locks:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for TurnLocks {
@@ -246,6 +249,8 @@ pub struct AppState {
     pub mcp_inputs: std::sync::Arc<mcp_input::Registry>,
     store: Mutex<store::Store>,
     runtime: tokio::sync::Mutex<runtime::Runtime>,
+    load_cancel: tokio::sync::watch::Sender<bool>,
+    load_status: std::sync::Arc<Mutex<Option<runtime::RuntimeStatus>>>,
     /// The gate between model turns and exclusive operations.
     operation: OperationGate,
     /// One model turn at a time per conversation.
@@ -401,6 +406,8 @@ pub fn run() {
                 mcp_inputs: std::sync::Arc::new(mcp_input::Registry::default()),
                 store: Mutex::new(store),
                 runtime: tokio::sync::Mutex::new(runtime::Runtime::new(data.join("runtime.log"))),
+                load_cancel: tokio::sync::watch::channel(false).0,
+                load_status: std::sync::Arc::new(Mutex::new(None)),
                 operation: OperationGate::default(),
                 turns: TurnLocks::default(),
                 cancel: tokio::sync::watch::channel(false).0,
@@ -439,7 +446,7 @@ pub fn run() {
                 }
             });
             for (folder, runtime) in [("models", false), ("runtimes", true)] {
-                if let Err(error) = install_recovery::clean(&data.join(folder), runtime) {
+                if let Err(error) = install_recovery::clean(&managed_storage::root(&data).map_err(std::io::Error::other)?.join(folder), runtime) {
                     let state = app.state::<AppState>();
                     let installer = if runtime { &state.runtime_installer } else { &state.model_installer };
                     if let Ok(mut inner) = installer.inner.lock() { inner.0.error = Some(format!("Interrupted installation cleanup needs attention: {error}")); };
@@ -472,6 +479,8 @@ pub fn run() {
             daytona_journal::pending_daytona_operations,
             commands::bootstrap,
             hardware::hardware_status,
+            managed_storage::managed_storage_info,
+            managed_storage::move_managed_storage,
             execution::get_execution_config,
             profile_tools::get_profile_config,
             profile_tools::save_profile_config,
@@ -544,7 +553,9 @@ pub fn run() {
             commands::save_preferences,
             commands::load_model,
             commands::unload_model,
+            runtime::runtime_devices,
             commands::runtime_status,
+            commands::cancel_model_load,
             commands::test_provider_inference,
             commands::detect_subscription_cli,
             commands::import_subscription_cli,
@@ -627,6 +638,7 @@ pub fn run() {
             gguf::read_model_metadata,
             runtime_install_commands::runtime_download_info,
             runtime_inventory::list_installed_runtimes,
+            runtime_inventory::delete_installed_runtime,
             runtime_install_commands::runtime_install_status,
             runtime_install_commands::install_runtime,
             runtime_install_commands::cancel_runtime_install,
@@ -712,8 +724,12 @@ mod tests {
     #[test]
     fn two_turns_can_hold_the_gate_at_once() {
         let gate = OperationGate::default();
-        let first = gate.try_shared().expect("first turn takes the shared lease");
-        let second = gate.try_shared().expect("second turn takes the shared lease");
+        let first = gate
+            .try_shared()
+            .expect("first turn takes the shared lease");
+        let second = gate
+            .try_shared()
+            .expect("second turn takes the shared lease");
         drop(first);
         drop(second);
     }

@@ -27,11 +27,7 @@ pub struct ToolSpec {
 }
 
 impl ToolSpec {
-    pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        input: Value,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, input: Value) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -80,9 +76,7 @@ impl From<(String, String, Value)> for ToolSpec {
 ///
 /// Registries that have no structured result keep the compact tuple form;
 /// this keeps one conversion point instead of a per-entry rewrite.
-pub fn catalog(
-    entries: impl IntoIterator<Item = (String, String, Value)>,
-) -> Vec<ToolSpec> {
+pub fn catalog(entries: impl IntoIterator<Item = (String, String, Value)>) -> Vec<ToolSpec> {
     entries.into_iter().map(ToolSpec::from).collect()
 }
 
@@ -111,17 +105,13 @@ mod tests {
 
     #[test]
     fn a_declared_result_contract_is_enforced() {
-        let spec = ToolSpec::new(
-            "demo",
-            "A demo tool.",
-            json!({"type":"object"}),
-        )
-        .with_output(json!({
-            "type":"object",
-            "required":["ok"],
-            "properties":{"ok":{"type":"boolean"}},
-            "additionalProperties":false,
-        }));
+        let spec =
+            ToolSpec::new("demo", "A demo tool.", json!({"type":"object"})).with_output(json!({
+                "type":"object",
+                "required":["ok"],
+                "properties":{"ok":{"type":"boolean"}},
+                "additionalProperties":false,
+            }));
         assert!(spec.has_output_contract());
         assert!(spec.validate_output(&json!({"ok":true})).is_ok());
         let error = spec.validate_output(&json!({"ok":"yes"})).unwrap_err();

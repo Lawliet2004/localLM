@@ -66,9 +66,7 @@ pub fn validate_image(image: &str) -> Result<(), String> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '@'))
     {
-        return Err(
-            "Container image may only contain letters, digits and . _ - / : @".into(),
-        );
+        return Err("Container image may only contain letters, digits and . _ - / : @".into());
     }
     Ok(())
 }

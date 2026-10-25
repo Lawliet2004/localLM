@@ -144,19 +144,21 @@ impl RuntimeConfig {
         available_gpu_bytes: Option<u64>,
     ) -> i32 {
         let Some(blocks) = model.block_count.filter(|count| *count > 0) else {
-            return 0;
+            return -1;
         };
         let max = i32::try_from(blocks.saturating_add(1))
             .unwrap_or(999)
             .clamp(1, 999);
         let Some(available) = available_gpu_bytes else {
-            return 0;
+            return -1;
         };
         let usable = available.saturating_sub(1024 * 1024 * 1024);
         if usable == 0 {
             return 0;
         }
-        let kv = kv_cache_bytes(model, config).unwrap_or(0);
+        let Some(kv) = kv_cache_bytes(model, config) else {
+            return -1;
+        };
         let gpu_full =
             model
                 .file_bytes
@@ -281,7 +283,7 @@ mod tests {
             context_length: 8192,
             ..Default::default()
         };
-        assert_eq!(RuntimeConfig::auto_gpu_layers(&model, &config, None), 0);
+        assert_eq!(RuntimeConfig::auto_gpu_layers(&model, &config, None), -1);
         assert_eq!(
             RuntimeConfig::auto_gpu_layers(&model, &config, Some(24 * 1024 * 1024 * 1024)),
             -1

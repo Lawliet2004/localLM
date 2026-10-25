@@ -26,6 +26,8 @@ pub(crate) fn app_state(root: &Path) -> crate::AppState {
         mcp_inputs: Arc::new(crate::mcp_input::Registry::default()),
         store: Mutex::new(crate::store::Store::open(&db_path).unwrap()),
         runtime: tokio::sync::Mutex::new(crate::runtime::Runtime::new(data.join("runtime.log"))),
+        load_cancel: tokio::sync::watch::channel(false).0,
+        load_status: Arc::new(Mutex::new(None)),
         operation: crate::OperationGate::default(),
         turns: crate::TurnLocks::default(),
         cancel: tokio::sync::watch::channel(false).0,

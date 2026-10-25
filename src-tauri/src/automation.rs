@@ -664,27 +664,109 @@ pub async fn reset_automation(state: tauri::State<'_, AppState>) -> Result<(), S
     state.automation.stop_all().await;
     Ok(())
 }
+async fn browser_prerequisite(config: &Config) -> Result<String, String> {
+    let candidates: Vec<PathBuf> = if !config.browser_executable_path.is_empty() {
+        vec![PathBuf::from(&config.browser_executable_path)]
+    } else {
+        let names = if config.browser_channel == "msedge" {
+            vec!["microsoft-edge", "microsoft-edge-stable", "msedge.exe"]
+        } else {
+            vec!["google-chrome", "google-chrome-stable", "chrome.exe"]
+        };
+        #[allow(unused_mut)]
+        let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .flat_map(|d| names.iter().map(move |n| d.join(n)))
+            .collect();
+        #[cfg(windows)]
+        for root in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
+            if let Some(root) = std::env::var_os(root) {
+                paths.push(
+                    PathBuf::from(root).join(if config.browser_channel == "msedge" {
+                        "Microsoft/Edge/Application/msedge.exe"
+                    } else {
+                        "Google/Chrome/Application/chrome.exe"
+                    }),
+                );
+            }
+        }
+        #[cfg(target_os = "macos")]
+        paths.push(PathBuf::from(if config.browser_channel == "msedge" {
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+        } else {
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        }));
+        paths
+    };
+    let path = candidates.into_iter().find(|p| crate::execution::executable(&p.to_string_lossy()))
+        .ok_or_else(|| format!("Selected browser ({}) is missing. Install it or set its executable path in Browser settings.", config.browser_channel))?;
+    let mut command = tokio::process::Command::new(path);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    use tokio::io::AsyncReadExt;
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Browser cannot start: {e}"))?;
+    let mut bytes = Vec::new();
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or("Browser output unavailable")?
+        .take(4097);
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        output
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        child.wait().await.map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Browser prerequisite probe timed out")??;
+    let version = String::from_utf8_lossy(&bytes);
+    let expected = if config.browser_channel == "msedge" {
+        "Edge"
+    } else {
+        "Chrome"
+    };
+    if !status.success()
+        || bytes.len() > 4096
+        || !version.contains(expected)
+        || !version.chars().any(|c| c.is_ascii_digit())
+    {
+        return Err(format!("The selected browser did not report a valid {expected} version. Repair its installation or select the matching executable. Interactive browser readiness is unverified."));
+    }
+    Ok(format!(
+        "{} · interactive automation still requires a supported desktop session.",
+        version.trim()
+    ))
+}
+
 #[tauri::command]
 pub async fn automation_diagnostics(
     state: tauri::State<'_, AppState>,
     config: Config,
 ) -> Result<Value, String> {
     let execution = state.database()?.execution_config()?;
-    let browser = config.browser_entry().and_then(|_| {
-        if Path::new(&execution.node_path).is_file() {
-            Ok(
-                "Browser engine found. A browser will launch only after an approved tool call."
-                    .to_string(),
-            )
-        } else {
-            Err("Configure Node.js in Execution settings.".into())
-        }
-    });
+    config.validate()?;
+    let package = config
+        .browser_entry()
+        .map(|_| "Pinned browser package found".to_string());
+    let node = crate::execution::probe_node(&execution.node_path, (18, 0, 0)).await;
+    // Launch only the version probe for the selected channel, never a browsing
+    // session. Actual page automation still follows the approval boundary.
+    let browser = browser_prerequisite(&config).await;
     let desktop = tokio::task::spawn_blocking(crate::computer_use::diagnostics)
         .await
         .map_err(|_| "Could not inspect desktop support.")?;
     Ok(
-        json!({"browser":{"available":browser.is_ok(),"message":browser.unwrap_or_else(|e|e)},"computer":desktop,"browserVersion":BROWSER_VERSION}),
+        json!({"browser":{"available":browser.is_ok() && node.is_ok() && package.is_ok(),"message":browser.as_ref().cloned().unwrap_or_else(|e|e.clone())}, "package":{"available":package.is_ok(),"message":package.unwrap_or_else(|e|e)}, "node":{"available":node.is_ok(),"message":node.unwrap_or_else(|e|e)}, "selectedBrowser":{"available":browser.is_ok(),"message":browser.unwrap_or_else(|e|e)},"computer":desktop,"browserVersion":BROWSER_VERSION}),
     )
 }
 
@@ -697,11 +779,7 @@ pub async fn install_browser_engine(state: tauri::State<'_, AppState>) -> Result
         .try_lock()
         .map_err(|_| "Stop the current response before setting up the browser engine.")?;
     let node = state.database()?.execution_config()?.node_path;
-    if !Path::new(&node).is_absolute() || !Path::new(&node).is_file() {
-        return Err(
-            "Configure an installed Node.js 18+ executable above, then run setup again.".into(),
-        );
-    }
+    crate::execution::probe_node(&node, (18, 0, 0)).await?;
     let parent = Path::new(&node)
         .parent()
         .ok_or("Node executable has no parent directory.")?;
@@ -855,8 +933,14 @@ mod tests {
     async fn a_browser_target_that_answers_with_a_private_address_is_refused() {
         // A name that resolves to a private address must never reach the
         // browser, even though the literal form is not visible in the call.
-        assert!(vet_browser_target(&json!({"url":"http://127.0.0.1/"})).await.is_err());
-        assert!(vet_browser_target(&json!({"url":"http://169.254.169.254/"})).await.is_err());
+        assert!(vet_browser_target(&json!({"url":"http://127.0.0.1/"}))
+            .await
+            .is_err());
+        assert!(
+            vet_browser_target(&json!({"url":"http://169.254.169.254/"}))
+                .await
+                .is_err()
+        );
         assert!(vet_browser_target(&json!({})).await.is_ok());
     }
     #[test]
@@ -1191,3 +1275,32 @@ mod tests {
 //     }
 //
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod browser_prerequisite_tests {
+    use super::*;
+    #[tokio::test]
+    async fn missing_selected_browser_is_not_reported_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            browser_executable_path: temp
+                .path()
+                .join("absent-browser")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        assert!(browser_prerequisite(&config)
+            .await
+            .unwrap_err()
+            .contains("missing"));
+        #[cfg(unix)]
+        {
+            config.browser_executable_path = "/bin/true".into();
+            assert!(browser_prerequisite(&config)
+                .await
+                .unwrap_err()
+                .contains("valid Chrome version"));
+        }
+    }
+}

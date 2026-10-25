@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { estimateMemory, fittingGpuLayers, modelMaxLayers, recommendedConfig } from './runtimeGuidance';
+import { estimateMemory, fittingGpuLayers, modelMaxLayers, recommendationIssue, recommendedConfig } from './runtimeGuidance';
 import { defaultRuntimeConfig, type HardwareStatus, type ModelMetadata } from './types';
 const model: ModelMetadata = { architecture: 'llama', contextLength: 262144, blockCount: 32, embeddingLength: 4096, headCount: 32, headCountKv: 8, keyLength: null, valueLength: null, fileBytes: 4 * 2 ** 30 };
 const gpu = (totalMib: number, usedMib: number): HardwareStatus => ({
-  logicalCpus: 12, memoryTotalBytes: 16 * 2 ** 30, memoryAvailableBytes: 8 * 2 ** 30, gpuStatus: 'ok', sampledAt: 0,
+  logicalCpus: 12, memoryTotalBytes: 16 * 2 ** 30, memoryAvailableBytes: 8 * 2 ** 30, gpuStatus: 'ok', sampledAt: Date.now(),
   gpus: [{ name: 'GPU', uuid: 'gpu', memoryUsedMib: usedMib, memoryTotalMib: totalMib, utilizationPercent: 0, driverVersion: '1' }],
 });
 describe('runtime memory guidance', () => {
@@ -46,10 +46,10 @@ describe('runtime memory guidance', () => {
   });
   it('recommends bounded context and preserves special runtime requirements', () => {
     expect(recommendedConfig({ ...model, contextLength: 2048 }, null).contextLength).toBe(2048);
-    expect(recommendedConfig({ ...model, architecture: 'hybridnet' }, null)).toMatchObject({ gpuLayers: 0 });
+    expect(recommendedConfig({ ...model, architecture: 'hybridnet' }, null)).toMatchObject({ gpuLayers: -1 });
     expect(recommendedConfig({ ...model, keyLength: 8, valueLength: 8 }, null)).toMatchObject({ cacheTypeK: 'f16', cacheTypeV: 'f16', flashAttention: false });
     expect(recommendedConfig(model, gpu(24 * 1024, 1024)).gpuLayers).toBe(-1);
-    expect(recommendedConfig(model, null).gpuLayers).toBe(0);
+    expect(recommendedConfig(model, null).gpuLayers).toBe(-1);
   });
   it('separates the model layer count from layers that fit in free VRAM', () => {
     expect(modelMaxLayers(model)).toBe(33);
@@ -58,7 +58,32 @@ describe('runtime memory guidance', () => {
     const tight = fittingGpuLayers(model, gpu(6 * 1024, 1024), config);
     expect(tight).toBeGreaterThan(0);
     expect(tight).toBeLessThan(33);
-    expect(fittingGpuLayers({ ...model, architecture: 'hybridnet' }, gpu(24 * 1024, 1024), config)).toBe(0);
-    expect(fittingGpuLayers(model, null, config)).toBe(0);
+    expect(fittingGpuLayers({ ...model, architecture: 'hybridnet' }, gpu(24 * 1024, 1024), config)).toBeNull();
+    expect(fittingGpuLayers(model, null, config)).toBeNull();
   });
+});
+
+it('never offers an oversized configuration as a safe recommendation', () => {
+  const machine = { ...gpu(0, 0), gpus: [], memoryTotalBytes: 8 * 2 ** 30, memoryAvailableBytes: 4 * 2 ** 30 };
+  const config = recommendedConfig(model, machine);
+  expect(config.contextLength).toBe(128);
+  expect(recommendationIssue(model, machine, config)).toMatch(/exceeds/);
+  const smaller = { ...model, fileBytes: 2 ** 30 };
+  const fit = recommendedConfig(smaller, machine);
+  expect(recommendationIssue(smaller, machine, fit)).toBeNull();
+  expect(recommendationIssue({ ...model, architecture: 'unknown' }, machine, fit)).toMatch(/unknown/);
+  expect(recommendationIssue(model, null, fit)).toMatch(/unknown/);
+});
+
+it('does not bind automatic placement to GPU zero or stale telemetry', () => {
+  const machine = gpu(24 * 1024, 0);
+  machine.gpus.push({ ...machine.gpus[0], uuid: 'second' });
+  expect(fittingGpuLayers(model, machine, defaultRuntimeConfig)).toBeNull();
+  expect(recommendedConfig(model, machine).gpuLayers).toBe(-1);
+  machine.sampledAt = Date.now() - 60000;
+  expect(recommendationIssue(model, machine, recommendedConfig(model, machine))).toMatch(/unknown/);
+});
+
+it('does not disable another backend when the sampled NVIDIA device has no room', () => {
+  expect(recommendedConfig(model, gpu(1024, 1024)).gpuLayers).toBe(-1);
 });

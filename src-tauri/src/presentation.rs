@@ -126,7 +126,11 @@ pub fn profile(mode: Mode, question: &str, reserve: u32) -> Option<&'static str>
     if q.split(|c: char| !c.is_alphanumeric())
         .any(|word| matches!(word, "chart" | "charts" | "plot" | "plots" | "scatterplot"))
     {
-        return Some(if q.contains("scatter") || q.contains("multi-series") { "data" } else { "chart" });
+        return Some(if q.contains("scatter") || q.contains("multi-series") {
+            "data"
+        } else {
+            "chart"
+        });
     }
     let coding = q.split(|c: char| !c.is_alphanumeric()).any(|word| {
         matches!(
@@ -145,7 +149,18 @@ pub fn profile(mode: Mode, question: &str, reserve: u32) -> Option<&'static str>
         .iter()
         .any(|word| q.contains(word));
     if coding && !educational {
-        return Some(if ["exact", "verbatim", "copy"].iter().any(|word| q.contains(word)) && !q.contains("diff") && !q.contains("tree") { "code" } else { "coding" });
+        return Some(
+            if ["exact", "verbatim", "copy"]
+                .iter()
+                .any(|word| q.contains(word))
+                && !q.contains("diff")
+                && !q.contains("tree")
+            {
+                "code"
+            } else {
+                "coding"
+            },
+        );
     }
     if [
         "quiz",

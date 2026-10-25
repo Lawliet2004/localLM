@@ -42,7 +42,8 @@ const READ_BYTES: usize = 1024 * 1024;
 const FILE_MARKER: &str = "\n[localLM: instruction file truncated at 64 KiB.]\n";
 
 /// Marker appended to the last file of a chain clipped at the chain bound.
-const CHAIN_MARKER: &str = "\n[localLM: instruction file and chain truncated; later instruction files are omitted.]\n";
+const CHAIN_MARKER: &str =
+    "\n[localLM: instruction file and chain truncated; later instruction files are omitted.]\n";
 
 /// Marker used when the remaining budget cannot hold the long markers.
 const SHORT_MARKER: &str = "\n[localLM: instruction truncated.]\n";
@@ -102,7 +103,6 @@ impl InstructionChain {
         }
         out
     }
-
 }
 
 /// Compare two chains and describe what changed.
@@ -390,7 +390,11 @@ fn clip(text: &str, limit: usize, chain_bound: bool) -> Option<String> {
     if text.len() <= limit {
         return Some(text.to_string());
     }
-    let long = if chain_bound { CHAIN_MARKER } else { FILE_MARKER };
+    let long = if chain_bound {
+        CHAIN_MARKER
+    } else {
+        FILE_MARKER
+    };
     let marker = if long.len() + 16 <= limit {
         long
     } else {
@@ -500,10 +504,7 @@ mod tests {
     fn ambient_has_file(root: &Path) -> bool {
         let mut current = Some(root.to_path_buf());
         while let Some(directory) = current {
-            if FILE_NAMES
-                .iter()
-                .any(|name| directory.join(name).is_file())
-            {
+            if FILE_NAMES.iter().any(|name| directory.join(name).is_file()) {
                 return true;
             }
             current = directory.parent().map(|parent| parent.to_path_buf());
@@ -703,12 +704,15 @@ mod tests {
         let chain = chain(temp.path());
         let found = file_in(&chain, &file).expect("workspace file");
         assert!(found.content.len() <= MAX_FILE_BYTES);
-        assert!(found.content.contains("[localLM: instruction file truncated"));
+        assert!(found
+            .content
+            .contains("[localLM: instruction file truncated"));
         assert!(chain.render().contains("truncated"));
     }
 
     #[test]
-    fn the_chain_is_ordered_from_the_outermost_directory_inwards() {        let temp = tempfile::tempdir().unwrap();
+    fn the_chain_is_ordered_from_the_outermost_directory_inwards() {
+        let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("AGENTS.md"), "outer").unwrap();
         let child = temp.path().join("child");
         std::fs::create_dir_all(&child).unwrap();

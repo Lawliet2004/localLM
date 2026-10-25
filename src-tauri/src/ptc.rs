@@ -703,16 +703,13 @@ impl<'a> Exec<'a> {
         // works inside a plan. Dispatching the wrapper itself is refused by
         // the harness.
         let (tool, tool_args) = if tool_name == crate::tool_discovery::INVOKE {
-            let (target, resolved) = crate::tool_discovery::resolve(
-                self.ctx.inherit_tools.iter(),
-                tool_name,
-                tool_args,
-            )
-            .map_err(|error_message| {
-                error(format!(
-                    "Tool '{tool_name}' rejected its arguments: {error_message}"
-                ))
-            })?;
+            let (target, resolved) =
+                crate::tool_discovery::resolve(self.ctx.inherit_tools.iter(), tool_name, tool_args)
+                    .map_err(|error_message| {
+                        error(format!(
+                            "Tool '{tool_name}' rejected its arguments: {error_message}"
+                        ))
+                    })?;
             (target, resolved)
         } else {
             let Some(tool) = self
@@ -806,12 +803,7 @@ impl<'a> Exec<'a> {
         let allow = if automatic {
             true
         } else {
-            let (approval_id, decision) = self
-                .ctx
-                .state
-                .approvals
-                .request()
-                .map_err(error)?;
+            let (approval_id, decision) = self.ctx.state.approvals.request().map_err(error)?;
             let _pending = self.ctx.state.approvals.guard(&approval_id);
             (self.ctx.emit)(
                 format!("Awaiting approval: {tool_name} (plan)"),
@@ -838,11 +830,7 @@ impl<'a> Exec<'a> {
             "authorization": if automatic { "auto-approved plan call" } else { "user approval decision" },
             "program": true, "callId": call_id, "stepId": self.ctx.step_id});
         let row = {
-            let store = self
-                .ctx
-                .state
-                .database()
-                .map_err(error)?;
+            let store = self.ctx.state.database().map_err(error)?;
             store
                 .append_message(
                     &self.ctx.conversation_id,
@@ -1017,11 +1005,7 @@ impl<'a> Exec<'a> {
             }
         }
         {
-            let store = self
-                .ctx
-                .state
-                .database()
-                .map_err(error)?;
+            let store = self.ctx.state.database().map_err(error)?;
             store
                 .update_message(
                     &row.id,
@@ -1255,11 +1239,7 @@ impl<'a> Exec<'a> {
                 "authorization": "auto-approved plan parallel read",
                 "program": true, "callId": call_id, "stepId": self.ctx.step_id});
             {
-                let store = self
-                    .ctx
-                    .state
-                    .database()
-                    .map_err(error)?;
+                let store = self.ctx.state.database().map_err(error)?;
                 store
                     .append_message(
                         &self.ctx.conversation_id,
@@ -1856,7 +1836,8 @@ mod tests {
         // The ptc_run schema itself enforces exactly-one-of plan|steps.
         let tool = tools
             .iter()
-            .find(|tool| tool.alias == "ptc_run").cloned()
+            .find(|tool| tool.alias == "ptc_run")
+            .cloned()
             .unwrap_or_else(|| crate::connectors::AgentTool::harness("ptc_run").unwrap());
         assert!(tool
             .prepare_arguments(json!({"plan": {"body": []}}))

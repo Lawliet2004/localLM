@@ -10,7 +10,7 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-pub const RESPONSE_STYLE: &str = "For completed work, lead with the concrete result. Use short paragraphs and bold only key outcomes. Briefly state what changed and report only checks actually performed and their outcomes. Mention remaining work or failures clearly. Do not invent file edits, tests, timing, or successful execution: rely on recorded tool results. Keep intermediate updates concise and put the final user-facing summary after tool work is complete. Follow the user's requested format when it differs.";
+pub const RESPONSE_STYLE: &str = "Write for a terminal log, not a document. Before a tool call, write at most one plain sentence saying what you are about to do, and none when the call is self-explanatory. Do not restate or summarize tool output; the user can see it. In intermediate updates use plain sentences only: no headings, bullets, bold, tables, or emoji. When the work is finished, lead the final message with the result, then add only the detail the user needs: what changed, and the checks you actually ran with their outcomes. State remaining work or failures plainly. Use short paragraphs and bold only key outcomes in the final message. Do not invent file edits, tests, timing, or successful execution: rely on recorded tool results. Follow the user's requested format when it differs.";
 
 pub const CONTINUE_INSTRUCTION: &str = "Continue the interrupted response without repeating earlier text. The user request is unchanged and any offered tools remain available. If the task requires saved files, create or update them with workspace tools rather than pasting the program in chat. Keep writes small and build incrementally. Finish naturally when the task is complete; do not ask the user to say go again.";
 
@@ -164,8 +164,6 @@ pub fn frozen_system_for_tools(
     )
 }
 
-
-
 pub fn volatile_scratchpad(injections: &[(String, String)]) -> Option<String> {
     let blocks: Vec<String> = injections
         .iter()
@@ -208,6 +206,37 @@ fn with_volatile_prefix(draft: &Value, volatile: Option<&str>) -> Value {
         }
     }
     message
+}
+
+/// Exact inverse of `with_volatile_prefix`: remove the injected scratchpad
+/// from the last message so differential counts can measure it. A draft that
+/// does not carry the prefix (it was compacted away or never injected) is
+/// left untouched.
+pub fn strip_volatile_prefix(messages: &mut [Value], volatile: Option<&str>) {
+    let Some(text) = volatile.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let Some(message) = messages.last_mut() else {
+        return;
+    };
+    match message.get_mut("content") {
+        Some(Value::String(content)) => {
+            let prefix = format!("{text}\n\n");
+            if let Some(rest) = content.strip_prefix(prefix.as_str()) {
+                *content = rest.to_string();
+            } else if content.as_str() == text {
+                *content = String::new();
+            }
+        }
+        Some(Value::Array(parts)) => {
+            if parts.first().and_then(|part| part["text"].as_str())
+                == Some(format!("{text}\n").as_str())
+            {
+                parts.remove(0);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Frozen system + history, excluding the current user draft (and any volatile

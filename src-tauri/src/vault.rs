@@ -4,16 +4,21 @@ use aes_gcm::{
 };
 use std::{io::Write, path::PathBuf, sync::Mutex};
 
+#[derive(Clone)]
 pub struct Vault {
     directory: PathBuf,
-    lock: Mutex<()>,
+    #[cfg(test)]
+    fail_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lock: std::sync::Arc<Mutex<()>>,
     pub refresh: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 impl Vault {
     pub fn new(directory: PathBuf) -> Self {
         Self {
             directory,
-            lock: Mutex::new(()),
+            #[cfg(test)]
+            fail_writes: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lock: std::sync::Arc::new(Mutex::new(())),
             refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -110,7 +115,16 @@ impl Vault {
         let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
         Ok(Some(unseal(&self.cipher()?, id, &bytes)?))
     }
+    #[cfg(test)]
+    pub(crate) fn fail_writes_for_test(&self) {
+        self.fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     pub fn save(&self, id: &str, secret: &[u8]) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Injected credential-store failure".into());
+        }
         validate_id(id)?;
         let _guard = self
             .lock
@@ -141,11 +155,8 @@ impl Vault {
     /// The keyring call is a D-Bus round trip to the platform credential
     /// store. On Linux that can block for seconds when the keyring is locked,
     /// and it must never happen on a tokio worker thread.
-    pub async fn load_blocking(
-        self: &std::sync::Arc<Self>,
-        id: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        let vault = std::sync::Arc::clone(self);
+    pub async fn load_blocking(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
+        let vault = self.clone();
         let id = id.to_string();
         tokio::task::spawn_blocking(move || vault.load(&id))
             .await
@@ -153,12 +164,8 @@ impl Vault {
     }
 
     /// Store a credential without blocking the async worker.
-    pub async fn save_blocking(
-        self: &std::sync::Arc<Self>,
-        id: &str,
-        secret: Vec<u8>,
-    ) -> Result<(), String> {
-        let vault = std::sync::Arc::clone(self);
+    pub async fn save_blocking(&self, id: &str, secret: Vec<u8>) -> Result<(), String> {
+        let vault = self.clone();
         let id = id.to_string();
         tokio::task::spawn_blocking(move || vault.save(&id, &secret))
             .await
@@ -166,11 +173,8 @@ impl Vault {
     }
 
     /// Remove a credential without blocking the async worker.
-    pub async fn clear_blocking(
-        self: &std::sync::Arc<Self>,
-        id: &str,
-    ) -> Result<(), String> {
-        let vault = std::sync::Arc::clone(self);
+    pub async fn clear_blocking(&self, id: &str) -> Result<(), String> {
+        let vault = self.clone();
         let id = id.to_string();
         tokio::task::spawn_blocking(move || vault.clear(&id))
             .await

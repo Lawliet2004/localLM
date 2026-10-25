@@ -10,7 +10,7 @@ const mock = vi.hoisted(() => ({
   deleteInstalledModel: vi.fn(),
   modelInstallStatus: vi.fn(async (): Promise<ModelInstallStatus> => ({ busy: false, phase: 'idle', received: 0, total: 0, path: null, error: null })),
   cancelModelInstall: vi.fn(),
-  hardwareStatus: vi.fn(async () => ({ logicalCpus: 8, memoryTotalBytes: 16 * 2 ** 30, memoryAvailableBytes: 8 * 2 ** 30, gpuStatus: 'ok', sampledAt: 0, gpus: [{ name: 'GPU', uuid: 'g', memoryUsedMib: 0, memoryTotalMib: 4096, utilizationPercent: 0, driverVersion: '1' }] })),
+  hardwareStatus: vi.fn(async () => ({ logicalCpus: 8, memoryTotalBytes: 16 * 2 ** 30, memoryAvailableBytes: 8 * 2 ** 30, gpuStatus: 'ok', sampledAt: Date.now(), gpus: [{ name: 'GPU', uuid: 'g', memoryUsedMib: 0, memoryTotalMib: 4096, utilizationPercent: 0, driverVersion: '1' }] })),
 }));
 vi.mock('../lib/api', () => ({ api: mock, nativeAvailable: true, errorMessage: String }));
 const model: InstalledModel = { id: 'C:/models/new.gguf', path: 'C:/models/new.gguf', filename: 'new.gguf', bytes: 1024, repo: 'publisher/new-GGUF', revision: 'a'.repeat(40), files: ['C:/models/new.gguf'], complete: true };
@@ -18,7 +18,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mock.searchHuggingFace.mockResolvedValue([]);
   mock.modelInstallStatus.mockResolvedValue({ busy: false, phase: 'idle', received: 0, total: 0, path: null, error: null });
-  mock.hardwareStatus.mockResolvedValue({ logicalCpus: 8, memoryTotalBytes: 16 * 2 ** 30, memoryAvailableBytes: 8 * 2 ** 30, gpuStatus: 'ok', sampledAt: 0, gpus: [{ name: 'GPU', uuid: 'g', memoryUsedMib: 0, memoryTotalMib: 4096, utilizationPercent: 0, driverVersion: '1' }] });
+  mock.hardwareStatus.mockResolvedValue({ logicalCpus: 8, memoryTotalBytes: 16 * 2 ** 30, memoryAvailableBytes: 8 * 2 ** 30, gpuStatus: 'ok', sampledAt: Date.now(), gpus: [{ name: 'GPU', uuid: 'g', memoryUsedMib: 0, memoryTotalMib: 4096, utilizationPercent: 0, driverVersion: '1' }] });
 });
 const props = { models: [model], loading: false, busy: false, selectedPath: '', loadedPath: null, onRefresh: vi.fn(async () => {}), onUse: vi.fn(async () => {}), onDeleted: vi.fn(async () => {}) };
 it('uses any downloaded model and requires an explicit delete action', async () => {

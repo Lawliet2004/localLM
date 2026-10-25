@@ -985,7 +985,10 @@ impl Workspace {
             ranges.push((located, replacement.new_text));
         }
         ranges.sort_by_key(|range| range.0.start);
-        if ranges.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+        if ranges
+            .windows(2)
+            .any(|pair| pair[0].0.end > pair[1].0.start)
+        {
             return Err("Patch replacements overlap in the original file.".into());
         }
         // The regions are resolved against the original text, so they are

@@ -237,7 +237,7 @@ describe('chat action reporting and submission', () => {
     render(<Chat {...props} messages={[message]} />);
     expect(screen.getByText('Searched the web')).toBeInTheDocument();
     expect(screen.getByText('fusion yield')).toBeInTheDocument();
-    expect(screen.getByText('1 result')).toBeInTheDocument();
+    expect(screen.getByText('1 source')).toBeInTheDocument();
     fireEvent.click(screen.getByText('fusion yield'));
     expect(within(screen.getByTestId('command-run-card')).getByRole('link', { name: 'NIF' })).toHaveAttribute('href', 'https://example.com/nif');
   });
@@ -263,28 +263,15 @@ describe('chat action reporting and submission', () => {
   });
 it('shows measured context usage in the context popover', () => {
      render(<Chat {...props} messages={[]} contextUsage={{ inputTokens: 123, responseReserve: 512, contextLength: 8192 }} />);
-     const popover = screen.getByRole('dialog', { name: 'Context usage and compaction' });
-     expect(popover).toHaveTextContent('123 input + 512 reserved / 8,192 tokens');
-   });
+     const popover = screen.getByRole('dialog', { name: 'Context window usage' });
+     expect(popover).toHaveTextContent('123/8,192 (1.5%)');
+  });
     it('warns when the draft overflows the context window', async () => {
       apiMocks.contextPreflight.mockResolvedValue({ available: true, breakdown: { total: 9000, instructions: 50, tools: 30, history: 4000, draft: 4920, responseReserve: 512, contextLength: 8192, exact: true, fits: false, overflow: 'Over the context limit — compact history or shorten the draft.' } });
       render(<Chat {...props} messages={[]} ready={true} draft="test prompt" />);
       await waitFor(() => {
         expect(screen.getByRole('alert')).toHaveTextContent('Over the context limit');
       });
-    });
-    it('triggers manual compaction from the context popover', async () => {
-      apiMocks.compactConversation.mockResolvedValue({ note: 'Compacted 4 messages into artifact art-1', checkpoint: { cutoff: 12345 } });
-      const messages: Message[] = [
-        { id: '1', conversationId: 'c1', role: 'user', content: 'Turn 1', reasoning: '', status: 'complete', createdAt: 1 },
-        { id: '2', conversationId: 'c1', role: 'assistant', content: 'Reply 1', reasoning: '', status: 'complete', createdAt: 2 },
-        { id: '3', conversationId: 'c1', role: 'user', content: 'Turn 2', reasoning: '', status: 'complete', createdAt: 3 },
-      ];
-      render(<Chat {...props} conversationKey="c1" messages={messages} ready={true} draft="Next message" />);
-      const compactBtn = await screen.findByRole('button', { name: 'Compact history' });
-      fireEvent.click(compactBtn);
-      await waitFor(() => expect(apiMocks.compactConversation).toHaveBeenCalledWith('c1'));
-      expect(await screen.findByText('Compacted 4 messages into artifact art-1')).toBeInTheDocument();
     });
   it.each([
     ['complete', { isError: true, message: 'Process failed' }, 'allowed', 'Failed'],

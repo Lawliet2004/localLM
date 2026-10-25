@@ -57,9 +57,7 @@ struct CatalogModel {
 
 /// Model-facing tool definitions.
 pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
-    let object = |properties: Value, required: &[&str]| {
-        json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
-    };
+    let object = |properties: Value, required: &[&str]| json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
     let worktree_item = json!({
         "type":"object",
         "required":["path","branch","head","locked"],
@@ -196,7 +194,9 @@ fn rename(
     // The store and the UI rename command cap the title at 160 characters;
     // the declared schema is wider, so the real limit is reported here.
     if title.chars().count() > MAX_TITLE_CHARS {
-        return Err(format!("Title must contain 1–{MAX_TITLE_CHARS} characters."));
+        return Err(format!(
+            "Title must contain 1–{MAX_TITLE_CHARS} characters."
+        ));
     }
     store.rename_conversation(conversation_id, title)?;
     Ok(json!({"title": title}))
@@ -461,11 +461,9 @@ fn variants_of(model: &crate::providers::RemoteModel) -> Vec<String> {
     if model.supports_images {
         variants.push("vision".to_string());
     }
-    if model
-        .controls
-        .as_ref()
-        .is_some_and(|controls| controls.reasoning_effort == crate::providers::ToolSupport::Supported)
-    {
+    if model.controls.as_ref().is_some_and(|controls| {
+        controls.reasoning_effort == crate::providers::ToolSupport::Supported
+    }) {
         variants.push("reasoning".to_string());
     }
     variants
@@ -691,7 +689,10 @@ mod tests {
         let first = search_models(&providers, None, &json!({"limit": 1, "offset": 0}));
         let second = search_models(&providers, None, &json!({"limit": 1, "offset": 1}));
         let id = |page: &Value| -> String {
-            page["providers"][0]["models"][0]["id"].as_str().unwrap().to_string()
+            page["providers"][0]["models"][0]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
         };
         assert_ne!(id(&first), id(&second));
         assert_eq!(first["next"], 1);
@@ -709,7 +710,10 @@ mod tests {
 
         let queried = search_models(&providers, None, &json!({"query": "sonnet"}));
         assert_eq!(queried["total"], 1);
-        assert_eq!(queried["providers"][0]["models"][0]["id"], "anthropic/claude-sonnet");
+        assert_eq!(
+            queried["providers"][0]["models"][0]["id"],
+            "anthropic/claude-sonnet"
+        );
 
         // The conversation's own provider is listed first.
         let current = search_models(&providers, Some("openai"), &json!({}));

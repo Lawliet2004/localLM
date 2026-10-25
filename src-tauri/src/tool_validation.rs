@@ -229,9 +229,7 @@ mod tests {
             .contains("recursion budget"));
         let schema = json!({"$ref":"#/$defs/node","$defs":{"node":{"allOf":[{"type":"object","properties":{"child":{"$ref":"#/$defs/node"}}},{"type":"object","properties":{"child":{"$ref":"#/$defs/node"}}}]}}});
         let compiled = compile(&schema).unwrap();
-        assert!(
-            compiled.check(&json!({"child":{"child":{}}})).unwrap()
-        );
+        assert!(compiled.check(&json!({"child":{"child":{}}})).unwrap());
         let mut value = json!({});
         for _ in 0..20 {
             value = json!({"child":value});

@@ -60,6 +60,7 @@ import './models.css';
 import './desktop.css';
 import './appearance.css';
 import './responses.css';
+import './activity.css';
 
 import { loadDraft, saveDraft, moveNewDraft } from './lib/drafts';
 
@@ -895,6 +896,19 @@ export default function App() {
 
   }
 
+  useEffect(() => {
+    if (!modelBusy || !nativeAvailable) return;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    async function refresh() {
+      try { const runtime = await api.runtimeStatus(); if (!disposed) setData(current => ({ ...current, runtime })); }
+      catch { /* The action reports its own error and refreshes authoritative state. */ }
+      finally { if (!disposed) timer = setTimeout(() => { void refresh(); }, 500); }
+    }
+    void refresh();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [modelBusy]);
+
   async function modelAction(load: boolean) {
 
     setModelBusy(true); setError('');
@@ -931,7 +945,11 @@ export default function App() {
 
     }
 
-    catch (e) { setError(errorMessage(e)); setData(current => ({ ...current, runtime: { phase: 'error', message: errorMessage(e), modelPath: null } })); }
+    catch (e) {
+      setError(errorMessage(e));
+      try { const runtime = await api.runtimeStatus(); setData(current => ({ ...current, runtime })); }
+      catch (refreshError) { setError(`${errorMessage(e)} Runtime status could not be refreshed: ${errorMessage(refreshError)}`); }
+    }
 
     finally { setModelBusy(false); }
 

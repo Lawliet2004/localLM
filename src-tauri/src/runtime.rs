@@ -142,10 +142,19 @@ impl Runtime {
         self.supports_images = false;
         Ok(self.status.clone())
     }
+    #[cfg(test)]
     pub async fn load(
         &mut self,
         preferences: &Preferences,
         config: &RuntimeConfig,
+    ) -> Result<RuntimeStatus, String> {
+        self.load_observed(preferences, config, None).await
+    }
+    pub async fn load_observed(
+        &mut self,
+        preferences: &Preferences,
+        config: &RuntimeConfig,
+        observer: Option<std::sync::Arc<std::sync::Mutex<Option<RuntimeStatus>>>>,
     ) -> Result<RuntimeStatus, String> {
         config.validate()?;
         preferences.validate()?;
@@ -167,10 +176,9 @@ impl Runtime {
             .and_then(|path| std::fs::metadata(path).ok())
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        let launch = resolve_launch_config(config, &model, flags.fit, projector_bytes).await?;
-        let model_bytes = std::fs::metadata(&model)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let launch =
+            resolve_launch_config(config, &model, &executable, flags.fit, projector_bytes).await?;
+        let model_bytes = crate::gguf::model_metadata(&model)?.file_bytes;
         let attempts = startup_attempts(model_bytes);
         self.stop().await?;
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -254,7 +262,18 @@ impl Runtime {
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|error| error.to_string())?;
+        let started = std::time::Instant::now();
         for _ in 0..attempts {
+            self.status.message = format!(
+                "Loading model · {} seconds elapsed · checking server readiness",
+                started.elapsed().as_secs()
+            );
+            if let Some(observer) = &observer {
+                if let Ok(mut status) = observer.lock() {
+                    *status = Some(self.status.clone());
+                }
+            }
+
             if self.inspect().phase == "error" {
                 return Err(self.status.message.clone());
             }
@@ -422,18 +441,43 @@ async fn inspect_runtime(executable: &Path) -> Result<RuntimeFlags, String> {
     Ok(RuntimeFlags::from_help(&help))
 }
 
+/// Integrity is independent of loadability. The server help proves flag
+/// support only; architecture/quantization support remains unknown until load.
+pub(crate) async fn preflight_download(runtime_path: &str, projector: bool) -> Result<(), String> {
+    if runtime_path.is_empty() {
+        return Ok(());
+    } // Offline provisioning is allowed.
+    let executable = std::fs::canonicalize(runtime_path).map_err(|_| "The selected runtime is missing. Select a native llama-server or clear its saved path before downloading for later use.")?;
+    let flags = inspect_runtime(&executable).await?;
+    if projector && !flags.mmproj {
+        return Err("The selected runtime does not support vision projectors. Update it or download text weights without a projector.".into());
+    }
+    Ok(())
+}
+
 async fn resolve_launch_config(
     config: &RuntimeConfig,
     model: &Path,
+    executable: &Path,
     fit_supported: bool,
     projector_bytes: u64,
 ) -> Result<RuntimeConfig, String> {
     if !config.automatic_gpu() || fit_supported {
         return Ok(config.clone());
     }
-    let available = crate::hardware::hardware_status()
-        .await
-        .free_vram_bytes()
+    let hardware = crate::hardware::hardware_status().await;
+    // Legacy numeric fitting is safe only when the selected server reports the
+    // same sole CUDA device. Other backends and ambiguous device lists stay auto.
+    let matches = match (
+        hardware.single_gpu_name(),
+        query_runtime_devices(executable).await,
+    ) {
+        (Some(name), Ok(devices)) => matches_single_cuda_device(&devices, name),
+        _ => false,
+    };
+    let available = matches
+        .then(|| hardware.free_vram_bytes())
+        .flatten()
         .map(|bytes| {
             bytes.saturating_sub(if config.vision_enabled && config.offload_projector {
                 projector_bytes
@@ -441,11 +485,15 @@ async fn resolve_launch_config(
                 0
             })
         });
+    // Missing NVIDIA telemetry cannot establish that a native backend is CPU-only.
+    if available.is_none() {
+        return Ok(config.clone());
+    }
     let mut launch = config.clone();
     launch.gpu_layers = crate::gguf::model_metadata(model)
         .ok()
         .map(|metadata| RuntimeConfig::auto_gpu_layers(&metadata, &launch, available))
-        .unwrap_or(0);
+        .unwrap_or(-1);
     if launch.gpu_layers == 0 {
         launch.offload_kv_cache = false;
     }
@@ -530,6 +578,49 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_preflight_rejects_missing_runtime_and_known_missing_projector_support() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("llama-server");
+        assert!(preflight_download(executable.to_str().unwrap(), false)
+            .await
+            .unwrap_err()
+            .contains("missing"));
+        preflight_download("", true).await.unwrap();
+        std::fs::write(&executable, "#!/bin/sh\necho --fit\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        preflight_download(executable.to_str().unwrap(), false)
+            .await
+            .unwrap();
+        assert!(preflight_download(executable.to_str().unwrap(), true)
+            .await
+            .unwrap_err()
+            .contains("does not support vision"));
+        std::fs::write(&executable, "#!/bin/sh\necho --mmproj\n").unwrap();
+        preflight_download(executable.to_str().unwrap(), true)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_fit_requires_the_selected_runtimes_single_matching_cuda_device() {
+        assert!(matches_single_cuda_device(
+            "Available devices:\n CUDA0: NVIDIA Example (8192 MiB)",
+            "NVIDIA Example"
+        ));
+        for devices in [
+            "Vulkan0: NVIDIA Example",
+            "CUDA0: Other GPU",
+            "CUDA0: NVIDIA Example\nCUDA1: Second GPU",
+            "",
+            "Available devices:",
+        ] {
+            assert!(!matches_single_cuda_device(devices, "NVIDIA Example"));
+        }
+    }
+
     #[test]
     fn model_validation_rejects_truncated_metadata_and_unknown_gguf_versions() {
         let temp = tempfile::tempdir().unwrap();
@@ -766,6 +857,22 @@ http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
             )
             .await
             .is_ok());
+        let before = runtime.inspect();
+        let invalid = Preferences {
+            model_path: directory
+                .path()
+                .join("missing.gguf")
+                .to_string_lossy()
+                .into_owned(),
+            ..preferences.clone()
+        };
+        assert!(runtime
+            .load(&invalid, &RuntimeConfig::default())
+            .await
+            .is_err());
+        assert_eq!(runtime.inspect().phase, "ready");
+        assert_eq!(runtime.inspect().model_path, before.model_path);
+        assert_eq!(runtime.inspect().loaded_config, before.loaded_config);
         runtime.stop().await.unwrap();
         assert!(!runtime.supports_images);
         assert!(runtime.status.projector.is_none());
@@ -854,4 +961,56 @@ http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
             assert!(error.contains("symlink"), "{error}");
         }
     }
+}
+
+#[tauri::command]
+pub async fn runtime_devices(state: tauri::State<'_, crate::AppState>) -> Result<String, String> {
+    let path = state.database()?.preferences()?.runtime_path;
+    if path.is_empty() {
+        return Err("Select and save a native runtime before inspecting its devices.".into());
+    }
+    let executable = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    query_runtime_devices(&executable).await
+}
+fn matches_single_cuda_device(devices: &str, name: &str) -> bool {
+    let lines: Vec<_> = devices
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "Available devices:")
+        .collect();
+    lines.len() == 1 && lines[0].starts_with("CUDA0:") && lines[0].contains(name)
+}
+async fn query_runtime_devices(executable: &Path) -> Result<String, String> {
+    let mut command = runtime_command(executable);
+    command
+        .arg("--list-devices")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    use tokio::io::AsyncReadExt;
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Cannot inspect selected runtime devices: {e}"))?;
+    let mut bytes = Vec::new();
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or("Runtime device output unavailable")?
+        .take(65537);
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        output
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        child.wait().await.map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Selected runtime device query timed out")??;
+    if !status.success() || bytes.is_empty() || bytes.len() > 65536 {
+        return Err("The selected runtime cannot report its devices. Acceleration capability remains unknown; update llama-server or inspect its native logs.".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "Runtime device output was not readable.".into())
 }

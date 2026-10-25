@@ -18,7 +18,8 @@ struct ProtectedStore {
 impl CredentialStore for ProtectedStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
         self.vault
-            .load(&self.id)
+            .load_blocking(&self.id)
+            .await
             .map_err(AuthError::CredentialStoreError)?
             .map(|bytes| {
                 serde_json::from_slice(&bytes).map_err(|_| {
@@ -32,12 +33,14 @@ impl CredentialStore for ProtectedStore {
             AuthError::CredentialStoreError("Could not encode authorization data.".into())
         })?;
         self.vault
-            .save(&self.id, &bytes)
+            .save_blocking(&self.id, bytes)
+            .await
             .map_err(AuthError::CredentialStoreError)
     }
     async fn clear(&self) -> Result<(), AuthError> {
         self.vault
-            .clear(&self.id)
+            .clear_blocking(&self.id)
+            .await
             .map_err(AuthError::CredentialStoreError)
     }
     async fn acquire_refresh_guard(&self) -> Result<Option<CredentialRefreshGuard>, AuthError> {

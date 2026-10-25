@@ -1,7 +1,6 @@
 //! Pinned installation metadata. User/model input cannot substitute URLs or hashes.
 use crate::download::Asset;
 use serde::Serialize;
-use tauri::Manager;
 
 pub const MODEL_FILENAME: &str = "MiniCPM5-2B.Q6_K.gguf";
 pub const MODEL: Asset<'static> = Asset {
@@ -50,15 +49,11 @@ pub struct ModelDownloadInfo {
 
 #[tauri::command]
 pub async fn model_download_info(
-    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
     filename: Option<String>,
 ) -> Result<ModelDownloadInfo, String> {
     let (filename, asset) = model(filename.as_deref())?;
-    let directory = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?
-        .join("models");
+    let directory = crate::managed_storage::root(&state.data_dir)?.join("models");
     tokio::fs::create_dir_all(&directory)
         .await
         .map_err(|error| format!("Could not prepare model directory: {error}"))?;

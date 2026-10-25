@@ -375,9 +375,7 @@ fn arm_parent_death_signal(mut command: tokio::process::Command) -> tokio::proce
     // fork and exec; it does not allocate or acquire locks.
     unsafe {
         command.pre_exec(move || {
-            rustix::process::set_parent_process_death_signal(Some(
-                rustix::process::Signal::KILL,
-            ))?;
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
             // The parent might have exited before the signal was armed.
             if rustix::process::getppid() != Some(parent) {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
@@ -2038,5 +2036,116 @@ mod tests {
         assert!(chunks
             .iter()
             .any(|(s, c)| s == "stdout" && c.contains("test_streaming_chunk")));
+    }
+}
+
+/// Probe the selected interpreter, not the shell's `node` alias. This also
+/// catches executable impostors and graphical-app PATH differences.
+pub(crate) async fn probe_node(path: &str, minimum: (u32, u32, u32)) -> Result<String, String> {
+    use std::sync::OnceLock;
+    type ProbeCache = std::collections::HashMap<String, (std::time::Instant, String)>;
+    static CACHE: OnceLock<tokio::sync::Mutex<ProbeCache>> = OnceLock::new();
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()));
+    let cache_key = format!("{path}:{stamp:?}:{minimum:?}");
+    let mut cache = CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(ProbeCache::new()))
+        .lock()
+        .await;
+    if let Some((time, version)) = cache.get(&cache_key) {
+        if time.elapsed() < Duration::from_secs(30) {
+            return Ok(version.clone());
+        }
+    }
+    if !executable(path) {
+        return Err("Configure the absolute path to an installed Node.js executable in Execution settings. Desktop apps may not inherit your shell/version-manager PATH.".into());
+    }
+    let mut command = tokio::process::Command::new(path);
+    command
+        .args([
+            "-p",
+            "JSON.stringify({version:process.versions.node,release:process.release.name})",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Cannot start Node.js: {e}"))?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or("Node output unavailable")?
+        .take(4097);
+    let mut bytes = Vec::new();
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        output
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        child.wait().await.map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Node.js prerequisite probe timed out.")??;
+    if !status.success() || bytes.len() > 4096 {
+        return Err("The selected executable could not run the Node.js prerequisite probe.".into());
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "The selected executable did not return Node.js version information.")?;
+    let version = value["version"]
+        .as_str()
+        .ok_or("Node.js version is unavailable")?;
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .map_err(|_| "Invalid Node.js version")?;
+    if value["release"] != "node" || parts.len() != 3 || (parts[0], parts[1], parts[2]) < minimum {
+        return Err(format!("Node.js {}.{}.{}+ is required; selected runtime reports {version}. Install a supported Node version and choose its absolute executable path in Execution settings.", minimum.0, minimum.1, minimum.2));
+    }
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(cache_key, (std::time::Instant::now(), version.into()));
+    Ok(version.into())
+}
+
+#[cfg(test)]
+mod prerequisite_tests {
+    use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probes_old_wrong_missing_and_feature_specific_node_versions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let node = temp.path().join("node");
+        assert!(probe_node(node.to_str().unwrap(), (18, 0, 0))
+            .await
+            .unwrap_err()
+            .contains("absolute path"));
+        std::fs::write(
+            &node,
+            "#!/bin/sh\nprintf '%s' '{\"release\":\"node\",\"version\":\"18.20.0\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            probe_node(node.to_str().unwrap(), (18, 0, 0))
+                .await
+                .unwrap(),
+            "18.20.0"
+        );
+        assert!(probe_node(node.to_str().unwrap(), (22, 13, 0))
+            .await
+            .unwrap_err()
+            .contains("22.13.0"));
+        std::fs::write(&node, "#!/bin/sh\nprintf 'not node'\n").unwrap();
+        assert!(probe_node(node.to_str().unwrap(), (18, 0, 0))
+            .await
+            .is_err());
     }
 }

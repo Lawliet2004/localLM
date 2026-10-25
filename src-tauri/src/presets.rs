@@ -177,83 +177,87 @@ pub fn minimal_workspace_tools() -> [&'static str; 1] {
 /// The preset derives from it, so the two cannot drift apart — the drift
 /// that a hand-maintained duplicate invites.
 const ASSISTANT_CATALOG: &[&str] = &[
-        "verification_run",
-        "verification_report",
-        "verification_compare",
-        "change_impact",
-        "http_session_create",
-        "http_session_close",
-        "http_request",
-        "http_compare",
-        "openapi_inspect",
-        "openapi_request",
-        "database_schema",
-        "database_query",
-        "database_explain",
-        "database_rehearse",
-        "database_cleanup",
-        "benchmark_run",
-        "benchmark_compare",
-        "profile_inspect",
-        "profile_capture",
-        "profile_compare",
-        "debugger_start",
-        "debugger_inspect",
-        "debugger_control",
-        "debugger_events",
-        "debugger_stop",
-        "process_start",
-        "process_poll",
-        "process_write",
-        "process_stop",
-        "shell_run", "workspace_open_preview",
-        "check_run",
-        "check_report",
-        "git_status",
-        "git_diff",
-        "git_stage",
-        "git_unstage",
-        "git_commit",
-        "git_branch",
-        "git_history",
-        "worktree_enter",
-        "worktree_exit",
-        "lsp_diagnostics",
-        "lsp_symbols",
-        "lsp_references",
-        "lsp_prepare_rename",
-        "lsp_rename",
-        "lsp_definition",
-        "lsp_hover",
-        "lsp_implementations",
-        "lsp_code_actions",
-        "lsp_prepare_code_action",
-        "lsp_apply_edit",
-        "lsp_execute_command",
-        "get_weather",
-        "web_search",
-        "web_read",
-        "web_find",
-        "file_search",
-        "file_read",
-        "file_write",
-        "run_code",
-        "format_paths",
-        "skill_list",
-        "skill_load",
-        "session_rename",
-        "session_move",
-        "worktree_list",
-        "models",
-        "plan_submit",
-        "ask_user",
-        "artifact_read",
+    "verification_run",
+    "verification_report",
+    "verification_compare",
+    "change_impact",
+    "http_session_create",
+    "http_session_close",
+    "http_request",
+    "http_compare",
+    "openapi_inspect",
+    "openapi_request",
+    "database_schema",
+    "database_query",
+    "database_explain",
+    "database_rehearse",
+    "database_cleanup",
+    "benchmark_run",
+    "benchmark_compare",
+    "profile_inspect",
+    "profile_capture",
+    "profile_compare",
+    "debugger_start",
+    "debugger_inspect",
+    "debugger_control",
+    "debugger_events",
+    "debugger_stop",
+    "process_start",
+    "process_poll",
+    "process_write",
+    "process_stop",
+    "shell_run",
+    "workspace_open_preview",
+    "check_run",
+    "check_report",
+    "git_status",
+    "git_diff",
+    "git_stage",
+    "git_unstage",
+    "git_commit",
+    "git_branch",
+    "git_history",
+    "worktree_enter",
+    "worktree_exit",
+    "lsp_diagnostics",
+    "lsp_symbols",
+    "lsp_references",
+    "lsp_prepare_rename",
+    "lsp_rename",
+    "lsp_definition",
+    "lsp_hover",
+    "lsp_implementations",
+    "lsp_code_actions",
+    "lsp_prepare_code_action",
+    "lsp_apply_edit",
+    "lsp_execute_command",
+    "get_weather",
+    "web_search",
+    "web_read",
+    "web_find",
+    "file_search",
+    "file_read",
+    "file_write",
+    "run_code",
+    "format_paths",
+    "skill_list",
+    "skill_load",
+    "session_rename",
+    "session_move",
+    "worktree_list",
+    "models",
+    "plan_submit",
+    "ask_user",
+    "artifact_read",
 ];
 
 /// The everyday assistant catalog as owned strings.
 #[cfg(test)]
 pub fn assistant_catalog() -> Vec<String> {
-    ASSISTANT_CATALOG.iter().map(|alias| alias.to_string()).collect()
+    ASSISTANT_CATALOG
+        .iter()
+        .map(|alias| alias.to_string())
+        .collect()
 }
 
 /// Aliases share the same opt-in source as their native equivalents. The
@@ -265,10 +269,9 @@ pub fn harness_source_allowed(alias: &str, workspace: bool, execution: bool) -> 
         name if crate::development_tools::owns(name) => {
             workspace && (!crate::development_tools::execution_tool(name) || execution)
         }
-        "file_search" | "file_read" | "file_write" | "format_paths" | "git_status"
-        | "git_diff" | "git_stage" | "git_unstage" | "git_commit" | "git_branch"
-        | "git_history" | "worktree_enter" | "worktree_exit" | "session_move"
-        | "worktree_list" => workspace,
+        "file_search" | "file_read" | "file_write" | "format_paths" | "git_status" | "git_diff"
+        | "git_stage" | "git_unstage" | "git_commit" | "git_branch" | "git_history"
+        | "worktree_enter" | "worktree_exit" | "session_move" | "worktree_list" => workspace,
         "lsp_diagnostics"
         | "lsp_symbols"
         | "lsp_references"
@@ -507,10 +510,7 @@ mod tests {
     #[test]
     fn standard_is_lean_and_creator_is_full() {
         let standard = get(STANDARD).unwrap();
-        assert_eq!(
-            standard.harness,
-            assistant_catalog()
-        );
+        assert_eq!(standard.harness, assistant_catalog());
         for advanced in [
             "workflow_run",
             "ralph_run",

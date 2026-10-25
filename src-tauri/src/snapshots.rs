@@ -164,7 +164,11 @@ impl From<Snapshot> for SnapshotView {
             conversation_id: snapshot.conversation_id,
             step: snapshot.step,
             created_at: snapshot.created_at,
-            files: snapshot.files.into_iter().map(SnapshotFileView::from).collect(),
+            files: snapshot
+                .files
+                .into_iter()
+                .map(SnapshotFileView::from)
+                .collect(),
             skipped: snapshot.skipped,
         }
     }
@@ -225,9 +229,7 @@ fn validate_path(path: &str) -> Result<(), String> {
         return Err("Snapshot paths must name a file inside the workspace.".into());
     }
     if path.contains('\0') || path.contains('\\') {
-        return Err(
-            "Snapshot paths use forward slashes and cannot contain backslashes.".into(),
-        );
+        return Err("Snapshot paths use forward slashes and cannot contain backslashes.".into());
     }
     let mut count = 0usize;
     for component in Path::new(path).components() {
@@ -315,10 +317,7 @@ fn with_transaction<T>(
         .map_err(db_error)?;
     match body(&store.connection) {
         Ok(value) => {
-            store
-                .connection
-                .execute_batch("COMMIT")
-                .map_err(db_error)?;
+            store.connection.execute_batch("COMMIT").map_err(db_error)?;
             Ok(value)
         }
         Err(error) => {
@@ -357,7 +356,11 @@ pub fn tracked_paths(store: &crate::store::Store, conversation_id: &str) -> Vec<
 }
 
 /// Pull workspace-relative paths out of one tool audit row.
-fn collect_paths(audit: &Value, paths: &mut Vec<String>, seen: &mut std::collections::BTreeSet<String>) {
+fn collect_paths(
+    audit: &Value,
+    paths: &mut Vec<String>,
+    seen: &mut std::collections::BTreeSet<String>,
+) {
     let Some(arguments) = audit
         .get("request")
         .and_then(|request| request.get("arguments"))
@@ -561,10 +564,7 @@ fn persist(store: &crate::store::Store, snapshot: &Snapshot) -> Result<(), Strin
     })
 }
 
-fn load_files(
-    store: &crate::store::Store,
-    snapshot_id: &str,
-) -> Result<Vec<SnapshotFile>, String> {
+fn load_files(store: &crate::store::Store, snapshot_id: &str) -> Result<Vec<SnapshotFile>, String> {
     let mut statement = store
         .connection
         .prepare("SELECT path,sha256,size,deleted FROM snapshot_files WHERE snapshot_id=?1 ORDER BY path")
@@ -582,10 +582,7 @@ fn load_files(
     rows.map(|row| row.map_err(db_error)).collect()
 }
 
-fn load_snapshot(
-    store: &crate::store::Store,
-    id: &str,
-) -> Result<Option<Snapshot>, String> {
+fn load_snapshot(store: &crate::store::Store, id: &str) -> Result<Option<Snapshot>, String> {
     let row = store
         .connection
         .query_row(
@@ -628,8 +625,8 @@ pub fn stage(
     if conversation_id.trim().is_empty() {
         return Err("A staged revert needs a conversation.".into());
     }
-    let snapshot = load_snapshot(store, snapshot_id)?
-        .ok_or("That snapshot no longer exists.".to_string())?;
+    let snapshot =
+        load_snapshot(store, snapshot_id)?.ok_or("That snapshot no longer exists.".to_string())?;
     if snapshot.conversation_id != conversation_id {
         return Err("That snapshot belongs to another conversation.".into());
     }
@@ -759,8 +756,8 @@ pub fn commit(
     root: &std::path::Path,
     staged_id: &str,
 ) -> Result<RevertReport, String> {
-    let staged = staged_revert(store, staged_id)?
-        .ok_or("No staged revert with that id.".to_string())?;
+    let staged =
+        staged_revert(store, staged_id)?.ok_or("No staged revert with that id.".to_string())?;
     let snapshot = load_snapshot(store, &staged.snapshot_id)?
         .ok_or("The snapshot for that revert is no longer available.".to_string())?;
     let blobs = content_root(store);
@@ -931,13 +928,12 @@ fn write_atomic(
 }
 
 /// The snapshots for a conversation, newest first.
-pub fn list(
-    store: &crate::store::Store,
-    conversation_id: &str,
-) -> Result<Vec<Snapshot>, String> {
+pub fn list(store: &crate::store::Store, conversation_id: &str) -> Result<Vec<Snapshot>, String> {
     let mut statement = store
         .connection
-        .prepare("SELECT id FROM snapshots WHERE conversation_id=?1 ORDER BY created_at DESC,rowid DESC")
+        .prepare(
+            "SELECT id FROM snapshots WHERE conversation_id=?1 ORDER BY created_at DESC,rowid DESC",
+        )
         .map_err(db_error)?;
     let ids: Vec<String> = statement
         .query_map([conversation_id], |row| row.get::<_, String>(0))
@@ -964,7 +960,9 @@ pub fn prune(
 ) -> Result<usize, String> {
     let mut statement = store
         .connection
-        .prepare("SELECT id FROM snapshots WHERE conversation_id=?1 ORDER BY created_at DESC,rowid DESC")
+        .prepare(
+            "SELECT id FROM snapshots WHERE conversation_id=?1 ORDER BY created_at DESC,rowid DESC",
+        )
         .map_err(db_error)?;
     let ids: Vec<String> = statement
         .query_map([conversation_id], |row| row.get::<_, String>(0))
@@ -1029,10 +1027,7 @@ fn referenced(store: &crate::store::Store, sha256: &str) -> Result<bool, String>
 
 /// The workspace a conversation's files live in: the project the task is
 /// filed under, or the global workspace when it is not filed.
-fn workspace_root(
-    store: &crate::store::Store,
-    conversation_id: &str,
-) -> Result<PathBuf, String> {
+fn workspace_root(store: &crate::store::Store, conversation_id: &str) -> Result<PathBuf, String> {
     let project = crate::workspace_ui::task_workspace(store, conversation_id)?;
     let root = match project {
         Some(path) if !path.trim().is_empty() => path,
@@ -1089,8 +1084,8 @@ pub fn commit_revert(
     staged_id: String,
 ) -> Result<RevertReportView, String> {
     let store = state.database()?;
-    let staged = staged_revert(&store, &staged_id)?
-        .ok_or("No staged revert with that id.".to_string())?;
+    let staged =
+        staged_revert(&store, &staged_id)?.ok_or("No staged revert with that id.".to_string())?;
     let root = workspace_root(&store, &staged.conversation_id)?;
     Ok(RevertReportView::from(commit(&store, &root, &staged_id)?))
 }

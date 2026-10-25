@@ -203,9 +203,7 @@ pub async fn probe_model_tools(
     provider_id: &str,
     model_id: &str,
 ) -> Result<ToolProbe, String> {
-    // Store guards are not Send; keep every database/vault read synchronous
-    // and scoped so nothing non-Send crosses an await.
-    let (provider, model, key) = {
+    let (provider, model) = {
         let store = state.database()?;
         let provider = store.provider(provider_id)?.ok_or("Unknown provider.")?;
         let model = provider
@@ -221,15 +219,16 @@ pub async fn probe_model_tools(
                 supports_images: false,
                 tool_support: ToolSupport::Unknown,
             });
-        let key = crate::providers::resolve_api_key(
-            &provider,
-            state
-                .daytona_vault
-                .load(&crate::providers::credential_id(&provider.id))?,
-        )
-        .unwrap_or_default();
-        (provider, model, key)
+        (provider, model)
     };
+    let key = crate::providers::resolve_api_key(
+        &provider,
+        state
+            .daytona_vault
+            .load_blocking(&crate::providers::credential_id(&provider.id))
+            .await?,
+    )
+    .unwrap_or_default();
     let backend = if crate::providers::is_subscription_format(&provider.api_format) {
         let kind = if provider.api_format == crate::providers::CHATGPT_SUBSCRIPTION
             || provider.id == "chatgpt-subscription"
@@ -240,7 +239,8 @@ pub async fn probe_model_tools(
         };
         let token =
             crate::subscription_auth::get_valid_access_token(&state.daytona_vault, kind).await?;
-        let account_id = crate::subscription_auth::load_session(&state.daytona_vault, kind)?
+        let account_id = crate::subscription_auth::load_session(&state.daytona_vault, kind)
+            .await?
             .and_then(|s| s.account_id);
         crate::inference::Backend::subscription(
             "subscription",

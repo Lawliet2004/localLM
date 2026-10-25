@@ -155,9 +155,12 @@ mod tests {
 
     #[test]
     fn a_build_failure_names_its_own_context() {
-        let error = client(Policy::following(Duration::from_secs(5)), "the download client failed")
-            .err()
-            .unwrap_or_default();
+        let error = client(
+            Policy::following(Duration::from_secs(5)),
+            "the download client failed",
+        )
+        .err()
+        .unwrap_or_default();
         assert!(error.is_empty() || error.contains("the download client failed"));
     }
 }

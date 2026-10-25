@@ -765,9 +765,9 @@ fn json_with_comments(text: &str) -> Result<Value, String> {
                 .iter()
                 .find(|b| !b.is_ascii_whitespace())
                 .is_some_and(|b| *b == b'}' || *b == b']')
-            {
-                bytes[i] = b' ';
-            }
+        {
+            bytes[i] = b' ';
+        }
         i += 1;
     }
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())

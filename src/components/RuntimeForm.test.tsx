@@ -16,7 +16,7 @@ const llama: ModelMetadata = {
 };
 const hardware: HardwareStatus = {
   logicalCpus: 12, memoryTotalBytes: 16 * 2 ** 30, memoryAvailableBytes: 8 * 2 ** 30,
-  gpuStatus: 'ok', sampledAt: 0,
+  gpuStatus: 'ok', sampledAt: Date.now(),
   gpus: [{ name: 'RTX', uuid: 'gpu', memoryUsedMib: 1024, memoryTotalMib: 24 * 1024, utilizationPercent: 0, driverVersion: '1' }],
 };
 
@@ -109,7 +109,7 @@ describe('runtime settings', () => {
     expect(await screen.findByText('33 layers in this model')).toBeVisible();
     expect(screen.getAllByText('32,768 tokens').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('All layers')).toBeVisible();
-    expect(screen.getByText('Recommended for this model')).toBeVisible();
+    expect(screen.getByText('Suggested starting settings')).toBeVisible();
     expect(screen.getByRole('progressbar', { name: 'Estimated GPU memory' })).toBeVisible();
   });
 
@@ -121,7 +121,7 @@ describe('runtime settings', () => {
     await screen.findByRole('button', { name: 'Use recommended settings' });
     await userEvent.click(screen.getByRole('button', { name: 'Use recommended settings' }));
     await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }));
-    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ contextLength: 32768, gpuLayers: -1 }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ contextLength: 8192, gpuLayers: -1 }));
   });
 
   it('rejects a context larger than the model maximum', async () => {
@@ -138,8 +138,9 @@ describe('runtime settings', () => {
     api.readModelMetadata.mockResolvedValue({ ...llama, architecture: 'hybridnet' });
     api.hardwareStatus.mockResolvedValue(hardware);
     render(<RuntimeForm initial={defaultRuntimeConfig} onSave={vi.fn()} busy={false} modelPath="C:/models/hybrid.gguf" />);
-    expect(await screen.findByText('CPU recommended')).toBeVisible();
-    expect(screen.getByText('Unknown')).toBeVisible();
+    expect(await screen.findByText(/Memory fit is unknown/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Use recommended settings' })).toBeDisabled();
+    expect(screen.getAllByText('Unknown').length).toBeGreaterThan(0);
     expect(screen.getByText(/cache layout incomplete/)).toBeVisible();
   });
 });

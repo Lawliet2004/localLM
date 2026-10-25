@@ -1,30 +1,12 @@
 import { safeSourceUrl, sourceIdentity } from '../lib/sources';
 import { memo, useCallback, useState, useEffect, useMemo, useRef, type ReactNode } from 'react';
-import { ArrowDown, Check, Copy, ChevronRight, FileCode, FileText, AlertCircle, XCircle, Atom, ExternalLink, LoaderCircle } from 'lucide-react';
+import { ArrowDown, Check, ChevronRight, AlertCircle, XCircle, ExternalLink, LoaderCircle } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
 import { AccumulatedAnsiParser, type AnsiLine } from '../lib/ansi';
 import { TRACE_ICONS, toolKindOf, type TraceKind } from './TraceIcon';
 import { CodeBlock } from './CodeBlock';
+import { StructuredResultView } from './StructuredResultView';
 import { DiffLines, diffCounts } from './DiffView';
-
-export function FileIcon({ filename, size = 14 }: { filename?: string; size?: number }) {
-  if (!filename) return <FileCode size={size} className="cmd-icon" />;
-  const lower = filename.toLowerCase();
-  const ext = lower.split('.').pop() || '';
-  if (ext === 'tsx' || ext === 'jsx') {
-    return <Atom size={size} className="cmd-icon file-icon-react" />;
-  }
-  if (ext === 'ts') {
-    return <span className="file-icon-ts">TS</span>;
-  }
-  if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
-    return <span className="file-icon-js">JS</span>;
-  }
-  if (lower.includes('log') || ext === 'log') {
-    return <FileText size={size} className="cmd-icon file-icon-log" />;
-  }
-  return <FileCode size={size} className="cmd-icon" />;
-}
 
 export interface CommandRunCardProps {
   toolName: string;
@@ -76,6 +58,28 @@ function domainOf(url?: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** `example.com/docs/page` for fetch-style rows; falls back to the raw text. */
+function domainPathOf(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname === '/' ? '' : parsed.pathname;
+    return `${parsed.hostname.replace(/^www\./, '')}${path}${parsed.search}`;
+  } catch {
+    return url;
+  }
+}
+
+/** First short scalar argument: the "main argument" shown for generic tools. */
+function mainArgumentOf(args?: Record<string, unknown>): string | undefined {
+  if (!args) return undefined;
+  for (const [key, value] of Object.entries(args)) {
+    if (/^(toolSummary|toolAction|callId|runId)$/.test(key)) continue;
+    if (typeof value === 'string' && value.trim()) return value.split(/\r?\n/)[0].trim();
+    if (typeof value === 'number') return String(value);
+  }
+  return undefined;
 }
 
 /** One terminal channel (stdout or stderr) with its own gutter and fold. */
@@ -232,6 +236,8 @@ export function CommandRunCard({
   const isTask = toolName === 'manage_task';
   const isCommand = Boolean(command || code || /exec|run_code|terminal|run_command/.test(toolName));
 
+  // Tools from a named local server keep their provenance in the title.
+  const isNamedServerTool = Boolean(localServerId) || environment !== 'Local';
   const kind = isWeb ? 'Web' : isEdit ? 'Edit' : isSearch ? 'Explore' : isRead ? 'Read' : isCommand ? 'Terminal' : 'Tool';
 
   let displayVerb = kind;
@@ -245,7 +251,7 @@ export function CommandRunCard({
     displayVerb = action === 'status' || action === 'check' || !action ? 'Checked task' : 'Task';
   } else if (isCommand) {
     displayVerb = status === 'running' ? 'Running' : status === 'awaiting_approval' ? 'Run' : 'Ran';
-  }
+  } else if (toolName && !isNamedServerTool) displayVerb = toolName;
 
   const firstLine = command ? command.split(/\r?\n/)[0].trim() : '';
   const displayFilename = summaryTitle === 'Task Log'
@@ -273,11 +279,13 @@ export function CommandRunCard({
 
   const displayTitle = isTask
     ? (taskTitle || 'Task')
+    : isWeb && searchQuery && /^https?:\/\//i.test(searchQuery)
+    ? domainPathOf(searchQuery)
     : isSearch
     ? (searchQuery || 'Search')
     : isCommand
     ? (firstLine || commandTitle)
-    : (displayFilename ?? (path || `${environment} · ${toolName}`));
+    : (displayFilename ?? (path || (isNamedServerTool ? undefined : mainArgumentOf(args)) || `${environment} · ${toolName}`));
 
   let searchResultCount: number | undefined = undefined;
   if (isSearch) {
@@ -296,6 +304,9 @@ export function CommandRunCard({
   }
 
   const resultObject = parseObjectJson(structuredResult) ?? parseObjectJson(stdout);
+  // The Result tab renders the structured payload itself; the stdout fallback
+  // above is for search/web metadata and must not feed this view.
+  const structuredObject = parseObjectJson(structuredResult);
   const webSources = isWeb ? webSourcesFrom(resultObject) : [];
   const webAnswer = isWeb && resultObject && typeof resultObject.answer === 'string' ? resultObject.answer.trim() : '';
   if (isWeb && resultObject?.sources) searchResultCount = webSources.length;
@@ -304,9 +315,7 @@ export function CommandRunCard({
   const HeaderGlyph = TRACE_ICONS[traceKind];
   const headerIcon = (
     <i className={`trace-icon trace-icon-${traceKind}`} aria-hidden="true">
-      {(traceKind === 'read' || traceKind === 'edit') && (path || displayFilename)
-        ? <FileIcon filename={displayFilename ?? path} size={13} />
-        : <HeaderGlyph size={13} />}
+      <HeaderGlyph size={18} />
     </i>
   );
 
@@ -381,14 +390,14 @@ export function CommandRunCard({
       return (
         <span className="status-badge running" data-testid="status-running">
           <LoaderCircle size={13} className="spinning" />
-          Running…
+          <span className="status-text">Running…</span>
         </span>
       );
     }
     if (status === 'awaiting_approval') {
       return (
         <span className="status-badge awaiting" data-testid="status-awaiting">
-          Awaiting Approval
+          Awaiting approval
         </span>
       );
     }
@@ -477,7 +486,7 @@ export function CommandRunCard({
           )}
           {isSearch && searchResultCount !== undefined && searchResultCount >= 0 && (
             <span className="trace-badge">
-              {searchResultCount} {searchResultCount === 1 ? 'result' : 'results'}
+              {searchResultCount} {isWeb ? (searchResultCount === 1 ? 'source' : 'sources') : (searchResultCount === 1 ? 'result' : 'results')}
             </span>
           )}
           {cwd && <span className="cmd-cwd" title={`Working directory: ${cwd}`}>{cwd}</span>}
@@ -617,7 +626,6 @@ export function CommandRunCard({
                 onClick={() => void copyOutput()}
                 title="Copy terminal output"
               >
-                {copied ? <Check size={13} className="text-success" /> : <Copy size={13} />}
                 <span>{copied ? 'Copied' : 'Copy'}</span>
               </button>
             )}
@@ -657,7 +665,15 @@ export function CommandRunCard({
         {/* Tab 1b: Structured result (separate from logs) */}
         {activeTab === 'result' && structuredResult && (
           <div className="code-view" data-testid="result-viewport">
-            <CodeBlock code={structuredResult} language="json" ariaLabel="Structured result" />
+            {structuredObject ? (
+              <StructuredResultView result={structuredObject} />
+            ) : (
+              <CodeBlock code={structuredResult} language="json" ariaLabel="Structured result" />
+            )}
+            <details className="tool-output-details raw-result-details">
+              <summary>Raw result JSON</summary>
+              <CodeBlock code={structuredResult} language="json" ariaLabel="Raw structured result" />
+            </details>
           </div>
         )}
 

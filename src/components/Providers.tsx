@@ -27,7 +27,10 @@ function parseCapacity(raw: string, min: number, max: number, label: string): nu
   if (!trimmed) return null;
   const value = Number(trimmed);
   if (!Number.isInteger(value) || value < min || value > max) {
-    throw new Error(`${label} must be a whole number between ${min.toLocaleString()} and ${max.toLocaleString()} tokens.`);
+    // Locale-stable grouping: the host locale (e.g. en-IN) would otherwise
+    // render "2,000,000" as "20,00,000" in an error message tests assert on.
+    const grouped = new Intl.NumberFormat('en-US').format;
+    throw new Error(`${label} must be a whole number between ${grouped(min)} and ${grouped(max)} tokens.`);
   }
   return value;
 }

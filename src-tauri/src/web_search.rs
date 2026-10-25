@@ -72,8 +72,8 @@ fn validate_request(question: &str, mode: &str) -> Result<(), String> {
 }
 
 /// Read the Google Programmable Search credential from the protected vault.
-fn stored_google_key(state: &AppState) -> Result<String, String> {
-    match state.daytona_vault.load(GOOGLE_KEY_ID)? {
+async fn stored_google_key(state: &AppState) -> Result<String, String> {
+    match state.daytona_vault.load_blocking(GOOGLE_KEY_ID).await? {
         Some(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
         None => Ok(String::new()),
     }
@@ -95,9 +95,12 @@ pub(crate) fn worker_tool(alias: &str) -> bool {
     )
 }
 
-pub(crate) fn worker_runtime_error(config: &crate::execution::ExecutionConfig) -> Option<String> {
-    (!crate::execution::executable(&config.node_path)).then(||
-        "Web and weather worker tools are unavailable. Configure an executable Node.js 22.13+ runtime in Execution settings.".into())
+pub(crate) async fn worker_runtime_error(
+    config: &crate::execution::ExecutionConfig,
+) -> Option<String> {
+    crate::execution::probe_node(&config.node_path, (22, 13, 0))
+        .await
+        .err()
 }
 
 pub async fn run_worker(
@@ -136,7 +139,8 @@ async fn run_worker_with_settings(
         }
         input["weatherCachePath"] = json!(state.data_dir.join("weather-cache.sqlite"));
     }
-    let (execution, searxng, disabled, provider, google_key, google_cx, fallback_enabled) = {
+    let google_key = stored_google_key(state).await?;
+    let (execution, searxng, disabled, provider, google_cx, fallback_enabled) = {
         let store = state.database()?;
         (
             store.execution_config()?,
@@ -145,7 +149,6 @@ async fn run_worker_with_settings(
             store.setting::<String>("web_search_provider")?,
             // The Google credential is a secret: it is read from the
             // protected vault, never from the plain settings table.
-            stored_google_key(state)?,
             store.setting::<String>("google_cx_id")?,
             store
                 .setting::<bool>("search_fallback_enabled")
@@ -160,7 +163,7 @@ async fn run_worker_with_settings(
         state.database()?.setting::<bool>("offline_mode")?,
         input["action"].as_str().unwrap_or(""),
     )?;
-    if let Some(error) = worker_runtime_error(&execution) {
+    if let Some(error) = worker_runtime_error(&execution).await {
         return Err(error);
     }
     let worker_path = state.data_dir.join("web-research-worker.mjs");
@@ -219,7 +222,7 @@ async fn run_worker_with_settings(
         // An empty field keeps the stored credential; the probe only replaces
         // it when the user typed a new one.
         let key = if settings.google_api_key.is_empty() {
-            stored_google_key(state)?
+            stored_google_key(state).await?
         } else {
             settings.google_api_key.clone()
         };
@@ -392,7 +395,7 @@ pub fn get_web_search_config(state: tauri::State<'_, AppState>) -> Result<Value,
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn save_web_search_config(
+pub async fn save_web_search_config(
     state: tauri::State<'_, AppState>,
     provider: String,
     searxng_base_url: String,
@@ -407,24 +410,25 @@ pub fn save_web_search_config(
     if let Some(mode) = &mode {
         validate_request("settings", mode)?;
     }
-    let store = state.database()?;
     // The Google credential is written to the protected vault. The settings
     // table keeps only the presence flag.
     if !google_api_key.is_empty() {
         state
             .daytona_vault
-            .save(GOOGLE_KEY_ID, google_api_key.as_bytes())?;
-        store.save_setting(GOOGLE_KEY_PRESENT, &true)?;
+            .save_blocking(GOOGLE_KEY_ID, google_api_key.into_bytes())
+            .await?;
+        state.database()?.save_setting(GOOGLE_KEY_PRESENT, &true)?;
     } else if clear_google_api_key == Some(true) {
-        state.daytona_vault.clear(GOOGLE_KEY_ID)?;
-        store.save_setting(GOOGLE_KEY_PRESENT, &false)?;
+        state.daytona_vault.clear_blocking(GOOGLE_KEY_ID).await?;
+        state.database()?.save_setting(GOOGLE_KEY_PRESENT, &false)?;
     } else {
         // An empty field keeps the stored credential.
-        store.save_setting(
+        state.database()?.save_setting(
             GOOGLE_KEY_PRESENT,
             &state.daytona_vault.contains(GOOGLE_KEY_ID)?,
         )?;
     }
+    let store = state.database()?;
     store.save_setting("web_search_provider", &provider)?;
     store.save_setting("searxng_base_url", &searxng_base_url)?;
     store.save_setting("google_cx_id", &google_cx_id)?;
@@ -530,8 +534,8 @@ pub fn delete_research_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn the_google_credential_lives_in_the_vault_and_the_settings_table_keeps_only_a_flag() {
+    #[tokio::test]
+    async fn the_google_credential_lives_in_the_vault_and_the_settings_table_keeps_only_a_flag() {
         let directory = tempfile::tempdir().unwrap();
         let state = crate::test_support::app_state(directory.path());
         let secret = "fixture-google-key";
@@ -562,15 +566,17 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !sealed.windows(secret.len()).any(|part| part == secret.as_bytes()),
+            !sealed
+                .windows(secret.len())
+                .any(|part| part == secret.as_bytes()),
             "the sealed credential must not contain the secret"
         );
         // The vault serves the credential and reports only its presence.
-        assert_eq!(stored_google_key(&state).unwrap(), secret);
+        assert_eq!(stored_google_key(&state).await.unwrap(), secret);
         assert!(state.daytona_vault.contains(GOOGLE_KEY_ID).unwrap());
     }
-    #[test]
-    fn worker_prerequisites_distinguish_native_and_worker_tools() {
+    #[tokio::test]
+    async fn worker_prerequisites_distinguish_native_and_worker_tools() {
         for alias in [
             "get_weather",
             "weather",
@@ -596,7 +602,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut config = crate::execution::ExecutionConfig::default();
         assert!(
-            worker_runtime_error(&config).is_none(),
+            worker_runtime_error(&config).await.is_none(),
             "Test environment needs Node for the bundled worker"
         );
         for path in [
@@ -609,14 +615,17 @@ mod tests {
             directory.path().to_string_lossy().into_owned(),
         ] {
             config.node_path = path;
-            assert!(worker_runtime_error(&config).unwrap().contains("Node.js"));
+            assert!(worker_runtime_error(&config)
+                .await
+                .unwrap()
+                .contains("Node.js"));
         }
         #[cfg(unix)]
         {
             let path = directory.path().join("not-executable");
             std::fs::write(&path, "not executable").unwrap();
             config.node_path = path.to_string_lossy().into_owned();
-            assert!(worker_runtime_error(&config).is_some());
+            assert!(worker_runtime_error(&config).await.is_some());
         }
     }
 

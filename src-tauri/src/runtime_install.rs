@@ -6,10 +6,10 @@ use std::{
 };
 use tokio::sync::watch;
 
-pub const MANAGED_RUNTIME_MESSAGE: &str = "The pinned CUDA runtime installer is for Windows. On Linux or macOS, select a native llama-server executable using Browse runtime in Model files. GGUF model and projector downloads are supported independently.";
+pub const MANAGED_RUNTIME_MESSAGE: &str = "The pinned CUDA installer supports Windows x64 only. For CPU, Vulkan (AMD/Intel), ROCm or macOS Metal, obtain a native llama-server from the official llama.cpp release/build instructions, then use Browse runtime in Model files. Choose a package matching your operating system, CPU architecture and backend.";
 
 pub fn managed_runtime_supported() -> bool {
-    cfg!(windows)
+    cfg!(all(target_os = "windows", target_arch = "x86_64"))
 }
 
 pub fn required_bytes(assets: &[runtime_archive::RuntimeAsset]) -> Result<u64, String> {
@@ -45,6 +45,15 @@ pub async fn install(
     tokio::fs::create_dir_all(root)
         .await
         .map_err(|error| error.to_string())?;
+    let reuse_root = root.to_path_buf();
+    progress("verifying", 0, 0);
+    if let Some(existing) =
+        tokio::task::spawn_blocking(move || crate::runtime_inventory::reusable(&reuse_root))
+            .await
+            .map_err(|_| "Runtime verification worker stopped")??
+    {
+        return Ok(existing);
+    }
     let required = required_bytes(&assets)?;
     if download::available_space(root)? < required {
         return Err(format!("Runtime installation requires {required} free bytes for archives, expanded files and reserve."));
@@ -110,6 +119,10 @@ pub async fn install(
     {
         return Err("Runtime bundle is missing llama-server.exe.".into());
     }
+    let receipt_root = output.clone();
+    tokio::task::spawn_blocking(move || crate::runtime_inventory::receipt(&receipt_root))
+        .await
+        .map_err(|_| "Runtime receipt worker stopped")??;
     let destination = root.join(format!("llama-b10855-cuda12.4-{}", uuid::Uuid::new_v4()));
     tokio::fs::rename(&output, &destination)
         .await

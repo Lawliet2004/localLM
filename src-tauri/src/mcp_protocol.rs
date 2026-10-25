@@ -453,7 +453,7 @@ mod tests {
             working_directory: root.to_string_lossy().into_owned(),
             environment: Default::default(),
         };
-        hub.save_local(config.clone()).unwrap();
+        hub.save_local(config.clone()).await.unwrap();
         hub.connect(&config.id).await.unwrap();
         (hub, config.id, log)
     }
@@ -701,7 +701,7 @@ mod tests {
             working_directory: dir.path().to_string_lossy().into_owned(),
             environment: Default::default(),
         };
-        hub.save_local(config.clone()).unwrap();
+        hub.save_local(config.clone()).await.unwrap();
         let error = match hub.connect(&config.id).await {
             Ok(_) => panic!("reserved namespace collision was accepted"),
             Err(error) => error,
