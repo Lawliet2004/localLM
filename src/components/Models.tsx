@@ -1,3 +1,4 @@
+import { BonsaiInstall } from './BonsaiInstall';
 import { ManagedStorage } from './ManagedStorage';
 import { PresentationDefaults } from './PresentationDefaults';
 import { useCallback, useEffect, useRef, useState, type SetStateAction } from 'react';
@@ -92,6 +93,11 @@ export function Models({ config, preferences, runtime, busy, onSaveConfig, onSav
       catch (e) { setError(String(e)); }
       return;
     }
+    if (filename === 'Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf') {
+      setLocalFilename(filename); setTab('library');
+      setNotice('Use Install and use Bonsai to install its matching Prism runtime and model together.');
+      return;
+    }
     const request = ++selectionRequest.current;
     setLocalFilename(filename);
     try {
@@ -150,7 +156,7 @@ export function Models({ config, preferences, runtime, busy, onSaveConfig, onSav
     {!['generation', 'diagnostics'].includes(initialTab) && <div className="tabs" role="tablist" aria-label="Model settings">{(['library','providers','runtime','model'] as const).map(value => <button role="tab" aria-selected={tab === value} key={value} onClick={() => { setTab(value); setNotice(''); }}>{value === 'library' ? 'Models' : value === 'providers' ? 'API providers' : value === 'model' ? 'Model files' : value === 'runtime' ? 'Runtime' : 'Model files'}</button>)}</div>}
     {notice && <p className="success" role="status">{notice}</p>}
     {error && <p className="error" role="alert">{error}</p>}
-    {tab === 'library' ? <ModelLibrary models={installed} loading={libraryLoading} busy={busy || switching} selectedPath={preferences.modelPath} loadedPath={runtime.modelPath} onRefresh={refreshLibrary} onUse={useModel} onDeleted={async () => { await onRefresh?.(); }} /> : tab === 'providers' ? <Providers providers={providers} selection={selection} busy={busy || switching} onSaveSelection={onSaveSelection} onRefresh={onRefresh} /> : <>
+    {tab === 'library' ? <><BonsaiInstall busy={busy} onInstalled={async loaded => { await refreshLibrary(); if (loaded) await onSaveSelection({ providerId: null, modelId: '' }); await onRefresh?.(); }} /><ModelLibrary models={installed} loading={libraryLoading} busy={busy || switching} selectedPath={preferences.modelPath} loadedPath={runtime.modelPath} onRefresh={refreshLibrary} onUse={useModel} onDeleted={async () => { await onRefresh?.(); }} /></> : tab === 'providers' ? <Providers providers={providers} selection={selection} busy={busy || switching} onSaveSelection={onSaveSelection} onRefresh={onRefresh} /> : <>
     {tab === 'model' && localModels.some(m => m.filename === localFilename) && <ModelDownload key={localFilename} filename={localFilename} busy={busy} onSelect={path => { updateDraft(current => ({ ...current, modelPath: path })); setNotice('Verified model selected. Save settings to apply it, then load the model.'); }} />}
     {tab === 'model' && <ManagedStorage busy={busy} onMoved={async () => { await refreshLibrary(); await onRefresh?.(); }} />}
     {tab === 'model' && <RuntimeDownload busy={busy} onSelect={path => { updateDraft(current => ({ ...current, runtimePath: path })); setNotice('Installed runtime selected. Save settings to apply it.'); }} />}

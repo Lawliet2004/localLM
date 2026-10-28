@@ -83,6 +83,7 @@ test('bundled worker distinguishes upstream engine failure from empty search', a
 test('research emits \x1e progress events on stderr and honors language filter', async () => {
   const { output, error } = await workerRaw({
     question: 'SearXNG search API documentation',
+    full: true,
     mode: 'fast',
     language: 'en',
     databasePath: ':memory:',
@@ -90,7 +91,6 @@ test('research emits \x1e progress events on stderr and honors language filter',
       searxngBaseUrl: `${base}/proxy`,
       searchRetries: 0,
       searxngTimeoutMs: 2000,
-      planning: 'rules',
       fetch: { timeoutSeconds: 2, jsRenderFallback: false, waybackFallback: false, domainLearning: false },
       cache: { enabled: false },
     },
@@ -98,9 +98,10 @@ test('research emits \x1e progress events on stderr and honors language filter',
   const stages = error.split('\n')
     .filter((line) => line.startsWith('\x1e'))
     .map((line) => JSON.parse(line.slice(1)).stage);
-  assert.ok(stages.includes('route'), `expected route progress, got ${stages}`);
-  assert.ok(stages.includes('search'), `expected search progress, got ${stages}`);
+  assert.deepEqual(stages, ['search'], 'the worker performs only the requested search');
   const result = JSON.parse(output);
   assert.equal(result.route.requiresWebSearch, true);
+  assert.deepEqual(result.queries.map(query => query.query), ['SearXNG search API documentation']);
+  assert.equal(result.documents[0].metadata.extractionMethod, 'snippet_only');
   assert.equal(requests.at(-1).searchParams.get('language'), 'en');
 });

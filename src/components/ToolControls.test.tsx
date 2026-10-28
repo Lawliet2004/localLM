@@ -233,7 +233,7 @@ describe('tool controls', () => {
     await userEvent.click(chatRadio);
     expect(onPresetChange).toHaveBeenCalledWith('chat');
   });
-  it.each([['code', /^Code \(PTC\)/], ['minimal', /^Minimal/], ['creator', /^Creator/]] as const)('selects and reflects the advanced %s preset without changing sources', async (id, name) => {
+  it.each([['code', /^Code/], ['minimal', /^Minimal/], ['creator', /^Creator/]] as const)('selects and reflects the advanced %s preset without changing sources', async (id, name) => {
     const onChange = vi.fn();
     const onPresetChange = vi.fn();
     const { rerender } = render(<ToolsSettings selected={['__workspace']} onChange={onChange} preset="standard" onPresetChange={onPresetChange} busy={false} />);

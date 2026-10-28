@@ -1,13 +1,16 @@
 //! Subagents: spawn/fork, foreground/background, depth cap (Phase 3).
 //!
-//! A child runs the same bounded tool loop as a parent (rounds x calls) with
-//! its own ephemeral history: the parent's history is never polluted. Every
+//! A child uses shared scheduling and provider validation with
+//! its own durable checkpoint history: the parent's history is never polluted. Every
 //! child owns a `runs` row (checkpoint `subagent`) plus `subagent_runs`
 //! lineage, so the Trajectory shows the whole team tree. Foreground children
 //! reuse the caller's reconstructed local tools; background children run on a
 //! supervisor task with their own SQLite connection and local-only tools.
 //! Anything needing approval follows the child policy (reads-only pin by
 //! default); denials become errored results, never silent skips.
+
+#[path = "agent_engine/children.rs"]
+mod child_engine;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,7 +38,21 @@ pub struct SubagentRun {
     pub updated_at: i64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub fn agent_summaries(store: &crate::store::Store, conversation: &str, wanted: &str) -> Result<Vec<serde_json::Value>, String> {
+    if !["all", "running", "completed", "failed", "interrupted"].contains(&wanted) {
+        return Err("list_agents state must be all, running, completed, failed, or interrupted.".into());
+    }
+    store.subagent_runs_for_conversation(conversation)?.into_iter()
+        .filter(|row| wanted == "all" || row.status == wanted)
+        .map(|row| {
+            let outcome = store.run(&row.child_run_id)?.and_then(|run| run.outcome);
+            let mut value = serde_json::to_value(row).map_err(|error| error.to_string())?;
+            value["outcome"] = serde_json::to_value(outcome).map_err(|error| error.to_string())?;
+            Ok(value)
+        }).collect()
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ChildPolicy {
     ReadsOnly,
     Full,
@@ -72,7 +89,12 @@ pub fn harness_detached_supported(alias: &str) -> bool {
         || (crate::lsp_tools::owns(alias) && alias != "lsp_execute_command")
         || matches!(
             alias,
-            "todo_write"
+            "process_start"
+                | "process_poll"
+                | "process_write"
+                | "process_stop"
+                | "shell_run"
+                | "todo_write"
                 | "todo_add"
                 | "todo_update"
                 | "goal_set"
@@ -255,17 +277,7 @@ pub async fn harness_detached(
         }
         "list_agents" => {
             let wanted = args.get("state").and_then(|v| v.as_str()).unwrap_or("all");
-            if !["all", "running", "completed", "failed", "interrupted"].contains(&wanted) {
-                return Err(
-                    "list_agents state must be all, running, completed, failed, or interrupted."
-                        .into(),
-                );
-            }
-            let rows = store.subagent_runs_for_conversation(&request.conversation_id)?;
-            let rows: Vec<&SubagentRun> = rows
-                .iter()
-                .filter(|row| wanted == "all" || row.status == wanted)
-                .collect();
+            let rows = agent_summaries(&store, &request.conversation_id, wanted)?;
             Ok(serde_json::json!({"agents": rows}))
         }
         "list_subagent_models" => {
@@ -309,6 +321,7 @@ pub type ChildEmit = Arc<dyn Fn(String, Option<serde_json::Value>) + Send + Sync
 /// Everything a background task needs: owned, Send + 'static.
 #[derive(Clone, Debug)]
 pub struct BackendSnapshot {
+    pub processes: crate::process_tools::ProcessRegistry,
     pub kind: String,
     pub endpoint: String,
     pub key: String,
@@ -340,7 +353,7 @@ impl BackendSnapshot {
                 self.endpoint.clone(),
                 self.key.clone(),
                 self.context_length,
-            )
+            ).map(|backend| backend.with_local_model(&self.model_id))
         } else if self.kind == "subscription" {
             let model = crate::providers::RemoteModel {
                 controls: self
@@ -457,6 +470,7 @@ pub async fn snapshot_for_conversation(
         )
     };
     let mut snapshot = BackendSnapshot {
+        processes: state.processes.clone(),
         model_capabilities: None,
         kind: "local".into(),
         endpoint: String::new(),
@@ -547,6 +561,7 @@ pub async fn snapshot_for_conversation(
         if inspected.phase != "ready" {
             return Err("Load a local model before spawning subagents.".into());
         }
+        snapshot.model_id = inspected.model_path.unwrap_or_default();
         snapshot.endpoint = runtime.endpoint.clone();
         snapshot.key = runtime.api_key.clone();
         snapshot.context_length = runtime.context_length;
@@ -765,7 +780,7 @@ pub fn global_registry() -> Arc<SubagentRegistry> {
         .clone()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChildRequest {
     pub label: String,
     pub prompt: String,
@@ -780,6 +795,98 @@ pub struct ChildRequest {
     pub conversation_id: String,
 }
 
+/// Credentials and live approval authority are deliberately absent. A resumed
+/// child intersects this catalog and policy with its current parent's access.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChildCheckpoint {
+    pub request: ChildRequest,
+    pub tools: std::collections::BTreeMap<String, String>,
+    pub model_id: String,
+    pub provider_kind: String,
+    pub api_format: String,
+    pub journal_seq: Option<u64>,
+}
+
+pub(super) fn child_tool_fingerprint(tool: &crate::connectors::AgentTool) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(serde_json::json!({"connector":tool.connector,"name":tool.tool.name,"definition":tool.definition()}).to_string()))
+}
+
+/// Reconstruct only committed exchanges. A dispatched call without a durable
+/// result cannot be safely regenerated; unstarted siblings are explicitly
+/// marked undispatched instead of being run by recovery.
+pub fn restore_child_checkpoint(
+    store: &crate::store::Store,
+    id: &str,
+) -> Result<crate::agent_engine::RunCheckpoint, String> {
+    let mut checkpoint = store.run_checkpoint(id)?.ok_or("No saved child checkpoint.")?;
+    let metadata = checkpoint.child.as_ref().ok_or("This historical child checkpoint cannot be resumed safely.")?;
+    let events = store.run_events(id)?;
+    let pending: Vec<_> = events.iter().filter(|event| metadata.journal_seq.is_none_or(|seq| event.seq > seq)).collect();
+    let mut started = std::collections::HashSet::new();
+    let mut results = HashMap::new();
+    for event in &pending {
+        if let Some(call) = &event.tool_call_id {
+            match event.event_type.as_str() {
+                "tool_started" | "tool_cancelled" => { started.insert(call.as_str()); }
+                "tool_result" => { results.insert(call.as_str(), event.payload["result"].clone()); }
+                _ => {}
+            }
+        }
+    }
+    if started.iter().any(|id| !results.contains_key(id))
+        || results.values().any(|result| matches!(result["status"].as_str(), Some("unknown" | "cancelled")))
+    {
+        return Err("A child action has no confirmed result. Review its saved activity before starting further work; recovery will not repeat it.".into());
+    }
+    for event in pending.iter().filter(|event| event.event_type == "provider_round") {
+        let assistant = &event.payload["assistant"];
+        let calls = assistant["tool_calls"].as_array().ok_or("Saved child exchange lacks canonical tool calls.")?;
+        checkpoint.messages.push(assistant.clone());
+        for call in calls {
+            let id = call["id"].as_str().ok_or("Saved child tool call lacks an id.")?;
+            let result = results.get(id).cloned().unwrap_or_else(|| crate::tool_envelope::failure_notice(
+                "not-dispatched", "The application stopped before this call was dispatched. No action was started.", false,
+                crate::tool_envelope::SIDE_NONE, &serde_json::json!({})));
+            checkpoint.messages.push(serde_json::json!({"role":"tool","tool_call_id":id,"content":result.to_string()}));
+        }
+    }
+    // Unknown outcomes in the checkpoint itself are equally unsafe.
+    if checkpoint.messages.iter().filter(|message| message["role"] == "tool").any(|message|
+        message["content"].as_str().and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .is_some_and(|result| matches!(result["status"].as_str(), Some("unknown" | "cancelled")))) {
+        return Err("The saved child checkpoint contains an uncertain action outcome. Review it before continuing.".into());
+    }
+    Ok(checkpoint)
+}
+
+pub fn prepare_child_resume(
+    store: &crate::store::Store,
+    snapshot: &BackendSnapshot,
+    conversation: &str,
+    id: &str,
+    policy: ChildPolicy,
+    followup: &str,
+) -> Result<(ChildRequest, crate::agent_engine::RunCheckpoint), String> {
+    let run = store.run(id)?.ok_or("Unknown child run.")?;
+    if run.conversation_id != conversation || run.checkpoint.as_deref() != Some("subagent") {
+        return Err("The child checkpoint belongs to another conversation or is not a child run.".into());
+    }
+    if !matches!(run.status, crate::agent_run::RunState::Paused | crate::agent_run::RunState::Failed | crate::agent_run::RunState::Cancelled | crate::agent_run::RunState::OutcomeUnknown) {
+        return Err("Only a stopped child can be resumed.".into());
+    }
+    let mut checkpoint = restore_child_checkpoint(store, id)?;
+    let metadata = checkpoint.child.as_mut().ok_or("Missing child recovery metadata.")?;
+    if metadata.request.conversation_id != conversation || checkpoint.workspace != snapshot.workspace_path || metadata.model_id != snapshot.model_id
+        || metadata.provider_kind != snapshot.kind || metadata.api_format != snapshot.api_format {
+        return Err("Resume requires the original conversation, workspace and model; its native history cannot be moved silently.".into());
+    }
+    if policy == ChildPolicy::ReadsOnly { metadata.request.policy = policy; }
+    metadata.journal_seq = None;
+    checkpoint.messages.push(serde_json::json!({"role":"user","content":format!("Continue from the saved child checkpoint. Completed tool results are authoritative; do not repeat completed actions. Parent followup: {followup}")}));
+    Ok((metadata.request.clone(), checkpoint))
+}
+
 pub fn validate_child_request(request: &ChildRequest) -> Result<(), String> {
     if request.label.trim().is_empty() || request.label.len() > 80 {
         return Err("Subagent label must be 1-80 characters.".into());
@@ -787,8 +894,8 @@ pub fn validate_child_request(request: &ChildRequest) -> Result<(), String> {
     if request.prompt.trim().is_empty() || request.prompt.len() > 4000 {
         return Err("Subagent prompt must be 1-4000 characters.".into());
     }
-    if request.max_rounds == 0 || request.max_rounds > 8 {
-        return Err("Subagent max_rounds must be 1-8.".into());
+    if request.max_rounds > 1_000_000 {
+        return Err("Subagent max_rounds exceeds the supported explicit budget.".into());
     }
     if let Some(persona) = &request.persona {
         if persona.len() > 500 {
@@ -1108,7 +1215,7 @@ fn merge_child_tools<'a>(
         .collect()
 }
 
-/// Drive the bounded child loop. Shared by foreground and background runs.
+/// Drive a child with shared scheduling and provider acceptance.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_child(
     state: &crate::AppState,
@@ -1116,228 +1223,23 @@ pub async fn drive_child(
     request: &ChildRequest,
     tools: Vec<ChildTool<'_>>,
     backend: &crate::inference::Backend,
-    mut cancel: ChildCancel,
+    cancel: ChildCancel,
     registry: Option<Arc<SubagentRegistry>>,
     child_run_id: &str,
     emit: Option<ChildEmit>,
 ) -> Result<String, String> {
-    use crate::inference::InferenceProvider;
-    validate_child_request(request)?;
-    if cancel.is_set() {
-        return Err("Subagent was interrupted before starting.".into());
-    }
-    let tools: Vec<&crate::connectors::AgentTool> = tools.iter().map(|tool| tool.tool()).collect();
-    let mut system = child_system_prompt(snapshot, request);
-    system.push_str(&format!(
-        "\nModel capability metadata (not independent verification): {}",
-        backend.capability_report()
-    ));
-    let mut messages = vec![
-        serde_json::json!({"role": "system", "content": system}),
-        serde_json::json!({"role": "user", "content": request.prompt}),
-    ];
-    let mut preferences = crate::store::Preferences {
-        system_prompt: snapshot.system_prompt.clone(),
-        temperature: snapshot.temperature,
-        top_p: snapshot.top_p,
-        max_tokens: snapshot.max_tokens,
-        ..Default::default()
-    };
-    backend.prepare_preferences(&mut preferences)?;
-    let mut answer = String::new();
-    let max_rounds = request.max_rounds.min(8);
-    // Monotonic per-run sequence: (run_id, seq) is the primary key.
-    let mut event_seq: u64 = 1;
-    for round in 0..max_rounds {
-        if cancel.is_set() {
-            if let Ok(store) = state.database() {
-                let _ = store.update_run_status(
-                    child_run_id,
-                    crate::agent_run::RunState::Cancelled,
-                    Some("Interrupted."),
-                    None,
-                );
-            }
-            return Err(INTERRUPTED.into());
-        }
-        // Mailbox: followup messages from send_message continue the loop.
-        if let Some(registry) = &registry {
-            for note in registry.take_mail(child_run_id) {
-                messages.push(serde_json::json!({"role": "user", "content": format!("[parent followup] {note}")}));
-            }
-        }
-        let mut payload = serde_json::json!({
-            "messages": messages, "temperature": preferences.temperature,
-            "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
-            "stream": true, "cache_prompt": true,
-        });
-        if snapshot.inference_slots >= 2 {
-            payload["id_slot"] = serde_json::json!(1);
-        }
-        if backend.supports_tools() && !tools.is_empty() {
-            payload["tools"] =
-                serde_json::json!(crate::tool_discovery::advertised(tools.iter().copied())
-                    .into_iter()
-                    .map(|tool| tool.definition())
-                    .collect::<Vec<_>>());
-        }
-        if let Some(schema) = &request.output_schema {
-            backend.constrain_output(&mut payload, schema)?;
-        }
-        let payload = backend.payload(&payload)?;
-        // Every blocking await — token counting, request headers, the stream,
-        // tool calls, approval — is selected against the child's cancel watch
-        // so an interrupt lands promptly instead of after a deadman timeout.
-        let _tokens = match tokio::select! {
-            _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
-            result = tokio::time::timeout(Duration::from_secs(45), backend.check_context(&payload, preferences.max_tokens)) => result,
-        } {
-            Ok(result) => result?,
-            Err(_) => return Err("Subagent context check timed out.".into()),
-        };
-        let response = match tokio::select! {
-            _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
-            result = tokio::time::timeout(Duration::from_secs(600), backend.stream(&payload)) => result,
-        } {
-            Ok(result) => result?,
-            Err(_) => return Err("Subagent model did not respond within ten minutes.".into()),
-        };
-        let outcome = collect_stream(backend, response, &mut answer, &mut cancel).await?;
-        if outcome.finish == "length" {
-            return Err("Subagent hit the response token limit.".into());
-        }
-        let calls = outcome.calls;
-        crate::arex::validate_batch(&calls)?;
-        if calls.is_empty() {
-            break;
-        }
-        if round + 1 >= max_rounds && !calls.iter().any(|c| c.name == "finish") {
-            return Err("Subagent round limit reached.".into());
-        }
-        messages.push(outcome.assistant_message);
-        for mut call in calls {
-            if cancel.is_set() {
-                return Err(INTERRUPTED.into());
-            }
-            let visible = crate::tool_discovery::advertised(tools.iter().copied())
-                .into_iter()
-                .any(|tool| tool.alias == call.name);
-            let resolved = if visible {
-                crate::tool_discovery::resolve(
-                    tools.iter().copied(),
-                    &call.name,
-                    call.arguments.clone(),
-                )
-            } else {
-                Err("Tool is deferred or unavailable. Use tool_search and tool_invoke for this child's authorized catalog.".into())
-            };
-            let (resolved_tool, arguments) = match resolved {
-                Ok(value) => value,
-                Err(error) => {
-                    messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":crate::tool_envelope::failure_notice("unavailable-tool",&error,false,crate::tool_envelope::SIDE_NONE,&serde_json::json!({})).to_string()}));
-                    continue;
-                }
-            };
-            let tool = &resolved_tool;
-            call.name = tool.alias.clone();
-            call.arguments = arguments;
-            // Capability kills re-check at dispatch; stale offers deny visibly.
-            if let Some(reason) =
-                crate::capabilities::ToolPolicy::guard(state.database()).denial_for_tool(tool)
-            {
-                messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,
-                    "content":crate::tool_envelope::failure_notice("capability-disabled", &reason, false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({})).to_string()}));
-                continue;
-            }
-            match tool.prepare_arguments(call.arguments.clone()) {
-                Ok(arguments) => call.arguments = arguments,
-                Err(error) => {
-                    messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":crate::tool_envelope::failure_notice("invalid-arguments", &error, false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({})).to_string()}));
-                    continue;
-                }
-            }
-            let allowed = request.policy.allows(tool.trusted_read())
-                && !tool.requires_approval(&call.arguments);
-            let result = if !allowed && emit.is_some() {
-                // Dropping the approval future releases the pending entry via
-                // its guard; nothing is left awaiting a decision.
-                let decision = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        if let Some(emit) = emit.as_ref() { emit("Approval withdrawn (subagent interrupted)".into(), Some(serde_json::Value::Null)); }
-                        return Err(INTERRUPTED.into());
-                    }
-                    decision = request_approval_for_child(state, request, child_run_id, emit.as_ref(), &call) => decision,
-                };
-                match decision {
-                    Some(true) => tokio::select! {
-                        _ = cancel.cancelled() => return Err(cancelled_tool_call(state, child_run_id, round, &call, &mut event_seq)),
-                        result = call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call, emit.as_ref()) => result,
-                    },
-                    _ => crate::tool_envelope::failure_notice("denied", "Denied by the subagent approval pin (reads-only). Ask the parent for what you need instead.", false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({"denied":true})),
-                }
-            } else if !allowed {
-                crate::tool_envelope::failure_notice("denied", "Denied by the subagent approval pin (reads-only). Ask the parent for what you need instead.", false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({"denied":true}))
-            } else {
-                // Dropping the call future aborts in-flight work; managed
-                // child processes die with the execution wrapper on drop.
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(cancelled_tool_call(state, child_run_id, round, &call, &mut event_seq)),
-                    result = call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call, emit.as_ref()) => result,
-                }
-            };
-            let control = if tool.harness_name().is_some()
-                && matches!(call.name.as_str(), "finish" | "update_context")
-            {
-                Some(result.clone())
-            } else {
-                None
-            };
-            let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
-                result,
-                &tool.tool.name,
-                &request.conversation_id,
-                Some(child_run_id),
-                crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
-            );
-            if let Some(artifact) = &maybe_artifact {
-                if let Ok(store) = state.database() {
-                    let _ = store.save_artifact(artifact);
-                }
-            }
-            if let Ok(store) = state.database() {
-                event_seq += 1;
-                let _ = store.append_run_event(&crate::agent_run::RunEvent {
-                    run_id: child_run_id.to_string(),
-                    seq: event_seq,
-                    step_id: format!("round-{round}"),
-                    tool_call_id: Some(call.id.clone()),
-                    event_type: "tool_result".into(),
-                    payload: serde_json::json!({"tool": tool.alias, "result": bounded}),
-                    created_at: crate::store::now(),
-                });
-            }
-            messages.push(serde_json::json!({"role": "tool", "tool_call_id": call.id, "content": bounded.to_string()}));
-            if let Some(control) = control {
-                if let Some(final_answer) = crate::arex::apply_control(
-                    &call.name,
-                    &control,
-                    &*state.database()?,
-                    &request.conversation_id,
-                    child_run_id,
-                    &mut messages,
-                )? {
-                    if let Some(schema) = &request.output_schema {
-                        check_output_schema(schema, &final_answer)?;
-                    }
-                    return Ok(final_answer);
-                }
-            }
-        }
-    }
-    if let Some(schema) = &request.output_schema {
-        check_output_schema(schema, &answer)?;
-    }
-    Ok(answer)
+    let borrowed = tools.iter().map(|tool| tool.tool()).collect();
+    child_engine::drive(
+        child_engine::Host::Foreground { state, emit },
+        snapshot,
+        request,
+        borrowed,
+        backend,
+        cancel,
+        registry,
+        child_run_id,
+    )
+    .await
 }
 
 /// Durable audit record for a tool call abandoned mid-flight: the work future
@@ -1354,7 +1256,7 @@ fn cancelled_tool_call(
         *event_seq += 1;
         let _ = store.append_run_event(&crate::agent_run::RunEvent {
             run_id: child_run_id.to_string(),
-            seq: *event_seq,
+            seq: 0,
             step_id: format!("round-{round}"),
             tool_call_id: Some(call.id.clone()),
             event_type: "tool_cancelled".into(),
@@ -1378,7 +1280,7 @@ fn cancelled_tool_call_detached(
         *event_seq += 1;
         let _ = store.append_run_event(&crate::agent_run::RunEvent {
             run_id: child_run_id.to_string(),
-            seq: *event_seq,
+            seq: 0,
             step_id: format!("round-{round}"),
             tool_call_id: Some(call.id.clone()),
             event_type: "tool_cancelled".into(),
@@ -1451,7 +1353,7 @@ async fn call_child_tool(
                     "replay-blocked",
                     "Not repeated: an earlier attempt this turn had an uncertain outcome.",
                     false,
-                    crate::tool_envelope::SIDE_UNKNOWN,
+                    crate::tool_envelope::SIDE_NONE,
                     &serde_json::json!({}),
                 );
             }
@@ -1491,7 +1393,7 @@ async fn call_child_tool(
                 &serde_json::json!({"hookBlocked":true}),
             );
         }
-        match tokio::time::timeout(tool.timeout(), Box::pin(crate::harness::execute(&ctx, alias, call.arguments.clone()))).await {
+        match crate::agent_engine::await_tool(crate::agent_engine::tool_deadline(tool,&call.arguments,state.database().ok().and_then(|s|s.setting(crate::sandbox::TOOL_TIMEOUT_KEY).ok()).flatten()), Box::pin(crate::harness::execute(&ctx, alias, call.arguments.clone()))).await {
             Ok(Ok(outcome)) => {
                 if let Ok(store) = state.database() {
                     for event in outcome.events {
@@ -1547,7 +1449,7 @@ async fn call_child_tool(
                     "replay-blocked",
                     "Not repeated: an earlier attempt this turn had an uncertain outcome.",
                     false,
-                    crate::tool_envelope::SIDE_UNKNOWN,
+                    crate::tool_envelope::SIDE_NONE,
                     &serde_json::json!({}),
                 );
             }
@@ -1559,7 +1461,20 @@ async fn call_child_tool(
             )),
             _ => None,
         };
-        match tokio::time::timeout(tool.timeout(), tool.call_with_input(call.arguments.clone(), None, mcp_ui)).await {
+        let operation = async {
+            if tool.is_local_execution() {
+                tool.call_in_process_session(
+                    call.arguments.clone(),
+                    &state.processes,
+                    &request.conversation_id,
+                )
+                .await
+            } else {
+                tool.call_with_input(call.arguments.clone(), None, mcp_ui)
+                    .await
+            }
+        };
+        match crate::agent_engine::await_tool(crate::agent_engine::tool_deadline(tool,&call.arguments,state.database().ok().and_then(|store|store.setting(crate::sandbox::TOOL_TIMEOUT_KEY).ok()).flatten()),operation).await {
             Ok(Ok(value)) => crate::tool_envelope::normalize(value, tool.envelope_family()),
             Ok(Err(error)) => crate::tool_envelope::normalize_error(&error, crate::tool_envelope::Cause::default(), tool.envelope_family()),
             Err(_) => crate::tool_envelope::normalize_error("Subagent tool call timed out. Its outcome may be unknown; do not automatically retry.", crate::tool_envelope::Cause { timeout: true, ..Default::default() }, tool.envelope_family()),
@@ -1679,6 +1594,17 @@ pub async fn run_child_inline(
     inherit: &[crate::connectors::AgentTool],
     emit: Option<ChildEmit>,
 ) -> Result<(String, String), String> {
+    run_child_inline_seeded(state, snapshot, request, inherit, emit, None).await
+}
+
+pub async fn run_child_inline_seeded(
+    state: &crate::AppState,
+    snapshot: &BackendSnapshot,
+    request: ChildRequest,
+    inherit: &[crate::connectors::AgentTool],
+    emit: Option<ChildEmit>,
+    seed: Option<crate::agent_engine::RunCheckpoint>,
+) -> Result<(String, String), String> {
     validate_child_request(&request)?;
     let backend = snapshot.backend()?;
     let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
@@ -1708,8 +1634,16 @@ pub async fn run_child_inline(
             error: None,
             created_at: now,
             updated_at: now,
+            outcome: None,
         })?;
         store.insert_subagent_run(&record)?;
+        if let Some(mut checkpoint) = seed {
+            let source = checkpoint.id.clone();
+            checkpoint.id = child_run_id.clone();
+            store.save_run_checkpoint(&checkpoint)?;
+            store.append_run_event(&crate::agent_run::RunEvent {run_id:child_run_id.clone(), seq:0, step_id:"resume".into(), tool_call_id:None,
+                event_type:"subagent_resume".into(), payload:serde_json::json!({"sourceRunId":source,"externalActionsRestarted":false}), created_at:now})?;
+        }
         let _ = store.append_run_event(&crate::agent_run::RunEvent {
             run_id: child_run_id.clone(),
             seq: 0,
@@ -1775,11 +1709,7 @@ pub async fn run_child_inline(
                 );
                 let _ = store.update_run_status(
                     &child_run_id,
-                    if cancelled {
-                        crate::agent_run::RunState::Cancelled
-                    } else {
-                        crate::agent_run::RunState::Failed
-                    },
+                    child_failure_state(&store, &child_run_id, cancelled),
                     Some(&error),
                     None,
                 );
@@ -1796,6 +1726,14 @@ pub fn spawn_background(
     snapshot: BackendSnapshot,
     request: ChildRequest,
 ) -> Result<String, String> {
+    spawn_background_seeded(snapshot, request, None)
+}
+
+pub fn spawn_background_seeded(
+    snapshot: BackendSnapshot,
+    request: ChildRequest,
+    seed: Option<crate::agent_engine::RunCheckpoint>,
+) -> Result<String, String> {
     validate_child_request(&request)?;
     let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
     let record_id = format!("sub-{}", uuid::Uuid::new_v4());
@@ -1811,6 +1749,7 @@ pub fn spawn_background(
         error: None,
         created_at: now,
         updated_at: now,
+        outcome: None,
     })?;
     store.insert_subagent_run(&SubagentRun {
         id: record_id,
@@ -1825,6 +1764,13 @@ pub fn spawn_background(
         created_at: now,
         updated_at: now,
     })?;
+    if let Some(mut checkpoint) = seed {
+        let source = checkpoint.id.clone();
+        checkpoint.id = child_run_id.clone();
+        store.save_run_checkpoint(&checkpoint)?;
+        store.append_run_event(&crate::agent_run::RunEvent {run_id:child_run_id.clone(), seq:0, step_id:"resume".into(), tool_call_id:None,
+            event_type:"subagent_resume".into(), payload:serde_json::json!({"sourceRunId":source,"externalActionsRestarted":false}), created_at:now})?;
+    }
     let registry = global_registry();
     let interrupt = registry.register(&child_run_id);
     // Detached children get only the per-child interrupt watch — never the
@@ -1924,11 +1870,7 @@ async fn run_background_core(
                 }
                 let _ = s.update_run_status(
                     &child_run_id,
-                    if cancelled {
-                        crate::agent_run::RunState::Cancelled
-                    } else {
-                        crate::agent_run::RunState::Failed
-                    },
+                    child_failure_state(&s, &child_run_id, cancelled),
                     Some(&error),
                     None,
                 );
@@ -1948,357 +1890,74 @@ async fn run_background_core(
     Ok(())
 }
 
-/// Detached driver: same bounds as drive_child without &AppState.
+fn child_failure_state(store: &crate::store::Store, id: &str, cancelled: bool) -> crate::agent_run::RunState {
+    store.run(id).ok().flatten().and_then(|run| run.outcome)
+        .map(|outcome| outcome.reason.run_state())
+        .unwrap_or(if cancelled { crate::agent_run::RunState::Cancelled } else { crate::agent_run::RunState::Failed })
+}
+
+/// Detached driver: same engine as drive_child without &AppState.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_detached(
     snapshot: &BackendSnapshot,
     request: &ChildRequest,
     tools: Vec<&crate::connectors::AgentTool>,
     backend: &crate::inference::Backend,
-    mut cancel: ChildCancel,
+    cancel: ChildCancel,
     registry: Option<Arc<SubagentRegistry>>,
     child_run_id: &str,
     store: Arc<Mutex<crate::store::Store>>,
 ) -> Result<String, String> {
-    use crate::inference::InferenceProvider;
-    validate_child_request(request)?;
-    if cancel.is_set() {
-        return Err("Subagent was interrupted before starting.".into());
-    }
-    let mut system = child_system_prompt(snapshot, request);
-    system.push_str(&format!(
-        "\nModel capability metadata (not independent verification): {}",
-        backend.capability_report()
-    ));
-    // Structured disclosure: parent-authorized tools this background child
-    // cannot serve — connectors/automations bound to the live session,
-    // capability kills, filtered or unavailable runtimes. The child sees the
-    // aliases honestly instead of silently missing them, and the run log
-    // carries the same list for review.
-    let limits = {
-        let policy = match store.lock() {
-            Ok(store) => crate::capabilities::ToolPolicy::resolve(&store),
-            Err(_) => crate::capabilities::ToolPolicy::closed(
-                "Capability settings are unreachable.".into(),
-            ),
-        };
-        detached_tool_limits(snapshot, &tools, &policy)
-    };
-    let mut event_seq: u64 = 1;
-    if !limits.is_empty() {
-        let names: Vec<&str> = limits
-            .iter()
-            .filter_map(|limit| limit["alias"].as_str())
-            .collect();
-        system.push_str(&format!(
-            "\nThis run executes in the background: these parent-authorized tools are not usable here — {}. Ask the parent for what you need instead.",
-            names.iter().take(24).cloned().collect::<Vec<_>>().join(", ")
-        ));
-        if let Ok(s) = store.lock() {
-            let _ = s.append_run_event(&crate::agent_run::RunEvent {
-                run_id: child_run_id.to_string(),
-                seq: event_seq,
-                step_id: "setup".into(),
-                tool_call_id: None,
-                event_type: "child_tool_limits".into(),
-                payload: serde_json::json!({"unavailable": limits}),
-                created_at: crate::store::now(),
-            });
-            event_seq += 1;
-        }
-    }
-    let mut messages = vec![
-        serde_json::json!({"role": "system", "content": system}),
-        serde_json::json!({"role": "user", "content": request.prompt}),
-    ];
-    let mut preferences = crate::store::Preferences {
-        system_prompt: snapshot.system_prompt.clone(),
-        temperature: snapshot.temperature,
-        top_p: snapshot.top_p,
-        max_tokens: snapshot.max_tokens,
-        ..Default::default()
-    };
-    backend.prepare_preferences(&mut preferences)?;
-    let mut answer = String::new();
-    let max_rounds = request.max_rounds.min(8);
-    for round in 0..max_rounds {
-        if cancel.is_set() {
-            if let Ok(s) = store.lock() {
-                let _ = s.update_run_status(
-                    child_run_id,
-                    crate::agent_run::RunState::Cancelled,
-                    Some("Interrupted."),
-                    None,
-                );
-            }
-            return Err(INTERRUPTED.into());
-        }
-        if let Some(registry) = &registry {
-            for note in registry.take_mail(child_run_id) {
-                messages.push(serde_json::json!({"role": "user", "content": format!("[parent followup] {note}")}));
-            }
-        }
-        let mut payload = serde_json::json!({
-            "messages": messages, "temperature": preferences.temperature,
-            "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
-            "stream": true, "cache_prompt": true,
-        });
-        if snapshot.inference_slots >= 2 {
-            payload["id_slot"] = serde_json::json!(1);
-        }
-        if backend.supports_tools() && !tools.is_empty() {
-            payload["tools"] =
-                serde_json::json!(crate::tool_discovery::advertised(tools.iter().copied())
-                    .into_iter()
-                    .map(|tool| tool.definition())
-                    .collect::<Vec<_>>());
-        }
-        if let Some(schema) = &request.output_schema {
-            backend.constrain_output(&mut payload, schema)?;
-        }
-        let payload = backend.payload(&payload)?;
-        // The interrupt watch is selected against every blocking await so a
-        // detached child stops promptly instead of out its deadman timeout.
-        let _tokens = match tokio::select! {
-            _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
-            result = tokio::time::timeout(Duration::from_secs(45), backend.check_context(&payload, preferences.max_tokens)) => result,
-        } {
-            Ok(result) => result?,
-            Err(_) => return Err("Subagent context check timed out.".into()),
-        };
-        let response = match tokio::select! {
-            _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
-            result = tokio::time::timeout(Duration::from_secs(600), backend.stream(&payload)) => result,
-        } {
-            Ok(result) => result?,
-            Err(_) => return Err("Subagent model did not respond within ten minutes.".into()),
-        };
-        let outcome = collect_stream(backend, response, &mut answer, &mut cancel).await?;
-        crate::arex::validate_batch(&outcome.calls)?;
-        if outcome.finish == "length" {
-            return Err("Subagent hit the response token limit.".into());
-        }
-        if outcome.calls.is_empty() {
-            break;
-        }
-        if round + 1 >= max_rounds && !outcome.calls.iter().any(|c| c.name == "finish") {
-            return Err("Subagent round limit reached.".into());
-        }
-        messages.push(outcome.assistant_message);
-        for mut call in outcome.calls {
-            if cancel.is_set() {
-                return Err(INTERRUPTED.into());
-            }
-            let visible = crate::tool_discovery::advertised(tools.iter().copied())
-                .into_iter()
-                .any(|tool| tool.alias == call.name);
-            let resolved = if visible {
-                crate::tool_discovery::resolve(
-                    tools.iter().copied(),
-                    &call.name,
-                    call.arguments.clone(),
-                )
-            } else {
-                Err("Tool is deferred or unavailable. Use tool_search and tool_invoke for this child's authorized catalog.".into())
-            };
-            let (resolved_tool, arguments) = match resolved {
-                Ok(value) => value,
-                Err(error) => {
-                    messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":crate::tool_envelope::failure_notice("unavailable-tool",&error,false,crate::tool_envelope::SIDE_NONE,&serde_json::json!({})).to_string()}));
-                    continue;
-                }
-            };
-            let tool = &resolved_tool;
-            call.name = tool.alias.clone();
-            call.arguments = arguments;
-            // Capability kills re-check at dispatch; stale offers deny visibly.
-            let capability_denial = {
-                let policy = match store.lock() {
-                    Ok(store) => crate::capabilities::ToolPolicy::resolve(&store),
-                    Err(_) => crate::capabilities::ToolPolicy::closed(
-                        "Capability settings are unreachable.".into(),
-                    ),
-                };
-                policy.denial_for_tool(tool)
-            };
-            if let Some(reason) = capability_denial {
-                messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,
-                    "content":crate::tool_envelope::failure_notice("capability-disabled", &reason, false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({})).to_string()}));
-                continue;
-            }
-            match tool.prepare_arguments(call.arguments.clone()) {
-                Ok(arguments) => call.arguments = arguments,
-                Err(error) => {
-                    messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":crate::tool_envelope::failure_notice("invalid-arguments", &error, false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({})).to_string()}));
-                    continue;
-                }
-            }
-            let result = if !request.policy.allows(tool.trusted_read())
-                || tool.requires_approval(&call.arguments)
-            {
-                crate::tool_envelope::failure_notice(
-                    "denied",
-                    "Denied by the subagent approval pin (reads-only).",
-                    false,
-                    crate::tool_envelope::SIDE_NONE,
-                    &serde_json::json!({"denied":true}),
-                )
-            } else if tool.harness_name() == Some(crate::tool_discovery::SEARCH) {
-                let policy = match store.lock() {
-                    Ok(store) => crate::capabilities::ToolPolicy::resolve(&store),
-                    Err(_) => crate::capabilities::ToolPolicy::closed(
-                        "Capability settings unreachable.".into(),
-                    ),
-                };
-                match crate::tool_discovery::search(tools.iter().copied(), &call.arguments, &policy)
-                {
-                    Ok(value) => crate::tool_envelope::normalize(value, tool.envelope_family()),
-                    Err(error) => crate::tool_envelope::normalize_error(
-                        &error,
-                        crate::tool_envelope::Cause::default(),
-                        tool.envelope_family(),
-                    ),
-                }
-            } else if let Some(alias) = tool.harness_name() {
-                // Background children have no AppState: serve the store-only
-                // and workspace-bounded harness subset locally; everything
-                // else fails loud. Awaited inside the cancel select so an
-                // interrupt cannot strand behind a blocked read.
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(cancelled_tool_call_detached(&store, child_run_id, round, &call, &mut event_seq)),
-                    result = harness_detached(snapshot, request, alias, call.arguments.clone()) => match result {
-                        Ok(value) => crate::tool_envelope::normalize(value, tool.envelope_family()),
-                        Err(error) => crate::tool_envelope::normalize_error(&error, crate::tool_envelope::Cause::default(), tool.envelope_family()),
-                    },
-                }
-            } else {
-                // Dropping the call future aborts in-flight work; managed
-                // child processes die with the execution wrapper on drop.
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(cancelled_tool_call_detached(&store, child_run_id, round, &call, &mut event_seq)),
-                    result = tokio::time::timeout(tool.timeout(), tool.call(call.arguments.clone())) => match result {
-                        Ok(Ok(value)) => crate::tool_envelope::normalize(value, tool.envelope_family()),
-                        Ok(Err(error)) => crate::tool_envelope::normalize_error(&error, crate::tool_envelope::Cause::default(), tool.envelope_family()),
-                        Err(_) => crate::tool_envelope::normalize_error("Subagent tool call timed out. Its outcome may be unknown; do not automatically retry.", crate::tool_envelope::Cause { timeout: true, ..Default::default() }, tool.envelope_family()),
-                    },
-                }
-            };
-            let control = if tool.harness_name().is_some()
-                && matches!(call.name.as_str(), "finish" | "update_context")
-            {
-                Some(result.clone())
-            } else {
-                None
-            };
-            let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
-                result,
-                &tool.tool.name,
-                &request.conversation_id,
-                Some(child_run_id),
-                crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
-            );
-            if let Some(artifact) = &maybe_artifact {
-                if let Ok(s) = store.lock() {
-                    let _ = s.save_artifact(artifact);
-                }
-            }
-            event_seq += 1;
-            if let Ok(s) = store.lock() {
-                let _ = s.append_run_event(&crate::agent_run::RunEvent {
-                    run_id: child_run_id.to_string(),
-                    seq: event_seq,
-                    step_id: format!("round-{round}"),
-                    tool_call_id: Some(call.id.clone()),
-                    event_type: "tool_result".into(),
-                    payload: serde_json::json!({"tool": tool.alias, "result": bounded}),
-                    created_at: crate::store::now(),
-                });
-            }
-            messages.push(serde_json::json!({"role": "tool", "tool_call_id": call.id, "content": bounded.to_string()}));
-            if let Some(control) = control {
-                if let Some(final_answer) = crate::arex::apply_control(
-                    &call.name,
-                    &control,
-                    &*store.lock().map_err(|_| "Store lock poisoned")?,
-                    &request.conversation_id,
-                    child_run_id,
-                    &mut messages,
-                )? {
-                    if let Some(schema) = &request.output_schema {
-                        check_output_schema(schema, &final_answer)?;
-                    }
-                    return Ok(final_answer);
-                }
-            }
-        }
-    }
-    if let Some(schema) = &request.output_schema {
-        check_output_schema(schema, &answer)?;
-    }
-    Ok(answer)
+    child_engine::drive(
+        child_engine::Host::Detached {
+            store,
+            processes: snapshot.processes.clone(),
+        },
+        snapshot,
+        request,
+        tools,
+        backend,
+        cancel,
+        registry,
+        child_run_id,
+    )
+    .await
 }
 
-struct StreamOutcome {
-    finish: String,
-    calls: Vec<crate::tool_calls::ToolCall>,
-    assistant_message: serde_json::Value,
-}
+use crate::agent_engine::ProviderRoundRecord as StreamOutcome;
 
 async fn collect_stream(
     backend: &crate::inference::Backend,
     response: reqwest::Response,
     answer: &mut String,
     cancel: &mut ChildCancel,
-) -> Result<StreamOutcome, String> {
-    let mut stream = response.bytes_stream();
-    let mut decoder = crate::sse::SseDecoder::default();
-    let mut protocol = crate::sse::ModelStream::for_backend(backend);
-    let mut calls = crate::tool_calls::ToolCalls::default();
+) -> Result<StreamOutcome, crate::agent_engine::StreamFailure> {
+    let mut stream = crate::agent_engine::ModelRound::new(backend, response);
     let mut text = String::new();
-    let mut finish = String::new();
-    'stream: loop {
-        // Interrupt wins over the per-chunk deadman: dropping the body stream
-        // aborts the HTTP read rather than waiting out the 300s timeout.
+    loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
-            next = tokio::time::timeout(Duration::from_secs(300), futures_util::StreamExt::next(&mut stream)) => next,
-        }
-        .map_err(|_| "Subagent model stopped responding.")?;
-        let Some(bytes) = next else {
-            decoder.finish()?;
-            return Err("Subagent stream ended without a completion marker.".into());
+            next = stream.next() => next?,
         };
-        for event in decoder.push(&bytes.map_err(|error| error.to_string())?)? {
-            let value = protocol.push(&event)?;
-            let Some(value) = value else {
-                if protocol.done {
-                    break 'stream;
-                }
-                continue;
-            };
-            if let Some(error) = value.get("error") {
-                return Err(backend.stream_error(error));
-            }
-            if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
-                finish = reason.to_string();
-            }
-            let delta = &value["choices"][0]["delta"];
-            calls.push(delta)?;
-            let chunk = delta["content"].as_str().unwrap_or("");
-            answer.push_str(chunk);
-            text.push_str(chunk);
-            if answer.len() > 1_048_576 {
-                return Err("Subagent output exceeded 1 MiB.".into());
-            }
-            if protocol.done {
-                break 'stream;
-            }
-        }
+        let Some(delta) = next else {
+            break;
+        };
+        answer.push_str(&delta.answer);
+        text.push_str(&delta.answer);
     }
+    let finish = stream.content.finish.clone();
+    let mut calls = std::mem::take(&mut stream.content.calls);
     if !matches!(finish.as_str(), "stop" | "tool_calls" | "length") {
-        return Err(format!(
-            "Subagent returned an unsupported finish reason: '{finish}'."
-        ));
+        return Err(format!("Subagent returned an unsupported finish reason: '{finish}'.").into());
+    }
+    if finish == "length" {
+        // A provider-declared cutoff may contain incomplete JSON. Preserve the
+        // attempt separately; neither native nor text calls enter dispatch.
+        return Ok(StreamOutcome {
+            finish,
+            calls: Vec::new(),
+            assistant_message: stream.assistant_message(&text, &[]),
+        });
     }
     if calls.is_empty() && (text.contains("<tool_call>") || text.contains("<function=")) {
         let parsed = crate::tool_calls::parse_text_tool_calls(&text)
@@ -2310,271 +1969,8 @@ async fn collect_stream(
         text = visible;
     }
     let calls = calls.finish()?;
-    let assistant_message = protocol.assistant_message(&text, &calls);
-    Ok(StreamOutcome {
-        finish,
-        calls,
-        assistant_message,
-    })
+    stream.accepted_record(finish, &text, calls).map_err(Into::into)
 }
-
-// ---- Workflows + Ralph (Phase 4 orchestration slice) ----
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct WorkflowStep {
-    pub prompt: String,
-    pub label: Option<String>,
-}
-
-/// Sequential fan-out: each step runs as a fresh child that sees prior
-/// summaries. Parallel: background children polled to settle (10 min budget).
-/// Parent `inherit` tools carry into workflow children, except live MCP peers
-/// (which cannot cross the clone boundary) — stages document that limit.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_workflow(
-    state: &crate::AppState,
-    snapshot: &BackendSnapshot,
-    conversation_id: &str,
-    parent_run_id: &str,
-    depth: i64,
-    policy: ChildPolicy,
-    mode: &str,
-    steps: Vec<WorkflowStep>,
-    max_rounds: usize,
-    inherit: &[crate::connectors::AgentTool],
-) -> Result<serde_json::Value, String> {
-    if steps.is_empty() || steps.len() > 5 {
-        return Err("workflow_run needs 1-5 steps.".into());
-    }
-    for step in &steps {
-        if step.prompt.trim().is_empty() || step.prompt.len() > 4000 {
-            return Err("Each workflow step needs a 1-4000 character prompt.".into());
-        }
-    }
-    if mode != "sequential" && mode != "parallel" {
-        return Err("workflow mode must be 'sequential' or 'parallel'.".into());
-    }
-    if mode == "sequential" {
-        let mut results = Vec::new();
-        let mut prior = String::new();
-        for (index, step) in steps.iter().enumerate() {
-            let prompt = if prior.is_empty() {
-                step.prompt.clone()
-            } else {
-                format!("{}\n\n[prior stage summaries]\n{prior}", step.prompt)
-            };
-            let request = ChildRequest {
-                label: step
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| format!("stage-{}", index + 1)),
-                prompt,
-                depth,
-                max_rounds,
-                tool_filter: None,
-                persona: None,
-                output_schema: None,
-                policy,
-                parent_run_id: parent_run_id.to_string(),
-                conversation_id: conversation_id.to_string(),
-            };
-            let inherited: Vec<crate::connectors::AgentTool> = inherit
-                .iter()
-                .filter(|tool| !tool.is_mcp())
-                .cloned()
-                .collect();
-            match run_child_inline(state, snapshot, request.clone(), &inherited, None).await {
-                Ok((child_run_id, answer)) => {
-                    prior.push_str(&format!(
-                        "\n[{}] {}\n",
-                        request.label,
-                        answer.chars().take(1000).collect::<String>()
-                    ));
-                    results.push(serde_json::json!({"label": request.label, "childRunId": child_run_id, "status": "completed",
-                        "summary": answer.chars().take(1500).collect::<String>()}));
-                }
-                Err(error) => {
-                    results.push(serde_json::json!({"label": request.label, "status": "failed", "error": error}));
-                    break;
-                }
-            }
-        }
-        return Ok(serde_json::json!({"mode": "sequential", "results": results}));
-    }
-    // Parallel: background children, then poll the durable rows to settle.
-    let mut ids = Vec::new();
-    for (index, step) in steps.iter().enumerate() {
-        let request = ChildRequest {
-            label: step
-                .label
-                .clone()
-                .unwrap_or_else(|| format!("branch-{}", index + 1)),
-            prompt: step.prompt.clone(),
-            depth,
-            max_rounds,
-            tool_filter: None,
-            persona: None,
-            output_schema: None,
-            policy,
-            parent_run_id: parent_run_id.to_string(),
-            conversation_id: conversation_id.to_string(),
-        };
-        ids.push(spawn_background(snapshot.clone(), request)?);
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
-    let mut global_cancel = state.cancel.subscribe();
-    loop {
-        if state.cancel_requested() {
-            for id in &ids {
-                state.subagents.interrupt(id);
-            }
-            return Err("Workflow was cancelled.".into());
-        }
-        let rows = {
-            let store = state.database()?;
-            store.subagent_runs_for_conversation(conversation_id)?
-        };
-        let mut settled = 0;
-        for id in &ids {
-            if let Some(row) = rows.iter().find(|row| &row.child_run_id == id) {
-                if row.status != "running" {
-                    settled += 1;
-                }
-            }
-        }
-        if settled >= ids.len() || tokio::time::Instant::now() > deadline {
-            let mut results = Vec::new();
-            for id in &ids {
-                let row = rows.iter().find(|row| &row.child_run_id == id);
-                results.push(match row {
-                    Some(row) if row.status == "completed" => serde_json::json!({"label": row.label, "childRunId": id, "status": "completed"}),
-                    Some(row) => serde_json::json!({"label": row.label, "childRunId": id, "status": row.status, "error": row.error}),
-                    None => serde_json::json!({"childRunId": id, "status": "unknown"}),
-                });
-            }
-            // Summaries live in each child's run events + settle notices.
-            return Ok(serde_json::json!({"mode": "parallel", "results": results,
-                "note": "Summaries are in each child's Trajectory events and settle notices."}));
-        }
-        // Wake on the app-wide cancel instead of sleeping out the whole 5s
-        // poll interval; the loop head interrupts the children and exits.
-        tokio::select! {
-            _ = global_cancel.changed() => {},
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Handoff {
-    pub status: String,
-    pub summary: String,
-    pub evidence: Option<String>,
-    pub next_steps: Option<String>,
-    pub blocker: Option<String>,
-}
-
-fn parse_handoff(answer: &str) -> Option<Handoff> {
-    // Last ```handoff fenced JSON block wins; otherwise the whole answer is
-    // treated as an in-progress summary by the caller.
-    let mut last: Option<&str> = None;
-    let mut search = answer;
-    while let Some(start) = search.find("```handoff") {
-        let rest = &search[start + "```handoff".len()..];
-        if let Some(end) = rest.find("```") {
-            last = Some(rest[..end].trim());
-            search = &rest[end + 3..];
-        } else {
-            break;
-        }
-    }
-    let text = last?;
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    if !value
-        .get("status")?
-        .as_str()
-        .map(|status| ["complete", "blocked", "continue"].contains(&status))?
-    {
-        return None;
-    }
-    serde_json::from_value(value).ok()
-}
-
-/// Ralph loop: fixed objective, fresh child per round, shared workspace,
-/// bounded handoff. Stops on complete/blocked or when rounds run out.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_ralph(
-    state: &crate::AppState,
-    snapshot: &BackendSnapshot,
-    conversation_id: &str,
-    parent_run_id: &str,
-    depth: i64,
-    policy: ChildPolicy,
-    objective: &str,
-    max_rounds: usize,
-    inherit: &[crate::connectors::AgentTool],
-) -> Result<serde_json::Value, String> {
-    if objective.trim().is_empty() || objective.len() > 2000 {
-        return Err("ralph_run needs an objective of 1-2000 characters.".into());
-    }
-    let max_rounds = max_rounds.clamp(1, 5);
-    let mut handoff: Option<Handoff> = None;
-    let mut rounds = Vec::new();
-    for round in 1..=max_rounds {
-        let prompt = match &handoff {
-            None => format!(
-                "Objective (immutable): {objective}\n\nWork one iteration. End with a ```handoff fence: \
-                 {{\"status\":\"complete\"|\"blocked\"|\"continue\",\"summary\":\"...\",\"evidence\":\"...\",\"next_steps\":\"...\",\"blocker\":\"...\"}}"
-            ),
-            Some(previous) => format!(
-                "Objective (immutable): {objective}\n\nPrevious handoff: {}\n\nContinue one iteration and end with a new ```handoff fence.",
-                serde_json::to_string(previous).unwrap_or_default()
-            ),
-        };
-        let request = ChildRequest {
-            label: format!("ralph-{round}"),
-            prompt,
-            depth,
-            max_rounds: 4,
-            tool_filter: None,
-            persona: None,
-            output_schema: None,
-            policy,
-            parent_run_id: parent_run_id.to_string(),
-            conversation_id: conversation_id.to_string(),
-        };
-        let inherited: Vec<crate::connectors::AgentTool> = inherit
-            .iter()
-            .filter(|tool| !tool.is_mcp())
-            .cloned()
-            .collect();
-        match run_child_inline(state, snapshot, request, &inherited, None).await {
-            Ok((child_run_id, answer)) => {
-                let parsed = parse_handoff(&answer).unwrap_or(Handoff {
-                    status: "continue".into(),
-                    summary: answer.chars().take(1000).collect(),
-                    evidence: None,
-                    next_steps: None,
-                    blocker: None,
-                });
-                let terminal = parsed.status == "complete" || parsed.status == "blocked";
-                rounds.push(serde_json::json!({"round": round, "childRunId": child_run_id, "handoff": parsed}));
-                handoff = Some(parsed);
-                if terminal {
-                    break;
-                }
-            }
-            Err(error) => {
-                rounds
-                    .push(serde_json::json!({"round": round, "status": "failed", "error": error}));
-                break;
-            }
-        }
-    }
-    Ok(serde_json::json!({"objective": objective, "rounds": rounds, "final": handoff}))
-}
-
-// ---- Model-facing + UI IPC ----
 
 #[tauri::command]
 pub fn list_subagent_runs(
@@ -2624,6 +2020,373 @@ pub fn list_models(store: &crate::store::Store) -> Result<Vec<serde_json::Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn safe_file_failures_and_transactional_retries_match_across_all_hosts() {
+        use serde_json::{json,Value};
+        for mode in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let state = crate::test_support::app_state(dir.path());
+            crate::test_support::select_fixture_model(&state,dir.path());
+            let mut stage = 0;
+            let (base,requests,server) = crate::test_support::scripted_sse_with(6,move |request| {
+                let last = || ->Value {
+                    let row = request["messages"].as_array().unwrap().iter().rev().find(|m|m["role"]=="tool").unwrap();
+                    serde_json::from_str(row["content"].as_str().unwrap()).unwrap()
+                };
+                if matches!(stage,1|2) {
+                    assert_eq!(last()["status"],"failure");
+                    assert_eq!(last()["error"]["sideEffects"],crate::tool_envelope::SIDE_NONE);
+                }
+                let (name,args) = match stage {
+                    0 => ("workspace_read_file",json!({"path":"missing.txt"})),
+                    1|3 => ("workspace_create_file",json!({"path":"nested/new.txt","content":"first"})),
+                    2 => ("workspace_create_directory",json!({"path":"nested"})),
+                    4 => {
+                        assert_eq!(last()["status"],"success");
+                        ("workspace_edit_file",json!({"path":"nested/new.txt","expected_sha256":last()["data"]["sha256"],"old_text":"first","new_text":"second"}))
+                    }
+                    _ => {
+                        assert_eq!(last()["data"]["status"],"committed");
+                        stage += 1;
+                        return format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"Saved the file after correcting the missing directory."},"finish_reason":"stop"}]}));
+                    }
+                };
+                let (name,args) = if request["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]==name) {
+                    (name,args)
+                } else {(crate::tool_discovery::INVOKE,json!({"name":name,"arguments":args}))};
+                let response = format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":0,"id":format!("file-{stage}"),"function":{"name":name,"arguments":args.to_string()}
+                }]},"finish_reason":"tool_calls"}]}));
+                stage += 1;
+                response
+            }).await;
+            let conversation = state.database().unwrap().create_conversation().unwrap().id;
+            let id = if mode == 0 {
+                {
+                    let store=state.database().unwrap();
+                    let mut provider=store.provider("fixture-loopback").unwrap().unwrap();
+                    provider.base_url=base;store.save_provider(&provider).unwrap();
+                    store.save_conversation_tools(&conversation,&crate::store::ConversationTools {
+                        access_mode:crate::permissions::AccessMode::FullAccess,sources:vec!["__workspace".into()],tools:vec![],
+                    }).unwrap();
+                }
+                crate::chat::send_message_inner(&state,conversation.clone(),"Read the missing file, create nested/new.txt after its directory exists, and edit it.".into(),
+                    Some(vec!["__workspace".into()]),Some(vec![]),None,None,tauri::ipc::Channel::new(|_|Ok(()))).await.unwrap();
+                state.database().unwrap().latest_run(&conversation).unwrap().unwrap().id
+            } else {
+                let mut snapshot=crate::test_support::snapshot(&state,dir.path(),&["workspace_read_file","workspace_create_file","workspace_create_directory","workspace_edit_file"]);
+                snapshot.kind="api".into();snapshot.base_url=base;snapshot.key="fixture-key".into();
+                let backend=snapshot.backend().unwrap();
+                let mut request=fixture_request(ChildPolicy::Full,&conversation);request.max_rounds=6;
+                let id="file-child";fixture_run(&state.database().unwrap(),id,&conversation);
+                let tools=local_tools(&snapshot,&crate::capabilities::ToolPolicy::resolve(&state.database().unwrap()));
+                let result=if mode == 2 {
+                    drive_detached(&snapshot,&request,tools.iter().collect(),&backend,ChildCancel::none(),None,id,
+                        Arc::new(Mutex::new(crate::store::Store::open(&state.db_path).unwrap()))).await
+                } else {
+                    drive_child(&state,&snapshot,&request,tools.into_iter().map(ChildTool::Owned).collect(),&backend,ChildCancel::none(),None,id,None).await
+                };
+                assert!(result.is_ok(),"{result:?}");id.into()
+            };
+            server.await.unwrap();assert_eq!(requests.lock().unwrap().len(),6);
+            assert_eq!(std::fs::read_to_string(dir.path().join("nested/new.txt")).unwrap(),"second");
+            assert_eq!(state.database().unwrap().run(&id).unwrap().unwrap().outcome.unwrap().reason,crate::agent_engine::StopReason::Completed);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn both_child_hosts_can_repair_an_observed_process_failure() {
+        use serde_json::{json, Value};
+        for detached in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = crate::test_support::app_state(dir.path());
+            let conversation = state.database().unwrap().create_conversation().unwrap().id;
+            let mut stage = 0;
+            let (base, requests, server) = crate::test_support::scripted_sse_with(4, move |request| {
+                let call = |name: &str, arguments:Value| json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":0,"id":format!("action-{stage}"),"function":{"name":name,"arguments":arguments.to_string()}
+                }]},"finish_reason":"tool_calls"}]});
+                let value = match stage {
+                    0 => call("process_start", json!({"command":"printf first >> observed.txt; exit 7","yield_ms":0})),
+                    1 => {
+                        let row = request["messages"].as_array().unwrap().iter().rev().find(|m|m["role"]=="tool").unwrap();
+                        let result:Value = serde_json::from_str(row["content"].as_str().unwrap()).unwrap();
+                        call("process_poll", json!({"id":result["data"]["id"]}))
+                    }
+                    2 => {
+                        let row = request["messages"].as_array().unwrap().iter().rev().find(|m|m["role"]=="tool").unwrap();
+                        let result:Value = serde_json::from_str(row["content"].as_str().unwrap()).unwrap();
+                        assert_eq!(result["status"], "failure");
+                        assert_eq!(result["data"]["exitCode"], 7);
+                        call("process_start", json!({"command":"printf repaired >> observed.txt","yield_ms":1000}))
+                    }
+                    _ => json!({"choices":[{"delta":{"content":"Repaired after inspecting exit 7."},"finish_reason":"stop"}]}),
+                };
+                stage += 1;
+                format!("data: {value}\n\ndata: [DONE]\n\n")
+            }).await;
+            let mut snapshot = crate::test_support::snapshot(&state, dir.path(), &["process_start","process_poll"]);
+            snapshot.kind = "api".into();
+            snapshot.base_url = base;
+            snapshot.key = "fixture-key".into();
+            let backend = snapshot.backend().unwrap();
+            let request = fixture_request(ChildPolicy::Full, &conversation);
+            let id = "repair-child";
+            fixture_run(&state.database().unwrap(), id, &conversation);
+            let tools = local_tools(&snapshot, &crate::capabilities::ToolPolicy::resolve(&state.database().unwrap()));
+            let result = if detached {
+                drive_detached(&snapshot, &request, tools.iter().collect(), &backend, ChildCancel::none(), None, id,
+                    Arc::new(Mutex::new(crate::store::Store::open(&state.db_path).unwrap()))).await
+            } else {
+                drive_child(&state, &snapshot, &request, tools.into_iter().map(ChildTool::Owned).collect(), &backend,
+                    ChildCancel::none(), None, id, None).await
+            };
+            assert_eq!(result.unwrap(), "Repaired after inspecting exit 7.");
+            server.await.unwrap();
+            assert_eq!(requests.lock().unwrap().len(), 4);
+            assert_eq!(std::fs::read_to_string(dir.path().join("observed.txt")).unwrap(), "firstrepaired");
+            assert_eq!(state.database().unwrap().run(id).unwrap().unwrap().outcome.unwrap().reason,
+                crate::agent_engine::StopReason::Completed);
+        }
+    }
+
+    #[tokio::test]
+    async fn child_checkpoint_resumes_after_restart_without_repeating_a_committed_command() {
+        use serde_json::json;
+        for detached in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = crate::test_support::app_state(dir.path());
+            let conversation = state.database().unwrap().create_conversation().unwrap().id;
+            let first = format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{
+                "reasoning_content":"retain this native state",
+                "tool_calls":[{"index":0,"id":"committed-once","function":{"name":"tool_invoke","arguments":json!({"name":"local_execute_command","arguments":{"command":"printf x >> committed"}}).to_string()}}]
+            },"finish_reason":"tool_calls"}]}));
+            let last = format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content":"Resumed from the saved result."},"finish_reason":"stop"}]}));
+            let (base, requests, server) = crate::test_support::scripted_sse(vec![first, last]).await;
+            let mut snapshot = crate::test_support::snapshot(&state, dir.path(), &["local_execute_command"]);
+            snapshot.kind = "api".into();
+            snapshot.base_url = base;
+            snapshot.key = "fixture-key".into();
+            let backend = snapshot.backend().unwrap();
+            let mut request = fixture_request(ChildPolicy::Full, &conversation);
+            request.max_rounds = 1;
+            let id = "old-child";
+            fixture_run(&state.database().unwrap(), id, &conversation);
+            let tools = local_tools(&snapshot, &crate::capabilities::ToolPolicy::resolve(&state.database().unwrap()));
+            let result = if detached {
+                drive_detached(&snapshot, &request, tools.iter().collect(), &backend, ChildCancel::none(), None, id,
+                    Arc::new(Mutex::new(crate::store::Store::open(&state.db_path).unwrap()))).await
+            } else {
+                drive_child(&state, &snapshot, &request, tools.into_iter().map(ChildTool::Owned).collect(), &backend,
+                    ChildCancel::none(), None, id, None).await
+            };
+            assert!(result.unwrap_err().contains("budget exhausted"));
+            assert_eq!(std::fs::read_to_string(dir.path().join("committed")).unwrap(), "x");
+            {
+                let reopened = crate::store::Store::open(&state.db_path).unwrap();
+                reopened.recover_interrupted().unwrap();
+                let run = reopened.run(id).unwrap().unwrap();
+                assert_eq!(run.status, crate::agent_run::RunState::Paused);
+                assert!(run.outcome.unwrap().resumable);
+                let other = reopened.create_conversation().unwrap().id;
+                assert!(prepare_child_resume(&reopened, &snapshot, &other, id, ChildPolicy::Full, "continue").is_err());
+                let mut moved = snapshot.clone();
+                moved.model_id = "different-model".into();
+                assert!(prepare_child_resume(&reopened, &moved, &conversation, id, ChildPolicy::Full, "continue").is_err());
+            }
+            // The current parent offers more capabilities but asks for approval.
+            // Recovery must retain the old catalog and narrow its access pin.
+            snapshot.allowed_tool_aliases.push("file_read".into());
+            snapshot.allowed_tool_aliases.push("subagent".into());
+            let mut inherit = local_tools(&snapshot, &crate::capabilities::ToolPolicy::resolve(&state.database().unwrap()));
+            inherit.push(crate::connectors::AgentTool::harness("subagent").unwrap());
+            let ctx = crate::harness::HarnessCtx {
+                state: &state, snapshot, conversation_id: conversation.clone(), run_id:"new-parent".into(),
+                step_id:"resume".into(), access_mode:crate::permissions::AccessMode::Ask,
+                depth:0, preset_id:"standard".into(), inherit_tools:&inherit, emit:Arc::new(|_,_|{}),
+            };
+            let outcome = crate::harness::execute(&ctx, "subagent", json!({"prompt":"Continue the saved work.","resume_from":id,"max_rounds":2})).await.unwrap();
+            assert_eq!(outcome.value["answer"], "Resumed from the saved result.");
+            assert_eq!(std::fs::read_to_string(dir.path().join("committed")).unwrap(), "x");
+            let child = outcome.value["childRunId"].as_str().unwrap();
+            let checkpoint = state.database().unwrap().run_checkpoint(child).unwrap().unwrap();
+            let metadata = checkpoint.child.unwrap();
+            assert_eq!(metadata.request.policy, ChildPolicy::ReadsOnly);
+            assert_eq!(metadata.tools.keys().map(String::as_str).collect::<Vec<_>>(), vec!["local_execute_command"]);
+            server.await.unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let replay = requests[1].body["messages"].as_array().unwrap();
+            assert!(replay.iter().any(|message| message["reasoning_content"] == "retain this native state"));
+            assert_eq!(replay.iter().filter(|message| message["role"] == "tool" && message["tool_call_id"] == "committed-once").count(), 1);
+        }
+    }
+
+    #[test]
+    fn child_recovery_distinguishes_undispatched_siblings_from_uncertain_actions() {
+        use serde_json::json;
+        let store = crate::store::Store::open_memory().unwrap();
+        let conversation = store.create_conversation().unwrap().id;
+        fixture_run(&store, "child", &conversation);
+        let request = fixture_request(ChildPolicy::Full, &conversation);
+        let mut checkpoint = crate::agent_engine::RunCheckpoint::capture("child", "work", "workspace", &[json!({"role":"user","content":"work"})]);
+        checkpoint.child = Some(ChildCheckpoint {request, tools:std::collections::BTreeMap::new(), model_id:"fixture".into(), provider_kind:"local".into(), api_format:String::new(), journal_seq:None});
+        store.save_run_checkpoint(&checkpoint).unwrap();
+        let event = |kind: &str, call:Option<&str>, payload| crate::agent_run::RunEvent {
+            run_id:"child".into(), seq:0, step_id:"round-0".into(), tool_call_id:call.map(str::to_string),
+            event_type:kind.into(), payload, created_at:crate::store::now(),
+        };
+        store.append_run_event(&event("provider_round", None, json!({"assistant":{"role":"assistant","content":"","reasoning_content":"native",
+            "tool_calls":[{"id":"one","function":{"name":"file_write","arguments":"{}"}},{"id":"two","function":{"name":"file_write","arguments":"{}"}}]}}))).unwrap();
+        store.append_run_event(&event("tool_started", Some("one"), json!({}))).unwrap();
+        assert!(restore_child_checkpoint(&store, "child").unwrap_err().contains("no confirmed result"));
+        let confirmed = crate::tool_envelope::normalize(json!({"saved":true}), crate::tool_envelope::Family::Harness);
+        store.append_run_event(&event("tool_result", Some("one"), json!({"result":confirmed}))).unwrap();
+        let recovered = restore_child_checkpoint(&store, "child").unwrap();
+        assert_eq!(recovered.messages.len(), 4);
+        assert_eq!(recovered.messages[1]["reasoning_content"], "native");
+        let skipped:serde_json::Value = serde_json::from_str(recovered.messages[3]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(skipped["error"]["code"], "not-dispatched");
+        // Re-reading recovery is pure: no new tool or journal entries appear.
+        assert_eq!(store.run_events("child").unwrap().len(), 3);
+        assert_eq!(restore_child_checkpoint(&store, "child").unwrap().messages, recovered.messages);
+        store.append_run_event(&event("tool_cancelled", Some("two"), json!({}))).unwrap();
+        store.recover_interrupted().unwrap();
+        let run = store.run("child").unwrap().unwrap();
+        assert_eq!(run.status, crate::agent_run::RunState::OutcomeUnknown);
+        assert!(!run.outcome.unwrap().resumable);
+    }
+
+    #[tokio::test]
+    async fn child_hosts_share_recovery_reasoning_durable_commands_and_final_answer_semantics() {
+        use serde_json::json;
+        for (detached, denied) in [(false, false), (true, false), (false, true), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = crate::test_support::app_state(dir.path());
+            let conversation = state.database().unwrap().create_conversation().unwrap().id;
+            let snapshot =
+                crate::test_support::snapshot(&state, dir.path(), &["local_execute_command"]);
+            let mut request = fixture_request(if denied { ChildPolicy::ReadsOnly } else { ChildPolicy::Full }, &conversation);
+            request.max_rounds = 0;
+            let id = if detached {
+                "child-background"
+            } else {
+                "child-foreground"
+            };
+            fixture_run(&state.database().unwrap(), id, &conversation);
+            let invocation =
+                json!({"name":"local_execute_command","arguments":{"command":"printf durable > child-output; printf durable"}})
+                    .to_string();
+            let first = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"content":"Running a command.","reasoning_content":"native child state","tool_calls":[{"index":0,"id":"once","type":"function","function":{"name":"tool_invoke","arguments":invocation}}]},"finish_reason":"tool_calls"}]})
+            );
+            let truncated = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"delta":{"content":"unfinished draft"}}]})
+            );
+            let cutoff = format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content":"Incomplete command.","tool_calls":[{"index":0,"id":"never-dispatch","type":"function","function":{"name":"tool_invoke","arguments":"{\"name\":\"local_execute_command\",\"arguments\":"}}]},"finish_reason":"length"}]}));
+            let last = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"content":"<think>private child reasoning</think>Final answer."},"finish_reason":"stop"}]})
+            );
+            let (base, requests, server) =
+                crate::test_support::scripted_sse(vec![first, cutoff, truncated, "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n".into(), last]).await;
+            let backend = crate::inference::Backend::OpenAi {
+                responses: false,
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+                base_url: base,
+                key: "fixture-key".into(),
+                model_id: "fixture".into(),
+                context_length: 32768,
+                max_output_tokens: Some(1000),
+                capabilities: crate::provider_capabilities::ModelCapabilities::legacy(true),
+            };
+            let tools = local_tools(
+                &snapshot,
+                &crate::capabilities::ToolPolicy::resolve(&state.database().unwrap()),
+            );
+            let result = if detached {
+                drive_detached(
+                    &snapshot,
+                    &request,
+                    tools.iter().collect(),
+                    &backend,
+                    ChildCancel::none(),
+                    None,
+                    id,
+                    Arc::new(Mutex::new(
+                        crate::store::Store::open(&state.db_path).unwrap(),
+                    )),
+                )
+                .await
+            } else {
+                drive_child(
+                    &state,
+                    &snapshot,
+                    &request,
+                    tools.into_iter().map(ChildTool::Owned).collect(),
+                    &backend,
+                    ChildCancel::none(),
+                    None,
+                    id,
+                    None,
+                )
+                .await
+            };
+            if denied {
+                assert!(result.unwrap_err().contains("denied action"));
+                assert!(!dir.path().join("child-output").exists());
+            } else {
+                assert_eq!(result.unwrap(), "Final answer.");
+                assert_eq!(std::fs::read_to_string(dir.path().join("child-output")).unwrap(), "durable");
+            }
+            server.await.unwrap();
+            {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            for request in requests.iter().skip(1) {
+                assert!(request.body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["reasoning_content"] == "native child state"));
+                assert!(!request.body["messages"].as_array().unwrap().iter().any(|message|
+                    message["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|call| call["id"] == "never-dispatch"))));
+            }
+            }
+            let events = state.database().unwrap().run_events(id).unwrap();
+            let results = events
+                .iter()
+                .filter(|event| event.event_type == "tool_result")
+                .collect::<Vec<_>>();
+            assert_eq!(results.len(), 1);
+            if !denied {
+            let process = results[0].payload["result"]["data"]["processId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("detached={detached}: {}", results[0].payload));
+            let restored = crate::process_tools::ProcessRegistry::persistent(state.db_path.clone());
+            let output = restored
+                .poll(
+                    &conversation,
+                    dir.path().to_str().unwrap(),
+                    json!({"id":process,"wait_ms":0}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output["exitCode"], 0);
+            }
+            assert_eq!(
+                state.database().unwrap().run(id).unwrap().unwrap().outcome.unwrap().reason,
+                if denied { crate::agent_engine::StopReason::PermissionDenied } else { crate::agent_engine::StopReason::Completed }
+            );
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == "provider_attempt_failed"));
+        }
+    }
+
     #[tokio::test]
     async fn child_native_responses_stream_preserves_original_ids_context_and_terminal_output() {
         use crate::inference::InferenceProvider;
@@ -2746,6 +2509,7 @@ mod tests {
                 }
             } else {
                 crate::inference::Backend::Local {
+                    bonsai_profile: false,
                     client,
                     endpoint,
                     key: "test-key".into(),
@@ -2846,7 +2610,7 @@ mod tests {
         })
         .is_err());
         assert!(validate_child_request(&ChildRequest {
-            max_rounds: 9,
+            max_rounds: 1_000_001,
             ..base.clone()
         })
         .is_err());
@@ -2886,18 +2650,6 @@ mod tests {
                 "{schema} should be accepted"
             );
         }
-    }
-    #[test]
-    fn handoff_parsing_prefers_last_fence() {
-        let answer = "first ```handoff\n{\"status\":\"continue\",\"summary\":\"a\"}\n``` then ```handoff\n{\"status\":\"blocked\",\"summary\":\"b\",\"blocker\":\"x\"}\n```";
-        let handoff = parse_handoff(answer).unwrap();
-        assert_eq!(handoff.status, "blocked");
-        assert!(parse_handoff("no fence here").is_none());
-        assert!(check_output_schema(&serde_json::json!({"required": ["a"]}), r#"{"a":1}"#).is_ok());
-        assert!(
-            check_output_schema(&serde_json::json!({"required": ["a"]}), r#"{"b":1}"#).is_err()
-        );
-        assert!(check_output_schema(&serde_json::json!({}), "not json").is_err());
     }
     #[test]
     fn output_schema_fully_enforces_nested_constraints() {
@@ -2959,6 +2711,7 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().to_str().unwrap().to_string();
         let snapshot = BackendSnapshot {
+            processes: Default::default(),
             model_capabilities: None,
             kind: "local".into(),
             endpoint: String::new(),
@@ -3039,6 +2792,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = tempfile::tempdir().unwrap();
         let snapshot = BackendSnapshot {
+            processes: Default::default(),
             model_capabilities: None,
             kind: "local".into(),
             endpoint: String::new(),
@@ -3135,6 +2889,7 @@ mod tests {
         aliases: &[&str],
     ) -> BackendSnapshot {
         BackendSnapshot {
+            processes: Default::default(),
             model_capabilities: None,
             kind: "local".into(),
             endpoint: endpoint.into(),
@@ -3190,6 +2945,7 @@ mod tests {
                 error: None,
                 created_at: now,
                 updated_at: now,
+                outcome: None,
             })
             .unwrap();
     }
@@ -3648,6 +3404,11 @@ mod tests {
         );
         let registry = global_registry();
         let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
+        fixture_run(
+            &store.lock().unwrap(),
+            &child_run_id,
+            &request.conversation_id,
+        );
         let flag = registry.register(&child_run_id);
         let cancel = ChildCancel::new(flag, registry.cancellation(&child_run_id), None);
         let interrupt_id = child_run_id.clone();
@@ -3700,6 +3461,11 @@ mod tests {
         );
         let registry = global_registry();
         let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
+        fixture_run(
+            &store.lock().unwrap(),
+            &child_run_id,
+            &request.conversation_id,
+        );
         let flag = registry.register(&child_run_id);
         let cancel = ChildCancel::new(flag, registry.cancellation(&child_run_id), None);
         let interrupt_id = child_run_id.clone();
@@ -3752,6 +3518,11 @@ mod tests {
         );
         let registry = global_registry();
         let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
+        fixture_run(
+            &store.lock().unwrap(),
+            &child_run_id,
+            &request.conversation_id,
+        );
         let flag = registry.register(&child_run_id);
         let cancel = ChildCancel::new(flag, registry.cancellation(&child_run_id), None);
         let interrupt_id = child_run_id.clone();
@@ -3808,10 +3579,10 @@ mod tests {
         // Round 1: token count ok, then a complete `local_run_code` tool call
         // that sleeps far beyond the test's patience.
         let args =
-            serde_json::json!({"language": "python", "code": "import time\ntime.sleep(120)"})
+            serde_json::json!({"name":"local_run_code","arguments":{"language": "python", "code": "import time\ntime.sleep(120)"}})
                 .to_string();
         let sse = format!(
-            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"local_run_code\",\"arguments\":{}}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"tool_invoke\",\"arguments\":{}}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
             serde_json::json!(args)
         );
         let (endpoint, server, mut hits) = fake_model_server(true, StreamStage::Complete(sse));
@@ -3904,6 +3675,11 @@ mod tests {
             let conversation = state.database().unwrap().create_conversation().unwrap();
             let request = fixture_request(ChildPolicy::ReadsOnly, &conversation.id);
             let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
+            fixture_run(
+                &state.database().unwrap(),
+                &child_run_id,
+                &request.conversation_id,
+            );
             let flag = state.subagents.register(&child_run_id);
             let cancel = ChildCancel::new(
                 flag,
@@ -3966,10 +3742,10 @@ mod tests {
             return;
         }
         let args =
-            serde_json::json!({"language": "python", "code": "import time\ntime.sleep(120)"})
+            serde_json::json!({"name":"local_run_code","arguments":{"language": "python", "code": "import time\ntime.sleep(120)"}})
                 .to_string();
         let sse = format!(
-            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"local_run_code\",\"arguments\":{}}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"tool_invoke\",\"arguments\":{}}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
             serde_json::json!(args)
         );
         let (endpoint, server, mut hits) = fake_model_server(true, StreamStage::Complete(sse));

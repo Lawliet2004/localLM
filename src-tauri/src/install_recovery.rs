@@ -56,11 +56,18 @@ pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
         let staging = directory
             .open_dir(&name)
             .map_err(|error| error.to_string())?;
-        let assets = crate::runtime_archive::catalog()?;
+        let staged_entries = entries(&staging)?;
+        let assets: Vec<_> = crate::runtime_catalog::packages()?
+            .into_iter()
+            .flat_map(|package| package.assets)
+            .collect();
+        let prism_archive = assets.iter().any(|asset| {
+            asset.files.is_empty() && staged_entries.iter().any(|name| name == &asset.name)
+        });
         let mut files = Vec::new();
         let mut has_bundle = false;
         // Validate the entire small layout before removing anything; never recurse through links.
-        for entry in entries(&staging)? {
+        for entry in staged_entries {
             if entry == "bundle" {
                 let metadata = staging
                     .symlink_metadata(&entry)
@@ -77,6 +84,7 @@ pub fn clean(root: &Path, runtime: bool) -> Result<usize, String> {
                             .iter()
                             .flat_map(|asset| &asset.files)
                             .any(|expected| expected.name == file)
+                            && !(prism_archive && crate::runtime_archive::safe_leaf(&file))
                             && file != "verified-files.json"
                     {
                         return Err("Unexpected runtime staging content; files retained.".into());

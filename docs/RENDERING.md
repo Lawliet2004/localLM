@@ -173,9 +173,12 @@ mounting until first inspection, then retain state across closing and reopening.
   delivery avoids rewriting the message array and parsing/serializing tool JSON.
   Lifecycle metadata still updates immediately. Completed messages and persisted
   journals remain authoritative; transient buffers are cleared at turn cleanup.
-- `ActivityTimeline` keeps one reasoning disclosure per turn; expansion
-  state survives streaming and live→persisted replays; durations display
-  only from recorded event data.
+- `ActivityTimeline` interleaves one reasoning disclosure per recorded model
+  round with commentary and tool calls. Exact-prefix matching preserves older
+  or incomplete journals without duplicating reasoning; a live trailing round
+  keeps its disclosure identity when its journal arrives. Durations display
+  only from matching recorded event data. Completed-round reasoning is journaled
+  before backend planning/finalization exits and tool validation.
 - WeakMap caches reuse parsed immutable tool records and normalized replay rows.
   Matching uses run identity or call timestamp intervals to keep reused provider
   call IDs from crossing runs; duplicate journal delivery keeps row order.
@@ -292,3 +295,20 @@ detector again returned `[]`. Screenshots and native interaction approval remain
 unavailable. Exact measurements, test failures and build outcomes are recorded
 separately in the implementation report; earlier pinned source references remain
 evidence for their initial-pass scope.
+
+## Round chronology — 25 October 2026
+
+Reasoning, intermediate commentary and tool groups follow journal sequence,
+including duplicate or out-of-order delivery. Mixed exploration summarizes
+searches and distinct files; commands and attention states remain separate.
+Partial journals retain unmatched tool messages instead of hiding them. Working
+commentary is borderless and exposed reasoning uses upright text. The existing
+status shimmer remains the live-activity indicator. No localhost preview was
+used; screenshot fidelity and native interaction remain unverified.
+
+The current surface specification is `ACTIVITY_DESIGN.md`. Run/step/call identity
+now owns tool positioning; unjournaled tools use recorded timestamps. The shared
+`src/lib/toolResult.ts` adapter reads native mutation arrays and restores owned
+artifact results for file summaries. `verification_status` events distinguish
+running checks from completed test evidence. Verification and remaining native
+acceptance limits are recorded in `AGENT_LOOP_RELIABILITY_2026-10-25.md`.

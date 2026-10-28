@@ -1,5 +1,5 @@
 pub mod agent_run;
-mod api_tools;
+mod agent_engine;
 pub mod approval;
 mod arex;
 pub mod artifacts;
@@ -15,15 +15,11 @@ mod computer_use;
 mod connectors;
 mod context;
 pub mod continuation;
-mod database_rehearsal;
-mod database_tools;
 pub mod daytona;
 pub mod daytona_cleanup;
 pub mod daytona_execution;
 pub mod daytona_journal;
 mod daytona_settings;
-mod debug_tools;
-mod development_credentials;
 mod development_tools;
 mod document_index;
 pub mod download;
@@ -41,7 +37,6 @@ pub mod harness;
 mod history;
 mod hooks;
 mod http_client;
-mod impact_tools;
 mod inference;
 mod inference_retry;
 mod inspector_browser;
@@ -62,8 +57,6 @@ mod model_catalog;
 mod model_install;
 mod model_library;
 mod oauth;
-mod openapi_tools;
-mod performance_tools;
 mod permission_rules;
 mod permissions;
 pub mod plans;
@@ -72,19 +65,15 @@ mod presentation;
 mod presentation_store;
 mod presets;
 mod process_tools;
-mod profile_tools;
 mod prompt;
 mod provider_capabilities;
 mod providers;
-mod ptc;
-#[cfg(test)]
-mod ptc_contract_regressions;
-mod remote_database;
 mod research_tasks;
 mod responses_adapter;
-mod rolling_window;
 mod runtime;
 pub mod runtime_archive;
+mod runtime_catalog;
+mod bonsai;
 mod runtime_config;
 pub mod runtime_install;
 mod runtime_install_commands;
@@ -92,7 +81,6 @@ mod runtime_inventory;
 mod runtime_log;
 pub mod sandbox;
 mod semantic_edits;
-mod semantic_impact;
 pub mod session_tools;
 pub mod sessions;
 pub mod skills;
@@ -106,8 +94,12 @@ pub mod system_tools;
 pub mod tasks;
 pub mod taste;
 mod terminal_ui;
-#[cfg(test)]
+#[cfg(any(test, feature = "harness-eval"))]
 mod test_support;
+#[cfg(feature = "harness-eval")]
+mod harness_eval;
+#[cfg(feature = "harness-eval")]
+pub use harness_eval::run as run_harness_eval;
 mod tool_calls;
 pub mod tool_compat;
 #[cfg(test)]
@@ -118,12 +110,12 @@ pub mod tool_spec;
 mod tool_validation;
 mod vault;
 mod verification_observer;
-mod verification_tools;
 pub mod weather;
 pub mod web_search;
 mod workspace;
 mod workspace_preview;
 mod workspace_ui;
+mod workspace_open;
 
 use std::sync::Mutex;
 use tauri::Manager;
@@ -261,11 +253,8 @@ pub struct AppState {
     oauth_operation: tokio::sync::Mutex<()>,
     oauth_cancel: tokio::sync::watch::Sender<bool>,
     pub subagents: std::sync::Arc<subagents::SubagentRegistry>,
-    pub terminals: tokio::sync::Mutex<sandbox::TerminalRegistry>,
     pub processes: process_tools::ProcessRegistry,
     pub previews: workspace_preview::Manager,
-    pub debuggers: debug_tools::Manager,
-    pub http_sessions: api_tools::Manager,
     pub verification_observers: verification_observer::Registry,
     pub language_servers: lsp_client::Manager,
     /// Interactive PTY shells for the inspector terminal panel.
@@ -416,11 +405,8 @@ pub fn run() {
                 oauth_operation: tokio::sync::Mutex::new(()),
                 oauth_cancel: tokio::sync::watch::channel(false).0,
                 subagents: subagents::global_registry(),
-                terminals: tokio::sync::Mutex::new(sandbox::TerminalRegistry::new()),
-                processes: process_tools::ProcessRegistry::default(),
+                processes: process_tools::ProcessRegistry::persistent(data.join("locallm.sqlite")),
                 previews: workspace_preview::Manager::default(),
-                debuggers: debug_tools::Manager::default(),
-                http_sessions: api_tools::Manager::default(),
                 verification_observers: verification_observer::Registry::default(),
                 language_servers: lsp_client::Manager::default(),
                 pty_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -482,19 +468,6 @@ pub fn run() {
             managed_storage::managed_storage_info,
             managed_storage::move_managed_storage,
             execution::get_execution_config,
-            profile_tools::get_profile_config,
-            profile_tools::save_profile_config,
-            remote_database::list_database_profiles,
-            remote_database::save_database_profile,
-            remote_database::delete_database_profile,
-            remote_database::test_database_profile,
-            development_credentials::list_http_credentials,
-            development_credentials::save_http_credential,
-            development_credentials::delete_http_credential,
-            development_credentials::get_reference_origins,
-            development_credentials::save_reference_origins,
-            debug_tools::get_debugger_policy,
-            debug_tools::save_debugger_policy,
             lsp_tools::get_lsp_config,
             lsp_tools::save_lsp_config,
             lsp_tools::test_lsp_server,
@@ -518,7 +491,7 @@ pub fn run() {
             execution::save_execution_config,
             execution::detect_interpreters,
             execution::test_interpreter,
-            api_tools::open_workspace_path,
+            workspace_open::open_workspace_path,
             workspace::get_workspace,
             workspace::set_workspace,
             workspace_ui::set_task_workspace,
@@ -636,6 +609,9 @@ pub fn run() {
             model_library::delete_installed_model,
             model_library::use_installed_model,
             gguf::read_model_metadata,
+            runtime_catalog::prism_runtime_choices,
+            bonsai::install_bonsai,
+            bonsai::cancel_bonsai_install,
             runtime_install_commands::runtime_download_info,
             runtime_inventory::list_installed_runtimes,
             runtime_inventory::delete_installed_runtime,
@@ -705,8 +681,6 @@ pub fn run() {
                 tauri::async_runtime::block_on(async {
                     state.automation.stop_all().await;
                     let _ = state.runtime.lock().await.stop().await;
-                    state.terminals.lock().await.close_all().await;
-                    state.debuggers.stop_all().await;
                     state.language_servers.shutdown().await;
                     state.connectors.lock().await.disconnect_all().await;
                 });

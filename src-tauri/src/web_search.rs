@@ -113,7 +113,7 @@ pub async fn run_worker(
 
 async fn run_worker_with_settings(
     state: &AppState,
-    snapshot: Option<&BackendSnapshot>,
+    _snapshot: Option<&BackendSnapshot>,
     mut input: Value,
     probe: Option<WebSearchSettings>,
     progress: Option<ProgressSink>,
@@ -229,39 +229,6 @@ async fn run_worker_with_settings(
         input["config"]["googleApiKey"] = json!(key);
         input["config"]["googleCxId"] = json!(settings.google_cx_id);
         input["config"]["searchFallback"]["enabled"] = json!(settings.search_fallback_enabled);
-    }
-    if let Some(model) = snapshot.filter(|s| s.kind == "local") {
-        let mut base = model.endpoint.trim_end_matches('/').to_string();
-        if base.ends_with("/chat/completions") {
-            base.truncate(base.len() - "/chat/completions".len());
-        }
-        if !base.ends_with("/v1") {
-            base.push_str("/v1");
-        }
-        input["localModel"] =
-            json!({"baseUrl":base,"modelName":model.model_id,"apiKey":model.key,"timeoutMs":45000});
-        let budget = model.context_length.saturating_sub(1400).min(6000);
-        if budget < 1000 {
-            return Err("Configure at least 2400 context tokens for research.".into());
-        }
-        input["localModel"]["maxInputTokens"] = json!(budget);
-        let configured = input["config"]["context"]
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        let total = configured
-            .get("totalInputBudget")
-            .and_then(Value::as_u64)
-            .unwrap_or(6000)
-            .min(budget as u64);
-        let evidence = configured
-            .get("evidenceTokenBudget")
-            .and_then(Value::as_u64)
-            .unwrap_or(2500)
-            .min(total.saturating_sub(1000));
-        input["config"]["context"] = Value::Object(configured);
-        input["config"]["context"]["totalInputBudget"] = json!(total);
-        input["config"]["context"]["evidenceTokenBudget"] = json!(evidence);
     }
     let mut command = tokio::process::Command::new(&execution.node_path);
     command
@@ -650,6 +617,8 @@ mod tests {
         assert_eq!(stored["documentId"], "doc-1");
         let found = run_worker(&state, None, json!({"action":"find","sessionId":"fetch-conv","documentId":"doc-1","term":"needle-term"})).await.unwrap();
         assert_eq!(found["id"], "doc-1");
+        assert_eq!(found["sessionId"], stored["sessionId"]);
+        assert_eq!(found["documentId"], stored["documentId"]);
         let passages = found["passages"].as_array().unwrap();
         assert!(
             passages
@@ -664,6 +633,8 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(opened["sessionId"], stored["sessionId"]);
+        assert_eq!(opened["documentId"], stored["documentId"]);
         assert!(
             opened["passages"]
                 .as_array()

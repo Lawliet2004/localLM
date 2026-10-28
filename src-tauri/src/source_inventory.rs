@@ -1,5 +1,4 @@
-//! Bounded source/build-input inventory shared by impact and verification.
-use crate::development_tools as dev;
+//! Bounded source/build-input inventory for optional check interpretation.
 use serde_json::{json, Value};
 pub fn relevant(path: &str) -> bool {
     if path.split('/').any(|p| {
@@ -74,37 +73,6 @@ pub fn inventory(root: &str) -> Result<Value, String> {
     paths.dedup();
     Ok(json!({"paths":paths,"warnings":warnings,"complete":warnings.is_empty()}))
 }
-pub fn snapshot(root: &str, paths: &[Value], allow_absent: bool) -> Result<Value, String> {
-    let workspace = crate::workspace::Workspace::open(root)?;
-    let mut files = serde_json::Map::new();
-    let mut warnings = Vec::new();
-    let mut bytes = 0usize;
-    for p in paths.iter().take(4096) {
-        let p = p.as_str().ok_or("Source path must be text.")?;
-        match workspace.language_optional_source(p) {
-            Ok(Some(text)) => {
-                bytes += text.len();
-                if bytes > 64 * 1024 * 1024 {
-                    warnings.push(json!({"path":p,"reason":"aggregate_byte_limit"}));
-                    break;
-                }
-                files.insert(p.into(), json!(dev::hash(text.as_bytes())));
-            }
-            Ok(None) if allow_absent => {
-                files.insert(p.into(), Value::Null);
-            }
-            Ok(None) => warnings.push(json!({"path":p,"reason":"missing"})),
-            Err(_) => warnings.push(json!({"path":p,"reason":"unreadable_or_excluded"})),
-        }
-    }
-    if paths.len() > 4096 {
-        warnings.push(json!({"reason":"file_limit"}));
-    }
-    Ok(
-        json!({"sha256":dev::hash(serde_json::to_vec(&files).map_err(|e|e.to_string())?.as_slice()),"files":files,"warnings":warnings,"complete":warnings.is_empty(),"scope":"selected_build_inputs"}),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,13 +87,6 @@ mod tests {
         let inventory = inventory(t.path().to_str().unwrap()).unwrap();
         assert_eq!(inventory["complete"], true, "{inventory}");
         assert_eq!(inventory["paths"], json!(["Cargo.toml", "src/main.rs"]));
-        let snapshot = snapshot(
-            t.path().to_str().unwrap(),
-            inventory["paths"].as_array().unwrap(),
-            false,
-        )
-        .unwrap();
-        assert_eq!(snapshot["complete"], true);
-        assert_eq!(snapshot["files"].as_object().unwrap().len(), 2);
+
     }
 }

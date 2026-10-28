@@ -717,7 +717,7 @@ mod tests {
         let (hub, id, log) = fixture(dir.path(), "normal").await;
         *state.connectors.lock().await = hub;
         let conversation = state.database().unwrap().create_conversation().unwrap().id;
-        let mut plan = crate::chat::assemble_turn(
+        let plan = crate::chat::assemble_turn(
             &state,
             &conversation,
             "Read selected MCP resources",
@@ -737,7 +737,7 @@ mod tests {
             .clone();
         assert!(crate::tool_discovery::visible(
             &plan.tool_definitions,
-            &stale_alias
+            crate::tool_discovery::INVOKE
         ));
         let narrow = crate::chat::assemble_turn(
             &state,
@@ -782,8 +782,6 @@ mod tests {
                 .find(|tool| tool.alias == stale_alias)
                 .unwrap()
         ));
-        plan.tools
-            .push(crate::connectors::AgentTool::harness("ptc_run").unwrap());
         let snapshot = crate::test_support::snapshot(&state, dir.path(), &[]);
         let emit: crate::subagents::ChildEmit = Arc::new(|_, _| {});
         let ctx = crate::harness::HarnessCtx {
@@ -799,20 +797,10 @@ mod tests {
             emit,
         };
         let before = count(&log, "resources/list");
-        let denied = crate::harness::execute(
-            &ctx,
-            "ptc_run",
-            json!({"plan":{"body":[{"call":{"tool":stale_alias,"args":{}}}]}}),
-        )
-        .await
-        .unwrap();
-        let denied =
-            crate::tool_envelope::normalize(denied.value, crate::tool_envelope::Family::Harness);
-        assert!(crate::tool_envelope::failed(&denied));
-        assert!(
-            denied.to_string().contains("mcp_resources_prompts"),
-            "{denied}"
-        );
+        let (target, _) = crate::tool_discovery::resolve(ctx.inherit_tools.iter(), crate::tool_discovery::INVOKE,
+            json!({"name":stale_alias,"arguments":{}})).unwrap();
+        let denial = crate::capabilities::ToolPolicy::guard(state.database()).denial_for_tool(target).unwrap();
+        assert!(denial.contains("mcp_resources_prompts"), "{denial}");
         assert_eq!(
             count(&log, "resources/list"),
             before,

@@ -22,6 +22,7 @@ pub fn reserve_native_read_round(
 pub fn saved_native_message(message: &Value) -> Option<Value> {
     if message.get("locallm_responses_output").is_some()
         || message.get("locallm_claude_content").is_some()
+        || message.get("reasoning_content").is_some()
     {
         Some(json!({"kind":NATIVE_MESSAGE,"message":message}))
     } else {

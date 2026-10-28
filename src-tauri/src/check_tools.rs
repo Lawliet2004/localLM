@@ -866,6 +866,7 @@ pub(crate) async fn execute_observed(
             if let Some(timeout) = args.timeout_seconds {
                 start["timeout_seconds"] = json!(timeout);
             }
+            if let Some(notice) = crate::process_tools::start_limit_notice(&config, &start) { return Ok(notice); }
             let started = registry
                 .start_observed(owner, workspace, config, start, completion)
                 .await?;
@@ -883,6 +884,12 @@ pub(crate) async fn execute_observed(
         }
         "check_report" => {
             let args: ReportArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if args.id.starts_with("dev_") {
+                return Ok(crate::tool_envelope::failure_notice(
+                    "wrong-id-type", "id requires a processId (proc-…) returned by check_run or verification_run. An evidenceId from verification_run belongs in verification_report({evidence_id: evidenceId}). A reportId belongs in verification_compare. No check was rerun.",
+                    false, crate::tool_envelope::SIDE_NONE, &json!({"field":"/id"}),
+                ));
+            }
             let wait = args.wait_ms.unwrap_or(0);
             if wait > 1000 {
                 return Err("Report wait_ms must be0–1000.".into());
@@ -927,6 +934,15 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn evidence_id_is_not_a_process_and_inspection_never_launches_a_command() {
+        let registry = crate::process_tools::ProcessRegistry::default();
+        let result = execute(&registry, "owner", "/fixture", Default::default(), "check_report", json!({"id":"dev_evidence"})).await.unwrap();
+        assert_eq!(result["error"]["code"], "wrong-id-type");
+        assert_eq!(result["error"]["sideEffects"], "none");
+        assert!(!registry.has_owned("owner", "/fixture").unwrap());
+    }
     fn snapshot(stdout: &str, stderr: &str, exit: Option<i32>, state: &str) -> Value {
         json!({"id":"fixture-process","state":state,"exitCode":exit,"error":null,"output":[{"cursor":0,"stream":"stdout","text":stdout},{"cursor":1,"stream":"stderr","text":stderr}],"hasMore":false,"truncated":false,"firstAvailableCursor":0,"nextCursor":2,"sideEffects":"possible"})
     }

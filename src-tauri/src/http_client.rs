@@ -123,10 +123,11 @@ pub fn builder(policy: Policy) -> reqwest::ClientBuilder {
 /// carrying an API key to another host, and the timeout is generous because
 /// a long generation is a normal outcome.
 pub fn model_provider() -> Result<reqwest::Client, String> {
-    client(
-        Policy::no_redirects(Duration::from_secs(180)),
-        "Could not create the provider HTTP client.",
-    )
+    let mut policy = Policy::no_redirects(Duration::from_secs(180));
+    // The loop owns header and idle deadlines. A total request timeout also
+    // kills a healthy stream while the provider is still producing tokens.
+    policy.timeout = None;
+    client(policy, "Could not create the provider HTTP client.")
 }
 
 /// The client used for a local model server.
@@ -134,10 +135,9 @@ pub fn model_provider() -> Result<reqwest::Client, String> {
 /// The proxy configuration is bypassed: a local endpoint must be reached
 /// directly.
 pub fn local_model() -> Result<reqwest::Client, String> {
-    client(
-        Policy::no_redirects(Duration::from_secs(600)).no_proxy(),
-        "Could not create the local model HTTP client.",
-    )
+    let mut policy = Policy::no_redirects(Duration::from_secs(600)).no_proxy();
+    policy.timeout = None;
+    client(policy, "Could not create the local model HTTP client.")
 }
 
 #[cfg(test)]

@@ -946,6 +946,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::test_support::app_state(dir.path());
         let conversation = state.database().unwrap().create_conversation().unwrap().id;
+        for id in ["child-foreground","child-background"] {let now=crate::store::now();state.database().unwrap().save_run(&crate::agent_run::RunRecord {id:id.into(),conversation_id:conversation.clone(),status:crate::agent_run::RunState::Preparing,model_provider:None,model_id:None,checkpoint:None,error:None,created_at:now,updated_at:now,outcome:None}).unwrap();}
+
         let snapshot = crate::test_support::snapshot(&state, dir.path(), &[]);
         let backend = backend(OPENAI_RESPONSES, ToolSupport::Supported, Some(supported()));
         let request = child_request(
@@ -1004,6 +1006,8 @@ mod tests {
                     let dir = tempfile::tempdir().unwrap();
                     let state = crate::test_support::app_state(dir.path());
                     let conversation = state.database().unwrap().create_conversation().unwrap().id;
+        for id in ["child-foreground","child-background"] {let now=crate::store::now();state.database().unwrap().save_run(&crate::agent_run::RunRecord {id:id.into(),conversation_id:conversation.clone(),status:crate::agent_run::RunState::Preparing,model_provider:None,model_id:None,checkpoint:None,error:None,created_at:now,updated_at:now,outcome:None}).unwrap();}
+
                     let snapshot = crate::test_support::snapshot(&state, dir.path(), &[]);
                     let answer = if valid {
                         r#"{"result":"ok"}"#

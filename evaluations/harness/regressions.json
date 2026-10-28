@@ -1,0 +1,206 @@
+{
+  "schemaVersion": 1,
+  "provenance": "Sanitized failure patterns reconstructed from the read-only DeepSeek run audit. No conversation bodies, credentials, private source documents or user workspace files are copied into these fixtures.",
+  "cases": [
+    {
+      "id": "productive-long-run",
+      "observed": "Two saved runs stopped at the fixed 64-round ceiling while work remained.",
+      "fixture": "67 distinct scoped file writes followed by a final response",
+      "test": "chat::finish_tests::productive_foreground_turn_commits_more_than_sixty_four_tool_rounds",
+      "expected": "68 provider requests, all writes committed, completed outcome"
+    },
+    {
+      "id": "active-stream-deadline",
+      "observed": "A saved run failed with a provider timeout after 40 completed rounds.",
+      "fixture": "Five active stream frames separated by 60 seconds of controlled Tokio time",
+      "test": "agent_engine::tests::active_stream_outlives_three_minutes_and_preserves_native_reasoning",
+      "expected": "No total-duration expiration while stream activity continues"
+    },
+    {
+      "id": "recursive-artifact-pages",
+      "observed": "Artifact pagination repeatedly created wrapped artifact pages.",
+      "fixture": "Unicode original artifact paged through normalization and result bounding at several budgets",
+      "test": "artifacts::tests::normalized_pages_recover_every_character_without_creating_artifacts",
+      "expected": "Original identity retained, valid advancing cursor, no child artifacts, exact recovered contents"
+    },
+    {
+      "id": "write-then-truncated-stream",
+      "fixture": "Commit a write; receive an unfinished response; recover with native reasoning replay",
+      "test": "chat::output_recovery_tests::truncated_round_after_write_retries_only_the_provider_and_replays_native_reasoning",
+      "expected": "Exactly one tool audit and one write; unfinished batch not dispatched"
+    },
+    {
+      "id": "redundant-verification",
+      "observed": "Verification policy required redundant execution and changes to test report formatting.",
+      "fixture": "Scoped write followed by a valid final answer",
+      "test": "chat::finish_tests::finishing_after_a_write_does_not_force_redundant_verification",
+      "expected": "No forced check_run rerun or report-format rewrite; commentary journal and final answer stored separately"
+    },
+    {
+      "id": "unexplained-interruption",
+      "observed": "Three cancelled saved runs had no terminal event identifying their cause.",
+      "fixture": "User cancellation during dispatched tools and startup recovery of an active run",
+      "tests": [
+        "chat::read_group_tests::real_turn_cancel_settles_every_dispatched_member",
+        "store::tests::explicit_startup_recovery_marks_abandoned_work_as_interrupted"
+      ],
+      "expected": "Typed terminal cause, resumability and checkpoint identity; uncertain actions never claimed successful"
+    },
+    {
+      "id": "child-parity",
+      "fixture": "Foreground and detached children each run one native command, encounter a truncated provider response, then finish",
+      "test": "subagents::tests::child_hosts_share_recovery_reasoning_durable_commands_and_final_answer_semantics",
+      "expected": "Native reasoning retained, command not repeated, result owned by the conversation, final answer excludes commentary"
+    },
+    {
+      "id": "durable-process",
+      "fixture": "Restore persisted completed and in-flight command records in a fresh registry",
+      "test": "process_tools::tests::restart_does_not_claim_an_inflight_command_succeeded_or_relaunch_it",
+      "expected": "Completed evidence readable; in-flight process becomes unknown without automatic relaunch"
+    },
+    {
+      "id": "long-command",
+      "fixture": "Real 61-second command, explicit 120-second command allowance, one event-driven completion wait",
+      "test": "process_tools::tests::command_outlives_the_former_default_and_waits_without_model_polling",
+      "expected": "Successful terminal output without extra model generations"
+    },
+    {
+      "id": "small-catalog",
+      "observed": "Saved conversations advertised 64 tools and approximately 48 KB of schemas.",
+      "fixture": "Actual preset catalogs and authorized specialist discovery",
+      "tests": [
+        "tool_discovery::catalog_tests::original_catalog_and_wrapper_boundaries_are_preserved",
+        "tool_discovery::catalog_tests::standard_web_reader_remains_advertised_with_search"
+      ],
+      "expected": "At most 20 advertised tools, no alphabetical filler, usable paired search/reader, original dispatch permissions retained"
+    },
+    {
+      "id": "web-handles-and-complete-passages",
+      "observed": "Live trials lost saved page references and stopped in the middle of a long code sample.",
+      "fixture": "Bounded normalized fetch/find results plus exact Unicode document/PDF windows recreated from serialized storage",
+      "tests": [
+        "artifacts::tests::bounded_web_pages_keep_document_handles_and_capture_canonical_content_once",
+        "artifacts::tests::bounded_web_matches_preserve_text_and_advance_only_past_visible_unicode",
+        "src/web/extraction/document_reading.test.ts: recovers long code paragraphs and PDF pages exactly through restart-safe cursors"
+      ],
+      "expected": "Exact document handles retained; visible passage cursors advance only over displayed text; long paragraphs remain fully retrievable"
+    },
+    {
+      "id": "committed-edit-hashes",
+      "observed": "Live trials reused an artifact checksum after a bounded edit omitted the updated file checksum.",
+      "fixture": "Two large scoped transactions with the second using the bounded first result as its expected file hash",
+      "test": "artifacts::tests::bounded_committed_patch_keeps_the_file_hash_for_the_next_transaction",
+      "expected": "Correct file hash retained independently of artifact checksum; next edit commits"
+    },
+    {
+      "id": "child-output-cutoff",
+      "fixture": "Both inline and detached children commit one command, receive a truncated JSON tool batch at the output limit, recover a disconnected stream, then finish",
+      "test": "subagents::tests::child_hosts_share_recovery_reasoning_durable_commands_and_final_answer_semantics",
+      "expected": "No truncated call dispatch/replay; bounded recovery; prior command executed once; denials do not become completed runs"
+    },
+    {
+      "id": "repetition-not-completion",
+      "fixture": "Provider emits repeated long paragraphs before its terminal marker is consumed",
+      "test": "chat::output_recovery_tests::repeated_output_is_a_resumable_blocker_and_never_a_completed_answer",
+      "expected": "Paused run with blocked outcome, saved partial output and resumable checkpoint"
+    },
+    {
+      "id": "child-resume-after-restart",
+      "fixture": "Both child hosts commit a command, stop at an explicit budget, reopen the database and resume through the production subagent dispatcher; reconstruct an interrupted multi-call batch separately",
+      "tests": [
+        "subagents::tests::child_checkpoint_resumes_after_restart_without_repeating_a_committed_command",
+        "subagents::tests::child_recovery_distinguishes_undispatched_siblings_from_uncertain_actions"
+      ],
+      "expected": "Native exchange replayed once; no completed command rerun; original catalog pinned and permissions narrowed; unstarted siblings marked undispatched; uncertain actions refuse automatic resumption"
+    },
+    {
+      "id": "transient-stream-error-frame",
+      "fixture": "Recognized overload/server error SSE frames after a completed write or child command; permanent quota and permission frames",
+      "tests": [
+        "agent_engine::tests::transient_stream_errors_recover_without_leaking_provider_secrets",
+        "chat::output_recovery_tests::truncated_round_after_write_retries_only_the_provider_and_replays_native_reasoning",
+        "subagents::tests::child_hosts_share_recovery_reasoning_durable_commands_and_final_answer_semantics"
+      ],
+      "expected": "Bounded retry without completed-tool replay or raw secret echo; permanent errors remain failures"
+    },
+    {
+      "id": "url-cursor-not-initial-extract",
+      "observed": "A URL cursor repeated the beginning; initial bounded results omitted the document cursor and encouraged artifact-byte offsets that skipped source text.",
+      "fixture": "Shipped worker cache seeded with Unicode at the extraction boundary, then initial and saved-handle reads normalized, artifact-bounded and persisted through the production dispatcher.",
+      "test": "harness::tests::url_reads_honor_text_cursors_and_keep_saved_document_identity",
+      "expected": "Both aliases expose exact text cursors; following every normalized bounded cursor reconstructs the complete document exactly once and preserves original document/artifact identity."
+    },
+    {
+      "id": "shared-stream-content",
+      "fixture": "Common ModelRound consumption of native provider completion, split reasoning markers, tool deltas, trailing usage and a partial literal marker; both child hosts and foreground exercise the same boundary.",
+      "tests": [
+        "agent_engine::tests::round_content_separates_reasoning_and_flushes_split_markers_before_acceptance",
+        "subagents::tests::child_hosts_share_recovery_reasoning_durable_commands_and_final_answer_semantics"
+      ],
+      "expected": "Reasoning stays separate from visible text, native state survives and no incomplete batch dispatches."
+    },
+    {
+      "id": "legacy-research-budget-is-metadata",
+      "fixture": "Deserialize a historical one-round ledger, record 70 productive operations.",
+      "test": "research_tasks::tests::legacy_budget_metadata_does_not_stop_a_new_general_purpose_task",
+      "expected": "Historical budget JSON retained; no independent research stop counter or imposed plan/search/verify checklist."
+    },
+    {
+      "id": "runtime-template-compatibility",
+      "fixture": "An arbitrary-named GGUF with the known unsupported filter, an authenticated render-only server and the installed Gemma/runtime launch.",
+      "tests": [
+        "runtime::tests::template_override_is_scoped_and_render_failure_never_reports_ready",
+        "runtime::tests::installed_runtime_renders_model_tool_template"
+      ],
+      "expected": "Content-based equivalent rewrite in a scoped temporary file; original GGUF unchanged; tool-schema and tool-result rendering validated without inference; rendering failure never reports ready."
+    },
+    {
+      "id": "early-denial-terminal-attribution",
+      "fixture": "Persisted path denial and a capability switched off after catalog assembly, each followed by repeated calls, an unrelated successful action and final text.",
+      "tests": [
+        "chat::output_recovery_tests::early_permission_denials_survive_unrelated_success_and_final_text",
+        "chat::output_recovery_tests::repeated_identical_invalid_tool_calls_stop_without_creating_a_file",
+        "agent_engine::tests::uncertain_action_remains_unknown_after_later_success_or_denial"
+      ],
+      "expected": "Permission-denied outcome survives; unrelated tools remain available; an undispatched repeat has no new side effects; failure-side uncertainty remains sticky without classifying successful reads as unknown."
+    },
+    {
+      "id": "observed-nonzero-exit-is-known",
+      "observed": "A completed nonzero command followed by repair caused outcome_unknown despite an observed exit and retained output.",
+      "fixture": "Real exit-7 commands and subsequent successful repairs through the process supervisor, persisted restart, foreground chat and both child hosts.",
+      "tests": [
+        "process_tools::tests::observed_nonzero_exit_stays_known_through_normalization_and_restart",
+        "chat::output_recovery_tests::observed_process_failure_can_be_repaired_without_an_uncertain_run",
+        "subagents::tests::both_child_hosts_can_repair_an_observed_process_failure",
+        "tool_envelope::tests::normalize_converts_legacy_execution_shape"
+      ],
+      "expected": "Known failures retain nonzero status and applied effects without poisoning the run; bounded successful output is partial; genuinely interrupted outcomes stay unknown."
+    },
+    {
+      "id": "workspace-preflight-is-not-an-uncertain-write",
+      "observed": "Missing-file reads and creation before a parent directory exists poisoned the run outcome and blocked a safe identical retry after repair.",
+      "fixture": "Real scoped reads and transactional create/edit operations, then six-round replay through foreground, inline child and detached child.",
+      "tests": [
+        "workspace::tests::model_file_aliases_share_transactions_and_safe_preflight_failures",
+        "subagents::tests::safe_file_failures_and_transactional_retries_match_across_all_hosts"
+      ],
+      "expected": "Known preflight failures have no new effects, successful retries commit through the existing writer, and actual uncertain transaction results stay explicit."
+    },
+    {
+      "id": "shared-identical-failure-streak",
+      "fixture": "Two actions, changing error objects, repeated identical errors and a successful action between failures.",
+      "test": "agent_engine::tests::failure_guard_is_local_to_the_action_and_identical_error",
+      "expected": "Only two identical failures block an action; success and changed errors reset its streak, with no global tool disable."
+    },
+    {
+      "id": "callable-host-driver",
+      "fixture": "Foreground, inline child and detached child use typed SessionHost round adapters through drive_session, including a productive 100-round host and controlled budget/blocker exits.",
+      "tests": [
+        "agent_engine::tests::shared_driver_respects_budget_and_returns_host_blockers_without_replaying_work",
+        "agent_engine::tests::productive_work_continues_beyond_the_old_round_ceiling",
+        "subagents::tests::safe_file_failures_and_transactional_retries_match_across_all_hosts"
+      ],
+      "expected": "One callable scheduler handles every host; explicit budget or blocker ends the driver without rerunning committed work. UI, storage and permissions remain host scoped."
+    }
+  ]
+}

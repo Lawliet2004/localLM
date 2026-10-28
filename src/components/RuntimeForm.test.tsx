@@ -26,6 +26,15 @@ describe('runtime settings', () => {
     api.readModelMetadata.mockImplementation(async (path: string) => path.includes('mmproj') ? { ...llama, fileBytes: 2 ** 30 } : llama);
     api.hardwareStatus.mockResolvedValue(hardware);
   });
+  it('saves the explicit MTP-off fallback for Bonsai without changing other model settings', async () => {
+    const onSave = vi.fn();
+    render(<RuntimeForm initial={{ ...defaultRuntimeConfig, contextLength: 8192 }} onSave={onSave} busy={false}
+      modelPath="/models/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf" />);
+    await userEvent.selectOptions(screen.getByLabelText('MTP'), 'off');
+    await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ mtpMode: 'off', contextLength: 8192 }));
+  });
+
   it('can disable vision without clearing its configured projector file', async () => {
     const onSave = vi.fn();
     render(<RuntimeForm initial={{ ...defaultRuntimeConfig, contextLength: 8192 }} onSave={onSave} busy={false}

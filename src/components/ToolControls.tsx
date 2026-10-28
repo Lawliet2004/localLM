@@ -337,8 +337,8 @@ export function ToolsSettings({ scopeLabel, onBack, selected, onChange, selected
           { id: 'chat', name: 'Chat', desc: 'Conversational assistant with minimal tool surface' },
           { id: 'research', name: 'Research', desc: 'Live search and fetch tools' },
           { id: 'coding', name: 'Coding', desc: 'Code editing, execution, and programmatic tools' },
-          { id: 'code', name: 'Code (PTC)', desc: 'Group approved tool calls in a bounded batch' },
-          { id: 'minimal', name: 'Minimal', desc: 'Persistent shell and file editing for benchmarking' },
+          { id: 'code', name: 'Code', desc: 'Coding capabilities with tools discovered as needed' },
+          { id: 'minimal', name: 'Minimal', desc: 'Supervised commands and file editing' },
           { id: 'creator', name: 'Creator', desc: 'Workflows, subagents, and runtime authoring tools' },
         ].map(p => (
           <label key={p.id} className="preference-row preference-radio">

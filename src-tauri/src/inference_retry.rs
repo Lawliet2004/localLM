@@ -1,6 +1,7 @@
 //! Bounded retries of inference HTTP responses, before any stream is handed
-//! to a consumer. Never retries transport failures or a partial 2xx stream;
-//! this module is not used by tool execution or provider discovery.
+//! to a consumer. Connection, request and timeout failures are retried only
+//! before accepting a response. Partial 2xx streams are recovered by the shared
+//! engine from committed history; tool execution is never replayed here.
 use chrono::{DateTime, Months, NaiveDateTime, TimeZone, Utc};
 use reqwest::{RequestBuilder, Response};
 use std::time::Duration;
@@ -252,10 +253,24 @@ pub(crate) async fn send(request: RequestBuilder) -> Result<Response, SendError>
         // the request cannot change endpoint/auth/body between attempts.
         trace.attempts += 1;
         trace.stop = Stop::Transport;
-        let mut response = pending.send().await.map_err(|error| SendError {
-            error,
-            trace: trace.clone(),
-        })?;
+        let mut response = match pending.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                // This is a model request before a response body exists. Tool
+                // execution is outside this retry boundary and is never replayed.
+                if (error.is_connect() || error.is_timeout() || error.is_request())
+                    && !error.is_builder() && trace.attempts < MAX_ATTEMPTS {
+                    if let Some(next) = template.as_ref().and_then(RequestBuilder::try_clone) {
+                        let wait = BASE_DELAY.saturating_mul(1 << (trace.attempts - 1));
+                        tokio::time::sleep(wait).await;
+                        trace.waited += wait;
+                        pending = next;
+                        continue;
+                    }
+                }
+                return Err(SendError { error, trace });
+            }
+        };
         // Some runtimes report permanent prompt/template/validation failures as
         // HTTP500, and quota exhaustion as429. Inspect a bounded error body and
         // retain it for the existing diagnostic boundary before deciding.
@@ -398,6 +413,7 @@ mod tests {
             .unwrap();
         match kind {
             "local" => Backend::Local {
+                    bonsai_profile: false,
                 client,
                 endpoint: url.into(),
                 key: "fixture-secret".into(),
@@ -657,7 +673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_success_stream_and_transport_failure_never_replay() {
+    async fn partial_success_stream_is_not_retried_but_pre_response_disconnect_recovers() {
         let mut reply = Reply::new(
             200,
             "Content-Type: text/event-stream\r\n",
@@ -685,17 +701,16 @@ mod tests {
             .await
             .is_err());
         task.await.unwrap();
-        let fixture = server(vec![Reply::new(503, "", "busy"), Reply::new(0, "", "")]).await;
-        let error = backend("openai", &fixture.url)
+        let fixture = server(vec![Reply::new(503, "", "busy"), Reply::new(0, "", ""), Reply::new(200, "", "done")]).await;
+        let response = backend("openai", &fixture.url)
             .stream(&json!({"stream":true}))
             .await
-            .unwrap_err();
+            .unwrap();
         assert_eq!(
             fixture.count(),
-            2,
-            "A transport failure after one HTTP retry must not cause another send"
+            3,
+            "A disconnected model request may retry without rerunning tools"
         );
-        assert!(error.contains("1 bounded pre-stream HTTP retry"), "{error}");
-        assert!(!error.contains("Retry-After exceeds"), "{error}");
+        assert_eq!(response.extensions().get::<RetryTrace>().unwrap().attempts, 3);
     }
 }

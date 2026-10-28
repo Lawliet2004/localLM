@@ -10,11 +10,11 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-pub const RESPONSE_STYLE: &str = "Write for a terminal log, not a document. Before a tool call, write at most one plain sentence saying what you are about to do, and none when the call is self-explanatory. Do not restate or summarize tool output; the user can see it. In intermediate updates use plain sentences only: no headings, bullets, bold, tables, or emoji. When the work is finished, lead the final message with the result, then add only the detail the user needs: what changed, and the checks you actually ran with their outcomes. State remaining work or failures plainly. Use short paragraphs and bold only key outcomes in the final message. Do not invent file edits, tests, timing, or successful execution: rely on recorded tool results. Follow the user's requested format when it differs.";
+pub const RESPONSE_STYLE: &str = "Answer the user's request in the format that best serves it. Keep progress updates brief and separate from the final answer. A self-explanatory tool call needs no narration. In the final answer, state the result, relevant evidence and unfinished work. Never invent edits, sources, tests, timing or successful execution. Follow explicit user instructions about format, detail and verification.";
 
 pub const CONTINUE_INSTRUCTION: &str = "Continue the interrupted response without repeating earlier text. The user request is unchanged and any offered tools remain available. If the task requires saved files, create or update them with workspace tools rather than pasting the program in chat. Keep writes small and build incrementally. Finish naturally when the task is complete; do not ask the user to say go again.";
 
-pub const WORKSPACE_GUIDANCE: &str = "When asked to create or update a file, perform the workspace tool calls in this turn. A promise or code pasted in chat does not save a file. Prefer small complete writes followed by patches; read back the result and perform relevant checks before claiming success. Use tool_search for deferred editing tools. If workspace_open_preview is offered, it can open a saved HTML project in a visible browser using Workspace and Local execution; Browser/Computer automation is separate. Do not ask for another go or confirmation when the user already requested the work and tool policy permits it.";
+pub const WORKSPACE_GUIDANCE: &str = "Save requested files with workspace tools; a promise or code pasted in chat does not create a file. Prefer a small valid file followed by incremental edits. Use tool_search when a needed tool is deferred. Choose verification that addresses the task and report only the checks actually performed. Continue work already authorized by the user within the available tool permissions.";
 
 /// Frozen when `local_run_code` is in the tool catalog. Short on purpose: small
 /// local models need a nudge to actually call the tool instead of guessing.
@@ -33,8 +33,10 @@ pub const GENUI_GUIDANCE: &str = include_str!("genui_prompt.txt");
 /// Injection kinds that ride on the current user draft. Anything pushed into
 /// `TurnPlan.injections` under a kind absent from this list is logged as a
 /// context_injection but silently never reaches the model.
+/// Capability provenance JSON is diagnostic data; offered schemas and actual
+/// tool results govern what the agent can do. Keep that JSON out of the draft.
 pub const VOLATILE_KINDS: [&str; 10] = [
-    "model_capabilities",
+    "workspace_root",
     "project_documents",
     "unavailable_tools",
     "disabled_sources",
@@ -52,7 +54,7 @@ pub fn frozen_system_for_project(
     system_prompt: &str,
     skill_instructions: &str,
     project_instructions: &str,
-    ptc_sdk: Option<&str>,
+    _legacy_sdk: Option<&str>,
     aliases: &[&str],
     generative_ui: bool,
 ) -> String {
@@ -89,13 +91,6 @@ pub fn frozen_system_for_project(
     if !guidance.is_empty() {
         parts.push(guidance.join("\n\n"));
     }
-    if let Some(sdk) = ptc_sdk.filter(|value| !value.is_empty()) {
-        parts.push(format!(
-            "Programmatic tool calling is ON. Submit a ptc_run 'plan' — a JSON program with let/call/if/for/parallel \
-             statements, {{\"$\":\"name\",\"path\":[...]}} references and bounded op transforms — or a flat 'steps' \
-             batch for independent calls. Every call is individually policy-checked, audited, and bounded.\n{sdk}"
-        ));
-    }
     parts.join("\n\n")
 }
 
@@ -104,7 +99,7 @@ pub fn frozen_system_for_project(
 pub fn frozen_system_with_guidance(
     system_prompt: &str,
     skill_instructions: &str,
-    ptc_sdk: Option<&str>,
+    _legacy_sdk: Option<&str>,
     tool_guidance: Option<&str>,
 ) -> String {
     let mut parts = vec![system_prompt.trim().to_string()];
@@ -118,13 +113,6 @@ pub fn frozen_system_with_guidance(
     if let Some(guidance) = tool_guidance.filter(|text| !text.is_empty()) {
         parts.push(guidance.to_string());
     }
-    if let Some(sdk) = ptc_sdk.filter(|value| !value.is_empty()) {
-        parts.push(format!(
-            "Programmatic tool calling is ON. Submit a ptc_run 'plan' — a JSON program with let/call/if/for/parallel \
-             statements, {{\"$\":\"name\",\"path\":[...]}} references and bounded op transforms — or a flat 'steps' \
-             batch for independent calls. Every call is individually policy-checked, audited, and bounded.\n{sdk}"
-        ));
-    }
     parts.join("\n\n")
 }
 
@@ -136,9 +124,9 @@ pub fn frozen_system_with_guidance(
 pub fn frozen_system(
     system_prompt: &str,
     skill_instructions: &str,
-    ptc_sdk: Option<&str>,
+    _legacy_sdk: Option<&str>,
 ) -> String {
-    frozen_system_for_project(system_prompt, skill_instructions, "", ptc_sdk, &[], false)
+    frozen_system_for_project(system_prompt, skill_instructions, "", _legacy_sdk, &[], false)
 }
 
 /// Called after availability, offline policy and model compatibility filtering.
@@ -150,7 +138,7 @@ pub fn frozen_system(
 pub fn frozen_system_for_tools(
     system_prompt: &str,
     skill_instructions: &str,
-    ptc_sdk: Option<&str>,
+    _legacy_sdk: Option<&str>,
     aliases: &[&str],
     generative_ui: bool,
 ) -> String {
@@ -158,7 +146,7 @@ pub fn frozen_system_for_tools(
         system_prompt,
         skill_instructions,
         "",
-        ptc_sdk,
+        _legacy_sdk,
         aliases,
         generative_ui,
     )
@@ -228,12 +216,9 @@ pub fn strip_volatile_prefix(messages: &mut [Value], volatile: Option<&str>) {
                 *content = String::new();
             }
         }
-        Some(Value::Array(parts)) => {
-            if parts.first().and_then(|part| part["text"].as_str())
-                == Some(format!("{text}\n").as_str())
-            {
+        Some(Value::Array(parts)) if parts.first().and_then(|part| part["text"].as_str())
+                == Some(format!("{text}\n").as_str()) => {
                 parts.remove(0);
-            }
         }
         _ => {}
     }
@@ -417,11 +402,11 @@ mod tests {
     }
 
     #[test]
-    fn response_style_and_ptc_sdk_are_frozen() {
+    fn response_style_is_frozen_without_retired_interpreter_instructions() {
         let sdk = "sdk_workspace_read_file()";
         let frozen = frozen_system("base", "", Some(sdk));
         assert!(frozen.contains(RESPONSE_STYLE));
-        assert!(frozen.contains(sdk));
+        assert!(!frozen.contains(sdk));
         let with_code =
             frozen_system_with_guidance("base", "", None, Some(CODE_EXECUTION_GUIDANCE));
         assert!(with_code.contains(CODE_EXECUTION_GUIDANCE));
@@ -470,7 +455,6 @@ mod tests {
         for required in [
             "base",
             "skill body",
-            "sdk body",
             RESPONSE_STYLE,
             CODE_EXECUTION_GUIDANCE,
             WEB_RESEARCH_GUIDANCE,

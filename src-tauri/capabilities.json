@@ -21,8 +21,8 @@
       "disabled": []
     },
     "code_ptc": {
-      "name": "Code (PTC)",
-      "description": "Programmatic Tool Calling via TypeScript SDK",
+      "name": "Code",
+      "description": "Coding capabilities with tools discovered as needed",
       "enabled": [
         "workspace_files",
         "local_execution",
@@ -34,9 +34,7 @@
         "git_tools",
         "lsp_tools"
       ],
-      "disabled": [
-        "workflows"
-      ]
+      "disabled": []
     },
     "minimal": {
       "name": "Minimal",
@@ -173,20 +171,16 @@
       }
     },
     {
-      "id": "workflows",
-      "kind": "Loop",
-      "version": 1,
-      "enabled": false,
-      "description": "Multi-stage fan-out workflow orchestration and Ralph loop.",
-      "config": {}
-    },
-    {
       "id": "mcp_resources_prompts",
       "kind": "Tool",
       "version": 1,
       "enabled": true,
       "description": "Bounded resources, URI templates and prompt retrieval from explicitly selected live MCP sources; retrieved content remains untrusted data.",
-      "config": { "maxCatalogEntries": 512, "maxCatalogBytes": 2097152, "maxResultBytes": 262144 }
+      "config": {
+        "maxCatalogEntries": 512,
+        "maxCatalogBytes": 2097152,
+        "maxResultBytes": 262144
+      }
     },
     {
       "id": "compaction",

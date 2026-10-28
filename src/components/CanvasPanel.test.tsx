@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { CanvasPanel } from './CanvasPanel';
 import type { CanvasArtifact } from '../lib/canvas';
@@ -18,6 +18,7 @@ describe('CanvasPanel', () => {
   it('renders an OpenUI artifact live and offers a Source view', async () => {
     render(<CanvasPanel artifact={openuiArtifact} versionCount={2} onVersion={vi.fn()} onClose={vi.fn()} />);
     expect(screen.getByRole('complementary')).toHaveAccessibleName('Canvas: Dashboard');
+    await act(async () => { await vi.dynamicImportSettled(); });
     expect(await screen.findByText('Total')).toBeInTheDocument();
     expect(screen.getByText('42')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Source' }));

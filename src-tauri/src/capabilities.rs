@@ -95,7 +95,6 @@ impl Registry {
                 }
                 "cloud_execution" => vec!["storage_sqlite".to_string()],
                 "subagents" => vec!["session_log".to_string(), "agent_loop".to_string()],
-                "workflows" => vec!["agent_loop".to_string(), "subagents".to_string()],
                 "compaction" => vec!["session_log".to_string()],
                 _ => vec![],
             };
@@ -203,7 +202,7 @@ pub fn disabled_ids(store: &crate::store::Store) -> Result<Vec<String>, String> 
 
 /// Effective kill set: explicit ids plus every capability that transitively
 /// requires a disabled dependency (e.g. disabling `session_log` also disables
-/// `skills_reader`, `subagents`, `workflows` and `compaction`). Catalog
+/// `skills_reader`, `subagents` and `compaction`). Catalog
 /// `enabled` defaults are NOT consulted here — presets alone decide what is
 /// offered — so advanced capabilities stay usable until explicitly killed.
 pub fn effective_disabled(store: &crate::store::Store) -> Result<HashSet<String>, String> {
@@ -236,7 +235,6 @@ pub const GATED: &[&str] = &[
     "system_time",
     "skills_reader",
     "subagents",
-    "workflows",
     "compaction",
     "git_tools",
     "lsp_tools",
@@ -262,14 +260,6 @@ pub fn source_capability(source: &str) -> Option<&'static str> {
 /// `presets::harness_source_allowed` plus orchestration families.
 pub fn harness_alias_capability(alias: &str) -> Option<&'static str> {
     match alias {
-        name if crate::debug_tools::owns(name) => Some("local_execution"),
-        name if crate::development_tools::owns(name) => {
-            Some(if crate::development_tools::execution_tool(name) {
-                "local_execution"
-            } else {
-                "workspace_files"
-            })
-        }
         "file_search" | "file_read" | "file_write" | "format_paths" => Some("workspace_files"),
         "skill_list" | "skill_load" => Some("skills_reader"),
         "git_status" | "git_diff" | "git_stage" | "git_unstage" | "git_commit" | "git_branch"
@@ -288,9 +278,6 @@ pub fn harness_alias_capability(alias: &str) -> Option<&'static str> {
         | "lsp_execute_command" => Some("lsp_tools"),
         "run_code"
         | "execute_command"
-        | "terminal_create"
-        | "terminal_send"
-        | "terminal_close"
         | "process_start"
         | "process_poll"
         | "process_write"
@@ -299,14 +286,12 @@ pub fn harness_alias_capability(alias: &str) -> Option<&'static str> {
         | "check_run"
         | "check_report"
         | "docker_exec"
-        | "ptc_run"
         | "workspace_open_preview" => Some("local_execution"),
         "subagent"
         | "send_message"
         | "interrupt_agent"
         | "list_agents"
         | "list_subagent_models" => Some("subagents"),
-        "workflow_run" | "ralph_run" => Some("workflows"),
         "compact_conversation" => Some("compaction"),
         _ => None,
     }
@@ -387,11 +372,6 @@ impl ToolPolicy {
 
     /// Reason a harness/catalog alias cannot run, if capability-gated.
     pub fn denial_for_alias(&self, alias: &str) -> Option<String> {
-        if crate::debug_tools::owns(alias) || crate::development_tools::execution_tool(alias) {
-            if let Some(reason) = self.denial("workspace_files") {
-                return Some(reason);
-            }
-        }
         harness_alias_capability(alias).and_then(|id| self.denial(id))
     }
 
@@ -553,8 +533,8 @@ mod tests {
             .effects("system_time")
             .contains(&"tool:system_time".to_string()));
         assert!(registry
-            .requires("workflows")
-            .contains(&"subagents".to_string()));
+            .requires("subagents")
+            .contains(&"agent_loop".to_string()));
     }
 
     #[test]
@@ -581,14 +561,12 @@ mod tests {
 
     #[test]
     fn catalog_defaults_do_not_disable_advanced_capabilities() {
-        // `subagents`/`workflows` carry enabled:false in capabilities.json, but
+        // `subagents` carries enabled:false in capabilities.json, but
         // presets still offer them — only a saved kill disables them.
         let (_dir, store) = open_store();
         assert!(is_enabled(&store, "subagents").unwrap());
-        assert!(is_enabled(&store, "workflows").unwrap());
         let policy = ToolPolicy::resolve(&store);
         assert!(policy.denial("subagents").is_none());
-        assert!(policy.denial("workflows").is_none());
     }
 
     #[test]
@@ -602,8 +580,7 @@ mod tests {
             "session_log",
             "skills_reader",
             "subagents",
-            "workflows",
-            "compaction",
+                    "compaction",
         ] {
             assert!(
                 disabled.contains(id),
@@ -623,7 +600,7 @@ mod tests {
             .save_setting(DISABLED_KEY, &vec!["agent_loop".to_string()])
             .unwrap();
         let disabled = effective_disabled(&store).unwrap();
-        assert!(disabled.contains("subagents") && disabled.contains("workflows"));
+        assert!(disabled.contains("subagents"));
         assert!(
             !disabled.contains("skills_reader"),
             "skills_reader does not require agent_loop"
@@ -633,8 +610,8 @@ mod tests {
             .unwrap();
         let disabled = effective_disabled(&store).unwrap();
         assert!(
-            disabled.contains("workflows"),
-            "workflows requires subagents"
+            disabled.contains("subagents"),
+            "the saved subagent restriction remains effective"
         );
     }
 
@@ -674,13 +651,10 @@ mod tests {
             ("file_write", "workspace_files"),
             ("file_search", "workspace_files"),
             ("run_code", "local_execution"),
-            ("terminal_send", "local_execution"),
-            ("ptc_run", "local_execution"),
+            ("process_write", "local_execution"),
             ("subagent", "subagents"),
             ("send_message", "subagents"),
             ("list_agents", "subagents"),
-            ("workflow_run", "workflows"),
-            ("ralph_run", "workflows"),
             ("compact_conversation", "compaction"),
         ] {
             assert_eq!(harness_alias_capability(alias), Some(capability), "{alias}");
@@ -699,10 +673,7 @@ mod tests {
             tool_capability(&crate::connectors::AgentTool::system_time()),
             Some("system_time")
         );
-        assert_eq!(
-            tool_capability(&crate::connectors::AgentTool::harness("workflow_run").unwrap()),
-            Some("workflows")
-        );
+        assert!(crate::connectors::AgentTool::harness("workflow_run").is_err());
         assert_eq!(
             tool_capability(&crate::connectors::AgentTool::harness("file_read").unwrap()),
             Some("workspace_files")
@@ -718,8 +689,8 @@ mod tests {
         let policy = ToolPolicy::resolve(&store);
         assert!(policy.denial_for_alias("subagent").is_some());
         assert!(
-            policy.denial_for_alias("workflow_run").is_some(),
-            "workflows require subagents"
+            crate::connectors::AgentTool::harness("workflow_run").is_err(),
+            "removed orchestration is never registered"
         );
         assert!(policy.denial_for_alias("todo_write").is_none());
     }

@@ -10,20 +10,22 @@ pub struct Info {
     destination: String,
     supported: bool,
     platform: &'static str,
-    message: Option<&'static str>,
+    message: Option<String>,
 }
 
 #[tauri::command]
 pub async fn runtime_download_info(
     state: tauri::State<'_, crate::AppState>,
+    runtime_id: Option<String>,
 ) -> Result<Info, String> {
     let root = crate::managed_storage::root(&state.data_dir)?.join("runtimes");
     tokio::fs::create_dir_all(&root)
         .await
         .map_err(|error| error.to_string())?;
-    let supported = crate::runtime_install::managed_runtime_supported();
+    let package = crate::runtime_catalog::package(runtime_id.as_deref())?;
+    let supported = package.supported();
     let assets = if supported {
-        crate::runtime_archive::catalog()?
+        package.assets
     } else {
         Vec::new()
     };
@@ -38,7 +40,7 @@ pub async fn runtime_download_info(
         destination: root.to_string_lossy().into_owned(),
         supported,
         platform: std::env::consts::OS,
-        message: (!supported).then_some(crate::runtime_install::MANAGED_RUNTIME_MESSAGE),
+        message: (!supported).then(|| crate::runtime_install::MANAGED_RUNTIME_MESSAGE.to_string()),
     })
 }
 
@@ -65,7 +67,11 @@ pub fn cancel_runtime_install(state: tauri::State<'_, crate::AppState>) -> Resul
     Ok(())
 }
 #[tauri::command]
-pub async fn install_runtime(state: tauri::State<'_, crate::AppState>) -> Result<Status, String> {
+pub async fn install_runtime(
+    state: tauri::State<'_, crate::AppState>,
+    runtime_id: Option<String>,
+) -> Result<Status, String> {
+    let package = crate::runtime_catalog::package(runtime_id.as_deref())?;
     let _installation = state
         .installation_operation
         .try_lock()
@@ -88,13 +94,18 @@ pub async fn install_runtime(state: tauri::State<'_, crate::AppState>) -> Result
     let _guard = RunGuard(installer);
     let result = async {
         let root = crate::managed_storage::root(&state.data_dir)?.join("runtimes");
-        crate::runtime_install::install(&root, receiver, |phase, received, total| {
-            if let Ok(mut inner) = installer.inner.lock() {
-                inner.0.phase = phase.into();
-                inner.0.received = received;
-                inner.0.total = total;
-            }
-        })
+        crate::runtime_install::install_package(
+            &root,
+            package,
+            receiver,
+            |phase, received, total| {
+                if let Ok(mut inner) = installer.inner.lock() {
+                    inner.0.phase = phase.into();
+                    inner.0.received = received;
+                    inner.0.total = total;
+                }
+            },
+        )
         .await
     }
     .await;

@@ -38,7 +38,9 @@
 .studio-detail-empty h3 { margin: 0; color: var(--text); font-size: 16px; font-weight: 600; letter-spacing: -.015em; }
 .studio-detail-empty p { margin: 0; max-width: 340px; font-size: 12.5px; line-height: 1.65; }
 .studio-detail-empty svg { margin: 0 auto; color: var(--accent); opacity: .85; }
-.quant-table { display: grid; border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; background: var(--background); }
+/* The discover split keeps this pane narrower than the viewport at any window
+   size, so the table must respond to its own width, not a media query. */
+.quant-table { container-type: inline-size; display: grid; border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; background: var(--background); }
 .quant-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 11px; border-bottom: 1px solid var(--border); }
 .quant-row:last-child { border-bottom: 0; }
 .quant-head { color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; background: var(--surface); cursor: default; }
@@ -49,6 +51,11 @@
 .quant-name { overflow-wrap: anywhere; font-size: 12px; color: var(--secondary); font-family: var(--font-mono); }
 .quant-size { display: grid; gap: 2px; font-variant-numeric: tabular-nums; }
 .quant-size small { color: var(--secondary); font-size: 10px; }
+@container (max-width: 640px) {
+  .quant-select { grid-template-columns: minmax(0, 1fr) 88px 118px; }
+  .quant-name { grid-row: 2; grid-column: 1 / -1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .quant-head span:nth-child(2) { grid-row: 2; grid-column: 1 / -1; }
+}
 .runtime-projector-file { overflow-wrap: anywhere; }
 .fit-badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: var(--radius-pill); background: var(--input); border: 1px solid var(--border); }
 .fit-gpu { color: var(--accent); border-color: var(--accent-soft); background: var(--accent-subtle); }
@@ -121,7 +128,7 @@
 .runtime-advanced { margin: 8px 0 24px; padding: 18px 20px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); }
 .runtime-advanced summary { cursor: pointer; font-size: 13px; font-weight: 600; }
 .runtime-advanced[open] summary { margin-bottom: 16px; }
-@media (max-width: 1000px) { .runtime-dashboard, .memory-meters, .runtime-stats, .studio-discover { grid-template-columns: 1fr; } .runtime-recommendation { align-items: start; flex-direction: column; } .library-model { grid-template-columns: 34px 1fr; } .library-actions { grid-column: 1 / -1; } .quant-head, .quant-select { grid-template-columns: 72px 1fr 108px; } .quant-name, .quant-head span:nth-child(2) { display: none; } }
+@media (max-width: 1000px) { .runtime-dashboard, .memory-meters, .runtime-stats, .studio-discover { grid-template-columns: 1fr; } .runtime-recommendation { align-items: start; flex-direction: column; } .library-model { grid-template-columns: 34px 1fr; } .library-actions { grid-column: 1 / -1; } }
 @media (max-width: 600px) { .studio-pane { padding: 16px; } .studio-search, .quant-cta { align-items: stretch; flex-direction: column; } .studio-hit { grid-template-columns: 34px 1fr; } .studio-hit-meta { grid-column: 2; align-items: start; } .runtime-compare div, .runtime-slider-row { grid-template-columns: 1fr; } }
 
 .download-activity { display: flex; align-items: center; gap: 16px; margin: 12px 20px 0; padding: 12px 16px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); flex-shrink: 0; box-shadow: var(--shadow-sm); }

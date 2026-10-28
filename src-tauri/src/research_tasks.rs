@@ -73,79 +73,6 @@ impl OperationStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TaskBudgets {
-    #[serde(default = "default_task_secs")]
-    pub task_timeout_secs: u64,
-    #[serde(default = "default_max_rounds")]
-    pub max_rounds: usize,
-    #[serde(default = "default_max_searches")]
-    pub max_searches: usize,
-    #[serde(default = "default_max_documents")]
-    pub max_documents: usize,
-    #[serde(default = "default_max_retries")]
-    pub max_retries: usize,
-    #[serde(default = "default_op_secs")]
-    pub operation_timeout_secs: u64,
-}
-
-fn default_task_secs() -> u64 {
-    1800
-}
-fn default_max_rounds() -> usize {
-    8
-}
-fn default_max_searches() -> usize {
-    12
-}
-fn default_max_documents() -> usize {
-    20
-}
-fn default_max_retries() -> usize {
-    2
-}
-fn default_op_secs() -> u64 {
-    240
-}
-
-impl Default for TaskBudgets {
-    fn default() -> Self {
-        Self {
-            task_timeout_secs: default_task_secs(),
-            max_rounds: default_max_rounds(),
-            max_searches: default_max_searches(),
-            max_documents: default_max_documents(),
-            max_retries: default_max_retries(),
-            operation_timeout_secs: default_op_secs(),
-        }
-    }
-}
-
-impl TaskBudgets {
-    pub fn validate(&self) -> Result<(), String> {
-        if !(60..=7200).contains(&self.task_timeout_secs) {
-            return Err("task_timeout_secs must be 60-7200.".into());
-        }
-        if !(1..=16).contains(&self.max_rounds) {
-            return Err("max_rounds must be 1-16.".into());
-        }
-        if !(1..=50).contains(&self.max_searches) {
-            return Err("max_searches must be 1-50.".into());
-        }
-        if !(1..=100).contains(&self.max_documents) {
-            return Err("max_documents must be 1-100.".into());
-        }
-        if self.max_retries > 5 {
-            return Err("max_retries must be 0-5.".into());
-        }
-        if !(10..=600).contains(&self.operation_timeout_secs) {
-            return Err("operation_timeout_secs must be 10-600.".into());
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TaskOperation {
     pub id: String,
     pub kind: String,
@@ -163,7 +90,10 @@ pub struct ResearchTask {
     pub conversation_id: String,
     pub question: String,
     pub status: TaskStatus,
-    pub budgets: TaskBudgets,
+    /// Historical budget metadata is retained for saved ledgers only.
+    /// Execution limits belong to the shared engine and explicit user budgets.
+    #[serde(default)]
+    pub budgets: Value,
     pub operations: Vec<TaskOperation>,
     pub completed_results: Vec<Value>,
     pub requirements: Vec<Value>,
@@ -174,33 +104,22 @@ pub struct ResearchTask {
 }
 
 impl ResearchTask {
-    pub fn new(
-        conversation_id: &str,
-        question: &str,
-        budgets: TaskBudgets,
-    ) -> Result<Self, String> {
+    pub fn new(conversation_id: &str, question: &str) -> Result<Self, String> {
         if question.trim().is_empty() || question.len() > 8000 {
             return Err("Task question must contain 1-8000 bytes.".into());
         }
-        budgets.validate()?;
         let now = crate::store::now();
         Ok(Self {
             id: format!("task_{}", uuid::Uuid::new_v4().simple()),
             conversation_id: conversation_id.to_string(),
             question: question.trim().to_string(),
             status: TaskStatus::Running,
-            budgets,
+            budgets: json!({}),
             operations: Vec::new(),
             completed_results: Vec::new(),
             requirements: Vec::new(),
             findings: Vec::new(),
-            pending_work: vec![
-                "plan".into(),
-                "search".into(),
-                "read".into(),
-                "verify".into(),
-                "answer".into(),
-            ],
+            pending_work: Vec::new(),
             created_at: now,
             updated_at: now,
         })
@@ -211,14 +130,14 @@ impl ResearchTask {
     }
 
     /// Record a checkpoint after a meaningful operation. Completed results
-    /// are appended; pending work advances. Returns false when a budget is
-    /// exhausted (task moves to `budget_exhausted` with partial results).
+    /// are appended and explicit pending work advances. This ledger does not
+    /// impose a separate execution budget.
     pub fn checkpoint_operation(
         &mut self,
         kind: &str,
         status: OperationStatus,
         summary: Option<String>,
-    ) -> bool {
+    ) {
         self.operations.push(TaskOperation {
             id: format!("op_{}", uuid::Uuid::new_v4().simple()),
             kind: kind.to_string(),
@@ -234,22 +153,6 @@ impl ResearchTask {
         }
         self.pending_work.retain(|work| work != kind);
         self.updated_at = crate::store::now();
-        !self.budget_exhausted()
-    }
-
-    pub fn budget_exhausted(&self) -> bool {
-        let searches = self
-            .operations
-            .iter()
-            .filter(|op| op.kind == "search")
-            .count();
-        let rounds = self.operations.len();
-        searches >= self.budgets.max_searches || rounds >= self.budgets.max_rounds
-    }
-
-    pub fn elapsed_exhausted(&self) -> bool {
-        crate::store::now().saturating_sub(self.created_at)
-            > (self.budgets.task_timeout_secs as i64) * 1000
     }
 
     pub fn pause(&mut self) -> Result<(), String> {
@@ -405,14 +308,9 @@ mod tests {
 
     #[test]
     fn checkpoint_pause_resume_cancel_flow() {
-        let mut task =
-            ResearchTask::new("conv", "Compare A and B", TaskBudgets::default()).unwrap();
+        let mut task = ResearchTask::new("conv", "Compare A and B").unwrap();
         assert!(!task.is_terminal());
-        assert!(task.checkpoint_operation(
-            "search",
-            OperationStatus::Completed,
-            Some("3 hits".into())
-        ));
+        task.checkpoint_operation("search", OperationStatus::Completed, Some("3 hits".into()));
         assert_eq!(task.completed_results.len(), 1);
         task.pause().unwrap();
         assert!(task.resume().is_ok());
@@ -424,7 +322,7 @@ mod tests {
 
     #[test]
     fn restart_recovery_marks_running_unknown_without_replaying() {
-        let mut task = ResearchTask::new("conv", "Long research", TaskBudgets::default()).unwrap();
+        let mut task = ResearchTask::new("conv", "Long research").unwrap();
         task.operations.push(TaskOperation {
             id: "op1".into(),
             kind: "search".into(),
@@ -450,40 +348,23 @@ mod tests {
     }
 
     #[test]
-    fn budget_exhaustion_yields_recoverable_partial_results() {
-        let budgets = TaskBudgets {
-            max_searches: 1,
-            max_rounds: 4,
-            ..TaskBudgets::default()
-        };
-        let mut task = ResearchTask::new("conv", "Q", budgets).unwrap();
-        assert!(!task.checkpoint_operation(
-            "search",
-            OperationStatus::Completed,
-            Some("partial".into())
-        ));
-        assert!(task.budget_exhausted());
-        assert_eq!(task.completed_results.len(), 1);
-        let summary = task.progress_summary();
-        assert_eq!(summary["partialResults"], 1);
-        assert_eq!(summary["pendingWork"].as_array().unwrap().len(), 4);
-    }
-
-    #[test]
-    fn budgets_validate_loudly() {
-        assert!(TaskBudgets {
-            task_timeout_secs: 10,
-            ..TaskBudgets::default()
+    fn legacy_budget_metadata_does_not_stop_a_new_general_purpose_task() {
+        let mut task = ResearchTask::new("conv", "Keep working").unwrap();
+        assert!(task.pending_work.is_empty());
+        assert_eq!(task.budgets, json!({}));
+        task.budgets = json!({"maxRounds": 1, "maxSearches": 1, "taskTimeoutSecs": 60});
+        let serialized = serde_json::to_string(&task).unwrap();
+        let mut restored: ResearchTask = serde_json::from_str(&serialized).unwrap();
+        for _ in 0..70 {
+            restored.checkpoint_operation(
+                "search",
+                OperationStatus::Completed,
+                Some("evidence".into()),
+            );
         }
-        .validate()
-        .is_err());
-        assert!(TaskBudgets {
-            max_rounds: 99,
-            ..TaskBudgets::default()
-        }
-        .validate()
-        .is_err());
-        assert!(TaskBudgets::default().validate().is_ok());
-        assert!(ResearchTask::new("c", "", TaskBudgets::default()).is_err());
+        assert_eq!(restored.status, TaskStatus::Running);
+        assert_eq!(restored.completed_results.len(), 70);
+        assert_eq!(restored.budgets, task.budgets);
+        assert!(ResearchTask::new("c", "").is_err());
     }
 }

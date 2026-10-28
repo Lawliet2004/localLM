@@ -21,7 +21,7 @@ export function repoParts(repo: string) {
 
 export function quantLabel(filename: string) {
   const name = filename.split(/[\\/]/).pop() ?? filename;
-  const match = name.match(/(IQ\d+_[A-Z]+|Q\d+_K_[MSx]|Q\d+_K|Q\d+_[01]|[QF]16|F32|BF16)(?=[.\-_']|$)/i);
+  const match = name.match(/(PQ\d+_[01]|PTQ\d+_[01]|IQ\d+_[A-Z]+|Q\d+_K_[MSx]|Q\d+_K|Q\d+_[01]|[QF]16|F32|BF16)(?=[.\-_']|$)/i);
   return match ? match[1].toUpperCase() : 'GGUF';
 }
 

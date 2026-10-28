@@ -59,6 +59,7 @@ export interface LocalServerConfig {
   environment: Record<string, string>;
 }
 export interface ModelInstallStatus {
+  profileId?: string | null;
   busy: boolean;
   phase: string;
   received: number;
@@ -82,19 +83,6 @@ export const api = {
   setPresentationMode: (conversationId: string | null, mode: import('./types').PresentationMode | null) => invoke<void>('set_presentation_mode', { conversationId, mode }),
   getPresentations: (conversationId: string) => invoke<import('./types').PresentationRecord[]>('get_presentations', { conversationId }),
   saveVisualState: (conversationId: string, messageId: string, visualState: Record<string, unknown>) => invoke<void>('save_visual_state', { conversationId, messageId, visualState }),
-  getDebuggerPolicy: () => invoke<import('./types').DebuggerPolicy>('get_debugger_policy'),
-  saveDebuggerPolicy: (policy: import('./types').DebuggerPolicy) => invoke<void>('save_debugger_policy', { policy }),
-  getProfilerConfig: () => invoke<import('./types').ProfilerConfig>('get_profile_config'),
-  saveProfilerConfig: (config: import('./types').ProfilerConfig) => invoke<void>('save_profile_config', { config }),
-  listHttpCredentials: () => invoke<import('./types').HttpCredentialView[]>('list_http_credentials'),
-  saveHttpCredential: (name: string, header: string, secret: string, origin: string) => invoke<import('./types').HttpCredentialView>('save_http_credential', { name, header, secret, origin }),
-  deleteHttpCredential: (id: string) => invoke<void>('delete_http_credential', { id }),
-  getReferenceOrigins: () => invoke<string[]>('get_reference_origins'),
-  saveReferenceOrigins: (origins: string[]) => invoke<void>('save_reference_origins', { origins }),
-  listDatabaseProfiles: () => invoke<import('./types').DatabaseProfile[]>('list_database_profiles'),
-  saveDatabaseProfile: (profile: import('./types').DatabaseProfile, password: string | null) => invoke<import('./types').DatabaseProfile>('save_database_profile', { profile, password }),
-  deleteDatabaseProfile: (id: string) => invoke<void>('delete_database_profile', { id }),
-  testDatabaseProfile: (id: string) => invoke<unknown>('test_database_profile', { id }),
   getAutomationConfig: () => invoke<import('./types').AutomationConfig>('get_automation_config'),
   saveAutomationConfig: (config: import('./types').AutomationConfig) => invoke<void>('save_automation_config', { config }),
   installBrowserEngine: () => invoke<import('./types').AutomationConfig>('install_browser_engine'),
@@ -145,9 +133,12 @@ export const api = {
   saveLocalConnector: (server: LocalServerConfig) => invoke<void>('save_local_connector', { server }),
   removeLocalConnector: (id: string) => invoke<void>('remove_local_connector', { id }),
   listInstalledRuntimes: () => invoke<{ id: string; path: string; complete: boolean; problem: string | null }[]>('list_installed_runtimes'),
-  runtimeDownloadInfo: () => invoke<{ bytes: number; requiredBytes: number; availableBytes: number; destination: string; supported?: boolean; platform?: string; message?: string | null }>('runtime_download_info'),
+  runtimeDownloadInfo: (runtimeId?: string) => invoke<{ bytes: number; requiredBytes: number; availableBytes: number; destination: string; supported?: boolean; platform?: string; message?: string | null }>('runtime_download_info', { runtimeId }),
   runtimeInstallStatus: () => invoke<ModelInstallStatus>('runtime_install_status'),
-  installRuntime: () => invoke<ModelInstallStatus>('install_runtime'),
+  installRuntime: (runtimeId?: string) => invoke<ModelInstallStatus>('install_runtime', { runtimeId }),
+  cancelBonsaiInstall: () => invoke<void>('cancel_bonsai_install'),
+  prismRuntimeChoices: () => invoke<{ id: string; backend: string; build: string }[]>('prism_runtime_choices'),
+  installBonsai: (runtimeId: string, mtpMode: 'auto' | 'off' = 'auto') => invoke<RuntimeStatus>('install_bonsai', { runtimeId, mtpMode }),
   cancelRuntimeInstall: () => invoke<void>('cancel_runtime_install'),
   modelDownloadInfo: (filename?: string) => invoke<ModelDownloadInfo>('model_download_info', { filename }),
   listInstalledModels: () => invoke<import('./types').InstalledModel[]>('list_installed_models'),

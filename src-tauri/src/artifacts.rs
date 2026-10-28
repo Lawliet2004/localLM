@@ -306,7 +306,7 @@ fn native_summary(
 ) -> Option<Value> {
     let enveloped = result.get("schemaVersion").and_then(Value::as_str)
         == Some(crate::tool_envelope::SCHEMA_VERSION);
-    if enveloped && result.pointer("/metadata/family").and_then(Value::as_str) != Some("harness") {
+    if enveloped && !matches!(result.pointer("/metadata/family").and_then(Value::as_str), Some("harness" | "workspace")) {
         return None;
     }
     let mut out = if enveloped {
@@ -327,7 +327,7 @@ fn native_summary(
             data,
             Vec::new(),
             if error.is_null() { None } else { Some(error) },
-            json!({"family":"harness","truncated":true,"sideEffects":result.pointer("/metadata/sideEffects").and_then(Value::as_str).unwrap_or("unknown")}),
+            json!({"family":result["metadata"]["family"],"truncated":true,"sideEffects":result.pointer("/metadata/sideEffects").and_then(Value::as_str).unwrap_or("unknown")}),
         )
     } else {
         data
@@ -354,7 +354,7 @@ fn lifecycle_excerpt(
     budget: usize,
 ) -> Option<Value> {
     let checks = matches!(tool, "check_run" | "check_report");
-    let debug = crate::debug_tools::owns(tool);
+    let debug = false;
     // `shell_run` returns a live process handle when the command outlives its
     // window. It has to keep the handle and the "still running" state, or the
     // model loses the only way to reach a child that is still running.
@@ -503,6 +503,205 @@ fn lifecycle_excerpt(
     Some(out)
 }
 
+fn append_text_excerpt(mut out: Value, key: &str, text: &str, enveloped: bool, budget: usize) -> Value {
+    let (mut low, mut high) = (0, text.len().min(budget));
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let mut candidate = out.clone();
+        let target = if enveloped { &mut candidate["data"] } else { &mut candidate };
+        target[key] = json!(truncate_utf8(text, mid));
+        if serialized_len(&candidate) <= budget {
+            out = candidate;
+            low = mid + 1;
+        } else if mid == 0 { break; } else { high = mid - 1; }
+    }
+    out
+}
+
+/// Keep file hashes separate from the saved artifact's checksum. Dropping a
+/// committed file's hash made agents reuse the artifact checksum for edits.
+fn workspace_excerpt(result: &Value, tool: &str, artifact: &ArtifactRecord, budget: usize) -> Option<Value> {
+    if result.pointer("/metadata/family").and_then(Value::as_str) != Some("workspace")
+        || crate::tool_envelope::failed(result)
+        || !matches!(tool, "apply_patch" | "workspace_apply_patch" | "edit_file" | "workspace_edit_file" | "read_file" | "workspace_read_file")
+    {
+        return None;
+    }
+    let source = &result["data"];
+    let mut data = serde_json::Map::new();
+    for key in ["path", "sha256", "totalLines", "bytesWritten", "reformatted", "transactionId", "recoveryRequired", "status"] {
+        if let Some(value) = source.get(key) { data.insert(key.into(), value.clone()); }
+    }
+    if source["changes"].is_array() {
+        data.insert("changes".into(), json!([]));
+        data.insert("changesOmitted".into(), json!(source["changes"].as_array()?.len()));
+    }
+    let mut out = native_summary(result, Value::Object(data), artifact, usize::MAX)?;
+    for key in ["_originalBytes", "_sha256"] {
+        if serialized_len(&out) > budget { out.as_object_mut()?.remove(key); }
+    }
+    if serialized_len(&out) > budget { return None; }
+    for change in source["changes"].as_array().into_iter().flatten() {
+        let mut slim = serde_json::Map::new();
+        for key in ["path", "destination", "sha256", "kind"] {
+            if let Some(value) = change.get(key) { slim.insert(key.into(), value.clone()); }
+        }
+        let mut candidate = out.clone();
+        candidate["data"]["changes"].as_array_mut()?.push(Value::Object(slim));
+        candidate["data"]["changesOmitted"] = json!(source["changes"].as_array()?.len() - candidate["data"]["changes"].as_array()?.len());
+        if serialized_len(&candidate) > budget { break; }
+        out = candidate;
+    }
+    if let Some(text) = source["content"].as_str() {
+        out = append_text_excerpt(out, "content", text, true, budget);
+    }
+    Some(out)
+}
+
+/// A fetched page lives in the document store. Its two-part reference must
+/// survive excerpting so the agent can search or open the remaining text.
+fn web_document_excerpt(
+    result: &Value,
+    tool: &str,
+    artifact: &ArtifactRecord,
+    budget: usize,
+) -> Option<Value> {
+    if !matches!(tool, "web_read" | "web_open" | "web_fetch_url" | "web_find") {
+        return None;
+    }
+    let enveloped = result["schemaVersion"] == crate::tool_envelope::SCHEMA_VERSION;
+    let source = if enveloped { &result["data"] } else { result };
+    let session = source["sessionId"].as_str().filter(|s| s.len() <= 128)?;
+    let document = source["documentId"].as_str().filter(|s| s.len() <= 128)?;
+    let mut out = native_summary(
+        result,
+        json!({"sessionId":session,"documentId":document}),
+        artifact,
+        usize::MAX,
+    )?;
+    // Leave space for initial-page text and its cursor before optional labels.
+    // Artifact byte counts are never document-text offsets.
+    let label_budget = budget.saturating_sub(if source["text"].is_string() { 160 } else { 0 });
+    for key in ["_originalBytes", "_sha256"] {
+        if serialized_len(&out) > label_budget {
+            out.as_object_mut()?.remove(key);
+        }
+    }
+    if serialized_len(&out) > budget {
+        return None;
+    }
+    if let Some(passages) = source["passages"].as_array() {
+        let mut kept = Vec::new();
+        for passage in passages {
+            let text = passage["text"].as_str().unwrap_or_default();
+            let mut candidate_passage = passage.clone();
+            // Spend the available space on complete passages first. A clipped
+            // passage advances only past the text actually shown, not its tail.
+            let mut best = None;
+            let (mut low, mut high) = (0, text.len());
+            while low <= high {
+                let mid = low + (high - low) / 2;
+                let excerpt = truncate_utf8(text, mid);
+                candidate_passage["text"] = json!(excerpt);
+                candidate_passage["chars"] = json!(excerpt.encode_utf16().count());
+                if excerpt.len() < text.len() {
+                    candidate_passage["textTruncated"] = json!(true);
+                    if let Some(start) = passage["textOffset"].as_u64() {
+                        candidate_passage["nextTextOffset"] =
+                            json!(start + excerpt.encode_utf16().count() as u64);
+                    }
+                } else {
+                    candidate_passage.as_object_mut()?.remove("textTruncated");
+                    candidate_passage["nextTextOffset"] = passage["nextTextOffset"].clone();
+                }
+                let mut candidate = out.clone();
+                let data = if enveloped {
+                    &mut candidate["data"]
+                } else {
+                    &mut candidate
+                };
+                let mut combined = kept.clone();
+                combined.push(candidate_passage.clone());
+                data["passages"] = json!(combined);
+                data["passagesOmitted"] = json!(passages.len() - combined.len());
+                if serialized_len(&candidate) <= budget {
+                    best = Some((candidate, candidate_passage.clone(), excerpt.len()));
+                    low = mid + 1;
+                } else if mid == 0 {
+                    break;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            let Some((candidate, passage, shown)) = best else {
+                break;
+            };
+            out = candidate;
+            kept.push(passage);
+            if shown < text.len() {
+                break;
+            }
+        }
+    }
+    for key in [
+        "url",
+        "title",
+        "textTotalChars",
+        "textTruncated",
+        "extractionMethod",
+        "snippetOnly",
+    ] {
+        if let Some(value) = source.get(key) {
+            let mut candidate = out.clone();
+            let target = if enveloped {
+                &mut candidate["data"]
+            } else {
+                &mut candidate
+            };
+            target[key] = value.clone();
+            if serialized_len(&candidate) <= label_budget {
+                out = candidate;
+            }
+        }
+    }
+    if let Some(text) = source["text"].as_str() {
+        let start = source["textOffset"].as_u64().unwrap_or(0);
+        let mut best = None;
+        let (mut low, mut high) = (0, text.len().min(budget));
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let visible = truncate_utf8(text, mid);
+            let next = start + visible.encode_utf16().count() as u64;
+            let more = visible.len() < text.len()
+                || source["nextTextOffset"].is_number()
+                || source["textTruncated"] == true
+                || source["textTotalChars"]
+                    .as_u64()
+                    .is_some_and(|total| next < total);
+            let mut candidate = out.clone();
+            let target = if enveloped {
+                &mut candidate["data"]
+            } else {
+                &mut candidate
+            };
+            target["text"] = json!(visible);
+            target["textOffset"] = json!(start);
+            target["nextTextOffset"] = if more { json!(next) } else { Value::Null };
+            target["textTruncated"] = json!(more);
+            if serialized_len(&candidate) <= budget {
+                best = Some(candidate);
+                low = mid + 1;
+            } else if mid == 0 {
+                break;
+            } else {
+                high = mid - 1;
+            }
+        }
+        out = best?;
+    }
+    Some(out)
+}
+
 /// A staged-tree pin is a continuation handle too. Keep it exact and flag
 /// that the excerpt is not a complete review; full diff bytes remain saved.
 fn git_diff_excerpt(
@@ -609,64 +808,6 @@ fn lsp_rename_excerpt(
     Some(out)
 }
 
-fn development_excerpt(
-    result: &Value,
-    tool: &str,
-    artifact: &ArtifactRecord,
-    budget: usize,
-) -> Option<Value> {
-    if !crate::development_tools::owns(tool) {
-        return None;
-    }
-    let source = if result.get("schemaVersion").is_some() {
-        &result["data"]
-    } else {
-        result
-    };
-    let mut data = json!({});
-    for key in [
-        "evidenceId",
-        "reportId",
-        "processId",
-        "benchmarkId",
-        "responseId",
-        "sessionId",
-        "profileId",
-        "originalTraceId",
-        "rehearsalId",
-    ] {
-        if tool == "verification_report" && key == "evidenceId" {
-            continue;
-        }
-        if let Some(id) = source[key].as_str() {
-            let prefix = if key == "processId" {
-                "proc-"
-            } else if key == "sessionId" {
-                "http-"
-            } else if key == "rehearsalId" {
-                ""
-            } else {
-                "dev_"
-            };
-            uuid::Uuid::parse_str(id.strip_prefix(prefix)?).ok()?;
-            data[key] = json!(id);
-        }
-    }
-    if data.as_object()?.is_empty() {
-        return None;
-    }
-    let mut out = native_summary(result, data, artifact, usize::MAX)?;
-    for key in ["_originalBytes", "_sha256"] {
-        if serialized_len(&out) > budget {
-            out.as_object_mut()?.remove(key);
-        }
-    }
-    if serialized_len(&out) > budget {
-        return None;
-    }
-    Some(out)
-}
-
 /// Bound a tool output so huge outputs (e.g. web pages, dumps, large files) do not blow up model context.
 /// When serialized output exceeds `max_chars` bytes, full output is captured in an `ArtifactRecord`, and a structured excerpt
 /// with truncation indicators and artifact ID is returned to the model.
@@ -677,18 +818,28 @@ pub fn bound_tool_result(
     run_id: Option<&str>,
     max_chars: usize,
 ) -> (Value, Option<ArtifactRecord>) {
-    let raw = result.to_string();
-    let size_bytes = raw.len();
-    if size_bytes <= max_chars {
+    // A page is a window into an existing artifact, not a new artifact. Size
+    // the final wire envelope (including escaping) before returning a cursor.
+    let page = result.get("data").filter(|v| v.get("excerpt").is_some()).unwrap_or(&result);
+    if tool_name == "artifact_read" && page["excerpt"].is_string() && page["id"].is_string() {
+        return (bound_artifact_page(&result, page, max_chars.max(MIN_RESULT_BUDGET)), None);
+    }
+    let wire_size = serialized_len(&result);
+    if wire_size <= max_chars {
         return (result, None);
     }
     // The enforced cap is a serialized UTF-8 byte bound. Below the supported
     // floor, fall back to the smallest useful envelope instead of emitting
     // an unbounded or dishonest result.
     let budget = max_chars.max(MIN_RESULT_BUDGET);
-    if size_bytes <= budget {
+    if wire_size <= budget {
         return (result, None);
     }
+
+    // Persist the same versioned contract the provider receives. Internal
+    // legacy aliases otherwise duplicate document text in the saved artifact.
+    let raw = crate::tool_envelope::model_result(&result).to_string();
+    let size_bytes = raw.len();
 
     let id = format!("art_{}", uuid::Uuid::new_v4().simple());
     let mut hasher = Sha256::new();
@@ -712,9 +863,10 @@ pub fn bound_tool_result(
     };
 
     if let Some(excerpt) = lifecycle_excerpt(&result, tool_name, &artifact, budget)
+        .or_else(|| workspace_excerpt(&result, tool_name, &artifact, budget))
+        .or_else(|| web_document_excerpt(&result, tool_name, &artifact, budget))
         .or_else(|| git_diff_excerpt(&result, tool_name, &artifact, budget))
         .or_else(|| lsp_rename_excerpt(&result, tool_name, &artifact, budget))
-        .or_else(|| development_excerpt(&result, tool_name, &artifact, budget))
     {
         return (excerpt, Some(artifact));
     }
@@ -1170,6 +1322,27 @@ pub fn bound_tool_result(
     (excerpt, Some(artifact))
 }
 
+fn bound_artifact_page(original: &Value, page: &Value, budget: usize) -> Value {
+    let text = page["excerpt"].as_str().unwrap_or_default();
+    let chars: Vec<char> = text.chars().collect();
+    let enveloped = crate::tool_envelope::is_envelope(original);
+    let render = |count: usize| {
+        let data = json!({"id":page["id"],"offset":page["offset"],"limit":count,
+            "totalChars":page["totalChars"],"hasMore":count < chars.len() || page["hasMore"] == true,
+            "excerpt":chars[..count].iter().collect::<String>()});
+        if enveloped {
+            crate::tool_envelope::make(crate::tool_envelope::Status::Success, data, vec![], None,
+                json!({"family":"harness","sideEffects":"none"}))
+        } else { data }
+    };
+    let (mut low, mut high) = (0, chars.len());
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if serialized_len(&render(mid)) <= budget { low = mid; } else { high = mid - 1; }
+    }
+    render(low)
+}
+
 /// Page through a stored artifact's full content by character window.
 /// Offsets clamp to the content length; limits cap at 20,000 chars.
 pub fn read_window(record: &ArtifactRecord, offset: usize, limit: usize) -> Value {
@@ -1198,6 +1371,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_committed_patch_keeps_the_file_hash_for_the_next_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::open(root.path().to_str().unwrap()).unwrap();
+        let before = "original\n".repeat(2000);
+        std::fs::write(root.path().join("note.txt"), &before).unwrap();
+        let hash = format!("{:x}", Sha256::digest(before.as_bytes()));
+        let changed = workspace.call("apply_patch", json!({"changes":[{"kind":"edit","path":"note.txt","expected_sha256":hash,"replacements":[{"old_text":before,"new_text":"updated\n".repeat(2000)}]}]})).unwrap();
+        let normalized = crate::tool_envelope::normalize(changed.clone(), crate::tool_envelope::Family::Workspace);
+        for budget in [512, 1024, 2048, 8192] {
+            let (bounded, artifact) = bound_tool_result(normalized.clone(), "apply_patch", "owner", None, budget);
+            assert!(serialized_len(&bounded) <= budget);
+            if budget >= 1024 {
+                assert_eq!(bounded["data"]["changes"][0]["sha256"], changed["changes"][0]["sha256"]);
+                assert_eq!(bounded["data"]["changesOmitted"], 0);
+                assert_ne!(bounded["data"]["changes"][0]["sha256"], artifact.unwrap().sha256);
+            }
+        }
+        let (bounded, _) = bound_tool_result(normalized, "apply_patch", "owner", None, 2048);
+        let next = workspace.call("apply_patch", json!({"changes":[{"kind":"edit","path":"note.txt","expected_sha256":bounded["data"]["changes"][0]["sha256"],"replacements":[{"old_text":"updated\n".repeat(2000),"new_text":"final\n".repeat(2000)}]}]})).unwrap();
+        assert_eq!(next["status"], "committed");
+        assert_eq!(std::fs::read_to_string(root.path().join("note.txt")).unwrap(), "final\n".repeat(2000));
+        let read = crate::tool_envelope::normalize(workspace.call("read_file", json!({"path":"note.txt","line_count":500})).unwrap(), crate::tool_envelope::Family::Workspace);
+        let (bounded, _) = bound_tool_result(read, "read_file", "owner", None, 2048);
+        assert_eq!(bounded["data"]["sha256"], next["changes"][0]["sha256"]);
+        assert!(bounded["data"]["content"].as_str().unwrap().contains("final"));
+    }
+
+    #[test]
+    fn bounded_web_pages_keep_document_handles_and_capture_canonical_content_once() {
+        let payload = json!({
+            "sessionId":format!("fetch-{}", uuid::Uuid::new_v4()),
+            "documentId":format!("fetch-{}", uuid::Uuid::new_v4()),
+            "url":"https://example.com/reference", "title":"Reference",
+            "text":"Unique source passage. 界🪐\n".repeat(2000),
+            "textTotalChars":50000,"textTruncated":true
+        });
+        let normalized = crate::tool_envelope::normalize(payload.clone(), crate::tool_envelope::Family::Harness);
+        let canonical = crate::tool_envelope::model_result(&normalized);
+        for budget in [512, 1024, 2048, 8192] {
+            for tool in ["web_read", "web_open", "web_fetch_url"] {
+                let (bounded, artifact) = bound_tool_result(normalized.clone(), tool, "owner", None, budget);
+                assert!(serialized_len(&bounded) <= budget, "{bounded}");
+                assert_eq!(bounded["data"]["sessionId"], payload["sessionId"]);
+                assert_eq!(bounded["data"]["documentId"], payload["documentId"]);
+                let visible = bounded["data"]["text"].as_str().unwrap();
+                assert!(!visible.is_empty());
+                assert!(payload["text"].as_str().unwrap().starts_with(visible));
+                assert_eq!(bounded["data"]["textOffset"], 0);
+                assert_eq!(bounded["data"]["nextTextOffset"], visible.encode_utf16().count());
+                let artifact = artifact.unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&artifact.content).unwrap(), canonical);
+                assert_eq!(artifact.size_bytes, artifact.content.len());
+                assert!(artifact.size_bytes < serialized_len(&normalized));
+                assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(artifact.content.as_bytes())));
+                // Follow the returned reference through the normal page boundary.
+                let page = crate::tool_envelope::normalize(read_window(&artifact, 0, 20000), crate::tool_envelope::Family::Harness);
+                let (page, recursive) = bound_tool_result(page, "artifact_read", "owner", None, budget);
+                assert!(recursive.is_none());
+                assert_eq!(page["data"]["id"], artifact.id);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_web_matches_preserve_text_and_advance_only_past_visible_unicode() {
+        let text = "🪐 unique source fact. ".repeat(2000);
+        let payload = json!({"sessionId":"fetch-session", "documentId":"fetch-document", "passages":[
+            {"ref":"fetch-document:match:1","docId":"fetch-document","textOffset":300,"nextTextOffset":20000,"totalChars":20000,"chars":text.encode_utf16().count(),"text":text},
+            {"ref":"fetch-document:match:2","docId":"fetch-document","textOffset":13000,"nextTextOffset":null,"totalChars":20000,"text":"later fact"}
+        ]});
+        for budget in [1024, 2048, 8192] {
+            for tool in ["web_find", "web_read", "web_open"] {
+                let result = crate::tool_envelope::normalize(payload.clone(), crate::tool_envelope::Family::Harness);
+                let (bounded, artifact) = bound_tool_result(result, tool, "owner", None, budget);
+                assert!(serialized_len(&bounded) <= budget);
+                assert!(artifact.is_some());
+                assert_eq!(bounded["data"]["sessionId"], payload["sessionId"]);
+                let first = &bounded["data"]["passages"][0];
+                let visible = first["text"].as_str().unwrap();
+                assert!(!visible.is_empty());
+                assert!(text.starts_with(visible));
+                assert_eq!(first["textOffset"], 300);
+                assert_eq!(first["nextTextOffset"], 300 + visible.encode_utf16().count());
+                assert_eq!(bounded["data"]["passagesOmitted"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_pages_recover_every_character_without_creating_artifacts() {
+        let record = ArtifactRecord { id:"art_original".into(), conversation_id:"c".into(), run_id:None,
+            tool_name:"workspace_read_file".into(), mime_type:"text/plain".into(), size_bytes:0,
+            sha256:String::new(), created_at:0, content:"日本語\\\"\n".repeat(1200) };
+        for budget in [512, 2048, 8192] {
+            let mut recovered = String::new();
+            loop {
+                let offset = recovered.chars().count();
+                let page = crate::tool_envelope::normalize(read_window(&record, offset, 20000), crate::tool_envelope::Family::Harness);
+                let (bounded, artifact) = bound_tool_result(page, "artifact_read", "c", None, budget);
+                assert!(artifact.is_none());
+                assert!(bounded.to_string().len() <= budget);
+                let data = &bounded["data"];
+                assert_eq!(data["id"], record.id);
+                assert_eq!(data["offset"], offset);
+                let excerpt = data["excerpt"].as_str().unwrap();
+                assert!(!excerpt.is_empty());
+                recovered.push_str(excerpt);
+                assert_eq!(data["limit"], excerpt.chars().count());
+                if data["hasMore"] == false { break; }
+            }
+            assert_eq!(recovered, record.content);
+        }
+    }
+
+    #[test]
     fn rename_pins_survive_every_supported_byte_budget_without_false_review() {
         let id = format!("lsp_rename_{}", uuid::Uuid::new_v4().simple());
         let sha = "a".repeat(64);
@@ -1222,7 +1510,7 @@ mod tests {
                 assert_eq!(data["reviewIncomplete"], true);
                 let saved = saved.unwrap();
                 assert_eq!(out["_artifactId"], saved.id);
-                assert_eq!(saved.content, input.to_string());
+                assert_eq!(saved.content, crate::tool_envelope::model_result(&input).to_string());
                 if normalized {
                     assert_eq!(out["status"], "partial");
                     assert!(crate::tool_envelope::validate_envelope(&out).is_ok());
@@ -1304,7 +1592,7 @@ mod tests {
                 assert_eq!(out["_sha256"], artifact.sha256);
                 assert_eq!(
                     serde_json::from_str::<Value>(&artifact.content).unwrap(),
-                    normalized
+                    crate::tool_envelope::model_result(&normalized)
                 );
                 if budget >= 1024 {
                     assert_eq!(out["data"]["report"]["verdict"], "failed");

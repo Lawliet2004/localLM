@@ -1,6 +1,7 @@
 export type CacheType = 'f16' | 'q8_0' | 'q4_0';
 
 export interface RuntimeConfig {
+  mtpMode?: 'auto' | 'off';
   contextLength: number;
   gpuLayers: number;
   cpuThreads: number;
@@ -17,7 +18,7 @@ export interface RuntimeConfig {
 }
 
 export const defaultRuntimeConfig: RuntimeConfig = {
-  contextLength: 131072, gpuLayers: -1, cpuThreads: 6, batchSize: 512,
+  mtpMode: 'auto', contextLength: 131072, gpuLayers: -1, cpuThreads: 6, batchSize: 512,
   microBatchSize: 128, flashAttention: true, cacheTypeK: 'q8_0', cacheTypeV: 'q8_0',
   offloadKvCache: true, mmap: true, inferenceSlots: 1, visionEnabled: true, offloadProjector: true,
 };
@@ -36,11 +37,29 @@ export interface PresentationRecord {
 }
 export interface PresentationModes { defaultMode: PresentationMode; overrideMode: PresentationMode | null; effectiveMode: PresentationMode }
 export interface Message {
+  /** Transient round snapshots; persisted messages and the journal remain authoritative. */
+  liveRounds?: LiveModelRound[];
   presentation?: PresentationRecord;
   metrics?: ResponseMetrics | null;
   error?: string | null;
   id: string; conversationId: string; role: 'user' | 'assistant' | 'tool';
   content: string; reasoning: string; status: 'complete' | 'streaming' | 'interrupted' | 'error' | 'paused'; createdAt: number;
+}
+export interface ToolIdentity {
+  conversationId: string;
+  runId?: string | null;
+  stepId?: string | null;
+  toolCallId: string;
+}
+export interface LiveModelRound {
+  conversationId: string;
+  runId: string;
+  stepId: string;
+  roundIndex: number;
+  content: string;
+  reasoning: string;
+  lastSeq: number;
+  createdAt: number;
 }
 export interface InferenceRound {
   phase?: string;
@@ -173,6 +192,7 @@ export interface RunRecord {
   error?: string | null;
   createdAt: number;
   updatedAt: number;
+  outcome?: RunOutcome | null;
 }
 
 export interface RunEvent {
@@ -216,7 +236,10 @@ export interface TodoItem {
   updatedAt: number;
 }
 
+export type RunOutcome = { reason: 'completed' | 'user_cancelled' | 'user_paused' | 'app_restart' | 'provider_failure' | 'budget_exhausted' | 'permission_denied' | 'outcome_unknown' | 'blocked'; resumable: boolean; checkpoint: string | null };
 export interface ChatEvent {
+  outcome?: RunOutcome;
+  discardStep?: string;
   presentation?: PresentationRecord;
   notice?: string;
   messageId: string;

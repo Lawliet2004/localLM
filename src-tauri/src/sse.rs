@@ -68,6 +68,7 @@ pub struct ModelStream {
     tool_indices: std::collections::BTreeMap<u64, u64>,
     tool_has_input: std::collections::HashSet<u64>,
     native_content: crate::claude_adapter::StreamContent,
+    reasoning_content: String,
 }
 
 impl ModelStream {
@@ -80,6 +81,7 @@ impl ModelStream {
             tool_indices: Default::default(),
             tool_has_input: Default::default(),
             native_content: Default::default(),
+            reasoning_content: String::new(),
         }
     }
 
@@ -175,6 +177,17 @@ impl ModelStream {
             Some(value)
         };
         if let Some(value) = &normalized {
+            if !self.claude && self.responses.is_none() {
+                if let Some(text) = value["choices"][0]["delta"]["reasoning_content"]
+                    .as_str()
+                    .or_else(|| value["choices"][0]["delta"]["reasoning"].as_str())
+                {
+                    if self.reasoning_content.len().saturating_add(text.len()) > 4 * 1024 * 1024 {
+                        return Err("Provider reasoning exceeds 4 MiB.".into());
+                    }
+                    self.reasoning_content.push_str(text);
+                }
+            }
             if value["choices"][0]["finish_reason"]
                 .as_str()
                 .is_some_and(|reason| !reason.is_empty())
@@ -207,6 +220,9 @@ impl ModelStream {
     ) -> serde_json::Value {
         let mut message = serde_json::json!({"role":"assistant","content":text,
             "tool_calls":calls.iter().map(|call| call.model_value()).collect::<Vec<_>>()});
+        if !self.reasoning_content.is_empty() {
+            message["reasoning_content"] = serde_json::json!(self.reasoning_content);
+        }
         if let Some(content) = self
             .responses
             .as_ref()

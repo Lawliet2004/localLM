@@ -1,3 +1,4 @@
+import { Brain } from 'lucide-react';
 import type { ComponentType, ReactNode } from 'react';
 
 /** Semantic category of an activity-trail entry. Drives icon and row identity. */
@@ -35,7 +36,7 @@ const FolderGlyph = line(<><path d="M3.5 7.5v10a1 1 0 001 1h15a1 1 0 001-1v-8a1 
 const WebGlyph = line(<><circle cx="12" cy="12" r="8.5" /><path d="M3.5 12h17" /><path d="M12 3.5c2.5 2.4 3.6 5.2 3.6 8.5s-1.1 6.1-3.6 8.5c-2.5-2.4-3.6-5.2-3.6-8.5S9.5 5.9 12 3.5z" /></>);
 const TaskGlyph = line(<><path d="M5 7l1.6 1.6L9.5 5.7" /><path d="M12 7h7" /><path d="M5 15l1.6 1.6 2.9-2.9" /><path d="M12 15h7" /></>);
 const ToolGlyph = line(<><path d="M14.5 6.5a4 4 0 004.9 4.9L11 19.8a2 2 0 01-2.8-2.8l8.4-8.4" /><path d="M14.5 6.5a4 4 0 014.9-1.4l-2.4 2.4 1 2.4" /></>);
-const ThoughtGlyph = line(<><path d="M12 4v3M12 17v3M4 12h3M17 12h3" /><path d="M7 7l1.8 1.8M15.2 15.2L17 17M17 7l-1.8 1.8M8.8 15.2L7 17" /></>);
+const ThoughtGlyph = Brain;
 const SystemGlyph = line(<><rect x="4" y="5" width="16" height="4" rx="1" /><path d="M5.5 9v9.5h13V9" /><path d="M10 13h4" /></>);
 
 export const TRACE_ICONS: Record<TraceKind, IconComponent> = {
@@ -45,7 +46,7 @@ export const TRACE_ICONS: Record<TraceKind, IconComponent> = {
   command: CommandGlyph,
   search: SearchGlyph,
   folder: FolderGlyph,
-  explore: FolderGlyph,
+  explore: SearchGlyph,
   read: ReadGlyph,
   tool: ToolGlyph,
   thought: ThoughtGlyph,

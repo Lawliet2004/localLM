@@ -314,43 +314,8 @@ export interface ResearchSession {
   trace: ResearchTrace;
 }
 
-export interface GenerationRequest {
-  systemPrompt: string;
-  userPrompt: string;
-  temperature?: number;
-  maxTokens?: number;
-  stopSequences?: string[];
-  responseSchema?: Record<string, unknown>;
-  /**
-   * 'low' asks the backend to suppress or shrink reasoning traces for
-   * mechanical calls (planning, evidence extraction, claim checks). Providers
-   * only honor it after probing the model's chat template — never assumed.
-   */
-  reasoningEffort?: 'low' | 'default';
-}
-
-export interface GenerationResponse {
-  text: string;
-  tokensUsed?: number;
-  finishReason?: string;
-}
-
-export interface LLMProvider {
-  countTokens?(text: string): Promise<number>;
-  generate(request: GenerationRequest): Promise<GenerationResponse>;
-}
-
-export interface EmbeddingProvider {
-  embedQuery(text: string): Promise<number[]>;
-  embedDocuments(texts: string[]): Promise<number[][]>;
-}
-
 export interface TokenCounter {
   count(text: string): number;
-}
-
-export interface Reranker {
-  rerank(query: string, chunks: EvidenceChunk[], limit: number): Promise<EvidenceChunk[]>;
 }
 
 export interface SearchProvider {

@@ -11,7 +11,6 @@
 
 import { inflateSync, unzlibSync } from 'fflate';
 import type { RetrievedDocument } from '../types';
-import { chunkDocument } from '../chunking/semantic_chunker';
 import { defaultTokenCounter } from '../chunking/tokenizer';
 
 export interface StoredDocument extends RetrievedDocument {
@@ -30,6 +29,9 @@ export interface Passage {
   section?: string;
   text: string;
   chars: number;
+  textOffset: number;
+  nextTextOffset: number | null;
+  totalChars: number;
 }
 
 const MAX_PASSAGE_CHARS = 2000;
@@ -50,48 +52,38 @@ export class DocumentStore {
     return [...this.docs.keys()];
   }
 
-  /** Read a bounded passage window by page, section, or passage range. */
-  open(docId: string, options: { page?: number; section?: string; passage?: number; offset?: number } = {}): Passage[] {
+  /** Read exact windows of stored text. Cursors never skip a long paragraph. */
+  open(docId: string, options: { page?: number; section?: string; passage?: number; offset?: number; textOffset?: number } = {}): Passage[] {
     const doc = this.docs.get(docId);
     if (!doc) throw new Error('Unknown document in this session');
-    const fullText = doc.fullText || doc.text;
+    let fullText = doc.fullText || doc.text;
     if (!fullText.trim()) throw new Error(`Document ${docId} has no stored text`);
-
+    let page: number | undefined;
     if (typeof options.page === 'number' && doc.pages?.length) {
       const index = Math.max(1, Math.min(doc.pages.length, Math.floor(options.page))) - 1;
-      return [{
-        ref: `${docId}:page:${index + 1}`,
-        docId,
-        page: index + 1,
-        text: doc.pages[index].slice(0, MAX_PASSAGE_CHARS),
-        chars: Math.min(doc.pages[index].length, MAX_PASSAGE_CHARS),
-      }];
+      page = index + 1;
+      fullText = doc.pages[index];
     }
-
-    if (options.section) {
-      const needle = options.section.toLowerCase();
-      const chunks = chunkDocument({ ...doc, text: fullText }, { targetTokens: 500, overlapTokens: 60 });
-      const hit = chunks.find((c) => (c.headingPath || []).join(' ').toLowerCase().includes(needle));
-      if (hit) {
-        return [{
-          ref: `${docId}:section:${(hit.headingPath || ['untitled']).join('>')}`,
-          docId,
-          section: (hit.headingPath || []).join(' > '),
-          text: hit.text.slice(0, MAX_PASSAGE_CHARS),
-          chars: Math.min(hit.text.length, MAX_PASSAGE_CHARS),
-        }];
-      }
+    let section: string | undefined;
+    let start = Math.max(0, Math.floor(options.textOffset ?? ((options.passage ?? options.offset ?? 1) - 1) * MAX_PASSAGE_CHARS));
+    if (options.section && options.textOffset == null) {
+      const hit = [...fullText.matchAll(/^#{1,6}\s+(.+)$/gm)]
+        .find(match => match[1].toLowerCase().includes(options.section!.toLowerCase()));
+      if (!hit) throw new Error('Unknown section in this document');
+      start = hit.index!;
+      section = hit[1];
     }
-
-    const chunks = chunkDocument({ ...doc, text: fullText }, { targetTokens: 500, overlapTokens: 60 });
-    const index = Math.max(0, (options.passage ?? options.offset ?? 1) - 1);
-    return chunks.slice(index, index + 1).map((chunk, i) => ({
-      ref: `${docId}:passage:${index + i + 1}`,
-      docId,
-      section: (chunk.headingPath || []).join(' > ') || undefined,
-      text: chunk.text.slice(0, MAX_PASSAGE_CHARS),
-      chars: Math.min(chunk.text.length, MAX_PASSAGE_CHARS),
-    }));
+    if (start >= fullText.length) return [];
+    // JavaScript offsets count UTF-16 code units. Keep surrogate pairs intact.
+    if (start > 0 && /[\uDC00-\uDFFF]/.test(fullText[start])) start--;
+    let end = Math.min(fullText.length, start + MAX_PASSAGE_CHARS);
+    if (end < fullText.length && /[\uDC00-\uDFFF]/.test(fullText[end])) end--;
+    return [{
+      ref: page ? `${docId}:page:${page}${start ? `:offset:${start}` : ''}`
+        : `${docId}:passage:${Math.floor(start / MAX_PASSAGE_CHARS) + 1}:offset:${start}`,
+      docId, page, section, text: fullText.slice(start, end), chars: end - start,
+      textOffset: start, nextTextOffset: end < fullText.length ? end : null, totalChars: fullText.length,
+    }];
   }
 
   /** Document-local search over full stored text with surrounding context. */
@@ -115,6 +107,7 @@ export class DocumentStore {
         docId,
         text: fullText.slice(start, end),
         chars: end - start,
+        textOffset: start, nextTextOffset: end < fullText.length ? end : null, totalChars: fullText.length,
       });
       from = at + needle.length;
     }

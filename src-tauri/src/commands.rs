@@ -352,7 +352,6 @@ pub async fn delete_conversation(state: State<'_, AppState>, id: String) -> Resu
     // that produced it no longer exists, so a running child would otherwise
     // be left with no reachable handle.
     state.processes.stop_owned(&id);
-    state.terminals.lock().await.close_owned(&id).await;
     let store = state.database()?;
     store.delete_conversation(&id)?;
     crate::workspace_ui::remove_task_meta(&store, &id)
@@ -433,6 +432,19 @@ pub async fn load_model(state: State<'_, AppState>) -> Result<RuntimeStatus, Str
 }
 
 pub(crate) async fn load_selected_model(state: &AppState) -> Result<RuntimeStatus, String> {
+    load_selected_model_with_install_cancel(state, None).await
+}
+
+pub(crate) async fn load_selected_model_with_install_cancel(
+    state: &AppState,
+    installation_cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<RuntimeStatus, String> {
+    if installation_cancel
+        .as_ref()
+        .is_some_and(|cancel| *cancel.borrow())
+    {
+        return Err("Model loading cancelled.".into());
+    }
     let (mut preferences, config) = {
         let store = state.database()?;
         (store.preferences()?, store.runtime_config()?)
@@ -466,7 +478,22 @@ pub(crate) async fn load_selected_model(state: &AppState) -> Result<RuntimeStatu
             crate::runtime::Runtime::new(state.data_dir.join("runtime.log")),
         )
     };
+    let installation_cancelled = async move {
+        if let Some(mut cancel) = installation_cancel {
+            if !*cancel.borrow() {
+                let _ = cancel.changed().await;
+            }
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     let result = tokio::select! {
+        _ = installation_cancelled => {
+            match runtime.stop().await {
+                Ok(_) => Err("Model loading cancelled.".into()),
+                Err(error) => Err(format!("Cancellation cleanup failed: {error}")),
+            }
+        },
         result = runtime.load_observed(&preferences, &config, Some(state.load_status.clone())) => result,
         _ = cancel.changed() => {
             match runtime.stop().await {

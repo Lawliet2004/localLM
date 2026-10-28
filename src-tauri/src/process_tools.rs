@@ -17,6 +17,51 @@ const OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_PROCESSES: usize = 64;
 const MAX_ACTIVE_PER_OWNER: usize = 8;
 
+/// Publish the same lifetime ceiling the process supervisor enforces. This is
+/// applied before freezing the authorized catalog, including deferred tools.
+pub fn configure_tool(
+    tool: &mut crate::connectors::AgentTool,
+    config: &crate::execution::ExecutionConfig,
+) {
+    if tool.connector != "Harness" {
+        return;
+    }
+    if matches!(
+        tool.alias.as_str(),
+        "process_start" | "check_run" | "verification_run"
+    ) {
+        let limit = config.bash.timeout_seconds.clamp(1, 300);
+        let property = &mut tool.tool.input_schema["properties"]["timeout_seconds"];
+        property["maximum"] = json!(limit);
+        property["default"] = json!(limit);
+        property["description"] = json!(format!("Effective process lifetime: 1–{limit} seconds. Omit to use {limit}. Model arguments cannot increase this configured limit."));
+    }
+}
+
+fn validate_start_limits(yield_ms: u64, timeout: u64, configured: u64) -> Result<(), String> {
+    if yield_ms > 1000 {
+        return Err(format!("Invalid arguments at /yield_ms: received {yield_ms}; allowed 0–1000 ms. No command was launched."));
+    }
+    let limit = configured.min(300);
+    if timeout == 0 || timeout > limit {
+        return Err(format!("Invalid arguments at /timeout_seconds: received {timeout}; effective maximum is {limit} seconds (allowed 1–{limit}). Omit timeout_seconds to use the configured limit. No command was launched."));
+    }
+    Ok(())
+}
+
+pub(crate) fn start_limit_notice(
+    config: &crate::execution::ExecutionConfig,
+    args: &Value,
+) -> Option<Value> {
+    let limit = config.bash.timeout_seconds.min(300);
+    let timeout = args["timeout_seconds"].as_u64().unwrap_or(limit);
+    let yield_ms = args["yield_ms"].as_u64().unwrap_or(100);
+    validate_start_limits(yield_ms, timeout, config.bash.timeout_seconds).err().map(|message| {
+        crate::tool_envelope::failure_notice("invalid-arguments", &message, false, crate::tool_envelope::SIDE_NONE,
+            &json!({"field":if yield_ms > 1000 {"/yield_ms"} else {"/timeout_seconds"},"limits":{"timeout_seconds":{"minimum":1,"maximum":limit},"yield_ms":{"minimum":0,"maximum":1000}}}))
+    })
+}
+
 pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     let schema = |properties, required: &[&str]| json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
     let id = json!({"type":"string","minLength":1,"maxLength":128,"description":"The process ID returned by process_start, owned by this conversation and workspace."});
@@ -28,10 +73,10 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
             "yield_ms":{"type":"integer","minimum":0,"maximum":1000,"default":100},
             "stdin":{"type":"string","maxLength":65536},"close_stdin":{"type":"boolean","default":false}
         }), &["command"])),
-        ("process_poll".into(), "Read incremental stdout/stderr and the current state of an owned process. Pass the previous nextCursor to avoid repeated output. hasMore means another page is available; truncated and firstAvailableCursor explicitly report output lost from the bounded buffer. Polling does not execute a command.".into(), schema(json!({
+        ("process_poll".into(), "Read incremental stdout/stderr and the current state of an owned process. Pass the previous nextCursor to avoid repeated output. hasMore means another page is available; truncated and firstAvailableCursor explicitly report output lost from the bounded buffer. By default waits for completion without generating more model rounds. Set wait_ms for a bounded snapshot, or zero for an immediate snapshot. Polling does not execute a command.".into(), schema(json!({
             "id":id,"cursor":{"type":"integer","minimum":0,"default":0},
             "max_bytes":{"type":"integer","minimum":8192,"maximum":65536,"default":65536},
-            "wait_ms":{"type":"integer","minimum":0,"maximum":1000,"default":0}
+            "wait_ms":{"type":"integer","minimum":0,"maximum":300000}
         }), &["id"])),
         ("process_write".into(), "Write stdin to an owned running process, for example a line ending in newline. Set close_stdin to deliver EOF. Input can cause side effects and follows shell approval settings. A timeout can mean bytes were partially written; do not blindly retry.".into(), schema(json!({
             "id":id,"input":{"type":"string","maxLength":65536},"close_stdin":{"type":"boolean","default":false}
@@ -96,6 +141,7 @@ struct Frame {
     text: String,
 }
 struct Output {
+    changed: tokio::sync::watch::Sender<u64>,
     phase: &'static str,
     exit_code: Option<i32>,
     error: Option<String>,
@@ -110,6 +156,7 @@ struct Output {
 impl Default for Output {
     fn default() -> Self {
         Self {
+            changed: tokio::sync::watch::channel(0).0,
             phase: "running",
             exit_code: None,
             error: None,
@@ -135,6 +182,8 @@ impl Output {
             text,
         });
         self.next += 1;
+        self.changed
+            .send_modify(|version| *version = version.wrapping_add(1));
         while self.bytes > OUTPUT_BYTES {
             if let Some(frame) = self.frames.pop_front() {
                 self.bytes -= frame.text.len();
@@ -173,7 +222,8 @@ impl Output {
         Ok(
             json!({"id":id,"state":self.phase,"durationMs":self.duration_ms,"exitCode":self.exit_code,"error":error,"message":message,
             "output":frames,"nextCursor":next,"hasMore":next < self.next,
-            "truncated":cursor < base || self.incomplete,"firstAvailableCursor":base,"sideEffects":"possible",
+            "truncated":cursor < base || self.incomplete,"firstAvailableCursor":base,
+            "sideEffects":if self.phase == "exited" && !self.incomplete { crate::tool_envelope::SIDE_APPLIED } else { crate::tool_envelope::SIDE_UNKNOWN },
             "isError":self.incomplete || matches!(self.phase, "failed" | "timed_out" | "unknown") || (self.phase == "exited" && self.exit_code.is_some_and(|code| code != 0))}),
         )
     }
@@ -198,9 +248,37 @@ struct Process {
     control: mpsc::Sender<Control>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ProcessRegistry {
-    processes: Mutex<HashMap<String, Arc<Process>>>,
+    processes: Arc<Mutex<HashMap<String, Arc<Process>>>>,
+    database: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Debug for ProcessRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessRegistry")
+            .field("persistent", &self.database.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+struct DurableProcess {
+    database: std::path::PathBuf,
+    id: String,
+    owner: String,
+    workspace: String,
+}
+impl DurableProcess {
+    fn save(&self, output: &Output) -> Result<(), String> {
+        let value = output.poll(&self.id, 0, OUTPUT_BYTES)?;
+        let db = rusqlite::Connection::open(&self.database).map_err(|e| e.to_string())?;
+        db.busy_timeout(Duration::from_secs(2))
+            .map_err(|e| e.to_string())?;
+        db.execute("INSERT INTO process_results(id,owner,workspace,snapshot,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET snapshot=excluded.snapshot,updated_at=excluded.updated_at",
+            rusqlite::params![self.id,self.owner,self.workspace,value.to_string(),crate::store::now()]).map_err(|e|e.to_string())?;
+        Ok(())
+    }
 }
 
 /// A cancelled start must not leave a process whose ID was never delivered.
@@ -220,6 +298,65 @@ impl Drop for PendingStart<'_> {
 }
 
 impl ProcessRegistry {
+    pub fn persistent(database: std::path::PathBuf) -> Self {
+        Self {
+            processes: Arc::new(Mutex::new(HashMap::new())),
+            database: Some(database),
+        }
+    }
+
+    fn restored(
+        &self,
+        owner: &str,
+        workspace: &str,
+        id: &str,
+        cursor: u64,
+        max_bytes: usize,
+    ) -> Result<Value, String> {
+        let path = self
+            .database
+            .as_ref()
+            .ok_or("Process is unknown or its completed record expired.")?;
+        let db = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
+        let text: String = db
+            .query_row(
+                "SELECT snapshot FROM process_results WHERE id=?1 AND owner=?2 AND workspace=?3",
+                rusqlite::params![id, owner, workspace],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Process is unknown or belongs to another conversation/workspace.")?;
+        let mut value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        if value["state"] == "running" {
+            value["state"] = json!("unknown");
+            value["isError"] = json!(true);
+            value["error"] = json!("Application restarted while this process was active. Its outcome is unknown; inspect the workspace before retrying.");
+        }
+        if cursor > value["nextCursor"].as_u64().unwrap_or(0) {
+            return Err("Process cursor is beyond the available output.".into());
+        }
+        let cursor = cursor.max(value["firstAvailableCursor"].as_u64().unwrap_or(0));
+        let mut bytes = 0;
+        let frames: Vec<Value> = value["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|frame| frame["cursor"].as_u64().is_some_and(|n| n >= cursor))
+            .take_while(|frame| {
+                bytes += frame["text"].as_str().unwrap_or_default().len();
+                bytes <= max_bytes
+            })
+            .cloned()
+            .collect();
+        let next = frames
+            .last()
+            .and_then(|frame| frame["cursor"].as_u64())
+            .map(|n| n + 1)
+            .unwrap_or(cursor);
+        value["hasMore"] = json!(next < value["nextCursor"].as_u64().unwrap_or(0));
+        value["nextCursor"] = json!(next);
+        value["output"] = json!(frames);
+        Ok(value)
+    }
     /// Terminate every process this registry owns.
     ///
     /// Tauri ends the application with `std::process::exit`, so no destructor
@@ -266,6 +403,11 @@ impl ProcessRegistry {
         alias: &str,
         args: Value,
     ) -> Result<Value, String> {
+        if alias == "process_start" {
+            if let Some(notice) = start_limit_notice(&config, &args) {
+                return Ok(notice);
+            }
+        }
         match alias {
             "process_start" => self.start(owner, workspace, config, args).await,
             "process_poll" => self.poll(owner, workspace, args).await,
@@ -315,7 +457,9 @@ impl ProcessRegistry {
     ) -> Result<Value, String> {
         let args: StartArgs = serde_json::from_value(args).map_err(|error| error.to_string())?;
         let yield_ms = args.yield_ms.unwrap_or(100);
-        let timeout = args.timeout_seconds.unwrap_or(config.bash.timeout_seconds);
+        let timeout = args
+            .timeout_seconds
+            .unwrap_or(config.bash.timeout_seconds.min(300));
         if owner.is_empty() || workspace.is_empty() {
             return Err("Process start needs a conversation and workspace.".into());
         }
@@ -325,10 +469,7 @@ impl ProcessRegistry {
                 "Process command must contain 1–32768 bytes and stdin at most 64 KiB.".into(),
             );
         }
-        if yield_ms > 1000 || !(1..=300).contains(&timeout) || timeout > config.bash.timeout_seconds
-        {
-            return Err("Process yield must be 0–1000 ms; timeout must be 1–300 seconds within the configured shell limit.".into());
-        }
+        validate_start_limits(yield_ms, timeout, config.bash.timeout_seconds)?;
         if let Some(cwd) = args.cwd {
             config.bash.working_directory = cwd;
         }
@@ -378,6 +519,35 @@ impl ProcessRegistry {
             .env("PYTHONUTF8", "1")
             .envs(&config.bash.environment);
         crate::execution::memory_limit(&mut command, &config.bash);
+        self.start_prepared(
+            owner,
+            workspace,
+            command,
+            timeout,
+            yield_ms,
+            args.stdin,
+            args.close_stdin,
+            completion,
+            None,
+        )
+        .await
+    }
+
+    /// All model execution adapters enter the same supervisor after constructing
+    /// their approved command and scoped environment.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_prepared(
+        &self,
+        owner: &str,
+        workspace: &str,
+        command: tokio::process::Command,
+        timeout: u64,
+        yield_ms: u64,
+        input: String,
+        close_stdin: bool,
+        completion: Option<crate::verification_observer::Completion>,
+        on_chunk: Option<crate::execution::ChunkCallback>,
+    ) -> Result<Value, String> {
         let id = format!("proc-{}", uuid::Uuid::new_v4());
         {
             let mut processes = self
@@ -427,8 +597,22 @@ impl ProcessRegistry {
                 started_at,
                 ..Output::default()
             }));
-            let out_reader = tokio::spawn(read_output(stdout, "stdout", output.clone()));
-            let err_reader = tokio::spawn(read_output(stderr, "stderr", output.clone()));
+            let durable = self.database.as_ref().map(|database| DurableProcess {
+                database: database.clone(),
+                id: id.clone(),
+                owner: owner.into(),
+                workspace: workspace.into(),
+            });
+            if let Some(durable) = &durable {
+                durable.save(&*output.lock().map_err(|_| "Process output unavailable.")?)?;
+            }
+            let out_reader = tokio::spawn(read_output(
+                stdout,
+                "stdout",
+                output.clone(),
+                on_chunk.clone(),
+            ));
+            let err_reader = tokio::spawn(read_output(stderr, "stderr", output.clone(), on_chunk));
             let (control, receiver) = mpsc::channel(8);
             processes.insert(
                 id.clone(),
@@ -442,6 +626,7 @@ impl ProcessRegistry {
             );
             tokio::spawn(supervise(
                 child, stdin, receiver, output, out_reader, err_reader, timeout, completion,
+                durable,
             ));
         }
         let mut pending = PendingStart {
@@ -449,12 +634,12 @@ impl ProcessRegistry {
             id: id.clone(),
             armed: true,
         };
-        if !args.stdin.is_empty() || args.close_stdin {
+        if !input.is_empty() || close_stdin {
             if let Err(error) = self
                 .write(
                     owner,
                     workspace,
-                    json!({"id":id,"input":args.stdin,"close_stdin":args.close_stdin}),
+                    json!({"id":id,"input":input,"close_stdin":close_stdin}),
                 )
                 .await
             {
@@ -469,6 +654,68 @@ impl ProcessRegistry {
         Ok(value)
     }
 
+    pub(crate) async fn run_prepared(
+        &self,
+        owner: &str,
+        workspace: &str,
+        command: tokio::process::Command,
+        timeout: u64,
+        input: String,
+        on_chunk: Option<crate::execution::ChunkCallback>,
+    ) -> Result<Value, String> {
+        let launch = self
+            .start_prepared(
+                owner, workspace, command, timeout, 0, input, true, None, on_chunk,
+            )
+            .await?;
+        let id = launch["id"]
+            .as_str()
+            .ok_or("Missing supervised process ID")?;
+        let mut pending = PendingStart {
+            registry: self,
+            id: id.into(),
+            armed: true,
+        };
+        let process = self.owned(owner, workspace, id)?;
+        let mut changed = process
+            .output
+            .lock()
+            .map_err(|_| "Process output unavailable")?
+            .changed
+            .subscribe();
+        loop {
+            if process
+                .output
+                .lock()
+                .map_err(|_| "Process output unavailable")?
+                .phase
+                != "running"
+            {
+                break;
+            }
+            changed
+                .changed()
+                .await
+                .map_err(|_| "Process supervisor stopped unexpectedly")?;
+        }
+        let mut value = self.snapshot(owner, workspace, id, 0, OUTPUT_BYTES)?;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        for frame in value["output"].as_array().into_iter().flatten() {
+            let target = if frame["stream"] == "stdout" {
+                &mut stdout
+            } else {
+                &mut stderr
+            };
+            target.push_str(frame["text"].as_str().unwrap_or_default());
+        }
+        value["stdout"] = json!(stdout);
+        value["stderr"] = json!(stderr);
+        value["processId"] = json!(id);
+        pending.armed = false;
+        Ok(value)
+    }
+
     fn snapshot(
         &self,
         owner: &str,
@@ -477,7 +724,10 @@ impl ProcessRegistry {
         cursor: u64,
         max_bytes: usize,
     ) -> Result<Value, String> {
-        let process = self.owned(owner, workspace, id)?;
+        let process = match self.owned(owner, workspace, id) {
+            Ok(process) => process,
+            Err(_) => return self.restored(owner, workspace, id, cursor, max_bytes),
+        };
         let output = process
             .output
             .lock()
@@ -485,14 +735,8 @@ impl ProcessRegistry {
         output.poll(id, cursor, max_bytes)
     }
 
-    /// A consistent bounded snapshot for native check/report adapters. It
-    /// exposes only an already-owned process and never increases retention.
-    ///
-    /// The stop request travels on the same bounded queue as `Control::Write`.
-    /// When that queue is full the request cannot be delivered, and dropping
-    /// the error silently would leave a process running with no acknowledgement.
-    /// The failure is therefore reported on the process itself, with the same
-    /// wording `ProcessRegistry::stop` uses.
+    /// Exercise stop-queue failure handling without a running process.
+    #[cfg(test)]
     pub(crate) fn request_stop(&self, owner: &str, workspace: &str, id: &str) {
         if let Ok(process) = self.owned(owner, workspace, id) {
             let (reply, _) = oneshot::channel();
@@ -518,13 +762,48 @@ impl ProcessRegistry {
     pub async fn poll(&self, owner: &str, workspace: &str, args: Value) -> Result<Value, String> {
         let args: PollArgs = serde_json::from_value(args).map_err(|error| error.to_string())?;
         let limit = args.max_bytes.unwrap_or(65536);
-        let wait = args.wait_ms.unwrap_or(0);
-        if !(8192..=65536).contains(&limit) || wait > 1000 {
-            return Err("Process max_bytes must be 8192–65536 and wait_ms 0–1000.".into());
+        let wait = args.wait_ms;
+        if !(8192..=65536).contains(&limit) || wait.is_some_and(|wait| wait > 300_000) {
+            return Err("Process max_bytes must be 8192–65536 and wait_ms 0–300000.".into());
         }
-        self.owned(owner, workspace, &args.id)?;
-        if wait > 0 {
-            tokio::time::sleep(Duration::from_millis(wait)).await;
+        let process = match self.owned(owner, workspace, &args.id) {
+            Ok(process) => process,
+            Err(_) => {
+                return self.restored(owner, workspace, &args.id, args.cursor.unwrap_or(0), limit)
+            }
+        };
+        if wait != Some(0) {
+            let mut changed = process
+                .output
+                .lock()
+                .map_err(|_| "Process output unavailable.")?
+                .changed
+                .subscribe();
+            let completion = async {
+                loop {
+                    if process
+                        .output
+                        .lock()
+                        .map_err(|_| "Process output unavailable.")?
+                        .phase
+                        != "running"
+                    {
+                        return Ok::<_, String>(());
+                    }
+                    changed
+                        .changed()
+                        .await
+                        .map_err(|_| "Process supervisor stopped.")?;
+                }
+            };
+            match wait {
+                Some(wait) => {
+                    let _ = tokio::time::timeout(Duration::from_millis(wait), completion).await;
+                }
+                None => {
+                    completion.await?;
+                }
+            }
         }
         self.snapshot(owner, workspace, &args.id, args.cursor.unwrap_or(0), limit)
     }
@@ -565,7 +844,7 @@ impl ProcessRegistry {
         if !(1..=600).contains(&wait_secs) {
             return Err("shell_run timeout_secs must be 1–600.".into());
         }
-        let mut start_args = json!({"command":args.command,"yield_ms":0,"timeout_seconds":config.bash.timeout_seconds,"close_stdin":true});
+        let mut start_args = json!({"command":args.command,"yield_ms":0,"timeout_seconds":config.bash.timeout_seconds.min(300),"close_stdin":true});
         if let Some(cwd) = args.cwd {
             start_args["cwd"] = json!(cwd);
         }
@@ -620,9 +899,11 @@ impl ProcessRegistry {
                 "message":"Still running; continue with process_poll or stop it with process_stop."}),
             );
         }
-        let exit_code = self.snapshot(owner, workspace, &id, 0, 8192)?["exitCode"].clone();
+        let terminal = self.snapshot(owner, workspace, &id, 0, 8192)?;
+        let exit_code = terminal["exitCode"].clone();
         Ok(
             json!({"status":state,"processId":id,"exitCode":exit_code,"stdout":stdout,"stderr":stderr,"truncated":truncated,"durationMs":duration_ms,
+            "sideEffects":terminal["sideEffects"],
             "isError":exit_code.as_i64() != Some(0) || state != "exited"}),
         )
     }
@@ -679,6 +960,7 @@ async fn read_output(
     mut reader: impl AsyncRead + Unpin,
     stream: &'static str,
     output: Arc<Mutex<Output>>,
+    on_chunk: Option<crate::execution::ChunkCallback>,
 ) {
     let mut bytes = [0; 4096];
     let mut pending = Vec::new();
@@ -686,6 +968,11 @@ async fn read_output(
         match reader.read(&mut bytes).await {
             Ok(count) => {
                 let text = crate::terminal_ui::decode(&mut pending, &bytes[..count], count == 0);
+                if let Some(callback) = &on_chunk {
+                    if !text.is_empty() {
+                        callback(stream, &text);
+                    }
+                }
                 if let Ok(mut state) = output.lock() {
                     state.push(stream, text);
                 }
@@ -731,6 +1018,7 @@ async fn supervise(
     err_reader: tokio::task::JoinHandle<()>,
     timeout: u64,
     completion: Option<crate::verification_observer::Completion>,
+    durable: Option<DurableProcess>,
 ) {
     let mut stdin = Some(stdin);
     let deadline = tokio::time::sleep(Duration::from_secs(timeout));
@@ -752,7 +1040,7 @@ async fn supervise(
                 Err(error) => ("failed", None, Some(format!("Process wait failed: {error}"))),
             },
             _ = &mut deadline => break match terminate(&mut child).await {
-                Ok(code) => ("timed_out", code, Some("Configured process timeout exceeded; process tree stopped.".into())),
+                Ok(code) => ("timed_out", code, Some("Execution timed out; process tree stopped.".into())),
                 Err(error) => ("unknown", None, Some(error)),
             },
             control = receiver.recv() => match control {
@@ -790,9 +1078,6 @@ async fn supervise(
     }
     drop(stdin);
     drop(child); // Stop any surviving descendants before sealing observation.
-    if let Some(completion) = completion {
-        completion.finish(phase).await;
-    }
     let mut out_reader = out_reader;
     let mut err_reader = err_reader;
     if tokio::time::timeout(Duration::from_secs(1), async {
@@ -815,12 +1100,70 @@ async fn supervise(
         if error.is_some() {
             state.error = error;
         }
+        state
+            .changed
+            .send_modify(|version| *version = version.wrapping_add(1));
+        if let Some(durable) = &durable {
+            if let Err(error) = durable.save(&state) {
+                state.error = Some(format!(
+                    "Completed process result could not be persisted: {error}"
+                ));
+                state.incomplete = true;
+            }
+        }
+    }
+    // A durable sealed observation must never race ahead of drained output
+    // and the terminal process state. Reports can see terminal output while
+    // sealing is in progress, but cannot claim verification until both exist.
+    if let Some(completion) = completion {
+        completion.finish(phase).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_schemas_publish_effective_limits_for_direct_and_deferred_tools() {
+        let mut config = crate::execution::ExecutionConfig::default();
+        config.bash.timeout_seconds = 60;
+        for alias in ["process_start", "check_run"] {
+            let mut tool = crate::connectors::AgentTool::harness(alias).unwrap();
+            configure_tool(&mut tool, &config);
+            let schema = &tool.tool.input_schema;
+            assert_eq!(schema["properties"]["timeout_seconds"]["maximum"], 60);
+            for rejected in [180, 180, 120] {
+                assert!(crate::tool_validation::validate(
+                    schema,
+                    &json!({"command":"echo ok","timeout_seconds":rejected})
+                )
+                .is_err());
+            }
+            assert!(crate::tool_validation::validate(
+                schema,
+                &json!({"command":"echo ok","timeout_seconds":60})
+            )
+            .is_ok());
+            assert!(
+                crate::tool_validation::validate(schema, &json!({"command":"echo ok"})).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_lifetimes_name_the_effective_limit_before_spawning() {
+        assert!(validate_start_limits(900, 180, 60)
+            .unwrap_err()
+            .contains("effective maximum is 60"));
+        assert!(validate_start_limits(500, 120, 60)
+            .unwrap_err()
+            .contains("/timeout_seconds"));
+        assert!(validate_start_limits(1001, 60, 60)
+            .unwrap_err()
+            .contains("/yield_ms"));
+        assert!(validate_start_limits(500, 60, 60).is_ok());
+    }
 
     #[tokio::test]
     async fn a_stop_is_acknowledged_before_the_observation_is_sealed() {
@@ -1176,8 +1519,8 @@ mod tests {
         let state = crate::test_support::app_state(directory.path());
         crate::test_support::select_fixture_model(&state, directory.path());
         for (preset, expected) in [
-            (crate::presets::CODE, "ptc_run"),
-            (crate::presets::CREATOR, "workflow_run"),
+            (crate::presets::CODE, "process_start"),
+            (crate::presets::CREATOR, "subagent"),
             (crate::presets::MINIMAL, "workspace_edit_file"),
         ] {
             let plan = crate::chat::assemble_turn(
@@ -1215,6 +1558,101 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn completed_output_survives_registry_reopen_and_ownership_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.sqlite");
+        let _store = crate::store::Store::open(&db).unwrap();
+        let root = dir.path().to_str().unwrap();
+        let registry = ProcessRegistry::persistent(db.clone());
+        let start = registry
+            .start(
+                "owner",
+                root,
+                Default::default(),
+                json!({"command":"printf durable","yield_ms":0}),
+            )
+            .await
+            .unwrap();
+        let id = start["id"].as_str().unwrap();
+        let result = finished(&registry, root, id).await;
+        assert_eq!(result["exitCode"], 0);
+        // Terminal persistence precedes the notification observed by poll.
+        drop(registry);
+        let restored = ProcessRegistry::persistent(db);
+        let saved = restored
+            .poll("owner", root, json!({"id":id,"wait_ms":0}))
+            .await
+            .unwrap();
+        assert_eq!(saved["state"], "exited");
+        assert_eq!(saved["exitCode"], 0);
+        assert!(saved["output"].to_string().contains("durable"));
+        assert!(restored
+            .poll("someone-else", root, json!({"id":id}))
+            .await
+            .is_err());
+        assert!(restored
+            .poll("owner", "another-workspace", json!({"id":id}))
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn observed_nonzero_exit_stays_known_through_normalization_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.sqlite");
+        let _store = crate::store::Store::open(&db).unwrap();
+        let root = dir.path().to_str().unwrap();
+        let registry = ProcessRegistry::persistent(db.clone());
+        let start = registry.start("owner", root, Default::default(),
+            json!({"command":"printf observed; exit 7","yield_ms":0})).await.unwrap();
+        let id = start["id"].as_str().unwrap();
+        let result = finished(&registry, root, id).await;
+        let normalized = crate::tool_envelope::normalize(result, crate::tool_envelope::Family::Harness);
+        assert_eq!(normalized["status"], "failure");
+        assert_eq!(normalized["error"]["sideEffects"], crate::tool_envelope::SIDE_APPLIED);
+        assert_eq!(crate::agent_engine::termination_after_tool(None, &normalized), None);
+        drop(registry);
+        let restored = ProcessRegistry::persistent(db);
+        let saved = restored.poll("owner", root, json!({"id":id,"wait_ms":0})).await.unwrap();
+        assert_eq!(saved["exitCode"], 7);
+        assert_eq!(saved["sideEffects"], crate::tool_envelope::SIDE_APPLIED);
+        assert!(saved["output"].to_string().contains("observed"));
+        let shell = restored.execute("owner", root, Default::default(), "shell_run",
+            json!({"command":"exit 7","timeout_secs":10})).await.unwrap();
+        let normalized = crate::tool_envelope::normalize(shell, crate::tool_envelope::Family::Harness);
+        assert_eq!(normalized["error"]["code"], "nonzero-exit");
+        assert_eq!(normalized["error"]["sideEffects"], crate::tool_envelope::SIDE_APPLIED);
+        assert_eq!(crate::agent_engine::termination_after_tool(None, &normalized), None);
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_claim_an_inflight_command_succeeded_or_relaunch_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.sqlite");
+        let _store = crate::store::Store::open(&db).unwrap();
+        let root = dir.path().to_str().unwrap();
+        let registry = ProcessRegistry::persistent(db.clone());
+        let start = registry
+            .start(
+                "owner",
+                root,
+                Default::default(),
+                json!({"command":"sleep 10; touch should-not-exist","yield_ms":0}),
+            )
+            .await
+            .unwrap();
+        let id = start["id"].as_str().unwrap();
+        let reopened = ProcessRegistry::persistent(db);
+        let unknown = reopened
+            .poll("owner", root, json!({"id":id,"wait_ms":0}))
+            .await
+            .unwrap();
+        assert_eq!(unknown["state"], "unknown");
+        assert_eq!(unknown["isError"], true);
+        assert!(unknown["exitCode"].is_null());
+        assert!(!dir.path().join("should-not-exist").exists());
+        registry.stop_owned("owner");
+    }
     async fn finished(registry: &ProcessRegistry, root: &str, id: &str) -> Value {
         for _ in 0..100 {
             let result = registry
@@ -1226,6 +1664,39 @@ mod tests {
             }
         }
         panic!("Process did not finish promptly")
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "Controlled real 61-second command; run explicitly on a permitted host"]
+    async fn command_outlives_the_former_default_and_waits_without_model_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let registry = ProcessRegistry::default();
+        let mut config = crate::execution::ExecutionConfig::default();
+        config.bash.timeout_seconds = 120;
+        let process = registry
+            .start(
+                "owner",
+                root,
+                config,
+                json!({"command":"sleep 61; printf survived","yield_ms":0}),
+            )
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = registry
+            .poll("owner", root, json!({"id":process["id"],"max_bytes":65536}))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(60));
+        assert_eq!(result["state"], "exited");
+        assert_eq!(result["exitCode"], 0);
+        assert!(result["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|frame| frame["text"] == "survived"));
     }
 
     #[tokio::test]

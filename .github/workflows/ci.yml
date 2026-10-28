@@ -43,6 +43,11 @@ jobs:
       - name: Test
         working-directory: src-tauri
         run: cargo test --lib
+      - name: Agent loop acceptance (isolated loopback provider)
+        working-directory: src-tauri
+        # These tests use temporary app data and a scripted local SSE server;
+        # they require TCP, but no browser, model weights or provider secrets.
+        run: cargo test --lib chat::output_recovery_tests -- --ignored
 
   frontend:
     name: Frontend

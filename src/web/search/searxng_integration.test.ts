@@ -18,7 +18,6 @@ it('keeps failure diagnostics in research sessions when SearXNG is misconfigured
   vi.stubGlobal('fetch', fetchMock);
   const session = await new WebSearchEngine({ config: {
     searchRetries: 3,
-    queries: { fast: 1, normal: 1, deep: 1 },
     cache: { ...DEFAULT_CONFIG.cache, enabled: false },
   } }).research('Find the latest software release', { mode: 'fast' });
   expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -28,12 +27,11 @@ it('keeps failure diagnostics in research sessions when SearXNG is misconfigured
   expect(session.documents).toEqual([]);
 });
 
-it('does not paginate beyond an exhausted research query budget', async () => {
+it('performs one requested search without hidden pagination', async () => {
   const fetchMock = vi.fn().mockImplementation(async () => Response.json({ results: [] }));
   vi.stubGlobal('fetch', fetchMock);
   const session = await new WebSearchEngine({ config: {
-    searchRetries: 0, enablePagination: true,
-    queries: { fast: 1, normal: 1, deep: 1 },
+    searchRetries: 0,
     cache: { ...DEFAULT_CONFIG.cache, enabled: false },
   } }).research('Find the latest software release', { mode: 'fast' });
   expect(fetchMock).toHaveBeenCalledTimes(1);

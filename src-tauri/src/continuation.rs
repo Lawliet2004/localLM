@@ -108,9 +108,9 @@ pub struct Budgets {
 impl Default for Budgets {
     fn default() -> Self {
         Self {
-            max_rounds: 64,
-            max_searches: 16,
-            max_fetches: 16,
+            max_rounds: u32::MAX,
+            max_searches: u32::MAX,
+            max_fetches: u32::MAX,
             max_retries: 1,
             rounds_used: 0,
             searches_used: 0,
@@ -268,7 +268,9 @@ pub fn continuation_after_tool(
     if result_failed(result) {
         let message = result_error_message(result);
         let class = classify_execution_failure(message);
-        if class.denied || class.ambiguous || outcome_uncertain(result) {
+        let validation_rejection = result.pointer("/error/sideEffects").and_then(Value::as_str) == Some("none")
+            && matches!(result.pointer("/error/code").and_then(Value::as_str), Some("invalid-arguments" | "wrong-id-type" | "invalid-evidence"));
+        if !validation_rejection && (class.denied || class.ambiguous || outcome_uncertain(result)) {
             return Continuation::Stop {
                 message: message.to_string(),
                 retryable: false,
@@ -302,8 +304,69 @@ pub fn search_disables_tools(_search_ok: bool, _plan_mode: bool) -> bool {
     false
 }
 
-/// One corrective round when a mutated run finishes without checks.
-pub const VERIFY_BEFORE_FINISH: &str = "You changed files but have not run checks. Run check_run (or explain why checks are not applicable) before finishing.";
+/// Historical prompt retained only to assert it is never reintroduced.
+#[cfg(test)]
+pub const VERIFY_BEFORE_FINISH: &str = "You changed files without a completed check result. If a check is running, inspect its processId with check_report; otherwise run check_run (or explain why checks are not applicable). Launch success is not verification. State pending, failed, or unrecognized results honestly before finishing.";
+
+/// Keep launch acknowledgement distinct from completed test evidence. A later
+/// write invalidates earlier check observations; processes are tracked by ID.
+#[derive(Default)]
+pub struct VerificationProgress {
+    changed: bool,
+    reports: std::collections::BTreeMap<String, String>,
+    stale_processes: std::collections::BTreeSet<String>,
+}
+
+impl VerificationProgress {
+    pub fn observe(&mut self, name: &str, result: &Value) {
+        if name.strip_prefix("workspace_").is_some_and(crate::workspace::is_write_call)
+            && !crate::tool_envelope::failed(result) {
+            self.changed = true;
+            self.stale_processes.extend(self.reports.keys().cloned());
+            self.reports.clear();
+        }
+        let data = result.get("data").filter(|v| v.is_object()).unwrap_or(result);
+        let check = data.get("check").unwrap_or(data);
+        let process_tool = matches!(name, "process_start" | "process_poll" | "process_stop" | "shell_run" | "local_execute_command" | "local_run_code");
+        let id = check["processId"].as_str().or_else(|| data["processId"].as_str())
+            .or_else(|| process_tool.then(|| data["id"].as_str()).flatten());
+        let verdict = check["report"]["verdict"].as_str().or_else(|| {
+            if !process_tool { return None; }
+            match data["state"].as_str() {
+                Some("running" | "starting" | "stopping") => Some("running"),
+                Some("unknown") => Some("unknown"),
+                _ if data["exitCode"] == 0 && !crate::tool_envelope::failed(result) => Some("command_succeeded"),
+                _ if data["exitCode"].is_number() || crate::tool_envelope::failed(result) => Some("failed"),
+                _ => None,
+            }
+        });
+        if let (Some(id), Some(verdict)) = (id, verdict) {
+            if self.stale_processes.contains(id) { return; }
+            self.reports.insert(id.into(), verdict.into());
+        }
+    }
+
+    #[cfg(test)]
+    pub fn needs_check(&self) -> bool {
+        self.changed && (self.reports.is_empty() || self.reports.values().any(|v| v == "running"))
+    }
+
+    pub fn summary(&self) -> Option<Value> {
+        if !self.changed && self.reports.is_empty() { return None; }
+        let (status, message) = if self.reports.is_empty() {
+            ("unverified", "Changed files have no completed check result.")
+        } else if self.reports.values().any(|v| v == "running") {
+            ("pending", "Checks are still running; tests have not been verified.")
+        } else if self.reports.values().any(|v| !matches!(v.as_str(), "passed" | "command_succeeded")) {
+            ("failed", "Checks failed or returned incomplete evidence. Inspect the check results.")
+        } else if self.reports.values().any(|v| v == "command_succeeded") {
+            ("command_only", "Check commands succeeded; passing tests were not established for every check.")
+        } else {
+            ("passed", "Recorded test suites passed. This covers those checks only.")
+        };
+        Some(serde_json::json!({"status":status,"message":message,"processes":self.reports}))
+    }
+}
 
 pub const WEB_LOOKUP_RETRY: &str = "The offered web search tool is available, and no web lookup has been attempted for this request. Use it to check public current information before claiming the data or internet access is unavailable. Follow the original request, preserve source links and uncertainty, and respect any explicit instruction not to browse. Do not invent data.";
 
@@ -414,6 +477,50 @@ pub(crate) fn tool_signature(tool: &crate::connectors::AgentTool, arguments: &Va
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn check_launch_failure_completion_and_subsequent_writes_remain_distinct() {
+        let mut state = VerificationProgress::default();
+        state.observe("workspace_create_file", &json!({"status":"success"}));
+        state.observe("check_run", &json!({"status":"failure","error":{"code":"invalid-arguments"}}));
+        assert!(state.needs_check());
+        state.observe("check_run", &json!({"data":{"processId":"proc-one","report":{"verdict":"running"}}}));
+        assert_eq!(state.summary().unwrap()["status"], "pending");
+        assert!(state.needs_check());
+        state.observe("check_report", &json!({"data":{"processId":"proc-one","report":{"verdict":"command_succeeded"}}}));
+        assert_eq!(state.summary().unwrap()["status"], "command_only");
+        state.observe("check_report", &json!({"data":{"processId":"proc-one","report":{"verdict":"passed","testsPassed":true}}}));
+        assert_eq!(state.summary().unwrap()["status"], "passed");
+        assert!(!state.needs_check());
+        state.observe("workspace_edit_file", &json!({"status":"success"}));
+        state.observe("check_report", &json!({"data":{"processId":"proc-one","report":{"verdict":"passed","testsPassed":true}}}));
+        assert_eq!(state.summary().unwrap()["status"], "unverified");
+        assert!(state.needs_check());
+    }
+
+    #[test]
+    fn a_passing_check_does_not_hide_a_second_running_or_failed_check() {
+        let mut state = VerificationProgress::default();
+        state.observe("check_report", &json!({"processId":"proc-one","report":{"verdict":"passed"}}));
+        state.observe("verification_run", &json!({"processId":"proc-two","check":{"processId":"proc-two","report":{"verdict":"running"}}}));
+        assert_eq!(state.summary().unwrap()["status"], "pending");
+        state.observe("verification_report", &json!({"check":{"processId":"proc-two","report":{"verdict":"failed"}}}));
+        assert_eq!(state.summary().unwrap()["status"], "failed");
+    }
+    #[test]
+    fn ordinary_execution_and_process_results_record_command_evidence() {
+        let mut state = VerificationProgress::default();
+        state.observe("local_execute_command", &json!({"data":{"processId":"one","exitCode":0}}));
+        assert_eq!(state.summary().unwrap()["status"], "command_only");
+        state.observe("process_start", &json!({"data":{"id":"two","state":"running"}}));
+        assert_eq!(state.summary().unwrap()["status"], "pending");
+        state.observe("process_poll", &json!({"data":{"id":"two","state":"exited","exitCode":0}}));
+        assert_eq!(state.summary().unwrap()["status"], "command_only");
+        state.observe("workspace_apply_patch", &json!({"status":"success"}));
+        assert_eq!(state.summary().unwrap()["status"], "unverified");
+        state.observe("process_poll", &json!({"data":{"id":"two","exitCode":0}}));
+        assert_eq!(state.summary().unwrap()["status"], "unverified");
+    }
     /// A `search` call may carry up to four queries and a `visit` call up to
     /// four URLs, and the worker issues one provider request per element.
     /// Charging one unit per call would let a single admitted call spend four

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    io::{Read, Write},
+    io::Read,
     path::{Component, Path},
     sync::Arc,
 };
@@ -445,83 +445,7 @@ impl Workspace {
         }
         String::from_utf8(bytes).map_err(|_| "Language server document must be UTF-8.".into())
     }
-    /// Online backup preserves WAL consistency. Pin/check native identities and
-    /// refuse linked main/sidecar files; external writers still share SQLite locks.
-    pub(crate) fn sqlite_backup(&self, path: &str, target: &Path) -> Result<(), String> {
-        let _guard = self
-            .transaction_lock
-            .read()
-            .map_err(|_| "Workspace transaction lock unavailable.")?;
-        patch::ensure_clear(&self.directory)?;
-        valid_path(path, false)?;
-        let main = open_file_no_links(&self.directory, path, OpenOptions::new().read(true))
-            .map_err(|e| e.to_string())?;
-        let identity = patch::file_identity::single_link_identity(&main)?;
-        for suffix in ["-wal", "-shm"] {
-            let side = format!("{path}{suffix}");
-            match self.directory.symlink_metadata(&side) {
-                Ok(_) => {
-                    let file =
-                        open_file_no_links(&self.directory, &side, OpenOptions::new().read(true))
-                            .map_err(|e| e.to_string())?;
-                    patch::file_identity::single_link_identity(&file)?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        let source = rusqlite::Connection::open_with_flags(
-            self.root.join(path),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| e.to_string())?;
-        source
-            .busy_timeout(std::time::Duration::from_millis(250))
-            .map_err(|e| e.to_string())?;
-        let size: i64 = source
-            .query_row(
-                "SELECT page_count*page_size FROM pragma_page_count(),pragma_page_size()",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if size > 32 * 1024 * 1024 {
-            return Err("SQLite backup exceeds 32 MiB.".into());
-        }
-        let mut destination = rusqlite::Connection::open(target).map_err(|e| e.to_string())?;
-        {
-            let backup = rusqlite::backup::Backup::new(&source, &mut destination)
-                .map_err(|e| e.to_string())?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                if std::time::Instant::now() > deadline {
-                    return Err("SQLite online backup timed out under concurrent writes.".into());
-                }
-                match backup.step(64).map_err(|e| e.to_string())? {
-                    rusqlite::backup::StepResult::Done => break,
-                    rusqlite::backup::StepResult::More => (),
-                    rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
-                        std::thread::sleep(std::time::Duration::from_millis(10))
-                    }
-                    _ => return Err("Unknown SQLite backup state.".into()),
-                }
-                if backup.progress().pagecount > 8192 * 16 {
-                    return Err("SQLite backup grew beyond the page budget.".into());
-                }
-            }
-        }
-        destination
-            .execute_batch("PRAGMA journal_mode=DELETE;")
-            .map_err(|e| e.to_string())?;
-        let check = open_file_no_links(&self.directory, path, OpenOptions::new().read(true))
-            .map_err(|e| e.to_string())?;
-        if patch::file_identity::single_link_identity(&check)? != identity {
-            return Err("SQLite source identity changed during backup.".into());
-        }
-        Ok(())
-    }
+
     pub(crate) fn language_optional_source(&self, path: &str) -> Result<Option<String>, String> {
         valid_path(path, false)?;
         match self.directory.symlink_metadata(path) {
@@ -530,26 +454,7 @@ impl Workspace {
             Ok(_) => self.language_source(path).map(Some),
         }
     }
-    /// Bounded binary snapshot using the shared no-follow, identity and recovery policy.
-    pub(crate) fn development_bytes(&self, path: &str, max: usize) -> Result<Vec<u8>, String> {
-        let _guard = self
-            .transaction_lock
-            .read()
-            .map_err(|_| "Workspace transaction lock unavailable.")?;
-        patch::ensure_clear(&self.directory)?;
-        valid_path(path, false)?;
-        let file = open_file_no_links(&self.directory, path, OpenOptions::new().read(true))
-            .map_err(|e| e.to_string())?;
-        patch::file_identity::single_link_identity(&file)?;
-        let mut bytes = Vec::new();
-        file.take(max as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        if bytes.len() > max {
-            return Err("Development input exceeds the byte limit.".into());
-        }
-        Ok(bytes)
-    }
+
     pub fn output_artifact(&self, path: &str) -> Result<(Vec<u8>, &'static str), String> {
         let _guard = self
             .transaction_lock
@@ -615,6 +520,23 @@ impl Workspace {
             transaction_lock: patch::root_lock(Path::new(path))?,
         })
     }
+    /// Model dispatch keeps known no-change failures distinct from uncertain
+    /// transactions. Raw callers retain the existing Result interface.
+    pub(crate) fn call_model(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        match self.call(name, arguments) {
+            Err(message) if !is_write_call(name) || matches!(name,
+                "create_file" | "edit_file" | "apply_patch" | "write_file" | "write_file_base64"
+                    | "append_file" | "multi_edit" | "edit_lines" | "copy_file" | "move_file" | "delete_file") => {
+                // These aliases use the transactional writer. Its Err
+                // paths precede project writes; commit/rollback uncertainty
+                // is returned as an explicit typed result and passes through.
+                Ok(crate::tool_envelope::failure_notice("workspace-error", &message, false,
+                    crate::tool_envelope::SIDE_NONE, &json!({})))
+            }
+            result => result,
+        }
+    }
+
     pub fn call(&self, name: &str, arguments: Value) -> Result<Value, String> {
         // Reads share the root guard; writes and recovery take it exclusively
         // so a transaction can never overlap a native reader.
@@ -680,8 +602,13 @@ impl Workspace {
                         break;
                     }
                     let entry = entry.map_err(|error| error.to_string())?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let path = if request.path == "." { name.clone() } else { format!("{}/{name}",request.path) };
+                    if crate::sandbox::check_fs_path("", &path, false).is_err() {
+                        continue;
+                    }
                     let kind = entry.file_type().map_err(|error| error.to_string())?;
-                    entries.push(json!({"name":entry.file_name().to_string_lossy(),"kind":if kind.is_symlink() { "link" } else if kind.is_dir() { "directory" } else { "file" }}));
+                    entries.push(json!({"name":name,"kind":if kind.is_symlink() { "link" } else if kind.is_dir() { "directory" } else { "file" }}));
                 }
                 entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
                 Ok(json!({"entries":entries,"truncated":truncated}))
@@ -742,25 +669,18 @@ impl Workspace {
                 if request.content.len() > 65_536 {
                     return Err("New file content exceeds 64 KiB.".into());
                 }
-                let mut file = open_file_no_links(
-                    &self.directory,
-                    &request.path,
-                    OpenOptions::new().write(true).create_new(true),
-                )
-                .map_err(|error| {
-                    format!("Could not create file (existing files are preserved): {error}")
-                })?;
-                file.write_all(request.content.as_bytes())
-                    .and_then(|_| file.sync_all())
-                    .map_err(|error| {
-                        format!("File write failed; a partial file may remain: {error}")
-                    })?;
-                // The formatter rewrites the file in place, so the handle is
-                // released first.
-                drop(file);
+                let mut result = self.patch_call("apply_patch", json!({"changes":[{
+                    "kind":"create","path":request.path,"content":request.content,
+                }]}))?;
+                if result["status"] != "committed" {
+                    return Ok(result);
+                }
+                result.as_object_mut().unwrap().remove("changes");
                 let path = request.path.clone();
                 let pre_format_sha256 = format!("{:x}", Sha256::digest(request.content.as_bytes()));
-                let mut result = json!({"path":path,"bytesWritten":request.content.len(),"sha256":pre_format_sha256.clone()});
+                result["path"] = json!(path);
+                result["bytesWritten"] = json!(request.content.len());
+                result["sha256"] = json!(pre_format_sha256);
                 self.apply_auto_format(&mut result, &path, &pre_format_sha256);
                 Ok(result)
             }
@@ -787,7 +707,7 @@ impl Workspace {
                 let file = open_file_no_links(
                     &self.directory,
                     &request.path,
-                    OpenOptions::new().read(true).write(true),
+                    OpenOptions::new().read(true),
                 )
                 .map_err(|error| error.to_string())?;
                 let metadata = file.metadata().map_err(|error| error.to_string())?;
@@ -818,23 +738,22 @@ impl Workspace {
                     &request.new_text,
                     request.replace_all,
                 )?;
-                {
-                    use std::io::{Seek, SeekFrom};
-                    let mut writer = file;
-                    writer
-                        .seek(SeekFrom::Start(0))
-                        .map_err(|error| error.to_string())?;
-                    writer.set_len(0).map_err(|error| error.to_string())?;
-                    writer
-                        .write_all(updated.as_bytes())
-                        .and_then(|_| writer.sync_all())
-                        .map_err(|error| {
-                            format!("File write failed; the file may be incomplete: {error}")
-                        })?;
+                drop(file);
+                let mut result = self.patch_call("write_file", json!({
+                    "path":request.path,"content":updated,"expected_sha256":request.expected_sha256,
+                }))?;
+                if result["status"] != "committed" {
+                    return Ok(result);
                 }
+                result.as_object_mut().unwrap().remove("changes");
                 let pre_format_sha256 = format!("{:x}", Sha256::digest(updated.as_bytes()));
                 let path = request.path.clone();
-                let mut result = json!({"path":path,"replacements":replacements,"bytesWritten":updated.len(),"sha256":pre_format_sha256.clone(),"diff":unified_diff(&path,&text,&updated),"match":kind.as_str()});
+                result["path"] = json!(path);
+                result["replacements"] = json!(replacements);
+                result["bytesWritten"] = json!(updated.len());
+                result["sha256"] = json!(pre_format_sha256);
+                result["diff"] = json!(unified_diff(&path,&text,&updated));
+                result["match"] = json!(kind.as_str());
                 self.apply_auto_format(&mut result, &path, &pre_format_sha256);
                 Ok(result)
             }
@@ -1047,6 +966,35 @@ pub async fn set_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn model_file_aliases_share_transactions_and_safe_preflight_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path().to_str().unwrap()).unwrap();
+        for (name, args) in [
+            ("read_file",json!({"path":"missing.txt"})),
+            ("create_file",json!({"path":"nested/new.txt","content":"first"})),
+            ("apply_patch",json!({"changes":[{"kind":"create","path":"nested/new.txt","content":"first"}]})),
+        ] {
+            let result = workspace.call_model(name,args).unwrap();
+            assert_eq!(result["status"], "failure");
+            assert_eq!(result["error"]["sideEffects"], crate::tool_envelope::SIDE_NONE);
+            assert_eq!(crate::agent_engine::termination_after_tool(None,&result),None);
+        }
+        workspace.call("create_directory",json!({"path":"nested"})).unwrap();
+        let created = workspace.call_model("create_file",json!({"path":"nested/new.txt","content":"first"})).unwrap();
+        assert_eq!(created["status"],"committed");
+        assert!(created["transactionId"].is_string());
+        assert!(created.get("changes").is_none(),"Creation must not echo the entire file in a second diff");
+        let unchanged = workspace.call_model("create_file",json!({"path":"nested/new.txt","content":"overwrite"})).unwrap();
+        assert_eq!(unchanged["error"]["sideEffects"],crate::tool_envelope::SIDE_NONE);
+        let edited = workspace.call_model("edit_file",json!({"path":"nested/new.txt","expected_sha256":created["sha256"],"old_text":"first","new_text":"second"})).unwrap();
+        assert_eq!(edited["status"],"committed");
+        assert!(edited["transactionId"].is_string());
+        assert_eq!(std::fs::read_to_string(dir.path().join("nested/new.txt")).unwrap(),"second");
+        let stale = workspace.call_model("edit_file",json!({"path":"nested/new.txt","expected_sha256":created["sha256"],"old_text":"second","new_text":"must not write"})).unwrap();
+        assert_eq!(stale["error"]["sideEffects"],crate::tool_envelope::SIDE_NONE);
+        assert_eq!(std::fs::read_to_string(dir.path().join("nested/new.txt")).unwrap(),"second");
+    }
     #[cfg(unix)]
     #[test]
     fn sensitive_files_cannot_be_accessed_through_internal_link_aliases() {

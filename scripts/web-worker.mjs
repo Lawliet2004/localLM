@@ -1,5 +1,4 @@
 import { WebSearchEngine, formatDiagnosticReport } from '../src/web/index.ts';
-import { LocalOpenAICompatibleProvider } from '../src/web/models/local_provider.ts';
 import { SqliteStorage } from './web-storage.mjs';
 import { PinnedPageFetcher } from './web-transport.mjs';
 import { renderPage } from './web-render.mjs';
@@ -9,16 +8,35 @@ import { ClaimVerifier } from '../src/web/verification/claim_verifier.ts';
 import { WeatherProvider, validateWeatherRequest } from '../src/web/verticals/weather/weather_provider.ts';
 
 /** Bounded page shape returned to the model for visit/fetch-url calls. */
-function shapeDocument(doc) {
-  return {
+function shapeDocument(doc, selection = {}) {
+  const text = doc.text || '';
+  let end = Math.min(8000, text.length);
+  if (end < text.length && /[\uDC00-\uDFFF]/.test(text[end])) end--;
+  const result = {
     id: doc.id, url: doc.url, title: doc.title,
     extractionMethod: doc.metadata?.extractionMethod || 'main_content',
     snippetOnly: (doc.metadata?.extractionMethod || '').includes('snippet'),
     ocrRequired: Boolean(doc.metadata?.ocrRequired),
-    text: (doc.text || '').slice(0, 8000),
+    text: text.slice(0, end),
+    textOffset: 0,
+    nextTextOffset: end < text.length ? end : null,
+    textTotalChars: text.length,
+    textTruncated: end < text.length,
     headings: (doc.headings || []).slice(0, 30),
     links: (doc.links || []).slice(0, 20),
   };
+  if (['page', 'section', 'passage', 'offset', 'textOffset'].some(key => selection[key] != null)) {
+    const store = new DocumentStore();
+    store.save({ ...doc, fullText: doc.text || '', extractionMethod: result.extractionMethod });
+    // URL reads and saved-handle reads use the same exact text-window contract.
+    // Do not return the initial extract alongside a selected later passage.
+    delete result.text;
+    delete result.textTruncated;
+    delete result.textOffset;
+    delete result.nextTextOffset;
+    result.passages = store.open(doc.id, selection);
+  }
+  return result;
 }
 
 /** Persist a fetched document into a research session so open/find can
@@ -100,7 +118,6 @@ async function runRequest(request) {
           maxBytes: request.config.fetch.maxBytes,
         })
       : undefined,
-    llmProvider: request.localModel ? new LocalOpenAICompatibleProvider(request.localModel) : undefined,
   });
   let result;
   if (request.action === 'health') {
@@ -115,10 +132,10 @@ async function runRequest(request) {
       // Full stored document text, not only previously compressed evidence.
       const passages = store.open(request.documentId, {
         page: request.page, section: request.section,
-        passage: request.passage, offset: request.offset,
+        passage: request.passage, offset: request.offset, textOffset: request.textOffset,
       });
       result = {
-        id: doc.id, url: doc.url, title: doc.title,
+        id: doc.id, sessionId: request.sessionId, documentId: doc.id, url: doc.url, title: doc.title,
         extractionMethod: doc.metadata?.extractionMethod || 'main_content',
         snippetOnly: (doc.metadata?.extractionMethod || '').includes('snippet'),
         passages,
@@ -129,7 +146,7 @@ async function runRequest(request) {
       const passages = store.find(request.documentId, String(request.term || ''), 400);
       // Expandable context: each match carries its stable ref for follow-ups.
       result = {
-        id: doc.id, url: doc.url, title: doc.title,
+        id: doc.id, sessionId: request.sessionId, documentId: doc.id, url: doc.url, title: doc.title,
         extractionMethod: doc.metadata?.extractionMethod || 'main_content',
         snippetOnly: (doc.metadata?.extractionMethod || '').includes('snippet'),
         passages,
@@ -145,9 +162,9 @@ async function runRequest(request) {
       const doc = await engine.fetchUrl(request.url);
       if (typeof request.sessionId === 'string' && request.sessionId) {
         stashDocument(storage, request.sessionId, doc);
-        result = { ...shapeDocument(doc), sessionId: request.sessionId, documentId: doc.id };
+        result = { ...shapeDocument(doc, request), sessionId: request.sessionId, documentId: doc.id };
       } else {
-        result = shapeDocument(doc);
+        result = shapeDocument(doc, request);
       }
     }
   } else if (request.action === 'fetch-urls') {

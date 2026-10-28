@@ -236,6 +236,8 @@ pub struct RunRecord {
     pub error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub outcome: Option<crate::agent_engine::RunOutcome>,
 }
 
 impl RunRecord {
@@ -468,7 +470,6 @@ mod tests {
         let mut task = crate::research_tasks::ResearchTask::new(
             "conv",
             "keep the tariff",
-            crate::research_tasks::TaskBudgets::default(),
         )
         .unwrap();
         task.conversation_id = store.create_conversation().unwrap().id;

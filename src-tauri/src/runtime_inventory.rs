@@ -11,12 +11,26 @@ pub struct InstalledRuntime {
 }
 
 fn inspect(root: &Path) -> Result<Vec<InstalledRuntime>, String> {
-    inspect_assets(root, &crate::runtime_archive::catalog()?)
+    let mut items = Vec::new();
+    for package in crate::runtime_catalog::packages()? {
+        items.extend(inspect_package(root, &package)?);
+    }
+    Ok(items)
 }
+#[cfg(test)]
 fn inspect_assets(
     root: &Path,
     assets: &[crate::runtime_archive::RuntimeAsset],
 ) -> Result<Vec<InstalledRuntime>, String> {
+    let mut package = crate::runtime_catalog::package(None)?;
+    package.assets = assets.to_vec();
+    inspect_package(root, &package)
+}
+fn inspect_package(
+    root: &Path,
+    package: &crate::runtime_catalog::Package,
+) -> Result<Vec<InstalledRuntime>, String> {
+    let assets = &package.assets;
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -33,7 +47,7 @@ fn inspect_assets(
         }
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(suffix) = name.strip_prefix("llama-b10855-cuda12.4-") else {
+        let Some(suffix) = name.strip_prefix(&package.prefix()) else {
             continue;
         };
         if uuid::Uuid::parse_str(suffix).is_err()
@@ -47,24 +61,28 @@ fn inspect_assets(
         let bundle = directory
             .open_dir(&name)
             .map_err(|error| error.to_string())?;
-        let problem = assets
-            .iter()
-            .flat_map(|asset| &asset.files)
-            .find_map(|file| match bundle.symlink_metadata(&file.name) {
-                Ok(metadata)
-                    if metadata.is_file()
-                        && !metadata.file_type().is_symlink()
-                        && metadata.len() == file.bytes =>
-                {
-                    None
-                }
-                _ => Some(format!("Missing or unexpected file: {}", file.name)),
-            });
+        let files = bundle_files(&root.join(&name), assets);
+        let problem = files.as_ref().err().cloned().or_else(|| {
+            files.as_ref().ok().and_then(|files| {
+                files
+                    .iter()
+                    .find_map(|file| match bundle.symlink_metadata(&file.name) {
+                        Ok(metadata)
+                            if metadata.is_file()
+                                && !metadata.file_type().is_symlink()
+                                && metadata.len() == file.bytes =>
+                        {
+                            None
+                        }
+                        _ => Some(format!("Missing or unexpected file: {}", file.name)),
+                    })
+            })
+        });
         result.push(InstalledRuntime {
             id: name.clone(),
             path: root
                 .join(name)
-                .join("llama-server.exe")
+                .join(&package.executable)
                 .to_string_lossy()
                 .into_owned(),
             complete: problem.is_none(),
@@ -88,6 +106,30 @@ pub async fn list_installed_runtimes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prism_receipts_are_isolated_by_package_and_reuse_rehashes_every_file() {
+        let root = tempfile::tempdir().unwrap();
+        let package = crate::runtime_catalog::package(Some("prism-linux-cpu")).unwrap();
+        let directory = root
+            .path()
+            .join(format!("{}{}", package.prefix(), uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("llama-server"), b"good").unwrap();
+        std::fs::write(directory.join("libllama.so"), b"library").unwrap();
+        assert!(!inspect_package(root.path(), &package).unwrap()[0].complete);
+        receipt_assets(&directory, &package.assets).unwrap();
+        assert_eq!(
+            reusable_package(root.path(), &package).unwrap(),
+            Some(directory.join("llama-server"))
+        );
+        let other = crate::runtime_catalog::package(Some("prism-linux-cuda")).unwrap();
+        assert!(reusable_package(root.path(), &other).unwrap().is_none());
+        std::fs::write(directory.join("libllama.so"), b"changed").unwrap();
+        assert!(reusable_package(root.path(), &package).unwrap().is_none());
+        std::fs::remove_file(directory.join("libllama.so")).unwrap();
+        assert!(!inspect_package(root.path(), &package).unwrap()[0].complete);
+    }
+
     #[test]
     fn reuses_only_complete_bundles_whose_extracted_hashes_still_match() {
         let temp = tempfile::tempdir().unwrap();
@@ -135,16 +177,29 @@ mod tests {
 }
 
 /// Only bundles with a receipt from verified extraction can be reused.
-pub(crate) fn reusable(root: &Path) -> Result<Option<std::path::PathBuf>, String> {
-    reusable_assets(root, &crate::runtime_archive::catalog()?)
+pub(crate) fn reusable_package(
+    root: &Path,
+    package: &crate::runtime_catalog::Package,
+) -> Result<Option<std::path::PathBuf>, String> {
+    reusable_checked(root, package)
 }
+#[cfg(test)]
 fn reusable_assets(
     root: &Path,
     assets: &[crate::runtime_archive::RuntimeAsset],
 ) -> Result<Option<std::path::PathBuf>, String> {
+    let mut package = crate::runtime_catalog::package(None)?;
+    package.assets = assets.to_vec();
+    reusable_checked(root, &package)
+}
+fn reusable_checked(
+    root: &Path,
+    package: &crate::runtime_catalog::Package,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let assets = &package.assets;
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    for item in inspect_assets(root, assets)? {
+    for item in inspect_package(root, package)? {
         if !item.complete {
             continue;
         }
@@ -166,8 +221,9 @@ fn reusable_assets(
         else {
             continue;
         };
-        let mut valid = hashes.len() == assets.iter().map(|a| a.files.len()).sum::<usize>();
-        for file in assets.iter().flat_map(|a| &a.files) {
+        let files = bundle_files(parent, assets)?;
+        let mut valid = hashes.len() == files.len();
+        for file in &files {
             let mut input =
                 std::fs::File::open(parent.join(&file.name)).map_err(|e| e.to_string())?;
             let mut hash = Sha256::new();
@@ -187,17 +243,89 @@ fn reusable_assets(
     }
     Ok(None)
 }
-pub(crate) fn receipt(bundle: &Path) -> Result<(), String> {
-    receipt_assets(bundle, &crate::runtime_archive::catalog()?)
+
+// Whole-archive SHA-256 pins Prism bundles. Record bounded, flat extracted
+// files in the receipt, then rehash them before any installation is reused.
+fn extracted_files(
+    bundle: &Path,
+    assets: &[crate::runtime_archive::RuntimeAsset],
+) -> Result<Vec<crate::runtime_archive::RuntimeFile>, String> {
+    if assets.iter().all(|a| !a.files.is_empty()) {
+        return Ok(assets.iter().flat_map(|a| a.files.clone()).collect());
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(bundle).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "verified-files.json" {
+            continue;
+        }
+        if files.len() >= 1000
+            || !crate::runtime_archive::safe_leaf(&name)
+            || !entry
+                .file_type()
+                .is_ok_and(|t| t.is_file() && !t.is_symlink())
+        {
+            return Err("Unexpected extracted runtime entry.".into());
+        }
+        files.push(crate::runtime_archive::RuntimeFile {
+            name,
+            bytes: entry.metadata().map_err(|e| e.to_string())?.len(),
+        });
+    }
+    Ok(files)
 }
-fn receipt_assets(
+fn bundle_files(
+    bundle: &Path,
+    assets: &[crate::runtime_archive::RuntimeAsset],
+) -> Result<Vec<crate::runtime_archive::RuntimeFile>, String> {
+    if assets.iter().all(|a| !a.files.is_empty()) {
+        return Ok(assets.iter().flat_map(|a| a.files.clone()).collect());
+    }
+    let receipt = bundle.join("verified-files.json");
+    if !receipt
+        .symlink_metadata()
+        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.len() < 65536)
+    {
+        return Err("Runtime verification receipt missing or invalid.".into());
+    }
+    let hashes: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(&std::fs::read(receipt).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if hashes.is_empty()
+        || hashes.len() > 1000
+        || !hashes
+            .keys()
+            .any(|n| n == "llama-server" || n == "llama-server.exe")
+    {
+        return Err("Runtime receipt has no server executable.".into());
+    }
+    hashes
+        .into_iter()
+        .map(|(name, hash)| {
+            if !crate::runtime_archive::safe_leaf(&name)
+                || hash.len() != 64
+                || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err("Invalid runtime receipt entry.".into());
+            }
+            let bytes = bundle
+                .join(&name)
+                .symlink_metadata()
+                .map(|m| m.len())
+                .unwrap_or(0);
+            Ok(crate::runtime_archive::RuntimeFile { name, bytes })
+        })
+        .collect()
+}
+pub(crate) fn receipt_assets(
     bundle: &Path,
     assets: &[crate::runtime_archive::RuntimeAsset],
 ) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     let mut hashes = std::collections::BTreeMap::new();
-    for file in assets.iter().flat_map(|a| &a.files) {
+    for file in extracted_files(bundle, assets)? {
         let mut input = std::fs::File::open(bundle.join(&file.name)).map_err(|e| e.to_string())?;
         let mut hash = Sha256::new();
         let mut buffer = [0u8; 65536];
@@ -243,9 +371,13 @@ pub async fn delete_installed_runtime(
         .ok_or("Runtime folder unavailable")?;
     let bundle = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
         .map_err(|e| e.to_string())?;
-    let expected: Vec<_> = crate::runtime_archive::catalog()?
+    let package = crate::runtime_catalog::packages()?
         .into_iter()
-        .flat_map(|a| a.files.into_iter().map(|f| f.name))
+        .find(|p| id.starts_with(&p.prefix()))
+        .ok_or("Unknown runtime package.")?;
+    let expected: Vec<_> = bundle_files(path, &package.assets)?
+        .into_iter()
+        .map(|f| f.name)
         .chain(std::iter::once("verified-files.json".into()))
         .collect();
     let entries = bundle

@@ -4,7 +4,7 @@ import { readFileSync, mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 const args = process.argv.slice(2);
 if (!args.length || args.includes('--help')) {
-  console.log('LocalLM research: node scripts/web-search-cli.mjs ask "question" [--research fast|normal|deep] [--trace] [--sources] [--json] [--config path.json]\nHealth: node scripts/web-search-cli.mjs health\nSet LOCAL_LLM_BASE_URL and LOCAL_LLM_MODEL to use an already-running local model.');
+  console.log('LocalLM research: node scripts/web-search-cli.mjs ask "question" [--research fast|normal|deep] [--trace] [--sources] [--json] [--config path.json]\nHealth: node scripts/web-search-cli.mjs health');
 } else {
   let mode='normal', config={}, trace=false, json=false, sources=false, enabled=true;
   const words=[];
@@ -25,8 +25,7 @@ if (!args.length || args.includes('--help')) {
   mkdirSync('.local',{recursive:true});
   const child=spawn(process.execPath,[resolve('src-tauri/resources/web/worker.mjs')],{stdio:['pipe','pipe','inherit'],windowsHide:true});
   child.stdin.end(JSON.stringify({question,mode,trace,full:json,action:args[0]==='health'?'health':undefined,
-    config:{...config,enabled},databasePath:resolve('.local/web-research.sqlite'),
-    localModel:process.env.LOCAL_LLM_BASE_URL?{baseUrl:process.env.LOCAL_LLM_BASE_URL,modelName:process.env.LOCAL_LLM_MODEL}:undefined}));
+    config:{...config,enabled},databasePath:resolve('.local/web-research.sqlite')}));
   let output='';
   for await(const chunk of child.stdout) output+=chunk;
   const code=await new Promise(resolve=>child.on('close',resolve));

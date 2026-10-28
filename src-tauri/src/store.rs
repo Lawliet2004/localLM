@@ -373,6 +373,14 @@ impl Store {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS runs_conversation ON runs(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS run_checkpoints(
+                id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+                payload TEXT NOT NULL, updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS process_results(
+                id TEXT PRIMARY KEY, owner TEXT NOT NULL, workspace TEXT NOT NULL,
+                snapshot TEXT NOT NULL, updated_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS run_events(
                 run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
                 seq INTEGER NOT NULL,
@@ -528,6 +536,10 @@ impl Store {
                 Self::SCHEMA_VERSION
             ));
         }
+        let has_outcome: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs') WHERE name='outcome_json')", [], |row| row.get(0)
+        ).map_err(db_error)?;
+        if !has_outcome { connection.execute("ALTER TABLE runs ADD COLUMN outcome_json TEXT", []).map_err(db_error)?; }
         let has_error: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='error')",
@@ -586,13 +598,38 @@ impl Store {
     /// `native_tool_round_edit` trigger, which then deletes the native
     /// provider context anchored on that row.
     pub fn recover_interrupted(&self) -> Result<()> {
+        let interrupted = {
+            let mut query = self.connection.prepare("SELECT id,conversation_id,checkpoint FROM runs WHERE status IN ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round')").map_err(db_error)?;
+            let rows = query.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?))).map_err(db_error)?;
+            rows.collect::<std::result::Result<Vec<_>,_>>().map_err(db_error)?
+        };
+        let transaction = rusqlite::Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate).map_err(db_error)?;
         self.connection
             .execute_batch(
-                "UPDATE messages SET status='interrupted' WHERE status='streaming';
-                 UPDATE runs SET status='cancelled' WHERE status IN
-                   ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round');",
+                "UPDATE messages SET status='interrupted' WHERE status='streaming';",
             )
             .map_err(db_error)?;
+        for (id, conversation, checkpoint) in interrupted {
+            let child = checkpoint.as_deref() == Some("subagent");
+            let child_recoverable = child && crate::subagents::restore_child_checkpoint(self, &id).is_ok();
+            let outcome = crate::agent_engine::RunOutcome { reason:crate::agent_engine::StopReason::AppRestart,
+                resumable:!child || child_recoverable, checkpoint:if self.run_checkpoint(&id)?.is_some() {Some(id.clone())} else {checkpoint} };
+            self.update_run_status(&id, if child && !child_recoverable { crate::agent_run::RunState::OutcomeUnknown } else { crate::agent_run::RunState::Paused },
+                Some("Application restarted. Completed work is preserved; in-flight actions have unknown outcomes and were not repeated."), None)?;
+            self.save_run_outcome(&id, &outcome)?;
+            if child {
+                self.connection.execute("UPDATE subagent_runs SET status='interrupted', error=?1, updated_at=?2 WHERE child_run_id=?3 AND status='running'",
+                    params!["Application restarted; saved work requires an explicit resume.", now(), id]).map_err(db_error)?;
+            }
+            let seq = self.next_session_event_seq(&conversation)?;
+            self.insert_session_event(&crate::sessions::SessionEvent {
+                id:uuid::Uuid::new_v4().to_string(), conversation_id:conversation,
+                run_id:Some(id), seq:0, step_id:None, tool_call_id:None,
+                event_type:"turn_end".into(), payload:serde_json::json!({"status":"interrupted","outcome":outcome}),
+                ignorable:false, created_at:now(),
+            }, seq)?;
+        }
+        transaction.commit().map_err(db_error)?;
         crate::presentation_store::recover_interrupted(&self.connection)?;
         Ok(())
     }
@@ -717,10 +754,25 @@ impl Store {
             .map_err(db_error)?;
         Ok(())
     }
+    pub fn save_run_checkpoint(&self, checkpoint:&crate::agent_engine::RunCheckpoint)->Result<()> {
+        let payload=serde_json::to_string(checkpoint).map_err(|e|e.to_string())?;
+        self.connection.execute("INSERT INTO run_checkpoints(id,payload,updated_at) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at",
+            params![checkpoint.id,payload,now()]).map_err(db_error)?;
+        Ok(())
+    }
+    pub fn run_checkpoint(&self,id:&str)->Result<Option<crate::agent_engine::RunCheckpoint>> {
+        let payload:Option<String>=self.connection.query_row("SELECT payload FROM run_checkpoints WHERE id=?1",[id],|row|row.get(0)).optional().map_err(db_error)?;
+        payload.map(|payload|serde_json::from_str(&payload).map_err(|e|e.to_string())).transpose()
+    }
+    pub fn save_run_outcome(&self, id: &str, outcome: &crate::agent_engine::RunOutcome) -> Result<()> {
+        self.connection.execute("UPDATE runs SET outcome_json=?1 WHERE id=?2",
+            params![serde_json::to_string(outcome).map_err(|e| e.to_string())?, id]).map_err(db_error)?;
+        Ok(())
+    }
     pub fn run(&self, id: &str) -> Result<Option<crate::agent_run::RunRecord>> {
         self.connection
             .query_row(
-                "SELECT id, conversation_id, status, model_provider, model_id, checkpoint, error, created_at, updated_at
+                "SELECT id, conversation_id, status, model_provider, model_id, checkpoint, error, created_at, updated_at, outcome_json
                  FROM runs WHERE id=?1",
                 [id],
                 |row| {
@@ -737,7 +789,8 @@ impl Store {
                         error: row.get(6)?,
                         created_at: row.get(7)?,
                         updated_at: row.get(8)?,
-                    })
+                    outcome: row.get::<_, Option<String>>(9)?.and_then(|text| serde_json::from_str(&text).ok()),
+})
                 },
             )
             .optional()
@@ -748,7 +801,7 @@ impl Store {
         // user-visible active run, even while still executing.
         let mut latest = self.connection
             .query_row(
-                "SELECT id, conversation_id, status, model_provider, model_id, checkpoint, error, created_at, updated_at
+                "SELECT id, conversation_id, status, model_provider, model_id, checkpoint, error, created_at, updated_at, outcome_json
                  FROM runs WHERE conversation_id=?1
                  AND (checkpoint IS NULL OR checkpoint != 'subagent')
                  ORDER BY created_at DESC, rowid DESC LIMIT 1",
@@ -767,7 +820,8 @@ impl Store {
                         error: row.get(6)?,
                         created_at: row.get(7)?,
                         updated_at: row.get(8)?,
-                    })
+                    outcome: row.get::<_, Option<String>>(9)?.and_then(|text| serde_json::from_str(&text).ok()),
+})
                 },
             )
             .optional()
@@ -788,27 +842,16 @@ impl Store {
         Ok(latest)
     }
     pub fn append_run_event(&self, event: &crate::agent_run::RunEvent) -> Result<()> {
-        let seq = if event.seq > 0 {
-            event.seq as i64
-        } else {
-            // Harness-nested child events arrive without a sequence; allocate
-            // the next one so the (run_id, seq) primary key never collides.
-            self.connection
-                .query_row(
-                    "SELECT COALESCE(MAX(seq), -1) + 1 FROM run_events WHERE run_id=?1",
-                    [&event.run_id],
-                    |row| row.get(0),
-                )
-                .map_err(db_error)?
-        };
         let payload = serde_json::to_string(&event.payload).map_err(|e| e.to_string())?;
+        // Allocation and insertion are one SQLite write statement. Child
+        // dispatch and interrupt delivery can use different connections.
         self.connection
             .execute(
                 "INSERT INTO run_events(run_id, seq, step_id, tool_call_id, event_type, payload, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 SELECT ?1, CASE WHEN ?2 > 0 THEN ?2 ELSE COALESCE(MAX(seq), -1) + 1 END, ?3, ?4, ?5, ?6, ?7 FROM run_events WHERE run_id=?1",
                 params![
                     event.run_id,
-                    seq,
+                    event.seq as i64,
                     event.step_id,
                     event.tool_call_id,
                     event.event_type,
@@ -846,6 +889,11 @@ impl Store {
             .map_err(db_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_error)
+    }
+
+    pub fn latest_run_event_seq(&self, run_id: &str) -> Result<Option<u64>> {
+        self.connection.query_row("SELECT MAX(seq) FROM run_events WHERE run_id=?1", [run_id],
+            |row| row.get::<_, Option<i64>>(0)).map(|seq| seq.map(|seq| seq as u64)).map_err(db_error)
     }
     pub fn save_artifact(&self, artifact: &crate::artifacts::ArtifactRecord) -> Result<()> {
         self.connection
@@ -989,7 +1037,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, conversation_id, status, model_provider, model_id, checkpoint, error, created_at, updated_at
+                "SELECT id, conversation_id, status, model_provider, model_id, checkpoint, error, created_at, updated_at, outcome_json
                  FROM runs WHERE conversation_id=?1 ORDER BY created_at",
             )
             .map_err(db_error)?;
@@ -1008,7 +1056,8 @@ impl Store {
                     error: row.get(6)?,
                     created_at: row.get(7)?,
                     updated_at: row.get(8)?,
-                })
+                outcome: row.get::<_, Option<String>>(9)?.and_then(|text| serde_json::from_str(&text).ok()),
+})
             })
             .map_err(db_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -2832,40 +2881,7 @@ impl Store {
         self.connection.execute("INSERT INTO settings VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,text]).map_err(db_error)?;
         Ok(())
     }
-    /// Commit a rehearsal intent and its discovery index together before any
-    /// remote creation. Taking the SQLite write lock before reading prevents
-    /// concurrent rehearsal starts from losing each other's discovery handles.
-    pub(crate) fn save_rehearsal_ledger(&self, id: &str, ledger: &serde_json::Value) -> Result<()> {
-        uuid::Uuid::parse_str(id).map_err(|_| "Invalid rehearsal ID.")?;
-        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO settings(key,value) VALUES ('development.rehearsal_index','[]')",
-            [],
-        )
-        .map_err(db_error)?;
-        let text: String = tx
-            .query_row(
-                "SELECT value FROM settings WHERE key='development.rehearsal_index'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(db_error)?;
-        let mut index: Vec<String> =
-            serde_json::from_str(&text).map_err(|_| "Invalid rehearsal discovery index.")?;
-        if !index.iter().any(|entry| entry == id) {
-            if index.len() >= 128 {
-                return Err("Rehearsal journal limit reached; inspect existing ledgers.".into());
-            }
-            index.push(id.into());
-        }
-        tx.execute("INSERT INTO settings(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![format!("development.rehearsal.{id}"), serde_json::to_string(ledger).map_err(|e| e.to_string())?]).map_err(db_error)?;
-        tx.execute(
-            "UPDATE settings SET value=?1 WHERE key='development.rehearsal_index'",
-            [serde_json::to_string(&index).map_err(|e| e.to_string())?],
-        )
-        .map_err(db_error)?;
-        tx.commit().map_err(db_error)
-    }
+
     pub fn runtime_config(&self) -> Result<RuntimeConfig> {
         self.setting("runtime")
     }
@@ -3187,11 +3203,28 @@ mod tests {
         let audit = store
             .append_message(&conversation, "tool", "{}", "streaming")
             .unwrap();
+        store.save_run(&crate::agent_run::RunRecord {
+            id:"abandoned".into(), conversation_id:conversation.clone(), status:crate::agent_run::RunState::Generating,
+            model_provider:None, model_id:None, checkpoint:None, error:None,
+            created_at:1, updated_at:1, outcome:None,
+        }).unwrap();
+        store.save_run_checkpoint(&crate::agent_engine::RunCheckpoint::capture("abandoned", "finish the task", "workspace", &[])).unwrap();
         store.recover_interrupted().unwrap();
         assert_eq!(
             store.message_status(&audit.id).unwrap().as_deref(),
             Some("interrupted")
         );
+        let run = store.run("abandoned").unwrap().unwrap();
+        assert_eq!(run.status, crate::agent_run::RunState::Paused);
+        let outcome = run.outcome.unwrap();
+        assert_eq!(outcome.reason, crate::agent_engine::StopReason::AppRestart);
+        assert!(outcome.resumable);
+        assert_eq!(outcome.checkpoint.as_deref(), Some("abandoned"));
+        let events = store.session_events(&conversation, None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "turn_end");
+        store.recover_interrupted().unwrap();
+        assert_eq!(store.session_events(&conversation, None, None).unwrap().len(), 1);
     }
     #[test]
     fn latest_run_recovers_legacy_pause_and_does_not_leak_it_into_new_turns() {
@@ -3199,7 +3232,7 @@ mod tests {
         let store = super::Store::open(&temp.path().join("pause.sqlite")).unwrap();
         let chat = store.create_conversation().unwrap().id;
         let mut task =
-            crate::research_tasks::ResearchTask::new(&chat, "Paused request", Default::default())
+            crate::research_tasks::ResearchTask::new(&chat, "Paused request")
                 .unwrap();
         task.pause().unwrap();
         store.save_research_task(&task).unwrap();
@@ -3213,7 +3246,8 @@ mod tests {
             error: Some(crate::agent_run::pause_notice(false).into()),
             created_at: 1,
             updated_at: 2,
-        };
+        outcome: None,
+};
         store.save_run(&run).unwrap();
         assert_eq!(
             store.latest_run(&chat).unwrap().unwrap().status,
@@ -3244,7 +3278,6 @@ mod tests {
         let mut task = crate::research_tasks::ResearchTask::new(
             &conversation.id,
             "Long research question",
-            crate::research_tasks::TaskBudgets::default(),
         )
         .unwrap();
         task.checkpoint_operation(
@@ -4155,6 +4188,35 @@ mod tests {
     }
 
     #[test]
+    fn child_run_events_allocate_atomically_across_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.sqlite");
+        let store = Store::open(&path).unwrap();
+        let conversation = store.create_conversation().unwrap().id;
+        store.save_run(&crate::agent_run::RunRecord {
+            id:"child".into(), conversation_id:conversation, status:crate::agent_run::RunState::Generating,
+            model_provider:None, model_id:None, checkpoint:Some("subagent".into()), error:None,
+            created_at:1, updated_at:1, outcome:None,
+        }).unwrap();
+        let workers = (0..3).map(|worker| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let store = Store::open(&path).unwrap();
+                for index in 0..40 {
+                    store.append_run_event(&crate::agent_run::RunEvent {
+                        run_id:"child".into(), seq:0, step_id:format!("{worker}-{index}"), tool_call_id:None,
+                        event_type:"tool_started".into(), payload:serde_json::json!({}), created_at:1,
+                    }).unwrap();
+                }
+            })
+        }).collect::<Vec<_>>();
+        for worker in workers { worker.join().unwrap(); }
+        let events = store.run_events("child").unwrap();
+        assert_eq!(events.len(), 120);
+        assert_eq!(events.iter().map(|event| event.seq).collect::<Vec<_>>(), (0..120).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn session_events_monotonic_sequence_and_forking() {
         let store = Store::open_memory().unwrap();
         let conv = store.create_conversation().unwrap();
@@ -4168,7 +4230,8 @@ mod tests {
             error: None,
             created_at: 1000,
             updated_at: 1000,
-        };
+        outcome: None,
+};
         store.save_run(&run).unwrap();
 
         // 1. Monotonic sequence auto-assignment when seq = 0
@@ -4276,7 +4339,8 @@ mod tests {
                 error: None,
                 created_at: now,
                 updated_at: now,
-            })
+            outcome: None,
+})
             .unwrap();
         for (seq, event_type) in [(1u64, "user_msg"), (2u64, "assistant_msg")] {
             store

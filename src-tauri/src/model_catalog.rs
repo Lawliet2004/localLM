@@ -2,6 +2,13 @@
 use crate::download::Asset;
 use serde::Serialize;
 
+pub const BONSAI_FILENAME: &str = "Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf";
+pub const BONSAI: Asset<'static> = Asset {
+    url: "https://huggingface.co/prism-ml/Ternary-Bonsai-2-9B-gguf/resolve/5b2abb02362efbed46bbe204014b02837778b2c2/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf",
+    bytes: 2_675_410_720,
+    sha256: "c79fcdfaf6b7bf47089b50dadcfd11f9ce7d3e96adf3bbefde7912e5ef69e22b",
+};
+
 pub const MODEL_FILENAME: &str = "MiniCPM5-2B.Q6_K.gguf";
 pub const MODEL: Asset<'static> = Asset {
     url: "https://huggingface.co/prithivMLmods/MiniCPM5-2B-GGUF/resolve/8b969e82c3ea123d604242f6d97a93b98a452070/MiniCPM5-2B.Q6_K.gguf",
@@ -16,6 +23,7 @@ pub const STANDARD_RUNTIME_RELATIVE: &str = ".local/runtime/llama-server.exe";
 pub fn model(filename: Option<&str>) -> Result<(&'static str, Asset<'static>), String> {
     match filename.unwrap_or(MODEL_FILENAME) {
         MODEL_FILENAME => Ok((MODEL_FILENAME, MODEL)),
+        BONSAI_FILENAME => Ok((BONSAI_FILENAME, BONSAI)),
         _ => Err("Choose a model from the managed catalog.".into()),
     }
 }

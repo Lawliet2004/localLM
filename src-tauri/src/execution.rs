@@ -7,7 +7,7 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -436,6 +436,8 @@ pub struct LocalExecution {
     config: ExecutionConfig,
     directory: PathBuf,
     workspace: crate::workspace::Workspace,
+    supervisor: crate::process_tools::ProcessRegistry,
+    owner: String,
 }
 impl LocalExecution {
     pub fn new(config: ExecutionConfig, directory: &str) -> Result<Self, String> {
@@ -444,7 +446,28 @@ impl LocalExecution {
             config,
             directory: std::fs::canonicalize(directory).map_err(|e| e.to_string())?,
             workspace: crate::workspace::Workspace::open(directory)?,
+            supervisor: Default::default(),
+            owner: format!("execution-{}", uuid::Uuid::new_v4()),
         })
+    }
+    pub fn supervised(
+        mut self,
+        supervisor: crate::process_tools::ProcessRegistry,
+        owner: &str,
+    ) -> Self {
+        self.supervisor = supervisor;
+        self.owner = owner.into();
+        self
+    }
+    pub(crate) fn session(
+        &self,
+        supervisor: crate::process_tools::ProcessRegistry,
+        owner: &str,
+    ) -> Result<Self, String> {
+        Ok(
+            Self::new(self.config.clone(), &self.directory.to_string_lossy())?
+                .supervised(supervisor, owner),
+        )
     }
     pub fn code_available(&self) -> bool {
         self.python_available()
@@ -771,70 +794,34 @@ impl LocalExecution {
         if python {
             memory_limit(&mut command, &self.config.python);
         }
-        let mut child = managed_spawn(command)
-            .map_err(|error| format!("Interpreter launch failed: {error}"))?;
-        let mut input = child.stdin().take().ok_or("Missing process input pipe.")?;
-        let output = child
-            .stdout()
-            .take()
-            .ok_or("Missing process output pipe.")?;
-        let errors = child.stderr().take().ok_or("Missing process error pipe.")?;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let started = std::time::Instant::now();
-        let out_cb = on_chunk.clone();
-        let err_cb = on_chunk;
-        let result = tokio::time::timeout(Duration::from_secs(timeout), async {
-            let write = async {
-                // Structured-result helpers ride in front of the approved code
-                // so plain prints stay logs and only marker lines count. For
-                // PowerShell the helper is defined in the -Command prelude.
-                let payload = if python {
-                    json!({"code":request.code, "args":request.args, "stdin":request.stdin,
-                        "file":request.file.as_ref().map(|file| self.directory.join(file).to_string_lossy().into_owned())}).to_string()
-                } else if matches!(request.language, Language::Powershell) {
-                    request.code.clone()
-                } else {
-                    format!("{wrapped_code}{}", request.code)
-                };
-                match input.write_all(payload.as_bytes()).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-                    Err(error) => return Err(error.to_string()),
-                };
-                drop(input);
-                Ok(())
-            };
-            let wait = async { child.wait().await.map_err(|error| error.to_string()) };
-            let (_, _, _, status) = tokio::try_join!(
-                write,
-                read_output(output, &mut stdout, "stdout", out_cb),
-                read_output(errors, &mut stderr, "stderr", err_cb),
-                wait
-            )?;
-            Ok::<_, String>(status)
-        })
-        .await;
-        let (exit_code, error) = match result {
-            Ok(Ok(status)) => (status.code(), None),
-            result => {
-                let error = match result {
-                    Err(_) => "Execution timed out.".into(),
-                    Ok(Err(error)) => error,
-                    _ => unreachable!(),
-                };
-                let _ = child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-                (None, Some(error))
-            }
+        let payload = if python {
+            json!({"code":request.code,"args":request.args,"stdin":request.stdin,
+                "file":request.file.as_ref().map(|file|self.directory.join(file).to_string_lossy().into_owned())}).to_string()
+        } else if matches!(request.language, Language::Powershell) {
+            request.code.clone()
+        } else {
+            format!("{wrapped_code}{}", request.code)
         };
-        drop(child);
-        let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
-        let stderr_text = String::from_utf8_lossy(&stderr).into_owned();
-        let duration_ms = started.elapsed().as_millis();
-        let structured = parse_structured_results(&stdout_text);
+        let mut result = self
+            .supervisor
+            .run_prepared(
+                &self.owner,
+                &self.directory.to_string_lossy(),
+                command,
+                timeout,
+                payload,
+                on_chunk,
+            )
+            .await?;
+        bound_adapter_output(&mut result);
+        let stdout_text = result["stdout"].as_str().unwrap_or_default();
+        let stderr_text = result["stderr"].as_str().unwrap_or_default();
+        let exit_code = result["exitCode"].as_i64();
+        let error = result["error"].as_str();
+        let duration_ms = result["durationMs"].as_f64().unwrap_or_default() as u128;
+        let structured = parse_structured_results(stdout_text);
         let (artifacts, artifact_errors) = self.collect_artifacts(&request.artifacts);
-        let legacy = json!({"provider":"local","cwd":directory.to_string_lossy(),"workspace":self.directory.to_string_lossy(),"interpreter":program,"exitCode":exit_code,"stdout":stdout_text,"stderr":stderr_text,"error":error,"isError":error.is_some() || exit_code!=Some(0),"durationMs":duration_ms,"artifacts":artifacts,"artifactErrors":artifact_errors});
+        let legacy = json!({"provider":"local","cwd":directory.to_string_lossy(),"workspace":self.directory.to_string_lossy(),"interpreter":program,"exitCode":exit_code,"stdout":stdout_text,"stderr":stderr_text,"error":error,"isError":error.is_some() || exit_code!=Some(0),"durationMs":duration_ms,"processId":result["processId"],"truncated":result["truncated"],"artifacts":artifacts,"artifactErrors":artifact_errors});
         Ok(finish_execution_result(
             legacy,
             structured,
@@ -926,57 +913,20 @@ impl LocalExecution {
             .envs(&self.config.bash.environment);
 
         memory_limit(&mut cmd, &self.config.bash);
-        let mut child =
-            managed_spawn(cmd).map_err(|error| format!("Command launch failed: {error}"))?;
-        let mut input = child.stdin().take().ok_or("Missing process input pipe.")?;
-
-        let output = child
-            .stdout()
-            .take()
-            .ok_or("Missing process output pipe.")?;
-        let errors = child.stderr().take().ok_or("Missing process error pipe.")?;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let started = std::time::Instant::now();
-
-        let out_cb = on_chunk.clone();
-        let err_cb = on_chunk;
-
-        let result = tokio::time::timeout(Duration::from_secs(timeout), async {
-            let write = async {
-                match input.write_all(request.stdin.as_bytes()).await {
-                    Ok(()) => (),
-                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => (),
-                    Err(e) => return Err(e.to_string()),
-                }
-                drop(input);
-                Ok(())
-            };
-            let wait = async { child.wait().await.map_err(|error| error.to_string()) };
-            let (_, _, _, status) = tokio::try_join!(
-                write,
-                read_output(output, &mut stdout, "stdout", out_cb),
-                read_output(errors, &mut stderr, "stderr", err_cb),
-                wait
-            )?;
-            Ok::<_, String>(status)
-        })
-        .await;
-
-        let (exit_code, error) = match result {
-            Ok(Ok(status)) => (status.code(), None),
-            result => {
-                let error = match result {
-                    Err(_) => "Execution timed out.".into(),
-                    Ok(Err(error)) => error,
-                    _ => unreachable!(),
-                };
-                let _ = child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-                (None, Some(error))
-            }
-        };
-        drop(child);
+        let mut result = self
+            .supervisor
+            .run_prepared(
+                &self.owner,
+                &self.directory.to_string_lossy(),
+                cmd,
+                timeout,
+                request.stdin,
+                on_chunk,
+            )
+            .await?;
+        bound_adapter_output(&mut result);
+        let exit_code = result["exitCode"].as_i64();
+        let error = result["error"].as_str();
         let (artifacts, artifact_errors) = self.collect_artifacts(&request.artifacts);
         Ok(json!({
             "provider": "local",
@@ -987,58 +937,28 @@ impl LocalExecution {
             "artifactErrors": artifact_errors,
             "interpreter": self.config.bash_path,
             "exitCode": exit_code,
-            "stdout": String::from_utf8_lossy(&stdout),
-            "stderr": String::from_utf8_lossy(&stderr),
+            "stdout":result["stdout"],
+            "stderr":result["stderr"],
+            "processId":result["processId"],
+            "truncated":result["truncated"],
             "error": error,
             "isError": error.is_some() || exit_code != Some(0),
-            "durationMs": started.elapsed().as_millis()
+            "durationMs":result["durationMs"].as_f64().unwrap_or_default() as u64
         }))
     }
 }
-async fn read_output(
-    mut stream: impl AsyncRead + Unpin,
-    output: &mut Vec<u8>,
-    stream_name: &'static str,
-    on_chunk: Option<ChunkCallback>,
-) -> Result<(), String> {
-    let mut buffer = [0; 4096];
-    let mut pending = Vec::new();
-    loop {
-        let count = stream
-            .read(&mut buffer)
-            .await
-            .map_err(|error| error.to_string())?;
-        if count == 0 {
-            if let Some(ref cb) = on_chunk {
-                let text = crate::terminal_ui::decode(&mut pending, &[], true);
-                if !text.is_empty() {
-                    cb(stream_name, &text);
-                }
+fn bound_adapter_output(value: &mut Value) {
+    for key in ["stdout", "stderr"] {
+        if let Some(text) = value[key].as_str().filter(|text| text.len() > 65536) {
+            let mut end = 65536;
+            while !text.is_char_boundary(end) {
+                end -= 1;
             }
-            return Ok(());
-        }
-        let available = 65_536 - output.len();
-        let to_take = count.min(available);
-        if to_take > 0 {
-            output.extend_from_slice(&buffer[..to_take]);
-            if let Some(ref cb) = on_chunk {
-                let chunk_text =
-                    crate::terminal_ui::decode(&mut pending, &buffer[..to_take], false);
-                if !chunk_text.is_empty() {
-                    cb(stream_name, &chunk_text);
-                }
-            }
-        }
-        if count > available {
-            return Err("Execution output exceeded 64 KiB per stream.".into());
+            value[key] = json!(&text[..end]);
+            value["truncated"] = json!(true);
         }
     }
 }
-
-/// Python driver: reads user source from stdin and runs it as a notebook cell.
-/// Last expression / last simple assignment become locallm_result; print stays
-/// on stdout for the host fallback. math/json/datetime/decimal/fractions/
-/// statistics/re are preloaded. Never uses eval on unparsed text.
 fn python_repl_driver() -> &'static str {
     r#"import ast, collections, datetime, decimal, fractions, itertools, json, math, random, re, statistics, sys, io, os
 _emitted = {"n": 0}
@@ -1227,10 +1147,11 @@ fn finish_execution_result(
         .get("error")
         .and_then(Value::as_str)
         .is_some_and(|message| message.contains("timed out"));
-    let stream_truncated = legacy
-        .get("error")
-        .and_then(Value::as_str)
-        .is_some_and(|message| message.contains("exceeded 64 KiB"));
+    let stream_truncated = legacy.get("truncated") == Some(&Value::Bool(true))
+        || legacy
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("exceeded 64 KiB"));
     let stdout_text = legacy
         .get("stdout")
         .and_then(Value::as_str)
@@ -1348,6 +1269,8 @@ fn finish_execution_result(
         status,
         json!({
             "exitCode": legacy.get("exitCode").cloned().unwrap_or(Value::Null),
+            "processId":legacy["processId"],
+            "cwd":legacy["cwd"],
             "logs": {"stdout": stdout_text, "stderr": stderr_text},
             "result": data_result,
             "resultStatus": result_status,
@@ -1361,6 +1284,7 @@ fn finish_execution_result(
             map.entry(key.clone()).or_insert_with(|| val.clone());
         }
     }
+    envelope["isError"] = json!(status != crate::tool_envelope::Status::Success);
     envelope
 }
 #[tauri::command]
@@ -1686,27 +1610,6 @@ mod tests {
             rustix::process::getrlimit(rustix::process::Resource::As).current,
             Some(128 * 1024 * 1024)
         );
-    }
-    #[tokio::test]
-    async fn streaming_preserves_utf8_split_between_reads() {
-        let (mut writer, reader) = tokio::io::duplex(16);
-        let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let capture = collected.clone();
-        let callback: ChunkCallback =
-            std::sync::Arc::new(move |_, text| capture.lock().unwrap().push_str(text));
-        let write = async move {
-            for byte in "héllo世界🌍".as_bytes() {
-                writer.write_all(&[*byte]).await.unwrap();
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        };
-        let mut bytes = Vec::new();
-        let (_, result) = tokio::join!(
-            write,
-            read_output(reader, &mut bytes, "stdout", Some(callback))
-        );
-        result.unwrap();
-        assert_eq!(*collected.lock().unwrap(), "héllo世界🌍");
     }
     #[tokio::test]
     async fn runs_python_and_javascript_and_reports_nonzero_exit() {

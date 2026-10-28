@@ -6,7 +6,7 @@ use std::{
 };
 use tokio::sync::watch;
 
-pub const MANAGED_RUNTIME_MESSAGE: &str = "The pinned CUDA installer supports Windows x64 only. For CPU, Vulkan (AMD/Intel), ROCm or macOS Metal, obtain a native llama-server from the official llama.cpp release/build instructions, then use Browse runtime in Model files. Choose a package matching your operating system, CPU architecture and backend.";
+pub const MANAGED_RUNTIME_MESSAGE: &str = "The standard llama.cpp CUDA installer supports Windows x64 only. Bonsai has a separate managed Prism installer in Models. For other engines or backends, obtain a native llama-server from its official release/build instructions, then use Browse runtime in Model files. Choose a package matching your operating system, CPU architecture and backend.";
 
 pub fn managed_runtime_supported() -> bool {
     cfg!(all(target_os = "windows", target_arch = "x86_64"))
@@ -14,6 +14,12 @@ pub fn managed_runtime_supported() -> bool {
 
 pub fn required_bytes(assets: &[runtime_archive::RuntimeAsset]) -> Result<u64, String> {
     let total = assets.iter().try_fold(0_u64, |total, asset| {
+        if asset.files.is_empty() {
+            return total
+                .checked_add(asset.bytes)
+                .and_then(|n| n.checked_add(runtime_archive::MAX_EXPANDED_BYTES))
+                .ok_or("Runtime size overflow.");
+        }
         asset.files.iter().try_fold(
             total
                 .checked_add(asset.bytes)
@@ -35,22 +41,39 @@ pub async fn install(
     cancel: watch::Receiver<bool>,
     progress: impl Fn(&str, u64, u64),
 ) -> Result<PathBuf, String> {
+    install_package(
+        root,
+        crate::runtime_catalog::package(None)?,
+        cancel,
+        progress,
+    )
+    .await
+}
+
+pub async fn install_package(
+    root: &Path,
+    package: crate::runtime_catalog::Package,
+    cancel: watch::Receiver<bool>,
+    progress: impl Fn(&str, u64, u64),
+) -> Result<PathBuf, String> {
     if *cancel.borrow() {
         return Err("Runtime installation cancelled.".into());
     }
-    if !managed_runtime_supported() {
+    if !package.supported() {
         return Err(MANAGED_RUNTIME_MESSAGE.into());
     }
-    let assets = runtime_archive::catalog()?;
+    let assets = package.assets.clone();
     tokio::fs::create_dir_all(root)
         .await
         .map_err(|error| error.to_string())?;
     let reuse_root = root.to_path_buf();
     progress("verifying", 0, 0);
-    if let Some(existing) =
-        tokio::task::spawn_blocking(move || crate::runtime_inventory::reusable(&reuse_root))
-            .await
-            .map_err(|_| "Runtime verification worker stopped")??
+    let reuse_package = package.clone();
+    if let Some(existing) = tokio::task::spawn_blocking(move || {
+        crate::runtime_inventory::reusable_package(&reuse_root, &reuse_package)
+    })
+    .await
+    .map_err(|_| "Runtime verification worker stopped")??
     {
         return Ok(existing);
     }
@@ -73,7 +96,7 @@ pub async fn install(
         .await
         .map_err(|error| error.to_string())?;
     let client = download::client()?;
-    for asset in assets {
+    for asset in assets.clone() {
         if *cancel.borrow() {
             return Err("Runtime installation cancelled.".into());
         }
@@ -112,22 +135,24 @@ pub async fn install(
     if *cancel.borrow() {
         return Err("Runtime installation cancelled.".into());
     }
-    let executable = output.join("llama-server.exe");
+    let executable = output.join(&package.executable);
     if !tokio::fs::try_exists(&executable)
         .await
         .map_err(|error| error.to_string())?
     {
-        return Err("Runtime bundle is missing llama-server.exe.".into());
+        return Err(format!("Runtime bundle is missing {}.", package.executable));
     }
     let receipt_root = output.clone();
-    tokio::task::spawn_blocking(move || crate::runtime_inventory::receipt(&receipt_root))
-        .await
-        .map_err(|_| "Runtime receipt worker stopped")??;
-    let destination = root.join(format!("llama-b10855-cuda12.4-{}", uuid::Uuid::new_v4()));
+    tokio::task::spawn_blocking(move || {
+        crate::runtime_inventory::receipt_assets(&receipt_root, &assets)
+    })
+    .await
+    .map_err(|_| "Runtime receipt worker stopped")??;
+    let destination = root.join(format!("{}{}", package.prefix(), uuid::Uuid::new_v4()));
     tokio::fs::rename(&output, &destination)
         .await
         .map_err(|error| format!("Could not publish complete runtime: {error}"))?;
-    Ok(destination.join("llama-server.exe"))
+    Ok(destination.join(&package.executable))
 }
 
 #[cfg(test)]

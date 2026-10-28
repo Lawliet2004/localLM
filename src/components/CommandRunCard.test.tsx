@@ -423,3 +423,14 @@ it('defers completed command contents until inspection and preserves them on col
   view.rerender(<CommandRunCard toolName="execute_command" command="cargo test" status="completed" stdout={'record\n'.repeat(3000)} />);
   expect(screen.getByTestId('terminal-viewport')).toBe(viewport);
 });
+
+it.each([
+  ['partial', 'Partially completed'],
+  ['cancelled', 'Cancelled'],
+  ['unknown', 'Outcome unknown'],
+  ['denied', 'Denied'],
+] as const)('presents %s as its own outcome', (status, label) => {
+  render(<CommandRunCard toolName="workspace_edit_file" status={status} />);
+  expect(screen.getByTestId(`status-${status}`)).toHaveTextContent(label);
+  expect(screen.queryByTestId('status-finished')).not.toBeInTheDocument();
+});

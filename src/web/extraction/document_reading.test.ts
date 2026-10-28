@@ -92,6 +92,35 @@ describe('full-document reading', () => {
     expect(section[0].section).toContain('Usage');
   });
 
+  it('recovers long code paragraphs and PDF pages exactly through restart-safe cursors', () => {
+    const text = '# Long source\n\n' + 'a'.repeat(1998) + '🪐' + 'const x = 1;'.repeat(1200) + '\n# Tail\nLast fact.';
+    const document = {
+      id: 'long', url: 'https://example.com/source', domain: 'example.com', title: 'Source',
+      text, fullText: text, pages: [text], retrievedAt: '2026-10-25', searchResultIds: [],
+      extractionMethod: 'main_content' as const,
+    };
+    for (const page of [undefined, 1]) {
+      let recovered = '', textOffset = 0;
+      for (;;) {
+        const store = new DocumentStore();
+        store.save(JSON.parse(JSON.stringify(document)));
+        const [part] = store.open('long', { page, textOffset });
+        expect(part.textOffset).toBe(textOffset);
+        expect(part.totalChars).toBe(text.length);
+        expect(part.text).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/);
+        recovered += part.text;
+        if (part.nextTextOffset === null) break;
+        expect(part.nextTextOffset).toBeGreaterThan(textOffset);
+        textOffset = part.nextTextOffset;
+      }
+      expect(recovered).toBe(text);
+    }
+    const store = new DocumentStore();
+    store.save(document);
+    const [match] = store.find('long', 'Last fact');
+    expect(store.open('long', { textOffset: match.textOffset })[0].text).toContain('Last fact');
+  });
+
   it('keeps PDF page references and fails scanned PDFs explicitly', () => {
     const page1 = '(Hello page one and more extractable text for the page) Tj';
     const page2 = '(Hello page two and more extractable text for the page) Tj';

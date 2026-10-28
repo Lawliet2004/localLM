@@ -154,10 +154,11 @@ fn lifecycle_setup(
                 error: None,
                 created_at: crate::store::now(),
                 updated_at: crate::store::now(),
-            })
+            outcome: None,
+})
             .unwrap();
         let task =
-            crate::research_tasks::ResearchTask::new(&chat, "Contract fixture", Default::default())
+            crate::research_tasks::ResearchTask::new(&chat, "Contract fixture")
                 .unwrap();
         store.save_research_task(&task).unwrap();
         chat

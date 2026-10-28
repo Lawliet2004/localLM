@@ -1020,7 +1020,7 @@ mod tests {
             assert_eq!(out["data"]["reviewIncomplete"], true);
             assert!(crate::tool_envelope::validate_envelope(&out).is_ok());
             let full: Value = serde_json::from_str(&artifact.unwrap().content).unwrap();
-            assert_eq!(full, normalized);
+            assert_eq!(full, crate::tool_envelope::model_result(&normalized));
         }
     }
 }

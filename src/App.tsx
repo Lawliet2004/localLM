@@ -1,4 +1,5 @@
 import { toolOutput } from './lib/toolOutput';
+import { appendModelDelta, toolStreamId } from './lib/agentTranscript';
 import { CommandPalette } from './components/CommandPalette';
 import { useEffect, useRef, useState } from 'react';
 import { Check, ChevronDown, Download, Pencil, Trash2, X, ArrowLeft, ArrowRight, Folder, MoreHorizontal } from 'lucide-react';
@@ -27,7 +28,6 @@ import { SecuritySettings } from './components/SecuritySettings';
 import { GitSettings } from './components/GitSettings';
 import { WeatherSettings } from './components/WeatherSettings';
 import { Execution } from './components/Execution';
-import { DevelopmentSettings } from './components/DevelopmentSettings';
 import { LanguageServerSettings } from './components/LanguageServerSettings';
 import { NativeExecutionSettings } from './components/NativeExecutionSettings';
 import { AutomationSettings } from './components/AutomationSettings';
@@ -699,7 +699,7 @@ export default function App() {
 
           const stream = event.toolStream;
 
-          const toolMsgId = `tool-${stream.toolCallId}`;
+          const toolMsgId = toolStreamId({ conversationId, runId: event.runId, stepId: event.stepId, toolCallId: stream.toolCallId });
           streamedTools.add(toolMsgId);
 
           if (stream.type === 'started') {
@@ -723,6 +723,9 @@ export default function App() {
                   content: JSON.stringify({
 
                     request: {
+                      callId: stream.toolCallId,
+                      runId: event.runId,
+                      stepId: event.stepId,
 
                       name: stream.toolName,
 
@@ -820,9 +823,10 @@ export default function App() {
 
           const existing = current.find(message => message.id === event.messageId);
 
-          if (existing) return current.map(message => message.id === event.messageId ? { ...message, content: message.content + event.content, reasoning: message.reasoning + event.reasoning } : message);
+          if (existing) return current.map(message => message.id === event.messageId ? appendModelDelta(message, event) : message);
 
-          return [...current, { id: event.messageId, conversationId, role: 'assistant', content: event.content, reasoning: event.reasoning, status: 'streaming', createdAt: Date.now() }];
+          if (!event.content && !event.reasoning) return current;
+          return [...current, appendModelDelta({ id: event.messageId, conversationId, role: 'assistant', content: '', reasoning: '', status: 'streaming', createdAt: Date.now() }, event)];
 
         });
 
@@ -1019,7 +1023,7 @@ export default function App() {
   const activeProject = allProjects(workspaceIndex).find(p => p.id === projectId);
   const activeProjectName = activeProject?.name ?? '';
 
-  const settingsPage = page === 'general' ? <GeneralSettings accessMode={accessMode} onAccessMode={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} nativeAvailable={nativeAvailable} projectPath={activeProject?.path} modelLabel={modelLabel} scopeLabel={active?.title} onPage={navigate} /> : page === 'appearance' ? <AppearanceSettings preferences={appearance.preferences} theme={theme} onChange={appearance.update} onReset={appearance.reset} saveError={appearance.saveError} /> : page === 'tools' ? <ToolsSettings onChooseWorkspace={chooseTaskWorkspace} accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} preset={preset} onPresetChange={changePreset} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} scopeLabel={active?.title} onBack={() => navigate('chat')} busy={busy} loading={loading} saving={savingTools} onNavigate={target => navigate(target)} /> : ['models', 'inference', 'diagnostics'].includes(page) ? <Models key={page} initialTab={page === 'inference' ? 'generation' : page === 'diagnostics' ? 'diagnostics' : 'library'} onRefresh={async () => { setData(normalizeBootstrap(await api.bootstrap())); }} providers={data.providers} selection={modelSelection} requestedModel={requestedModel} onRequestedModelHandled={() => setRequestedModel(undefined)} config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveSelection={saveModelSelection} onSaveConfig={async config => { try { await api.saveConfig(config); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'security' ? <SecuritySettings accessMode={accessMode} onAccessMode={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} scope={active?.title} /> : page === 'git' ? <GitSettings root={activeProject?.path} onOpenReview={() => { navigate('chat'); setReviewRequest(value => value + 1); }} /> : page === 'weather' ? <WeatherSettings /> : page === 'web-search' ? <Execution key={page} section="web-search" /> : page === 'execution' ? <Execution key={page} /> : page === 'hooks' ? <HooksSettings /> : page === 'development-tools' ? <DevelopmentSettings /> : page === 'language-servers' ? <LanguageServerSettings root={activeProject?.path} /> : page === 'bash' || page === 'python' ? <NativeExecutionSettings key={page} kind={page} /> : page === 'browser-use' ? <AutomationSettings key={page} mode="browser" onConfigureExecution={() => navigate('execution')} /> : page === 'computer-use' ? <AutomationSettings key={page} mode="computer" /> : page === 'connectors' ? <Connectors /> : page === 'permission-rules' ? <PermissionRulesSettings /> : page === 'plugins' ? <PluginSettings /> : <Skills />;
+  const settingsPage = page === 'general' ? <GeneralSettings accessMode={accessMode} onAccessMode={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} nativeAvailable={nativeAvailable} projectPath={activeProject?.path} modelLabel={modelLabel} scopeLabel={active?.title} onPage={navigate} /> : page === 'appearance' ? <AppearanceSettings preferences={appearance.preferences} theme={theme} onChange={appearance.update} onReset={appearance.reset} saveError={appearance.saveError} /> : page === 'tools' ? <ToolsSettings onChooseWorkspace={chooseTaskWorkspace} accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} preset={preset} onPresetChange={changePreset} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} scopeLabel={active?.title} onBack={() => navigate('chat')} busy={busy} loading={loading} saving={savingTools} onNavigate={target => navigate(target)} /> : ['models', 'inference', 'diagnostics'].includes(page) ? <Models key={page} initialTab={page === 'inference' ? 'generation' : page === 'diagnostics' ? 'diagnostics' : 'library'} onRefresh={async () => { setData(normalizeBootstrap(await api.bootstrap())); }} providers={data.providers} selection={modelSelection} requestedModel={requestedModel} onRequestedModelHandled={() => setRequestedModel(undefined)} config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || busy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveSelection={saveModelSelection} onSaveConfig={async config => { try { await api.saveConfig(config); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'security' ? <SecuritySettings accessMode={accessMode} onAccessMode={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} scope={active?.title} /> : page === 'git' ? <GitSettings root={activeProject?.path} onOpenReview={() => { navigate('chat'); setReviewRequest(value => value + 1); }} /> : page === 'weather' ? <WeatherSettings /> : page === 'web-search' ? <Execution key={page} section="web-search" /> : page === 'execution' ? <Execution key={page} /> : page === 'hooks' ? <HooksSettings /> : page === 'language-servers' ? <LanguageServerSettings root={activeProject?.path} /> : page === 'bash' || page === 'python' ? <NativeExecutionSettings key={page} kind={page} /> : page === 'browser-use' ? <AutomationSettings key={page} mode="browser" onConfigureExecution={() => navigate('execution')} /> : page === 'computer-use' ? <AutomationSettings key={page} mode="computer" /> : page === 'connectors' ? <Connectors /> : page === 'permission-rules' ? <PermissionRulesSettings /> : page === 'plugins' ? <PluginSettings /> : <Skills />;
 
   return <div className={`app desktop-app ${collapsed ? 'sidebar-collapsed' : ''}`}>
 

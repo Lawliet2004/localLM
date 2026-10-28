@@ -180,7 +180,7 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
             {quantRows.map(row => <div className={`quant-row${filename === row.file.filename ? ' selected' : ''}`} key={row.file.filename} role="row">
               <button type="button" className="quant-select" disabled={locked} aria-pressed={filename === row.file.filename} onClick={() => { setFilename(row.file.filename); setProjector(current => current || preferredProjector(catalog?.files ?? [], row.file.filename)); }}>
                 <strong>{row.quant}</strong>
-                <span className="quant-name">{row.file.filename.split('/').pop()}</span>
+                <span className="quant-name" title={row.file.filename.split('/').pop()}>{row.file.filename.split('/').pop()}</span>
                 <span className="quant-size" title={`${row.bytes.toLocaleString()} bytes`}><span>{gib(row.bytes)}</span><small>{hubSize(row.bytes)}</small></span>
                 <span className={`fit-badge fit-${row.kind}`}>{fitLabel(row.kind)}</span>
               </button>

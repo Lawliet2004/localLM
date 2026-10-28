@@ -1,128 +1,55 @@
-/**
- * Zero-Cost, Local-First Web Search + Grounding Engine for Small LLMs
- *
- * Core architectural principle:
- * Search broadly outside the LLM context (inspecting dozens of results and tens of thousands
- * of source tokens), algorithmically filter, chunk, retrieve, rerank, and compress evidence,
- * and provide the final 5B-10B parameter LLM with only ~1.5K-3K tokens of strictly grounded evidence.
- */
-
-import type {
-  SearchProvider,
-  LLMProvider,
-  EmbeddingProvider,
-  Reranker,
-  ResearchSession,
-  ResearchMode,
-  RetrievedDocument,
-  EvidenceChunk,
-  ExtractedFact,
-  EvidenceClaim,
-  TokenStats,
-  SearchMeta,
-  SearchResult,
-  FreshnessWindow,
-} from './types';
-import { emptySearchMeta, hasSearchMeta, mergeSearchMeta } from './types';
-import { createConfig } from './config/defaults';
-import type { WebSearchConfig } from './config/schema';
-import { fuseSearchResults } from './search/result_fusion';
-import { extractPdfText } from './documents/document_store';
-import { normalizeRequest } from './router/request_normalizer';
-import { routeRequest } from './router/intent_router';
-import { QueryPlanner } from './planning/query_planner';
-import { SearchService } from './search/search_service';
-import { SearXNGProvider, documentsFromSearchMeta } from './search/searxng_provider';
-import { GoogleSearchProvider } from './search/google_provider';
-import { rankSearchResults } from './ranking/search_ranker';
-import { selectPagesToFetch } from './fetch/fetch_policy';
-import { HttpFetcher } from './fetch/http_fetcher';
-import { fetchPageCascade, type CascadeOutcome, type CascadeOptions } from './fetch/cascade';
-import { DomainStatsStore, orderByDomainHealth } from './fetch/domain_stats';
-import { fallbackSnippetExtraction } from './extraction/extraction_fallback';
-import { chunkDocument } from './chunking/semantic_chunker';
-import { LocalHashingEmbeddingProvider } from './retrieval/embeddings';
-import { HybridRetriever } from './retrieval/hybrid_retriever';
-import { RerankerService, ResilientReranker } from './reranking/reranker';
-import { SourceManager } from './evidence/source_registry';
-import { EvidenceExtractor } from './evidence/extractor';
-import { deduplicateFacts } from './evidence/deduplicator';
-import { detectEvidenceConflicts } from './evidence/conflict_detector';
-import { buildGroundedContext, buildModelBudgetedContext } from './context/context_builder';
-import { AnswerGenerator } from './generation/answer_generator';
-import { extractAtomicClaims } from './verification/claim_extractor';
-import { ClaimVerifier } from './verification/claim_verifier';
-import { evaluateResearchRetry, isRepeatedQuery } from './verification/research_retry';
-import { initResearchState, recordRound, classifyRequirements } from './planning/research_state';
-import { WeatherProvider } from './verticals/weather/weather_provider';
-import { extractStructuredContent } from './extraction/structured_content';
-import { CurrencyProvider } from './verticals/currency/currency_provider';
-import { TimeProvider } from './verticals/time/time_provider';
-import { SearchCache } from './cache/search_cache';
+/** Search and document retrieval. The agent owns planning and synthesis. */
+import type { SearchProvider, RetrievedDocument, ResearchSession, ResearchMode, FreshnessWindow } from './types';
 import { ttlForFreshness } from './cache/search_cache';
 import { DocumentCache } from './cache/document_cache';
-import { PipelineLogger } from './observability/logger';
+import { mergeSearchMeta } from './types';
+import { createConfig } from './config/defaults';
+import type { WebSearchConfig } from './config/schema';
+import { SearchService } from './search/search_service';
+import { SearXNGProvider } from './search/searxng_provider';
+import { GoogleSearchProvider } from './search/google_provider';
+import { HttpFetcher } from './fetch/http_fetcher';
+import { fetchPageCascade, type CascadeOutcome, type CascadeOptions } from './fetch/cascade';
+import { DomainStatsStore } from './fetch/domain_stats';
+import { extractPdfText } from './documents/document_store';
+import { extractStructuredContent } from './extraction/structured_content';
+import { SourceManager } from './evidence/source_registry';
 import { TraceCollector } from './observability/trace';
-import { defaultTokenCounter } from './chunking/tokenizer';
 import { InMemoryStorageAdapter, type StorageAdapter } from './cache/sqlite';
-import { LocalEmbeddingProvider, LocalModelReranker } from './models/retrieval_providers';
-import { coverageMatrix } from './planning/coverage';
-import { isSafeUrl } from './security/ssrf_guard';
-
 export * from './types';
 export * from './config/schema';
 export * from './config/defaults';
 export { formatDiagnosticReport } from './observability/metrics';
-
-export interface ResearchProgress {
-  stage: 'route' | 'plan' | 'search' | 'fetch' | 'evidence' | 'answer' | 'verify';
-  message: string;
-  done?: number;
-  total?: number;
-}
-
+export interface ResearchProgress { stage: 'route' | 'plan' | 'search' | 'fetch' | 'evidence' | 'answer' | 'verify'; message: string; done?: number; total?: number }
 export interface EngineDependencies {
   searchProvider?: SearchProvider;
-  llmProvider?: LLMProvider;
-  embeddingProvider?: EmbeddingProvider;
-  reranker?: Reranker;
-  fetcher?: Pick<HttpFetcher, 'fetch'>;
-  jsRender?: import('./fetch/cascade').JsRenderer;
-  storage?: StorageAdapter;
-  config?: Partial<WebSearchConfig>;
-  /** Optional stage callback; the worker maps it onto its progress protocol. */
-  onProgress?: (progress: ResearchProgress) => void;
+  fetcher?: Pick<HttpFetcher, 'fetch'>; jsRender?: import('./fetch/cascade').JsRenderer;
+  storage?: StorageAdapter; config?: Partial<WebSearchConfig>; onProgress?: (progress: ResearchProgress) => void;
 }
-
 export class WebSearchEngine {
   public config: WebSearchConfig;
   private searchProvider: SearchProvider;
   private fallbackProvider?: SearchProvider;
   private searchStorage?: StorageAdapter;
-  private llmProvider?: LLMProvider;
-  private embeddingProvider: EmbeddingProvider;
-  private reranker: Reranker;
   private fetcher: Pick<HttpFetcher, 'fetch'>;
   private jsRender?: import('./fetch/cascade').JsRenderer;
-  private searchCache: SearchCache;
-  private documentCache: DocumentCache;
   private domainStats?: DomainStatsStore;
-  private weatherProvider: WeatherProvider;
-  private currencyProvider: CurrencyProvider;
-  private timeProvider: TimeProvider;
-  private queryPlanner: QueryPlanner;
-  private evidenceExtractor: EvidenceExtractor;
-  private answerGenerator: AnswerGenerator;
-  private claimVerifier: ClaimVerifier;
-  private logger: PipelineLogger;
-  private onProgress?: (progress: ResearchProgress) => void;
-  /** Concurrent calls for one URL share a single fetch cascade. */
   private inflightFetches = new Map<string, Promise<CascadeOutcome>>();
-
-  private progress(stage: ResearchProgress['stage'], message: string, extra?: { done?: number; total?: number }) {
-    try { this.onProgress?.({ stage, message, ...extra }); } catch { /* reporting never breaks research */ }
+  private onProgress?: (progress: ResearchProgress) => void;
+  constructor(deps: EngineDependencies = {}) {
+    this.config = createConfig(deps.config);
+    const google = this.config.googleApiKey && this.config.googleCxId
+      ? new GoogleSearchProvider(this.config.googleApiKey, this.config.googleCxId) : undefined;
+    const searxng = new SearXNGProvider(this.config.searxngBaseUrl, this.config.searxngTimeoutMs, this.config.searxngEngines, this.config.searxngDisabledEngines);
+    this.searchProvider = deps.searchProvider || (this.config.searchProvider === 'google' && google ? google : searxng);
+    this.fallbackProvider = !deps.searchProvider && this.config.searchFallback?.enabled
+      ? (this.searchProvider === google ? searxng : google) : undefined;
+    this.searchStorage = deps.storage;
+    this.fetcher = deps.fetcher || new HttpFetcher(this.config.fetch.globalConcurrency, this.config.fetch.perDomainConcurrency);
+    this.jsRender = this.config.fetch.jsRenderFallback ? deps.jsRender : undefined;
+    this.domainStats = this.config.fetch.domainLearning ? new DomainStatsStore(deps.storage ?? new InMemoryStorageAdapter()) : undefined;
+    this.onProgress = deps.onProgress;
   }
-
   private fetchCascade(url: string, options: CascadeOptions): Promise<CascadeOutcome> {
     const pending = this.inflightFetches.get(url);
     if (pending) return pending;
@@ -132,53 +59,6 @@ export class WebSearchEngine {
     return promise;
   }
 
-  constructor(deps: EngineDependencies = {}) {
-    this.config = createConfig(deps.config);
-    if (this.config.searchProvider === 'google' && this.config.googleApiKey && this.config.googleCxId) {
-      this.searchProvider = deps.searchProvider || new GoogleSearchProvider(this.config.googleApiKey, this.config.googleCxId);
-      this.fallbackProvider = (!deps.searchProvider && this.config.searchFallback?.enabled)
-        ? new SearXNGProvider(this.config.searxngBaseUrl, this.config.searxngTimeoutMs, this.config.searxngEngines, this.config.searxngDisabledEngines) : undefined;
-    } else {
-      this.searchProvider = deps.searchProvider || new SearXNGProvider(this.config.searxngBaseUrl, this.config.searxngTimeoutMs, this.config.searxngEngines, this.config.searxngDisabledEngines);
-      this.fallbackProvider = (!deps.searchProvider && this.config.searchFallback?.enabled && this.config.googleApiKey && this.config.googleCxId)
-        ? new GoogleSearchProvider(this.config.googleApiKey, this.config.googleCxId) : undefined;
-    }
-    this.llmProvider = deps.llmProvider;
-    this.embeddingProvider = deps.embeddingProvider || (this.config.localEmbedding ? new LocalEmbeddingProvider(this.config.localEmbedding, deps.storage) : new LocalHashingEmbeddingProvider());
-    const recencyWeight = this.config.reranking.recencyWeight ?? 0;
-    this.reranker = deps.reranker || (
-      this.config.localReranker && this.config.reranking.enabled
-        ? new ResilientReranker(new LocalModelReranker(this.config.localReranker), recencyWeight)
-        : new RerankerService(this.config.reranking.enabled, recencyWeight)
-    );
-    this.fetcher =
-      deps.fetcher ||
-      new HttpFetcher(
-        this.config.fetch.globalConcurrency,
-        this.config.fetch.perDomainConcurrency
-      );
-    this.jsRender = this.config.fetch.jsRenderFallback ? deps.jsRender : undefined;
-    this.searchCache = new SearchCache(deps.storage);
-    this.documentCache = new DocumentCache(deps.storage);
-    this.searchStorage = deps.storage;
-    this.domainStats = this.config.fetch.domainLearning
-      ? new DomainStatsStore(deps.storage ?? new InMemoryStorageAdapter())
-      : undefined;
-    this.weatherProvider = new WeatherProvider();
-    this.currencyProvider = new CurrencyProvider();
-    this.timeProvider = new TimeProvider();
-    this.queryPlanner = new QueryPlanner(this.llmProvider);
-    this.evidenceExtractor = new EvidenceExtractor(this.config.extractEvidenceWithModel ? this.llmProvider : undefined);
-    this.answerGenerator = new AnswerGenerator(this.llmProvider);
-    this.claimVerifier = new ClaimVerifier(this.config.verification.enabled ? this.llmProvider : undefined);
-    this.logger = new PipelineLogger(false);
-    this.onProgress = deps.onProgress;
-  }
-
-  /**
-   * Quota guard for the Google free tier: at most googleDailyLimit fallback
-   * calls per calendar day, counted in the research SQLite store.
-   */
   private async claimGoogleQuota(queryCount = 1): Promise<boolean> {
     const limit = this.config.searchFallback?.googleDailyLimit ?? 90;
     if (!this.searchStorage) return true;
@@ -190,55 +70,34 @@ export class WebSearchEngine {
     return true;
   }
 
-  /**
-   * Health Check: Validates status of dependencies without charging any paid APIs.
-   */
-  async getHealthStatus(): Promise<{
-    search: string;
-    database: string;
-    embeddingModel: string;
-    reranker: string;
-    llm: string;
-    google: string;
-    searchError?: string;
-    searxngDiagnostics?: import('./search/searxng_provider').SearXNGDiagnostics;
-  }> {
-    const searchHealth = this.config.searchProvider === 'google' && (!this.config.googleApiKey || !this.config.googleCxId)
-      ? { search: 'not_configured', searchError: 'Configure a Google API key and Custom Search Engine ID.' }
-      : this.searchProvider instanceof SearXNGProvider
-      ? await this.searchProvider.checkHealth()
-      : { search: 'ready' };
-
-    return {
-      ...searchHealth,
-      database: this.config.cache.enabled ? 'configured' : 'disabled',
-      embeddingModel: this.config.retrieval.embeddings ? this.embeddingProvider.constructor.name : 'disabled',
-      reranker: this.config.reranking.enabled ? this.reranker.constructor.name : 'disabled',
-      llm: this.llmProvider ? 'configured' : 'deterministic_fallback_ready',
-      google: this.config.googleApiKey && this.config.googleCxId ? 'configured' : 'not_configured',
-    };
+  async getHealthStatus() {
+    const health = this.config.searchProvider === 'google' && (!this.config.googleApiKey || !this.config.googleCxId)
+      ? { search:'not_configured', searchError:'Configure a Google API key and Custom Search Engine ID.' }
+      : this.searchProvider instanceof SearXNGProvider ? await this.searchProvider.checkHealth() : { search:'ready' };
+    return { ...health, database:this.config.cache.enabled ? 'configured' : 'disabled',
+      embeddingModel:'disabled', reranker:'disabled', llm:'agent_owned',
+      google:this.config.googleApiKey && this.config.googleCxId ? 'configured' : 'not_configured' };
   }
-
-  /**
-   * Fetch + extract one URL with full SSRF/redirect/fetch limits: HTML keeps
-   * headings, links, and table structure; PDFs keep page references. Missing
-   * text is not labeled OCR-required. Browser rendering fallback is
-   * intentionally NOT bundled: JS-dependent pages surface as snippet-only
-   * evidence with an explicit limitation (see docs).
-   */
   /** Direct search for agent-controlled research; no nested planning/synthesis. */
-  async searchQueries(queries: string[]) {
+  async searchQueries(queries: string[], filters: {freshness?: FreshnessWindow; language?: string; category?: string} = {}) {
     if (!Array.isArray(queries) || queries.length < 1 || queries.length > 4 ||
         queries.some(q => typeof q !== 'string' || !q.trim() || new TextEncoder().encode(q).length > 8000)) {
       throw new Error('search requires 1-4 nonempty queries, at most 8000 bytes each');
     }
-    const planned = [...new Set(queries.map(q => q.trim()))].map(query => ({ query, purpose: 'agent research', freshness: 'any' as const }));
+    const planned = [...new Set(queries.map(q => q.trim()))].map(query => ({ query, purpose: 'agent research', freshness: filters.freshness || 'any' as FreshnessWindow, language:filters.language, category:filters.category }));
+    const cacheKey = JSON.stringify([this.config.searchProvider, this.config.searxngBaseUrl, planned]);
+    const cached = this.config.cache.enabled ? await this.searchStorage?.get<Awaited<ReturnType<SearchService['executeSearches']>>>('agent_search',cacheKey) : null;
+    if (cached) return cached;
     if (this.searchProvider instanceof GoogleSearchProvider && !(await this.claimGoogleQuota(planned.length))) {
       throw new Error('Google daily quota exhausted');
     }
     const options = { maxConcurrentQueries: this.config.maxConcurrentQueries, retries: this.config.searchRetries, retryDelayMs: this.config.searchRetryDelayMs };
     const result = await new SearchService(this.searchProvider, options).executeSearches(planned, 10);
-    if (result.results.length || result.meta.answers.length || result.meta.infoboxes.length || !this.fallbackProvider) return result;
+    if (result.results.length || result.meta.answers.length || result.meta.infoboxes.length || !this.fallbackProvider) {
+      if (this.config.cache.enabled && !result.failureCount) await this.searchStorage?.set('agent_search',cacheKey,result,
+        ttlForFreshness(filters.freshness || 'any', this.config.cache.searchTtlSeconds.default));
+      return result;
+    }
     if (this.fallbackProvider instanceof GoogleSearchProvider && !(await this.claimGoogleQuota(planned.length))) return result;
     const fallback = await new SearchService(this.fallbackProvider, options).executeSearches(planned, 10);
     return {
@@ -250,6 +109,14 @@ export class WebSearchEngine {
   }
 
   async fetchUrl(rawUrl: string): Promise<RetrievedDocument> {
+    const cache = this.config.cache.enabled ? new DocumentCache(this.searchStorage) : null;
+    const cached = await cache?.get(rawUrl);
+    if (cached) return cached;
+    const document = await this.retrieveUrl(rawUrl);
+    await cache?.set(document);
+    return document;
+  }
+  private async retrieveUrl(rawUrl: string): Promise<RetrievedDocument> {
     const outcome = await this.fetchCascade(rawUrl, {
       timeoutSeconds: this.config.fetch.timeoutSeconds,
       maxBytes: this.config.fetch.maxBytes,
@@ -263,7 +130,7 @@ export class WebSearchEngine {
     if (res?.success && typeof res.body === 'string' && (['application/json', 'text/csv', 'application/csv', 'text/tab-separated-values'].includes(mime) || mime.endsWith('+json'))) {
       const structured = extractStructuredContent(res.body, mime);
       const url = res.finalUrl || rawUrl;
-      return { id: `data-${Date.now()}`, url, domain: new URL(url).hostname, title: new URL(url).pathname.split('/').pop() || 'Structured document',
+      return { id: `data-${crypto.randomUUID()}`, url, domain: new URL(url).hostname, title: new URL(url).pathname.split('/').pop() || 'Structured document',
         text: structured.text, retrievedAt: new Date().toISOString(), searchResultIds: [], metadata: { extractionMethod: structured.extractionMethod, rowCount: structured.rows } };
     }
     if (res?.success && res.body && (mime === 'application/pdf' || /\.pdf(\?|#|$)/i.test(res.finalUrl || rawUrl))) {
@@ -287,7 +154,7 @@ export class WebSearchEngine {
         }
       }
       return {
-        id: `pdf-${Date.now()}`,
+        id: `pdf-${crypto.randomUUID()}`,
         url: res.finalUrl || rawUrl,
         domain: new URL(res.finalUrl || rawUrl).hostname,
         title: rawUrl.split('/').pop() || 'PDF document',
@@ -300,7 +167,7 @@ export class WebSearchEngine {
     }
     if (outcome.document) {
       return {
-        id: `fetch-${Date.now()}`,
+        id: `fetch-${crypto.randomUUID()}`,
         url: outcome.document.finalUrl || rawUrl,
         domain: new URL(outcome.document.finalUrl || rawUrl).hostname,
         title: outcome.document.title || rawUrl,
@@ -322,847 +189,31 @@ export class WebSearchEngine {
     throw new Error(`Fetch failed: ${outcome.error || res?.error || 'unknown error'}`);
   }
 
-  private async retrieveCandidate(
-    candidate: SearchResult,
-    index: number,
-    freshness: string,
-  ): Promise<{ doc: RetrievedDocument | null; method: string; skippedLive?: boolean }> {
-    if (this.config.cache.enabled) {
-      const cached = await this.documentCache.get(candidate.url);
-      if (cached) return { doc: { ...cached, id: `doc-${index + 1}` }, method: 'cache' };
-    }
-
-    const outcome = await this.fetchCascade(candidate.url, {
-      timeoutSeconds: this.config.fetch.timeoutSeconds,
-      maxBytes: this.config.fetch.maxBytes,
-      userAgent: this.config.fetch.userAgent,
-      titleHint: candidate.title,
-      waybackFallback: this.config.fetch.waybackFallback,
-      domainStats: this.domainStats,
-      jsRender: this.jsRender,
-    });
-
-    if (outcome.document && outcome.document.text.trim().length > 0) {
-      const doc: RetrievedDocument = {
-        id: `doc-${index + 1}`,
-        url: outcome.document.finalUrl || candidate.url,
-        canonicalUrl: outcome.document.canonicalUrl || candidate.canonicalUrl,
-        domain: candidate.domain,
-        title: outcome.document.title || candidate.title,
-        author: outcome.document.author || (candidate.metadata?.author as string | undefined),
-        publishedAt: outcome.document.publishedAt || candidate.publishedAt,
-        text: outcome.document.text,
-        headings: outcome.document.headings,
-        links: outcome.document.links,
-        contentHash: outcome.document.contentHash,
-        retrievedAt: new Date().toISOString(),
-        searchResultIds: [candidate.id],
-        metadata: {
-          extractionMethod: outcome.method === 'github_raw' ? 'github_raw'
-            : outcome.method === 'js_render' ? 'js_render'
-            : outcome.method === 'wayback' ? 'wayback' : 'main_content',
-          archivedAt: outcome.document.archivedAt,
-        },
-      };
-      if (this.config.cache.enabled && outcome.method !== 'wayback') {
-        await this.documentCache.set(doc, freshness === 'any' ? 86400 : 900);
-      }
-      return { doc, method: outcome.method, skippedLive: outcome.skippedLive };
-    }
-
-    if (candidate.snippet && candidate.snippet.trim().length > 0) {
-      const fallbackExt = fallbackSnippetExtraction(candidate.title, candidate.snippet, candidate.url);
-      return {
-        doc: {
-          id: `doc-${index + 1}`,
-          url: candidate.url,
-          canonicalUrl: candidate.canonicalUrl,
-          domain: candidate.domain,
-          title: fallbackExt.title || candidate.title,
-          author: candidate.metadata?.author as string | undefined,
-          publishedAt: candidate.publishedAt,
-          text: fallbackExt.text,
-          contentHash: fallbackExt.contentHash,
-          retrievedAt: new Date().toISOString(),
-          searchResultIds: [candidate.id],
-          metadata: { extractionMethod: 'search_snippet', fetchError: outcome.error || 'fetch failed' },
-        },
-        method: 'search_snippet',
-        skippedLive: outcome.skippedLive,
-      };
-    }
-
-    return { doc: null, method: 'failed', skippedLive: outcome.skippedLive };
-  }
-
-  /**
-   * Primary entry point: Executes the entire search, retrieval, grounding, citation,
-   * and verification pipeline for a given user question.
-   */
-  async research(
-    question: string,
-    options: { mode?: ResearchMode; currentDate?: string; freshness?: FreshnessWindow; language?: string; category?: string } = {}
-  ): Promise<ResearchSession> {
+  async research(question: string, options: { mode?: ResearchMode; currentDate?: string; freshness?: FreshnessWindow; language?: string; category?: string } = {}): Promise<ResearchSession> {
     if (!this.config.enabled) throw new Error('Web research is disabled');
-    if (!question.trim() || question.length > 8000) throw new Error('Question must contain 1–8000 characters');
-    const startTime = Date.now();
-    const mode = options.mode || this.config.mode;
-    const curDate = options.currentDate || new Date().toISOString().split('T')[0];
-
+    if (!question.trim() || new TextEncoder().encode(question).length > 8000) throw new Error('Question must contain 1–8000 bytes');
+    const startedAt = new Date().toISOString();
+    this.onProgress?.({stage:'search', message:'Searching public sources'});
+    const outcome = await this.searchQueries([question], options);
+    const sources = new SourceManager();
+    const documents: RetrievedDocument[] = outcome.results.map((hit, index) => ({
+      id:`search-${index + 1}`, url:hit.url, title:hit.title, domain:new URL(hit.url).hostname,
+      text:hit.snippet || '', retrievedAt:new Date().toISOString(), searchResultIds:[hit.id],
+      metadata:{extractionMethod:'snippet_only'},
+    }));
+    const snippets = documents.map(doc => `[${sources.registerDocument(doc)}] ${doc.title} — ${doc.url}\n${doc.text}`);
     const trace = new TraceCollector();
-    trace.startTimer('total');
-
-    this.logger.log('request_received', { question, mode });
-
-    // Step 0: REQUEST NORMALIZATION (Section 8)
-    trace.startTimer('normalization');
-    const normalizedReq = normalizeRequest(question);
-    trace.endTimer('normalization');
-    this.logger.log('request_normalized', { normalizedReq });
-
-    // Step 1: ROUTE
-    trace.startTimer('route');
-    const route = routeRequest(normalizedReq.normalizedQuery);
-    trace.endTimer('route');
-    // Caller-supplied freshness narrows the routed window (never widens past it).
-    if (options.freshness && options.freshness !== 'any' && options.freshness !== route.freshness) {
-      const order = ['realtime', 'day', 'week', 'month', 'year', 'any'];
-      if (order.indexOf(options.freshness) < order.indexOf(route.freshness)) {
-        route.freshness = options.freshness;
-      }
-    }
-    this.logger.log('route_selected', { route });
-    this.progress('route', route.requiresWebSearch
-      ? `Web research (${route.vertical.toLowerCase()})`
-      : route.requiresExternalData ? `${route.vertical.charAt(0)}${route.vertical.slice(1).toLowerCase()} lookup` : 'Direct answer');
-
-    const sourceManager = new SourceManager();
-
-    // Fast path A: Static Knowledge (No external search required)
-    if (!route.requiresExternalData) {
-      const defaultStats: TokenStats = {
-        systemBudget: this.config.context.systemBudget,
-        questionBudget: defaultTokenCounter.count(question),
-        evidenceBudget: 0,
-        safetyMargin: this.config.context.safetyMargin,
-        totalInputBudget: this.config.context.totalInputBudget,
-        estimatedEvidenceTokens: 0,
-        finalPromptTokens: defaultTokenCounter.count(question),
-      };
-
-      const ans = await this.answerGenerator.generateAnswer(
-        {
-          systemPrompt: 'You are a helpful AI assistant. Answer the user question directly and accurately.',
-          userPrompt: question,
-          evidenceTokens: 0,
-        },
-        {},
-        [],
-        question
-      );
-
-      trace.endTimer('total');
-      const finalTrace = trace.getTrace();
-      finalTrace.totalLatencyMs = Date.now() - startTime;
-
-      return {
-        id: `sess-${crypto.randomUUID()}`,
-        question,
-        normalizedQuery: normalizedReq.normalizedQuery,
-        route,
-        queries: [],
-        results: [],
-        documents: [],
-        chunks: [],
-        retrievedChunks: [],
-        rerankedChunks: [],
-        evidence: [],
-        sources: {},
-        tokenUsage: defaultStats,
-        answer: ans.markdownWithCitations,
-        startedAt: new Date(startTime).toISOString(),
-        completedAt: new Date().toISOString(),
-        trace: finalTrace,
-      };
-    }
-
-    // Fast path B: Structured Verticals (Weather, Currency, Time)
-    if (!route.requiresWebSearch) {
-      let verticalData = '';
-      let sourceUrl = '';
-      let verticalError = '';
-      try {
-      if (route.vertical === 'WEATHER') {
-        const report = await this.weatherProvider.execute(question);
-        sourceUrl = report.sourceUrl;
-        verticalData = this.weatherProvider.formatReportAsEvidence(report);
-      } else if (route.vertical === 'CURRENCY') {
-        const report = await this.currencyProvider.execute(question);
-        sourceUrl = report.sourceUrl;
-        verticalData = this.currencyProvider.formatReportAsEvidence(report);
-      } else if (route.vertical === 'TIME') {
-        const report = await this.timeProvider.execute(question);
-        verticalData = this.timeProvider.formatReportAsEvidence(report);
-      }
-      } catch (error) {
-        verticalError = `I couldn't retrieve current ${route.vertical.toLowerCase()} data. ${error instanceof Error ? error.message : 'Provider unavailable.'}`;
-      }
-
-      // Register vertical pseudo-source
-      const sourceId = sourceUrl ? sourceManager.registerDocument({
-        id: 'VERT-1',
-        url: sourceUrl,
-        domain: new URL(sourceUrl).hostname,
-        title: `${route.vertical} Service`,
-        text: verticalData,
-        retrievedAt: new Date().toISOString(),
-        searchResultIds: [],
-      }) : '';
-
-      const verticalClaim: EvidenceClaim = {
-        id: 'CLM-V1',
-        claim: verticalData,
-        supportingSources: sourceId ? [sourceId] : [],
-        status: 'supported',
-        confidence: 0.99,
-      };
-
-      const context = buildGroundedContext(question, sourceManager.getAllSources(), [verticalClaim], {
-        currentDate: curDate,
-      });
-
-      // Structured measurements already answer the question. Do not let generation
-      // introduce a different number, location, rate, or timestamp.
-      const ans = this.answerGenerator.deterministicSynthesize(question, verticalError ? [] : [verticalClaim], sourceManager.getAllSources());
-      if (verticalError) ans.markdownWithCitations = verticalError;
-      if (route.vertical === 'TIME' && !verticalError) ans.markdownWithCitations = verticalData + '\nSource: local system clock.';
-
-      trace.endTimer('total');
-      const finalTrace = trace.getTrace();
-      finalTrace.totalLatencyMs = Date.now() - startTime;
-      finalTrace.evidenceClaims = verticalError ? 0 : 1;
-      finalTrace.verifiedClaims = 0;
-      finalTrace.finalEvidenceTokens = context.evidenceTokens;
-
-      const tokenStats: TokenStats = {
-        systemBudget: this.config.context.systemBudget,
-        questionBudget: defaultTokenCounter.count(question),
-        evidenceBudget: this.config.context.evidenceTokenBudget,
-        safetyMargin: this.config.context.safetyMargin,
-        totalInputBudget: this.config.context.totalInputBudget,
-        estimatedEvidenceTokens: context.evidenceTokens,
-        finalPromptTokens: context.evidenceTokens + defaultTokenCounter.count(question),
-      };
-
-      return {
-        id: `sess-${crypto.randomUUID()}`,
-        question,
-        normalizedQuery: normalizedReq.normalizedQuery,
-        route,
-        queries: [],
-        results: [],
-        documents: [],
-        chunks: [],
-        retrievedChunks: [],
-        rerankedChunks: [],
-        evidence: verticalError ? [] : [verticalClaim],
-        sources: sourceManager.getAllSources(),
-        tokenUsage: tokenStats,
-        answer: ans.markdownWithCitations,
-        startedAt: new Date(startTime).toISOString(),
-        completedAt: new Date().toISOString(),
-        trace: finalTrace,
-      };
-    }
-
-    // Standard Path: Full Web Search Pipeline
-    // Step 2: Query Planning
-    trace.startTimer('planning');
-    let maxQueries = this.config.queries.normal;
-    if (mode === 'fast') maxQueries = this.config.queries.fast;
-    if (mode === 'deep') maxQueries = this.config.queries.deep;
-    const totalQueryBudget = maxQueries;
-    const retryReserve = this.config.verification.enabled ? Math.min(this.config.verification.maxResearchRetries, Math.max(0, maxQueries - 1)) : 0;
-    maxQueries -= retryReserve;
-
-    // Rules-first planning: fast/normal answer well with deterministic query
-    // shaping, so `auto` only spends a model call on deep research.
-    const planningStrategy =
-      this.config.planning === 'model' ? 'model'
-      : this.config.planning === 'rules' ? 'rules'
-      : (mode === 'deep' ? 'model' : 'rules');
-    const plannedQueries = await this.queryPlanner.planQueries(
-      question,
-      route.freshness,
-      maxQueries,
-      curDate,
-      planningStrategy
-    );
-    // Caller filters (e.g. `web_search` language/category args) apply to every
-    // planned query, including pagination and suggestion follow-ups below.
-    if (options.language || options.category) {
-      for (const q of plannedQueries) {
-        if (options.language) q.language = options.language;
-        if (options.category) q.category = options.category;
-      }
-    }
-    this.progress('search', `Searching ${plannedQueries.length} ${plannedQueries.length === 1 ? 'query' : 'queries'}…`);
-    trace.endTimer('planning');
-    trace.update({ queriesGenerated: plannedQueries.length });
-    this.logger.log('queries_generated', { plannedQueries });
-
-    // Step 3: Concurrent Search Execution with Caching
-    trace.startTimer('search');
-    let searchOutcome: { results: SearchResult[]; rawCount: number; failureCount: number; failures?: Array<{ query: string; error: string }>; meta: SearchMeta };
-    const primaryName = this.searchProvider instanceof GoogleSearchProvider ? 'google' : 'searxng';
-    const cacheKey = plannedQueries.map((q) => q.query).join(';');
-    const cacheTtl = ttlForFreshness(route.freshness, this.config.cache.searchTtlSeconds.default);
-    const cachedHits = this.config.cache.enabled
-      ? await this.searchCache.get(primaryName, cacheKey, route.freshness)
-      : null;
-    const cachedMeta = this.config.cache.enabled
-      ? await this.searchCache.getMeta(primaryName, cacheKey, route.freshness)
-      : null;
-
-    if (cachedHits && cachedHits.length > 0) {
-      searchOutcome = { results: cachedHits, rawCount: cachedHits.length, failureCount: 0, meta: cachedMeta ?? emptySearchMeta() };
-      trace.update({ providerUsed: primaryName, fallbackUsed: false, fallbackReason: '' });
-    } else {
-      const searchService = new SearchService(this.searchProvider, {
-        maxConcurrentQueries: this.config.maxConcurrentQueries,
-        retries: this.config.searchRetries,
-        retryDelayMs: this.config.searchRetryDelayMs,
-      });
-      searchOutcome = await searchService.executeSearches(
-        plannedQueries,
-        this.config.resultsPerQuery
-      );
-      trace.update({
-        queryFailures: searchOutcome.failures,
-        searchFailureCount: searchOutcome.failureCount,
-      });
-      if (this.searchProvider instanceof SearXNGProvider && this.searchProvider.lastDiagnostics) {
-        trace.update({ searxngDiagnostics: { ...this.searchProvider.lastDiagnostics } });
-      }
-      if (this.config.cache.enabled && searchOutcome.results.length > 0) {
-        await this.searchCache.set(primaryName, cacheKey, searchOutcome.results, route.freshness, cacheTtl);
-        if (hasSearchMeta(searchOutcome.meta)) {
-          await this.searchCache.setMeta(primaryName, cacheKey, searchOutcome.meta, route.freshness, cacheTtl);
-        }
-      }
-      trace.update({ providerUsed: primaryName, fallbackUsed: false, fallbackReason: '' });
-      // Automatic fallback: primary empty + fallback configured + quota remains.
-      if (searchOutcome.results.length === 0 && !searchOutcome.meta.answers.length && !searchOutcome.meta.infoboxes.length && this.fallbackProvider) {
-        const fallbackName = this.fallbackProvider instanceof GoogleSearchProvider ? 'google' : 'searxng';
-        let reason = '';
-        if (fallbackName === 'google' && !(await this.claimGoogleQuota(plannedQueries.length))) {
-          reason = 'google daily quota exhausted';
-        } else {
-          const fbService = new SearchService(this.fallbackProvider, {
-            maxConcurrentQueries: this.config.maxConcurrentQueries,
-            retries: this.config.searchRetries,
-            retryDelayMs: this.config.searchRetryDelayMs,
-          });
-          const fbOutcome = await fbService.executeSearches(plannedQueries, this.config.resultsPerQuery);
-          const failures = [...(searchOutcome.failures || []), ...fbOutcome.failures];
-          const meta = mergeSearchMeta(searchOutcome.meta, fbOutcome.meta);
-          if (fbOutcome.results.length > 0) {
-            searchOutcome = { ...fbOutcome, failures, failureCount: failures.length, meta };
-            reason = `primary ${primaryName} empty; fell back to ${fallbackName}`;
-            if (this.config.cache.enabled) {
-              await this.searchCache.set(fallbackName, cacheKey, fbOutcome.results, route.freshness, this.config.cache.searchTtlSeconds.default);
-            }
-          } else {
-            searchOutcome = { ...searchOutcome, failures, failureCount: failures.length, meta };
-            reason = `primary ${primaryName} and fallback ${fallbackName} both empty`;
-          }
-        }
-        trace.update({ providerUsed: searchOutcome.results.length ? fallbackName : primaryName, fallbackUsed: searchOutcome.results.length > 0, fallbackReason: reason,
-          queryFailures: searchOutcome.failures, searchFailureCount: searchOutcome.failureCount });
-        this.logger.log('search_fallback', { primary: primaryName, fallback: fallbackName, reason });
-      }
-    }
-    trace.endTimer('search');
-    trace.update({
-      searchResults: searchOutcome.rawCount,
-      uniqueResults: searchOutcome.results.length,
-    });
-    this.logger.log('search_completed', {
-      raw: searchOutcome.rawCount,
-      unique: searchOutcome.results.length,
-    });
-    this.progress('search', `Search returned ${searchOutcome.results.length} unique ${searchOutcome.results.length === 1 ? 'result' : 'results'}`);
-
-    // Selective pagination: when page one yields nothing usable but queries
-    // succeeded, spend one budgeted page-two fetch per query (honors the
-    // configured query budget) before declaring the pool empty.
-    if (this.config.enablePagination && searchOutcome.results.length === 0 && searchOutcome.failureCount === 0) {
-      const paged = new SearchService(this.searchProvider, {
-        maxConcurrentQueries: this.config.maxConcurrentQueries,
-        retries: 0,
-      });
-      const pagedResults: typeof searchOutcome.results = [];
-      const pagedPages: number[] = [];
-      let pagedRaw = 0;
-      const remaining = Math.max(0, totalQueryBudget - plannedQueries.length);
-      for (const q of plannedQueries.slice(0, remaining)) {
-        plannedQueries.push({ ...q, page: 2, purpose: `${q.purpose} (page 2)` });
-        const extra = await paged.fetchAdditionalPage(q, 2, this.config.resultsPerQuery);
-        if (extra.results.length > 0) {
-          pagedResults.push(...extra.results);
-          pagedRaw += extra.results.length;
-          pagedPages.push(2);
-          if (extra.meta) searchOutcome.meta = mergeSearchMeta(searchOutcome.meta, extra.meta);
-        }
-      }
-      if (pagedResults.length > 0) {
-        const fused = fuseSearchResults([{ query: 'page-2', results: pagedResults }]);
-        searchOutcome = { ...searchOutcome, results: fused, rawCount: searchOutcome.rawCount + pagedRaw };
-        trace.update({
-          searchResults: searchOutcome.rawCount,
-          uniqueResults: fused.length,
-          paginationPages: pagedPages,
-        });
-        this.logger.log('search_pagination', { pages: pagedPages, recovered: fused.length });
-      }
-    }
-
-    // SearXNG related-search suggestions: one extra query when the first pass
-    // is thin, without another LLM round-trip. Cheap recall for small models.
-    if (
-      searchOutcome.meta.suggestions.length > 0 &&
-      searchOutcome.results.length < 3 &&
-      plannedQueries.length < totalQueryBudget
-    ) {
-      const suggestion = searchOutcome.meta.suggestions.find(
-        (s) => s.trim().length > 0 && !plannedQueries.some((q) => q.query.toLowerCase() === s.toLowerCase()),
-      );
-      if (suggestion) {
-        const extra = await new SearchService(this.searchProvider, { retries: 0 }).executeSearches(
-          [{ query: suggestion, purpose: 'SearXNG related-search suggestion', freshness: route.freshness, language: options.language, category: options.category }],
-          this.config.resultsPerQuery,
-        );
-        if (extra.results.length > 0) {
-          plannedQueries.push({ query: suggestion, purpose: 'SearXNG related-search suggestion', freshness: route.freshness, language: options.language, category: options.category });
-          const fused = fuseSearchResults([
-            { query: 'primary', results: searchOutcome.results },
-            { query: suggestion, results: extra.results },
-          ]);
-          searchOutcome = {
-            ...searchOutcome,
-            results: fused,
-            rawCount: searchOutcome.rawCount + extra.rawCount,
-            meta: mergeSearchMeta(searchOutcome.meta, extra.meta),
-          };
-          this.logger.log('search_suggestion', { suggestion, recovered: extra.results.length });
-        }
-      }
-    }
-
-    // Step 4: Multi-Factor Scoring & Ranking
-    trace.startTimer('ranking');
-    const rankedResults = rankSearchResults(searchOutcome.results.filter(r => isSafeUrl(r.url)), {
-      query: question,
-      freshness: route.freshness,
-      vertical: route.vertical,
-      totalPlannedQueries: plannedQueries.length,
-      weights: this.config.ranking,
-    });
-    trace.endTimer('ranking');
-
-    // Step 5: Page Fetch Selection
-    const pageBudget = mode === 'fast' ? this.config.fetch.fastPages : mode === 'deep' ? this.config.fetch.deepPages : this.config.fetch.normalPages;
-    let fetchPool = selectPagesToFetch(rankedResults, mode, this.config.fetch).slice(0, Math.max(1, pageBudget - retryReserve * 2));
-    let domainsDeprioritized: string[] = [];
-    if (this.domainStats) {
-      const ordered = await orderByDomainHealth(fetchPool, this.domainStats);
-      fetchPool = ordered.ordered;
-      domainsDeprioritized = ordered.deprioritized;
-    }
-    const pagesToFetch = fetchPool;
-    let pagesAttempted = pagesToFetch.length;
-    trace.update({ pagesSelected: pagesToFetch.length, domainsDeprioritized });
-    this.logger.log('pages_selected', { count: pagesToFetch.length });
-
-    // Instant answers / Wikipedia infoboxes are already the answer for many
-    // factoid questions. Inject them before page fetches so small models see
-    // structured evidence even when HTML extraction fails.
-    const documents: RetrievedDocument[] = documentsFromSearchMeta(searchOutcome.meta);
-
-    // Step 6: Safe Page Fetching & Main Content Extraction
-    trace.startTimer('fetch_extract');
-    let fetchFailures = 0;
-    let successfulFetches = 0;
-    let extractedTokens = documents.reduce((sum, d) => sum + defaultTokenCounter.count(d.text), 0);
-    let waybackRecoveries = 0;
-    const domainsChronicSkipped: string[] = [];
-
-    if (pagesToFetch.length > 0) {
-      this.progress('fetch', `Reading ${pagesToFetch.length} ${pagesToFetch.length === 1 ? 'page' : 'pages'}…`, { done: 0, total: pagesToFetch.length });
-    }
-    let fetchedCount = 0;
-    const fetchPromises = pagesToFetch.map(async (candidate, index) => {
-      const outcome = await this.retrieveCandidate(candidate, index + documents.length, route.freshness);
-      fetchedCount += 1;
-      this.progress('fetch', `Reading pages ${fetchedCount}/${pagesToFetch.length}`, { done: fetchedCount, total: pagesToFetch.length });
-      return outcome;
-    });
-
-    const settledDocs = await Promise.allSettled(fetchPromises);
-    for (const res of settledDocs) {
-      if (res.status === 'fulfilled' && res.value.doc) {
-        const { doc, method, skippedLive } = res.value;
-        if (method === 'wayback') waybackRecoveries++;
-        if (method === 'live' || method === 'github_raw' || method === 'js_render' || method === 'wayback' || method === 'cache') successfulFetches++;
-        else fetchFailures++;
-        if (skippedLive && !domainsChronicSkipped.includes(doc.domain)) domainsChronicSkipped.push(doc.domain);
-        extractedTokens += defaultTokenCounter.count(doc.text);
-        if (!documents.some(d => d.contentHash && d.contentHash === doc.contentHash)) documents.push(doc);
-      } else if (res.status === 'rejected') {
-        fetchFailures++;
-      } else {
-        fetchFailures++;
-      }
-    }
-    trace.endTimer('fetch_extract');
-    trace.update({
-      pagesFetched: successfulFetches,
-      fetchFailures,
-      extractedTokens,
-      waybackRecoveries,
-      domainsChronicSkipped,
-    });
-    this.logger.log('fetch_completed', { fetched: documents.length, failures: fetchFailures });
-
-    // Snippet salvage: when nothing was extracted but ranked candidates carry
-    // snippets, build snippet-only docs rather than returning empty evidence.
-    const salvageLimitations: string[] = [];
-    if (documents.length === 0) {
-      const salvaged = rankedResults
-        .filter(r => isSafeUrl(r.url) && r.snippet && r.snippet.trim().length > 0)
-        .slice(0, Math.max(1, pageBudget - fetchFailures));
-      for (const [i, candidate] of salvaged.entries()) {
-        const fallbackExt = fallbackSnippetExtraction(candidate.title, candidate.snippet!, candidate.url);
-        documents.push({
-          id: `doc-salvage-${i + 1}`,
-          url: candidate.url,
-          canonicalUrl: candidate.canonicalUrl,
-          domain: candidate.domain,
-          title: fallbackExt.title || candidate.title,
-          text: fallbackExt.text,
-          contentHash: fallbackExt.contentHash,
-          retrievedAt: new Date().toISOString(),
-          searchResultIds: [candidate.id],
-          metadata: { extractionMethod: 'snippet_salvage', fetchError: 'all fetches failed; snippet-only evidence, low confidence' },
-        });
-      }
-      if (documents.length > 0) {
-        salvageLimitations.push(`${fetchFailures} pages blocked or failed; showing snippet-only evidence, low confidence.`);
-      }
-    }
-
-    // Step 7: Semantic Document Chunking
-    trace.startTimer('chunking');
-    const allChunks: EvidenceChunk[] = [];
-    for (const doc of documents) {
-      // Register document in source registry
-      sourceManager.registerDocument(doc);
-
-      const chunks = chunkDocument(doc, {
-        targetTokens: this.config.chunking.targetTokens,
-        overlapTokens: this.config.chunking.overlapTokens,
-      });
-      allChunks.push(...chunks);
-    }
-    trace.endTimer('chunking');
-    trace.update({ chunksCreated: allChunks.length });
-
-    // Step 8: Hybrid Retrieval (BM25 + Dense Embeddings + RRF + Diversity)
-    trace.startTimer('retrieval');
-    const hybridRetriever = new HybridRetriever(this.embeddingProvider, {
-      bm25Enabled: this.config.retrieval.bm25,
-      embeddingsEnabled: this.config.retrieval.embeddings,
-      rrfK: this.config.retrieval.rrfK,
-      maxChunksPerDoc: this.config.retrieval.maxChunksPerDoc,
-    });
-    const candidateChunks = await hybridRetriever.retrieve(
-      question,
-      allChunks,
-      this.config.retrieval.candidateLimit
-    );
-    trace.endTimer('retrieval');
-    trace.update({ chunksAfterRetrieval: candidateChunks.length });
-
-    // Step 9: Cross-Encoder Reranking
-    trace.startTimer('rerank');
-    const rerankedChunks = await this.reranker.rerank(
-      question,
-      candidateChunks,
-      this.config.retrieval.finalLimit
-    );
-    trace.endTimer('rerank');
-    trace.update({ chunksAfterRerank: rerankedChunks.length });
-
-    // Step 10: Evidence Extraction & Compression
-    trace.startTimer('evidence');
-    const extractedFacts: ExtractedFact[] = [];
-    for (const chunk of rerankedChunks) {
-      const sourceId = sourceManager.getSourceIdForUrl(chunk.url) || 'S1';
-      const facts = await this.evidenceExtractor.extractFacts(question, chunk, sourceId);
-      extractedFacts.push(...facts);
-    }
-
-    // Step 11: Deduplication & Conflict Detection
-    const deduplicatedClaims = deduplicateFacts(extractedFacts);
-    const finalClaims = detectEvidenceConflicts(deduplicatedClaims);
-    trace.endTimer('evidence');
-    trace.update({ evidenceClaims: finalClaims.length });
-    this.progress('evidence', `Extracted ${finalClaims.length} evidence ${finalClaims.length === 1 ? 'claim' : 'claims'}`);
-
-    // Step 12: Context Building & Token Budget Management
-    trace.startTimer('context_builder');
-    let {allocation: budgetAllocation, context: groundedContext} = await buildModelBudgetedContext(question, sourceManager.getAllSources(), finalClaims, this.config.context, curDate, this.llmProvider?.countTokens?.bind(this.llmProvider));
-    trace.endTimer('context_builder');
-    trace.update({
-      finalEvidenceTokens: groundedContext.evidenceTokens,
-      finalPromptTokens: budgetAllocation.tokenStats.finalPromptTokens,
-    });
-
-    // Step 13: Grounded Answer Synthesis
-    trace.startTimer('generation');
-    this.progress('answer', 'Composing grounded answer…');
-    let answerOutcome = await this.answerGenerator.generateAnswer(
-      groundedContext,
-      sourceManager.getAllSources(),
-      budgetAllocation.claims,
-      question
-    );
-    trace.endTimer('generation');
-
-    // Step 14: Claim Verification
-    trace.startTimer('verification');
-    const atomicClaims = extractAtomicClaims(answerOutcome.text);
-    let verificationReport = await this.claimVerifier.verifyClaims(
-      atomicClaims,
-      budgetAllocation.claims
-    );
-    let coverage = coverageMatrix(question, budgetAllocation.claims);
-    trace.endTimer('verification');
-    trace.update({
-      verifiedClaims: verificationReport.supportedCount,
-      unsupportedClaims: verificationReport.unsupportedCount,
-      conflictingClaims: verificationReport.conflictingCount,
-    });
-
-    // Step 15: Iterative Research Retry Loop (Section 56 & Section 127)
-    // Structured research state tracks requirements, findings, contradictions,
-    // and stagnation; repeated actions and evidence-free rounds end the loop.
-    const researchState = initResearchState(question);
-    for (const claim of budgetAllocation.claims) {
-      recordRound(researchState, `initial: ${plannedQueries.map((q) => q.query).join('; ')}`, [claim], sourceManager.getAllSources());
-    }
-    researchState.completedActions = [`initial: ${plannedQueries.map((q) => q.query).join('; ')}`];
-    let retryCount = 0;
-    while (
-      this.config.verification.enabled &&
-      (!verificationReport.allSupported || coverage.some(cell => !cell.covered)) &&
-      retryCount < this.config.verification.maxResearchRetries && plannedQueries.length < totalQueryBudget && pagesAttempted < pageBudget
-    ) {
-      const retryEval = evaluateResearchRetry(
-        verificationReport,
-        retryCount,
-        this.config.verification.maxResearchRetries,
-        plannedQueries.map((q) => q.query),
-        researchState.roundsWithoutNewEvidence
-      );
-      const missing = coverage.find(cell => !cell.covered);
-      if (missing) {
-        const gapQuery = `${missing.entity} ${missing.dimension} official`;
-        if (!isRepeatedQuery(gapQuery, plannedQueries.map((q) => q.query))) {
-          retryEval.shouldRetry = true;
-          retryEval.targetedQuery = {query:gapQuery,purpose:'Fill missing comparison evidence',freshness:route.freshness};
-        }
-      }
-
-      if (!retryEval.shouldRetry || !retryEval.targetedQuery) {
-        break;
-      }
-      if (options.language) retryEval.targetedQuery.language = options.language;
-      if (options.category) retryEval.targetedQuery.category = options.category;
-
-      retryCount++;
-      trace.startTimer(`retry_${retryCount}`);
-      this.logger.log('retry_search_initiated', {
-        round: retryCount,
-        targetQuery: retryEval.targetedQuery,
-      });
-
-      // 1. Search targeted query
-      const searchService = new SearchService(this.searchProvider);
-      const retrySearchOutcome = await searchService.executeSearches(
-        [retryEval.targetedQuery],
-        this.config.resultsPerQuery
-      );
-
-      if (retrySearchOutcome.results.length > 0) {
-        plannedQueries.push(retryEval.targetedQuery);
-        const newRanked = rankSearchResults(retrySearchOutcome.results.filter(r => isSafeUrl(r.url)), {
-          query: retryEval.targetedQuery.query,
-          freshness: retryEval.targetedQuery.freshness,
-          vertical: route.vertical,
-          totalPlannedQueries: plannedQueries.length,
-          weights: this.config.ranking,
-        });
-
-        const retryPages = selectPagesToFetch(newRanked, 'fast', this.config.fetch).filter(r => !documents.some(d => d.url === r.url)).slice(0, Math.min(2, pageBudget - pagesAttempted));
-        pagesAttempted += retryPages.length;
-        rankedResults.push(...newRanked.filter(r => !rankedResults.some(old => old.url === r.url)));
-        const retryChunks: EvidenceChunk[] = [];
-
-        for (const candidate of retryPages) {
-          const retrieved = await this.retrieveCandidate(candidate, documents.length, route.freshness);
-          const retryDoc = retrieved.doc;
-          if (retrieved.method === 'live' || retrieved.method === 'github_raw' || retrieved.method === 'js_render' || retrieved.method === 'wayback' || retrieved.method === 'cache') {
-            successfulFetches++;
-            if (retrieved.method === 'wayback') waybackRecoveries++;
-          } else {
-            fetchFailures++;
-          }
-
-          if (retryDoc) {
-            extractedTokens += defaultTokenCounter.count(retryDoc.text);
-            documents.push(retryDoc);
-            sourceManager.registerDocument(retryDoc);
-            const chunks = chunkDocument(retryDoc, {
-              targetTokens: this.config.chunking.targetTokens,
-              overlapTokens: this.config.chunking.overlapTokens,
-            });
-            allChunks.push(...chunks);
-            retryChunks.push(...chunks);
-          }
-        }
-
-        if (retryChunks.length > 0) {
-          const retryCandidateChunks = await hybridRetriever.retrieve(
-            retryEval.targetedQuery.query,
-            retryChunks,
-            5
-          );
-          const retryReranked = await this.reranker.rerank(
-            retryEval.targetedQuery.query,
-            retryCandidateChunks,
-            3
-          );
-
-          for (const chunk of retryReranked) {
-            const sId = sourceManager.getSourceIdForUrl(chunk.url) || 'S1';
-            const facts = await this.evidenceExtractor.extractFacts(
-              retryEval.targetedQuery.query,
-              chunk,
-              sId
-            );
-            extractedFacts.push(...facts);
-          }
-
-          const updatedDeduplicated = deduplicateFacts(extractedFacts);
-          const updatedFinalClaims = detectEvidenceConflicts(updatedDeduplicated);
-          const roundStats = recordRound(researchState, retryEval.targetedQuery.query, updatedFinalClaims, sourceManager.getAllSources());
-          if (roundStats.newEvidence === 0) {
-            this.logger.log('retry_search_initiated', { round: retryCount, stagnant: true });
-          }
-          const {allocation: updatedBudget, context: updatedContext} = await buildModelBudgetedContext(question, sourceManager.getAllSources(), updatedFinalClaims, this.config.context, curDate, this.llmProvider?.countTokens?.bind(this.llmProvider));
-          budgetAllocation = updatedBudget;
-          groundedContext = updatedContext;
-          coverage = coverageMatrix(question, updatedBudget.claims);
-
-          answerOutcome = await this.answerGenerator.generateAnswer(
-            updatedContext,
-            sourceManager.getAllSources(),
-            updatedBudget.claims,
-            question
-          );
-
-          const newAtomicClaims = extractAtomicClaims(answerOutcome.text);
-          verificationReport = await this.claimVerifier.verifyClaims(
-            newAtomicClaims,
-            updatedBudget.claims
-          );
-
-          trace.update({
-            finalEvidenceTokens: updatedContext.evidenceTokens,
-            finalPromptTokens: updatedBudget.tokenStats.finalPromptTokens,
-            evidenceClaims: updatedBudget.claims.length,
-            verifiedClaims: verificationReport.supportedCount,
-            unsupportedClaims: verificationReport.unsupportedCount,
-            conflictingClaims: verificationReport.conflictingCount,
-          });
-        }
-      }
-      trace.endTimer(`retry_${retryCount}`);
-    }
-
-    // Never publish an unsupported draft just because retry budget ran out.
-    if (this.config.verification.enabled && (!verificationReport.allSupported || answerOutcome.invalidSourceIds.length > 0)) {
-      answerOutcome = this.answerGenerator.deterministicSynthesize(question, budgetAllocation.claims, sourceManager.getAllSources());
-      answerOutcome.markdownWithCitations += '\n\nSome requested details could not be independently verified; the statements above are attributed to the retrieved sources.';
-      verificationReport = this.claimVerifier.verifyClaimsDeterministic(extractAtomicClaims(answerOutcome.text), budgetAllocation.claims);
-    }
-    trace.update({queriesGenerated: plannedQueries.length, chunksCreated: allChunks.length,
-      pagesSelected: pagesAttempted, pagesFetched: successfulFetches, fetchFailures, extractedTokens,
-      uniqueResults: rankedResults.length,
-      verifiedClaims: verificationReport.supportedCount, unsupportedClaims: verificationReport.unsupportedCount,
-      conflictingClaims: verificationReport.conflictingCount});
-    trace.endTimer('total');
-    const finalTrace = trace.getTrace();
-    finalTrace.totalLatencyMs = Date.now() - startTime;
-
-    if (coverage.some(c => !c.covered)) answerOutcome.markdownWithCitations += '\n\nMissing comparison evidence: ' + coverage.filter(c => !c.covered).map(c => `${c.entity} (${c.dimension})`).join(', ') + '.';
-
-    // Requirement classification: answered / unresolved / blocked with a
-    // reason. A fluent final response is never proof of completion.
-    const requirements = classifyRequirements(researchState, budgetAllocation.claims);
-    const unresolved = requirements.filter((r) => r.status !== 'answered');
-    if (unresolved.length > 0) {
-      answerOutcome.markdownWithCitations += '\n\nUnresolved: ' + unresolved.map((r) => `${r.text} (${r.status}${r.reason ? `: ${r.reason}` : ''})`).join('; ') + '.';
-    }
-
-    const session: ResearchSession = {
-      coverage,
-      requirements,
-      researchState: {
-        openQuestions: researchState.openQuestions,
-        contradictions: researchState.contradictions,
-        rejected: researchState.rejected,
-        completedActions: researchState.completedActions,
-        pendingActions: researchState.pendingActions,
-      },
-      limitations: [
-        ...salvageLimitations,
-        ...coverage.filter(c => !c.covered).map(c => `Could not verify ${c.entity}: ${c.dimension}`),
-        ...unresolved.map((r) => `${r.id} ${r.status}: ${r.text}${r.reason ? ` — ${r.reason}` : ''}`),
-      ],
-      id: `sess-${crypto.randomUUID()}`,
-      question,
-      normalizedQuery: normalizedReq.normalizedQuery,
-      route,
-      queries: plannedQueries,
-      results: rankedResults,
-      searchMeta: searchOutcome.meta,
-      documents,
-      chunks: allChunks,
-      retrievedChunks: candidateChunks,
-      rerankedChunks,
-      evidence: budgetAllocation.claims,
-      sources: sourceManager.getAllSources(),
-      tokenUsage: budgetAllocation.tokenStats,
-      answer: answerOutcome.markdownWithCitations,
-      verification: verificationReport,
-      startedAt: new Date(startTime).toISOString(),
-      completedAt: new Date().toISOString(),
-      trace: finalTrace,
+    trace.update({ queriesGenerated:1, searchResults:outcome.results.length, uniqueResults:documents.length,
+      searchFailureCount:outcome.failureCount, queryFailures:outcome.failures,
+      providerUsed:this.config.searchProvider, searxngDiagnostics:this.searchProvider instanceof SearXNGProvider ? this.searchProvider.lastDiagnostics ? { ...this.searchProvider.lastDiagnostics } : undefined : undefined, totalLatencyMs:Date.now()-Date.parse(startedAt) });
+    return { id:`sess-${crypto.randomUUID()}`, question, normalizedQuery:question.trim(),
+      route:{vertical:'GENERAL_WEB', confidence:1, requiresExternalData:true, requiresWebSearch:true, freshness:options.freshness || 'any'},
+      queries:[{query:question, purpose:'agent search', freshness:options.freshness || 'any'}],
+      results:outcome.results, searchMeta:outcome.meta, documents, chunks:[], retrievedChunks:[], rerankedChunks:[], evidence:[],
+      sources:sources.getAllSources(), answer:snippets.join('\n\n'),
+      tokenUsage:{systemBudget:0,questionBudget:0,evidenceBudget:0,safetyMargin:0,totalInputBudget:0,estimatedEvidenceTokens:0,finalPromptTokens:0},
+      startedAt, completedAt:new Date().toISOString(), trace:trace.getTrace(),
+      limitations:['Search snippets are unverified source content. Open relevant pages before making factual claims.'],
     };
-
-    return session;
   }
 }
-

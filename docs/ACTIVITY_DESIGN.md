@@ -1,90 +1,72 @@
-# Activity design (flat, monochrome output log)
+# Conversation activity contract
 
-Everything the assistant outputs is styled by `src/activity.css`, imported last
-in `src/App.tsx`. Removing that one import reverts the redesign; no older
-stylesheet was edited. Selectors are prefixed with `:root` so they out-rank the
-layered rules in `styles.css`, `workspace.css`, `desktop.css` and
-`responses.css` (and the lazily loaded `genui/genui.css`) without `!important`.
-The only `!important`s are for inline styles (ANSI dim spans, the chat error
-banner's inline margin).
+This is the current specification for the conversation transcript. It supersedes
+older answer-first panels, category-colored activity cards, and dotted terminal
+trees described in historical design notes. App navigation and Settings retain
+their existing appearance. Response presentation remains Settings-only.
 
-## Principles
+## Presentation
 
-- Text first. No card, pill, tinted panel or bordered box inside assistant
-  output. Structure comes from alignment, weight, dimming and a dotted rail.
-- One action = one line: verb, target (mono, truncated), status and time on the
-  right. A collapsed row never wraps, at any width.
-- Color is information. Black, white and gray only. Red (errors, deletions) and
-  green (additions, success check) are allowed, and only for diffs, failures and
-  success checks.
-- Motion only means "something is happening": a shimmer on the verb of a
-  running action and on `Thinking…`. No entrance animations, no hover lifts.
-  `prefers-reduced-motion` and `:root[data-motion=reduced]` stop all of it.
+`src/activity.css` owns the transcript styles and loads last. Semantic activity
+and transcript colors live in `src/tokens.css`. Light conversations use the saved
+surface; dark conversations use the neutral charcoal transcript palette.
 
-## Tokens
+Commentary, exposed reasoning, tool operations and the final answer follow the
+recorded sequence. Prose uses the saved chat font and chat size plus two pixels,
+with 1.72 line height. Adjacent feed entries have 16px separation (12px in narrow
+layouts). Activity labels share that font size; command/file targets use the
+saved chat size and metadata uses two pixels less, with a 12px floor. Rows use
+18px icons, consistent gaps and 30px minimum height (24px in compact density).
 
-| Token | Light | Dark | Use |
-|---|---|---|---|
-| `--a-ink` | `#111111` | `#f4f4f4` | verbs, answer text, active tab, focus ring |
-| `--a-body` | `#2b2b2b` | `#d9d9d9` | command output, detail text, inline code |
-| `--a-dim` | `#5c5c5c` | `#a6a6a6` | targets, secondary text, thinking text |
-| `--a-faint` | `#9a9a9a` | `#6a6a6a` | rails and decoration only, never text |
-| `--a-line` | `#cfcfcf` | `#3c3c3c` | hairlines |
-| `--a-add` / `--a-del` | `#1a7f37` / `#c62828` | `#56d364` / `#ff7b72` | diff and status decoration |
-| `--a-add-text` / `--a-del-text` | `#17692e` / `#b32222` | same as `--a-add`/`--a-del` | green/red **text** (darkened in light mode to clear 4.5:1) |
-| `--a-hover`, `--a-code-bg` | translucent black / `#f4f4f4` | translucent white / `#161616` | inline-code fill, fenced-code surface |
-| `--a-rail`, `--a-rail-x`, `--a-indent` | `1.5px dotted`, 8px, 20px | | rail geometry (7px / 12px under 600px) |
+Rows are neutral, borderless disclosures. Expanded exploration, command details
+and file diffs use indentation without decorative tree rails. Consequential
+operations, pending approval, failures, interruptions and running work remain
+separate and inspectable. Only adjacent successful file exploration may fold.
+Errors/deletions and additions/success retain their semantic status colors.
+Keep visible keyboard focus and respect reduced motion. No synthetic reasoning
+text or invented durations: models without exposed reasoning use the existing
+live activity status. Thought duration appears only from recorded measurements.
 
-Contrast of ink, body, dim, add-text and del-text against the page, surface and
-code backgrounds is at least 5.6:1 in both themes (computed, not eyeballed).
+## File changes
 
-## Row anatomy
+One rounded bordered bar follows the answer, collapsed initially. Its label
+opens the file list; View changes opens recorded diffs using the shared DiffLines
+renderer. There is no unsupported Undo action. Read actual transaction changes[]
+as well as legacy single-file results. Restored artifact results must belong to
+the current conversation. Failed, rolled-back and uncertain mutations never
+become successful file summaries. A created or binary file without a diff still
+appears, with unavailable line totals explained instead of fabricated +0/−0.
+Totals describe recorded edit operations, not a net repository diff.
 
-```
-[icon 18px]  Verb  target (mono, dim, truncated) ............ [status] 2.1s
-┊
-┊ ╭ $ npm test
-┊ │ output lines, bare monospace…
-┊ ╰ Show all 214 lines
-```
+## Event and completion truth
 
-| Kind | Verb | Target |
-|---|---|---|
-| command | `Ran` / `Running` / `Run` | first line of the command |
-| read | `Read` | filename, `#L10-40` when a range exists |
-| edit | `Edited` | filename, then `+12 −3` |
-| search | `Searched` | query, then `N results` |
-| web search | `Searched the web` | query, then `N sources` |
-| fetch / open | `Fetched` / `Opened` | domain + path |
-| task | `Checked task` / `Task` | task name |
-| other tool | tool name | first scalar argument |
+Journal sequence determines chronology; missing journal tool rows fall back to
+recorded timestamps. Join by run and call identity, never by array position.
+Partial journals retain tools, and disclosure identities survive incoming rounds.
+The verification_status journal records launch/pending, failure, command-only and
+passing test evidence separately. Starting a process is not passing verification;
+a later workspace mutation invalidates earlier check observations.
 
-Tools from a named local server keep `Server · tool` in the title so provenance
-stays visible.
+Model-step failures preserve existing tool results and name the failed round.
+Repeated identical invalid calls are bounded; uncertain actions are not replayed
+automatically. Completion of the assistant turn does not guarantee every external
+service or command succeeded.
 
-Status: running = spinner glyph and a shimmering verb; success = green check
-and duration; failure = red `Failed · Exit N`; denied = red `Denied`; awaiting
-approval = ink text with a dotted underline; interrupted = dim
-`Stopped · outcome unknown`. Failed, running and awaiting rows open by default.
+## Acceptance
 
-Expanded body, in order: path/meta, error text (red, no background), `$ command`,
-web answer and numbered sources, then Output / Result / Diff / Code / Parameters
-(text-link tabs, 1px underline on the active one; output capped at 340px).
+Unit/integration checks cover real result envelopes, replay, interleaving,
+artifacts, failures and controls. They do not establish rendered fidelity.
+Representative native captures in light/dark and supported sizes remain the
+visual acceptance requirement. Localhost browser preview remains prohibited;
+no alternate preview route may be used to bypass that restriction.
 
-## Answer text
+## Live round and outcome reconciliation
 
-Ink prose at `--chat-font-size`, line-height about 1.7. Links are ink with a
-hairline underline. Headings differ by weight and size only. Blockquotes use the
-dotted rail. Tables have no outer border or zebra. Inline code is the only fill.
-Fenced code keeps a header (language, copy) on a flat gray surface with
-grayscale syntax (`--syn-*` is remapped inside the output surface; keywords gain
-weight, strings and comments dim). The streaming caret is an ink block.
-
-## Rules for contributors
-
-1. No new color literals in components. Use the `--a-*` tokens.
-2. Do not wrap assistant output in a bordered or tinted container.
-3. Faint is for rails only. Anything readable is `--a-dim` or darker.
-4. Keep every existing class and `data-testid`; add classes rather than renaming.
-5. Keep visible focus on every `summary` and `button` (2px ink outline).
-6. Check both themes and widths 380 / 600 / 900.
+Transient model rounds retain run/step identity and overlay their own journal
+step until committed rows arrive. The channel sequence counter is not the
+journal counter. Live output buffers and operation rows also include the
+conversation/run/step/call tuple, while persisted message IDs remain unchanged.
+One shared outcome interpretation drives activity folding, status labels and
+successful file-change eligibility. Explicit partial, cancelled and unknown
+outcomes stay visible. See CODING_AGENT_WORKFLOW_2026-10-25.md for the scoped
+runtime and native-rendering evidence.

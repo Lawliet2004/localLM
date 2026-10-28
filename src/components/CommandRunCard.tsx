@@ -16,7 +16,7 @@ export interface CommandRunCardProps {
   cwd?: string;
   environment?: string;
   localServerId?: string;
-  status: 'running' | 'completed' | 'failed' | 'interrupted' | 'awaiting_approval';
+  status: 'running' | 'completed' | 'failed' | 'interrupted' | 'awaiting_approval' | 'partial' | 'cancelled' | 'unknown' | 'denied';
   decision?: 'allowed' | 'denied' | string;
   isError?: boolean;
   exitCode?: number | null;
@@ -401,13 +401,16 @@ export function CommandRunCard({
         </span>
       );
     }
-    if (decision === 'denied') {
+    if (decision === 'denied' || status === 'denied') {
       return (
         <span className="status-badge failure" data-testid="status-denied">
           <XCircle size={12} />
           Denied
         </span>
       );
+    }
+    if (status === 'partial' || status === 'cancelled' || status === 'unknown') {
+      return <span className="status-badge interrupted" data-testid={`status-${status}`}><AlertCircle size={12} />{status === 'partial' ? 'Partially completed' : status === 'cancelled' ? 'Cancelled' : 'Outcome unknown'}</span>;
     }
     if (status === 'interrupted') {
       return (

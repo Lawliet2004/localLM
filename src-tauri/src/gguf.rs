@@ -104,6 +104,9 @@ pub struct ModelMetadata {
     /// (`enable_thinking` or `reasoning_effort`). Drives the kwargs sent on
     /// finalizing rounds so thinking never competes with the answer budget.
     pub thinking_control: Option<String>,
+    /// Kept internally for runtime compatibility; never sent to the frontend.
+    #[serde(skip)]
+    pub chat_template: Option<String>,
 }
 
 pub fn model_metadata(path: &Path) -> Result<ModelMetadata, String> {
@@ -165,6 +168,7 @@ fn parse_metadata(file: &mut impl Read, file_bytes: u64) -> std::io::Result<Mode
             } else if template.contains("enable_thinking") {
                 result.thinking_control = Some("enable_thinking".into());
             }
+            result.chat_template = Some(template);
         } else if kind == TYPE_U32 {
             numbers.insert(key, read_u32(file)?);
         } else if kind == TYPE_U64 {
@@ -391,6 +395,8 @@ mod tests {
         flat.extend_from_slice(&string_kv("tokenizer.chat_template", "plain template"));
         let metadata = parse_metadata(&mut flat_header(flat, 1).as_slice(), 100).unwrap();
         assert_eq!(metadata.thinking_control, None);
+        assert_eq!(metadata.chat_template.as_deref(), Some("plain template"));
+        assert!(serde_json::to_value(&metadata).unwrap().get("chatTemplate").is_none());
     }
 
     fn flat_header(kvs: Vec<u8>, count: u64) -> Vec<u8> {

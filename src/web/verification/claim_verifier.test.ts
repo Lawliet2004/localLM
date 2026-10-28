@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ClaimVerifier, arithmeticRecord, citationSupportsQuote, trustedSourceUrl } from './claim_verifier';
-import type { EvidenceClaim, LLMProvider } from '../types';
+import type { EvidenceClaim } from '../types';
 
 describe('Claim Verifier (Section 53-55)', () => {
   const evidence: EvidenceClaim[] = [
@@ -165,27 +165,4 @@ describe('Claim Verifier (Section 53-55)', () => {
     expect(report.claims[0].status).toBe('UNSUPPORTED');
   });
 
-  it('labels model-graded support as model_assessed', async () => {
-    const claim = 'Model X has about eight billion parameters.';
-    const evidence: EvidenceClaim[] = [{
-      id: 'CLM-1',
-      claim: 'Model X contains 8B parameters and supports 128K context window.',
-      supportingSources: ['S1'],
-      status: 'supported',
-      confidence: 0.9,
-    }];
-    const llm: LLMProvider = {
-      async generate() {
-        return {
-          text: JSON.stringify({
-            claims: [{ claim, status: 'SUPPORTED', sources: ['S1'], assessment: 'exact_excerpt' }],
-          }),
-        };
-      },
-    };
-    const report = await new ClaimVerifier(llm).verifyClaims([claim], evidence);
-    expect(report.claims[0].status).toBe('SUPPORTED');
-    expect(report.claims[0].assessment).toBe('model_assessed');
-    expect(report.supportedCount).toBe(1);
-  });
 });

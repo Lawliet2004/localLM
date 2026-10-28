@@ -240,3 +240,62 @@
   --terminal-bright-cyan: #b5e5e5;
   --terminal-bright-white: #ffffff;
 }
+
+/* Reference chat transcript: neutral canvas, prose, activity labels and edit bar. */
+:root {
+  --transcript-bg: var(--surface);
+  --transcript-body: #333333;
+  --transcript-label: #686868;
+  --transcript-panel: #f3f3f3;
+  --transcript-border: #dcdcdc;
+}
+:root[data-theme=dark] {
+  --transcript-bg: #1e1e1e;
+  --transcript-body: #cdcdcd;
+  --transcript-label: #929292;
+  --transcript-panel: #303030;
+  --transcript-border: #414141;
+}
+
+/* Shared conversation activity palette and geometry. */
+:root {
+  --a-ink: #111111;
+  --a-body: #2b2b2b;
+  --a-dim: #5c5c5c;
+  /* Rails and decoration only. Never use for text. */
+  --a-faint: #9a9a9a;
+  --a-line: #cfcfcf;
+  --a-add: #1a7f37;
+  --a-del: #c62828;
+  /* Same hues, darkened until text clears 4.5:1 on the paper background. */
+  --a-add-text: #17692e;
+  --a-del-text: #b32222;
+  --a-add-tint: rgba(26, 127, 55, .13);
+  --a-del-tint: rgba(198, 40, 40, .12);
+  --a-hover: rgba(0, 0, 0, .06);
+  --a-code-bg: #f4f4f4;
+  --a-rail: 1px solid var(--a-line);
+  --a-rail-x: 8px;
+  --a-indent: 20px;
+  --a-icon: 18px;
+  --a-row-h: 30px;
+  --a-label-size: calc(var(--chat-font-size, 16px) + 2px);
+  --a-target-size: var(--chat-font-size, 16px);
+  --a-meta-size: max(12px, calc(var(--chat-font-size, 16px) - 2px));
+  --a-mono: var(--font-mono, 'Cascadia Code', 'SFMono-Regular', Consolas, monospace);
+}
+:root[data-theme=dark] {
+  --a-ink: #f4f4f4;
+  --a-body: #d9d9d9;
+  --a-dim: #a6a6a6;
+  --a-faint: #6a6a6a;
+  --a-line: #3c3c3c;
+  --a-add: #56d364;
+  --a-del: #ff7b72;
+  --a-add-text: #56d364;
+  --a-del-text: #ff7b72;
+  --a-add-tint: rgba(86, 211, 100, .16);
+  --a-del-tint: rgba(255, 123, 114, .16);
+  --a-hover: rgba(255, 255, 255, .08);
+  --a-code-bg: #161616;
+}

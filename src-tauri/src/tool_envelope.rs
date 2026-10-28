@@ -75,6 +75,40 @@ pub fn make(
     })
 }
 
+/// Emit only the versioned contract. Flat keys remain decodable in saved
+/// journals and internal compatibility paths, but are not repeated to models.
+pub fn model_result(value: &Value) -> Value {
+    if value["schemaVersion"] != SCHEMA_VERSION {
+        return value.clone();
+    }
+    let mut canonical = value.clone();
+    if let Some(object) = canonical.as_object_mut() {
+        object.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "schemaVersion" | "status" | "data" | "artifacts" | "error" | "metadata"
+            )
+        });
+    }
+    if let Some(id) = value["_artifactId"].as_str() {
+        if !canonical["artifacts"]
+            .as_array()
+            .is_some_and(|artifacts| artifacts.iter().any(|artifact| artifact["id"] == id))
+        {
+            if !canonical["artifacts"].is_array() {
+                canonical["artifacts"] = json!([]);
+            }
+            canonical["artifacts"].as_array_mut().unwrap().push(
+                json!({"id":id,"sha256":value["_sha256"],"sizeBytes":value["_originalBytes"]}),
+            );
+        }
+    }
+    if let Some(note) = value.get("hookNote") {
+        canonical["metadata"]["hookNote"] = note.clone();
+    }
+    canonical
+}
+
 /// Which backend family produced a result. The dispatch site passes the typed
 /// variant it already knows — classification never reverse-engineers payload
 /// text.
@@ -594,7 +628,7 @@ pub fn legacy_execution_to_envelope(legacy: &Value, duration_ms: u128) -> Value 
         .and_then(Value::as_bool)
         .unwrap_or(true);
     let message = legacy.get("error").and_then(Value::as_str).unwrap_or("");
-    let truncated = message.contains("exceeded")
+    let truncated = legacy["truncated"] == true || message.contains("exceeded")
         || message.contains("truncated")
         || message.contains("Truncated");
     let (status, error) = if is_error {
@@ -615,6 +649,8 @@ pub fn legacy_execution_to_envelope(legacy: &Value, duration_ms: u128) -> Value 
                 message
             }, "retryable": false})),
         )
+    } else if truncated {
+        (Status::Partial, None)
     } else {
         (Status::Success, None)
     };
@@ -622,6 +658,8 @@ pub fn legacy_execution_to_envelope(legacy: &Value, duration_ms: u128) -> Value 
         status,
         json!({
             "exitCode": exit_code,
+            "processId": legacy["processId"],
+            "cwd": legacy["cwd"],
             "logs": {
                 "stdout": legacy.get("stdout").cloned().unwrap_or(Value::Null),
                 "stderr": legacy.get("stderr").cloned().unwrap_or(Value::Null),
@@ -631,7 +669,10 @@ pub fn legacy_execution_to_envelope(legacy: &Value, duration_ms: u128) -> Value 
         }),
         Vec::new(),
         error,
-        json!({"durationMs": duration_ms, "truncated": truncated}),
+        json!({"durationMs": duration_ms, "truncated": truncated,
+            "sideEffects":legacy.get("sideEffects").and_then(Value::as_str)
+                .filter(|side| matches!(*side, SIDE_NONE | SIDE_APPLIED | SIDE_ROLLED_BACK | SIDE_UNKNOWN))
+                .unwrap_or(SIDE_UNKNOWN)}),
     );
     // Compatibility: keep the legacy flat fields beside the envelope.
     if let (Some(map), Some(legacy_map)) = (envelope.as_object_mut(), legacy.as_object()) {
@@ -892,6 +933,16 @@ mod tests {
         );
         assert_eq!(failed["status"], "failure");
         assert_eq!(failed["error"]["code"], "nonzero-exit");
+        let bounded = normalize(
+            json!({"exitCode":0,"stdout":"bounded output","stderr":"","isError":false,
+                "truncated":true,"sideEffects":SIDE_APPLIED}),
+            Family::Harness,
+        );
+        assert_eq!(bounded["status"], "partial");
+        assert_eq!(bounded["data"]["logs"]["stdout"], "bounded output");
+        assert_eq!(bounded["metadata"]["sideEffects"], SIDE_APPLIED);
+        assert!(bounded["error"].is_null());
+        assert!(validate_envelope(&bounded).is_ok());
     }
 
     #[test]

@@ -207,7 +207,8 @@ mod stream_tests {
                 error: None,
                 created_at: crate::store::now(),
                 updated_at: crate::store::now(),
-            })
+            outcome: None,
+})
             .unwrap();
         let plan = crate::chat::assemble_turn(
             &state,
@@ -308,7 +309,8 @@ mod regressions {
                     error: None,
                     created_at: crate::store::now(),
                     updated_at: crate::store::now(),
-                })
+                outcome: None,
+})
                 .unwrap();
             (c.id, m.id)
         };

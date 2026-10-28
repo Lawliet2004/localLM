@@ -16,7 +16,7 @@ import { api, errorMessage, nativeAvailable } from '../lib/api';
 import { allProjects, conversationProjectId, groupByProject } from '../lib/projects';
 import type { Conversation, Hit, Project, WorkspaceIndex } from '../lib/types';
 
-export type Page = 'chat' | 'general' | 'appearance' | 'models' | 'connectors' | 'skills' | 'execution' | 'bash' | 'python' | 'development-tools' | 'language-servers' | 'weather' | 'web-search' | 'inference' | 'diagnostics' | 'security' | 'git' | 'browser-use' | 'computer-use' | 'tools' | 'hooks' | 'permission-rules' | 'plugins';
+export type Page = 'chat' | 'general' | 'appearance' | 'models' | 'connectors' | 'skills' | 'execution' | 'bash' | 'python' | 'language-servers' | 'weather' | 'web-search' | 'inference' | 'diagnostics' | 'security' | 'git' | 'browser-use' | 'computer-use' | 'tools' | 'hooks' | 'permission-rules' | 'plugins';
 
 interface Props {
   page: Page;

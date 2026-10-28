@@ -33,12 +33,14 @@ describe('createConfig environment overrides', () => {
     expect(config.searxngBaseUrl).toBe(DEFAULT_CONFIG.searxngBaseUrl);
   });
 
-  it('defaults match the bounded agent budget table', () => {
+  it('keeps low-memory limits scoped to retrieval transport', () => {
+    process.env.AGC_WEB_PROFILE = 'low_memory';
     const config = createConfig();
-    expect(config.queries).toEqual({ fast: 1, normal: 2, deep: 4 });
-    expect(config.fetch.fastPages).toBe(3);
-    expect(config.fetch.normalPages).toBe(6);
-    expect(config.fetch.deepPages).toBe(10);
-    expect(config.planning).toBe('auto');
+    expect(config.maxConcurrentQueries).toBe(2);
+    expect(config.fetch.globalConcurrency).toBe(4);
+    expect(config.fetch.perDomainConcurrency).toBe(1);
+    expect(config.fetch.maxBytes).toBe(DEFAULT_CONFIG.fetch.maxBytes);
+    config.fetch.userAgent = 'isolated';
+    expect(DEFAULT_CONFIG.fetch.userAgent).not.toBe('isolated');
   });
 });

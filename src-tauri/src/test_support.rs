@@ -36,12 +36,9 @@ pub(crate) fn app_state(root: &Path) -> crate::AppState {
         oauth_operation: tokio::sync::Mutex::new(()),
         oauth_cancel: tokio::sync::watch::channel(false).0,
         subagents: crate::subagents::global_registry(),
-        terminals: tokio::sync::Mutex::new(crate::sandbox::TerminalRegistry::new()),
-        processes: crate::process_tools::ProcessRegistry::default(),
+        processes: crate::process_tools::ProcessRegistry::persistent(db_path.clone()),
         previews: crate::workspace_preview::Manager::default(),
         language_servers: crate::lsp_client::Manager::default(),
-        debuggers: crate::debug_tools::Manager::default(),
-        http_sessions: crate::api_tools::Manager::default(),
         verification_observers: crate::verification_observer::Registry::default(),
         pty_sessions: Mutex::new(std::collections::HashMap::new()),
         web_search_cache: Mutex::new(crate::harness::WebSearchCache::default()),
@@ -58,6 +55,7 @@ pub(crate) fn snapshot(
     aliases: &[&str],
 ) -> crate::subagents::BackendSnapshot {
     crate::subagents::BackendSnapshot {
+        processes: state.processes.clone(),
         model_capabilities: None,
         kind: "local".into(),
         endpoint: String::new(),
@@ -131,6 +129,21 @@ pub(crate) async fn scripted_sse(
     Arc<Mutex<Vec<FixtureHttpRequest>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    let count = responses.len();
+    let mut responses = responses.into_iter();
+    scripted_sse_with(count, move |_| responses.next().unwrap()).await
+}
+
+/// A request-aware fixture lets later model rounds inspect real process IDs
+/// and reports returned by the preceding round, without bypassing dispatch.
+pub(crate) async fn scripted_sse_with(
+    count: usize,
+    mut respond: impl FnMut(&serde_json::Value) -> String + Send + 'static,
+) -> (
+    String,
+    Arc<Mutex<Vec<FixtureHttpRequest>>>,
+    tokio::task::JoinHandle<()>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -139,7 +152,7 @@ pub(crate) async fn scripted_sse(
     let requests = Arc::new(Mutex::new(Vec::new()));
     let records = requests.clone();
     let task = tokio::spawn(async move {
-        for body in responses {
+        for _ in 0..count {
             let (mut stream, _) =
                 tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
                     .await
@@ -182,6 +195,7 @@ pub(crate) async fn scripted_sse(
                     }
                 }
             }
+            let body = respond(&records.lock().unwrap().last().unwrap().body);
             let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
             stream.write_all(response.as_bytes()).await.unwrap();
         }

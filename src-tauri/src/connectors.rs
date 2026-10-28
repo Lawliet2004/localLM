@@ -541,6 +541,26 @@ impl AgentTool {
     pub fn definition(&self) -> Value {
         serde_json::json!({"type":"function","function":{"name":self.alias,"description":format!("{}: {} — {}", self.connector,self.tool.name,self.tool.description),"parameters":self.tool.input_schema}})
     }
+    pub(crate) fn is_local_execution(&self) -> bool {
+        matches!(self.backend, ToolBackend::Execution(_))
+    }
+    pub(crate) async fn call_in_process_session(
+        &self,
+        arguments: Value,
+        supervisor: &crate::process_tools::ProcessRegistry,
+        owner: &str,
+    ) -> Result<Value, String> {
+        if let ToolBackend::Execution(execution) = &self.backend {
+            let scoped = execution.session(supervisor.clone(), owner)?;
+            if self.tool.name == "execute_command" {
+                scoped.run_command(arguments).await
+            } else {
+                scoped.run(arguments).await
+            }
+        } else {
+            self.call(arguments).await
+        }
+    }
     pub async fn call(&self, arguments: Value) -> Result<Value, String> {
         self.call_with_input(arguments, None, None).await
     }
@@ -612,7 +632,7 @@ impl AgentTool {
             ToolBackend::Workspace(workspace) => {
                 let workspace = workspace.clone();
                 let name = self.tool.name.clone();
-                tokio::task::spawn_blocking(move || workspace.call(&name, arguments))
+                tokio::task::spawn_blocking(move || workspace.call_model(&name, arguments))
                     .await
                     .map_err(|_| "Workspace operation failed unexpectedly.")?
             }
@@ -1930,15 +1950,28 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         }];
         let (tools, omitted) = hub.tools_for_turn(&[], &selection).unwrap();
         assert!(tools.is_empty());
-        assert_eq!(omitted, [server.id.clone()]);
+        assert_eq!(omitted.as_slice(), std::slice::from_ref(&server.id));
         let labels = hub.unavailable_connector_labels(&omitted).await;
         assert_eq!(labels.len(), 1);
-        assert!(labels[0].starts_with("Calculator — local server saved but not started"), "{}", labels[0]);
-        assert!(labels[0].contains("start it with Connect in Connectors"), "{}", labels[0]);
-        assert!(!labels[0].contains("local-"), "raw ids are not user-facing: {}", labels[0]);
-        let remote = hub
-            .unavailable_connector_labels(&["deepwiki".into()])
-            .await;
-        assert_eq!(remote, ["deepwiki — not connected; use Connect in Connectors to sign in"]);
+        assert!(
+            labels[0].starts_with("Calculator — local server saved but not started"),
+            "{}",
+            labels[0]
+        );
+        assert!(
+            labels[0].contains("start it with Connect in Connectors"),
+            "{}",
+            labels[0]
+        );
+        assert!(
+            !labels[0].contains("local-"),
+            "raw ids are not user-facing: {}",
+            labels[0]
+        );
+        let remote = hub.unavailable_connector_labels(&["deepwiki".into()]).await;
+        assert_eq!(
+            remote,
+            ["deepwiki — not connected; use Connect in Connectors to sign in"]
+        );
     }
 }

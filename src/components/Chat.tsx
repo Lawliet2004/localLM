@@ -1,4 +1,5 @@
 import { useToolOutput } from '../lib/toolOutput';
+import { toolFileChanges, toolRecord, toolOutcome } from '../lib/toolResult';
 import { FileResult } from './FileResult';
 import { partitionActivity } from '../lib/activity';
 import { WorkSummary } from './WorkSummary';
@@ -22,7 +23,28 @@ import { CommandRunCard } from './CommandRunCard';
 import { PlanChecklist, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
 import { CanvasPanel } from './CanvasPanel';
 import { artifactVersions, extractArtifacts, findArtifact } from '../lib/canvas';
-import type { RunRecord } from '../lib/types';
+import type { RunOutcome, RunRecord } from '../lib/types';
+
+function runOutcomeNotice(run: RunRecord): string {
+  const causes: Record<RunOutcome['reason'], string> = {
+    completed: 'The run ended.',
+    user_cancelled: 'Stopped at your request.',
+    user_paused: 'Paused at your request.',
+    app_restart: 'The app restarted before this run finished.',
+    provider_failure: 'The model connection failed.',
+    budget_exhausted: 'The run reached its budget.',
+    permission_denied: 'An action was denied.',
+    outcome_unknown: 'An action has no confirmed result.',
+    blocked: 'The run stopped after repeated output or action failures.',
+  };
+  const outcome = run.outcome;
+  const cause = outcome && outcome.reason !== 'completed'
+    ? causes[outcome.reason] : `Run ${run.status.replace(/_/g, ' ')}.`;
+  if (outcome?.reason === 'outcome_unknown' || run.status === 'outcome_unknown') {
+    return `${cause} Review its activity before running it again.`;
+  }
+  return `${cause} ${outcome?.resumable && outcome.checkpoint ? 'Progress is saved. ' : ''}Review the activity before continuing.`;
+}
 import { MarkdownView } from './MarkdownView';
 import { MessageRenderer } from '../genui/MessageRenderer';
 import { ResearchContext, type HostClaim } from '../genui/grounding';
@@ -70,13 +92,7 @@ interface Props {
 
 const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Message; onStop?: () => void }) {
   const output = useToolOutput(message.conversationId, message.id);
-  let record: Record<string, unknown> = {};
-  try {
-    const value: unknown = JSON.parse(message.content);
-    if (value && typeof value === 'object' && !Array.isArray(value)) record = value as Record<string, unknown>;
-  } catch {
-    /* Preserve legacy tool content below. */
-  }
+  const record = toolRecord(message);
   const request = record.request && typeof record.request === 'object' ? (record.request as Record<string, unknown>) : record;
   const name = typeof request.name === 'string' ? request.name : 'Tool';
   const connector = typeof request.connector === 'string' ? request.connector : 'Connector';
@@ -104,7 +120,8 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
     ? dataRecord
     : undefined;
   const resultStatus = dataRecord && typeof dataRecord.resultStatus === 'string' ? dataRecord.resultStatus : undefined;
-  const diff = typeof dataRecord?.diff === 'string' ? dataRecord.diff : typeof resultRecord?.diff === 'string' ? resultRecord.diff : null;
+  const changes = toolFileChanges(message);
+  const diff = changes.filter(change => change.diff !== undefined).map(change => change.diff).join('\n') || (typeof dataRecord?.diff === 'string' ? dataRecord.diff : typeof resultRecord?.diff === 'string' ? resultRecord.diff : null);
   const stdout = message.status === 'streaming' && output.stdout ? output.stdout : typeof logsRecord?.stdout === 'string' ? logsRecord.stdout : resultRecord && typeof resultRecord.stdout === 'string' ? resultRecord.stdout : '';
   const stderr = message.status === 'streaming' && output.stderr ? output.stderr : typeof logsRecord?.stderr === 'string' ? logsRecord.stderr : resultRecord && typeof resultRecord.stderr === 'string' ? resultRecord.stderr : '';
   const exitCode = dataRecord && typeof dataRecord.exitCode === 'number' ? dataRecord.exitCode : resultRecord && typeof resultRecord.exitCode === 'number' ? resultRecord.exitCode : null;
@@ -114,19 +131,9 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
   const errorCode = typeof errorRecord?.code === 'string' ? errorRecord.code : undefined;
   const envelopeStatus = resultRecord && typeof resultRecord.status === 'string' ? resultRecord.status : undefined;
   const isError = resultRecord !== null && resultRecord.isError === true;
-  const failed = message.status === 'error' || isError || Boolean(error) || (exitCode !== null && exitCode !== 0) || ['error', 'failed', 'failure', 'denied', 'cancelled', 'unknown', 'partial'].includes(envelopeStatus ?? '');
   const decision = typeof request.decision === 'string' ? request.decision : undefined;
-  const status = message.status === 'interrupted'
-    ? 'interrupted'
-    : decision === 'denied'
-    ? 'failed'
-    : decision === 'pending'
-    ? 'awaiting_approval'
-    : message.status === 'streaming'
-    ? 'running'
-    : failed
-    ? 'failed'
-    : 'completed';
+  const outcome = toolOutcome(message);
+  const status = outcome.kind === 'success' ? 'completed' : outcome.kind === 'failure' ? 'failed' : outcome.kind;
   const command = typeof request.arguments === 'object' && request.arguments && 'command' in request.arguments
     ? String(request.arguments.command)
     : undefined;
@@ -544,7 +551,7 @@ export function Chat({
                 {user && <MessageBody message={user} />}
                 <ResearchContext.Provider value={{sources:evidenceSources,claims:hostClaims}}><WorkSummary messages={turn} events={activity} run={turnIndex === turns.length - 1 ? latestRun : undefined}><ActivityTimeline events={activity} messages={turn} generating={generating && turnIndex === turns.length - 1} renderMessage={m => <MessageBody message={m} suppressReasoning sourceLinks={sourceLinks} onSendPrompt={sendFromUi} onOpenCanvas={openCanvas} />} renderTool={m => <ToolMessage message={m} onStop={onCancel} />} /></WorkSummary></ResearchContext.Provider>
                 <AnswerSources messages={turn} events={activity} />
-                {turnIndex === turns.length - 1 && latestRun && ['failed', 'outcome_unknown', 'paused', 'cancelled'].includes(latestRun.status) && <p role="status" className="run-outcome">Run {latestRun.status.replace(/_/g, ' ')}. Review the activity above before retrying.</p>}
+                {turnIndex === turns.length - 1 && latestRun && ['failed', 'outcome_unknown', 'paused', 'cancelled'].includes(latestRun.status) && <p role="status" className="run-outcome">{runOutcomeNotice(latestRun)}</p>}
               </div>;
             })}
             {generating && (

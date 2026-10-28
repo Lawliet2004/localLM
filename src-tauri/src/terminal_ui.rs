@@ -3,8 +3,7 @@
 //!
 //! Sessions persist while the app runs so the inspector can close and reattach
 //! without killing the shell. A capped scrollback buffer replays on attach.
-//! This is separate from the model's `sandbox::TerminalRegistry`, which is a
-//! sentinel-driven command pipe, not an interactive console.
+//! Model commands use the process supervisor; this console belongs to the user.
 
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};

@@ -32,7 +32,7 @@ The full-stack extension uses the same system for Bash, Python, Weather, Web Sea
 
 ## Conversation and review extension — 17 October 2026
 
-Conversation answers precede one stable, collapsed reasoning disclosure and one completed-work disclosure. Pending approvals and failures stay visible. Stored source metadata attaches to the answer; HTTP(S) validation and deduplication are shared with web cards, and raw results sit under technical details. Code has one themed toolbar/frame. Generated files use the shared ArtifactViewer; HTML is literal source, native Open is an expanded dialog and native Save uses the file dialog/atomic writer.
+Conversation chronology and disclosures follow docs/ACTIVITY_DESIGN.md; earlier answer-first activity layouts are superseded. Pending approvals and failures stay visible. Stored source metadata attaches to the answer; HTTP(S) validation and deduplication are shared with web cards, and raw results sit under technical details. Code has one themed toolbar/frame. Generated files use the shared ArtifactViewer; HTML is literal source, native Open is an expanded dialog and native Save uses the file dialog/atomic writer.
 
 The composer keeps a model-aware reasoning choice separate from response length and a compact locality/capability disclosure. Latest sits above the actual composer region, including wrapped narrow controls. Command discovery uses Ctrl+Shift+P. Settings have six groups; project-document opt-in, voice capability boundaries and latency diagnostics use the existing control language. Trace/ANSI colors derive from theme tokens.
 
@@ -42,11 +42,15 @@ Final bounded visual evidence: `.impeccable/review/review-round-2/CONFIRMATION.m
 
 ## Conversation rendering system
 
-The conversation palette now separates two axes: **activity category** colors (`--cat-*` in tokens.css — violet reasoning, blue commands, cyan web, muted teal reads, amber edits, slate tools) and **execution status** (`--accent` success, `--warn` awaiting approval, `--error` failed/denied, neutral labelled interruptions). Category appears in trace icons, labels, subtle tints and left borders; status only affects badges. All category foregrounds meet AA contrast on their tinted surfaces in both themes.
+The current transcript contract is [docs/ACTIVITY_DESIGN.md](docs/ACTIVITY_DESIGN.md).
+It owns neutral chronological activity rows, exposed reasoning, file changes and
+verification outcomes. Earlier category-colored cards and terminal-tree rails
+are superseded. App chrome retains the paper/forest palette above.
 
-Shared primitives carry the visuals: `MarkdownView` is the single renderer for assistant prose and exposed reasoning; `CodeBlock` is the one frame/toolbar for fences, command input, code execution, file reads, JSON results and artifacts, with real highlight.js highlighting resolved through `src/lib/highlight.ts` (fixed grammar subset, aliases, path inference, LRU cache, escaped fallback, size caps); `DiffView` renders all diffs with `--diff-*` tokens. Terminal output uses the stateful parser in `src/lib/ansi.ts` with `--terminal-*` theme colors — SGR survives across lines and split chunks, unsupported sequences are stripped, carriage-return rewrites collapse, stdout and stderr stay separate channels, and the bounded viewport follows output only while the user is at the bottom.
-
-Syntax (`--syn-*`), code surface (`--code-*`) and category tokens are defined centrally; components carry no color literals. The full contract and verification notes live in docs/RENDERING.md.
+Shared MarkdownView, CodeBlock, DiffLines and ANSI rendering remain authoritative.
+All semantic colors, including transcript/activity values, live in tokens.css.
+No component introduces its own color literals. Responses.css handles answer
+content, while activity.css owns transcript composition and loads last.
 
 ## Answer presentation — 21 October 2026
 
@@ -71,56 +75,35 @@ Auto / Text / Visual dropdown or any equivalent response-presentation picker.
 The user explicitly removed it. Presentation preferences belong in Settings;
 older audits and implementation logs must not be used to restore this control.
 
-## Inline work log — 21 October 2026
+## Conversation activity — 25 October 2026
 
-The user's Codex screenshot references replace the earlier answer-first boxed
-activity treatment. Commentary and recorded work appear in sequence, completed
-tools use muted inline disclosure rows, and the final answer is followed by one
-compact edited-files panel with totals, full paths, View changes and Collapse
-files. Active approvals and unsuccessful outcomes remain visible. Recorded
-duration appears on a quiet divider above the turn. Existing appearance
-preferences, shared diff/code tokens, detailed tool inspection and Settings-only
-response presentation remain authoritative. `responses.css` owns this extension.
-No native visual comparison was available in this pass; localhost browser
-preview remains excluded by repository instructions.
+Use docs/ACTIVITY_DESIGN.md as the single current surface specification. The
+reference transcript uses spacious prose, neutral inline disclosure rows, a
+brain icon for actual exposed reasoning, and one initially collapsed rounded
+file-change bar. Preserve saved typography, the established reading width,
+shared rendering primitives and Settings-only response presentation.
 
-## Inline work log refinement — 22 October 2026
+Terminal channels retain the folded live tail and bounded expanded pages.
+Reading earlier output or opening details pauses following; Latest resumes it.
+Keep Markdown/disclosure identities stable during streaming. Journal recovery
+and native notifications must produce the same chronological display.
 
-This extension retains the existing paper/forest palette, semantic tokens,
-IBM Plex typography, shared primitives and Settings-only response presentation.
-The established reading width remains 744px (the 824px column less 80px of
-horizontal padding). It introduces no new theme, token system or packages.
+Current verification remains code-only. Detector and unit tests cannot establish
+visual approval; new native reference comparisons are outstanding. Localhost
+browser preview remains excluded by repository instructions.
 
-Tools use compact inline chronological disclosure rows. Only adjacent successful
-reads, searches and exploration can share a collapsed group; commands, edits and
-anything running or needing attention remain separate rows in sequence.
-Category icons and labelled status keep their distinct meanings. Detailed output
-opens inside the existing code frame. The edited-files summary stays compact,
-with recorded totals, full paths and shared diff review.
+## Coding workflow — 25 October 2026
 
-Terminal channels follow a folded 30-line live tail, with expanded output
-browsable in pages of up to 500 lines and full-source Copy retained. Reading
-earlier output, browsing pages or opening a chat disclosure pauses following.
-Resize-aware chat following accommodates growing content while following is
-active; Latest resumes following and remains available after completion.
-Markdown component identities survive streaming updates, artifact Markdown uses
-the shared renderer, and diffs retain syntax colors plus old/new source line
-coordinates.
+Live tool/output identity includes conversation, run, step and provider call ID.
+Per-step model snapshots bridge streaming and committed journal activity without
+inventing thought text or durations. Partial, cancelled and unknown outcomes
+remain distinct from successful work; the file-change summary requires confirmed
+successful mutations. User-inspected thought disclosures and manual reading
+positions remain stable during updates.
 
-The review disposition is **ship at CODE-ONLY scope**, after the regression for
-Latest after completion was fixed. The mechanical detector returned `[]`.
-This is not visual approval: no new screenshots, native/browser inspection or
-zoom/accessibility visual acceptance are available, and localhost preview remains
-prohibited. Overall UI performance and model latency were not measured. Earlier
-visual evidence above applies to its recorded scope, not this extension.
-
-The follow-up retains this same visual system and reading width. Conservative
-incremental Markdown blocks use the canonical shared renderer, with stable keys
-and first/last margins and caret placement preserving user-bubble rhythm.
-Completed command, file and raw details defer their contents until inspection,
-then retain local state. Long unchanged diff context folds behind a labelled
-toggle that preserves keyboard focus and source coordinates. Replay caches and
-optional committed-journal notifications support the same chronological rows;
-polling remains available for recovery. These changes add no dependencies.
-The reviewer accepted the final fixes at CODE-ONLY scope, with detector `[]`;
-screenshots and native interaction approval remain unavailable.
+Scoped native Tauri/WebKit rendering evidence for the coding-workflow fixture is
+recorded in docs/CODING_AGENT_WORKFLOW_2026-10-25.md. Light/dark desktop and narrow
+captures, expanded file changes and restart restoration were inspected using
+bundled assets on an isolated display. This does not establish broader reference
+matching or provider-quality acceptance. Localhost browser preview remains
+excluded.

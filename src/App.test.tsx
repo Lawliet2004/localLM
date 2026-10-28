@@ -152,7 +152,7 @@ describe('conversation permission modes', () => {
 });
 
 describe('remembered tool selection', () => {
-  it.each([['code', /^Code \(PTC\)/], ['minimal', /^Minimal/], ['creator', /^Creator/]] as const)('saves the advanced %s profile for a conversation and restores it after remount', async (id, name) => {
+  it.each([['code', /^Code/], ['minimal', /^Minimal/], ['creator', /^Creator/]] as const)('saves the advanced %s profile for a conversation and restores it after remount', async (id, name) => {
     const first = render(<App />);
     await userEvent.click(await screen.findByRole('button', { name: 'Saved chat' }));
     await screen.findByText('Export this message');
@@ -468,4 +468,39 @@ it('streams tool-local channels and reconciles completion to persisted history',
   expect(toolOutput.read('chat', 'tool-fixture')).toEqual({ stdout: '', stderr: '' });
   expect(screen.getAllByTestId('command-run-card')).toHaveLength(1);
   expect(screen.getByTestId('status-exit-0')).toBeInTheDocument();
+});
+
+it('keeps live output separate when provider call IDs repeat in different steps', async () => {
+  mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, runtime: { phase: 'ready', message: '', modelPath: 'fixture.gguf' }, rememberedTools: { sources: [], tools: [] } });
+  let receive!: (event: ChatEvent) => void;
+  let finish!: () => void;
+  mocks.sendMessage.mockImplementation((_id: string, _content: string, callback: (event: ChatEvent) => void) => {
+    receive = callback;
+    return new Promise<void>(resolve => { finish = resolve; });
+  });
+  await openChat();
+  fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Run twice' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+  await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledOnce());
+  const emit = (stepId: string, toolStream: NonNullable<ChatEvent['toolStream']>) => receive({ messageId: '', content: '', reasoning: '', runId: 'run', stepId, toolStream });
+  await act(async () => {
+    emit('one', { type: 'started', toolCallId: 'reused', toolName: 'execute_command', command: 'echo first' });
+    emit('one', { type: 'outputChunk', toolCallId: 'reused', stream: 'stdout', chunk: 'first output' });
+    emit('one', { type: 'finished', toolCallId: 'reused', exitCode: 0, durationMs: 10 });
+    emit('two', { type: 'started', toolCallId: 'reused', toolName: 'execute_command', command: 'echo second' });
+    emit('two', { type: 'outputChunk', toolCallId: 'reused', stream: 'stdout', chunk: 'second output' });
+  });
+  await waitFor(() => expect(screen.getAllByTestId('command-run-card')).toHaveLength(2));
+  const cards = screen.getAllByTestId('command-run-card');
+  fireEvent.click(screen.getByText('echo first'));
+  expect(cards[0]).toHaveTextContent('first output');
+  expect(cards[0]).not.toHaveTextContent('second output');
+  expect(cards[1]).toHaveTextContent('second output');
+  expect(cards[1]).not.toHaveTextContent('first output');
+  await act(async () => {
+    emit('two', { type: 'finished', toolCallId: 'reused', exitCode: 1, durationMs: 20 });
+    finish();
+  });
+  const { toolStreamId } = await import('./lib/agentTranscript');
+  for (const stepId of ['one', 'two']) expect(toolOutput.read('chat', toolStreamId({ conversationId: 'chat', runId: 'run', stepId, toolCallId: 'reused' }))).toEqual({ stdout: '', stderr: '' });
 });

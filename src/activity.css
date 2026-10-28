@@ -1,5 +1,4 @@
-/* Activity redesign: everything the assistant outputs, flat and monochrome,
-   in the manner of a terminal agent log. Loaded LAST (see App.tsx). Removing
+/* Conversation transcript: open prose and neutral inline activity rows. Loaded LAST (see App.tsx). Removing
    the import reverts the whole redesign; nothing in other stylesheets is edited.
    Contract and rules: docs/ACTIVITY_DESIGN.md.
 
@@ -11,44 +10,6 @@
 /* ------------------------------------------------------------------ */
 /* Tokens                                                              */
 /* ------------------------------------------------------------------ */
-:root {
-  --a-ink: #111111;
-  --a-body: #2b2b2b;
-  --a-dim: #5c5c5c;
-  /* Rails and decoration only. Never use for text. */
-  --a-faint: #9a9a9a;
-  --a-line: #cfcfcf;
-  --a-add: #1a7f37;
-  --a-del: #c62828;
-  /* Same hues, darkened until text clears 4.5:1 on the paper background. */
-  --a-add-text: #17692e;
-  --a-del-text: #b32222;
-  --a-add-tint: rgba(26, 127, 55, .13);
-  --a-del-tint: rgba(198, 40, 40, .12);
-  --a-hover: rgba(0, 0, 0, .06);
-  --a-code-bg: #f4f4f4;
-  --a-rail: 1.5px dotted var(--a-faint);
-  --a-rail-x: 8px;
-  --a-indent: 20px;
-  --a-icon: 18px;
-  --a-row-h: 28px;
-  --a-mono: var(--font-mono, 'Cascadia Code', 'SFMono-Regular', Consolas, monospace);
-}
-:root[data-theme=dark] {
-  --a-ink: #f4f4f4;
-  --a-body: #d9d9d9;
-  --a-dim: #a6a6a6;
-  --a-faint: #6a6a6a;
-  --a-line: #3c3c3c;
-  --a-add: #56d364;
-  --a-del: #ff7b72;
-  --a-add-text: #56d364;
-  --a-del-text: #ff7b72;
-  --a-add-tint: rgba(86, 211, 100, .16);
-  --a-del-tint: rgba(255, 123, 114, .16);
-  --a-hover: rgba(255, 255, 255, .08);
-  --a-code-bg: #161616;
-}
 :root[data-density=compact] { --a-row-h: 24px; }
 @media (max-width: 600px) {
   :root { --a-rail-x: 7px; --a-indent: 12px; --a-icon: 16px; }
@@ -100,14 +61,17 @@
 /* Feed                                                                */
 /* ------------------------------------------------------------------ */
 :root .activity-feed {
-  gap: 2px;
-  margin-block: 4px 12px;
+  --a-body: var(--transcript-body);
+  --a-ink: var(--transcript-body);
+  --a-dim: var(--transcript-label);
+  gap: 16px;
+  margin-block: 8px 24px;
   font-size: var(--chat-font-size, 16px);
   line-height: 1.5;
 }
 :root .activity-feed > * { animation: none; }
 /* Narration between tool rows is plain prose with small vertical margin. */
-:root .activity-feed .message-assistant { padding-block: 6px; margin-block: 0; }
+:root .activity-feed .message-assistant { padding-block: 0; margin-block: 0; }
 :root .activity-feed .message-assistant + .command-run-card,
 :root .activity-feed .message-assistant + details { margin-top: 2px; }
 
@@ -138,9 +102,9 @@
   display: flex;
   align-items: center;
   flex-wrap: nowrap;
-  gap: 8px;
+  gap: 10px;
   min-height: var(--a-row-h);
-  padding: 2px 0;
+  padding: 0;
   border-radius: 3px;
   background: transparent;
   color: var(--a-dim);
@@ -186,10 +150,10 @@
 :root .command-run-card .activity-kind {
   flex: 0 0 auto;
   font-family: var(--font-sans);
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1.4;
-  color: var(--a-ink);
+  font-size: var(--a-label-size);
+  font-weight: 400;
+  line-height: 1.6;
+  color: var(--a-dim);
   white-space: nowrap;
 }
 /* Target */
@@ -201,7 +165,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--a-mono);
-  font-size: 12.5px;
+  font-size: var(--a-target-size);
   font-weight: 400;
   line-height: 1.6;
   color: var(--a-dim);
@@ -213,13 +177,13 @@
   border: 0;
   background: transparent;
   font-family: var(--a-mono);
-  font-size: 12px;
+  font-size: var(--a-meta-size);
   font-weight: 400;
   color: var(--a-dim);
   white-space: nowrap;
 }
 :root .command-run-card .trace-badge { font-family: var(--font-sans); }
-:root .command-run-card .trace-diff-counts { flex: 0 0 auto; gap: 6px; font-family: var(--a-mono); font-size: 12px; white-space: nowrap; }
+:root .command-run-card .trace-diff-counts { flex: 0 0 auto; gap: 6px; font-family: var(--a-mono); font-size: var(--a-meta-size); white-space: nowrap; }
 :root .command-run-card .trace-diff-counts .diff-added { color: var(--a-add-text); }
 :root .command-run-card .trace-diff-counts .diff-removed { color: var(--a-del-text); }
 :root .command-run-card :is(.cmd-cwd, .env-pill) { display: none; }
@@ -246,15 +210,14 @@
 /* Group and thinking labels */
 :root details.activity-summary .activity-summary-label,
 :root details.trace-thought-details .trace-thought-label {
-  font-size: 14px;
-  font-weight: 500;
+  font-size: var(--a-label-size);
+  font-weight: 400;
   color: var(--a-dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
 }
-:root details.activity-summary .activity-summary-label { font-size: 13px; }
 
 /* ------------------------------------------------------------------ */
 /* Status                                                              */
@@ -267,7 +230,7 @@
   border: 0;
   border-radius: 0;
   background: transparent;
-  font-size: 12px;
+  font-size: var(--a-meta-size);
   font-weight: 400;
   white-space: nowrap;
   color: var(--a-dim);
@@ -297,7 +260,7 @@
   padding: 0;
   border: 0;
   background: transparent;
-  font-size: 12px;
+  font-size: var(--a-meta-size);
   color: var(--a-dim);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -309,7 +272,7 @@
   border-radius: 0;
   background: transparent;
   box-shadow: none;
-  font-size: 12px;
+  font-size: var(--a-meta-size);
   color: var(--a-dim);
   text-decoration: underline dotted var(--a-faint);
   text-underline-offset: 3px;
@@ -342,7 +305,7 @@
 :root[data-motion=reduced] .command-run-card .spinning { animation: none; }
 
 /* ------------------------------------------------------------------ */
-/* Expanded body on the dotted rail                                    */
+/* Expanded tool details                                    */
 /* ------------------------------------------------------------------ */
 :root .command-run-card .card-body,
 :root .file-result .file-result-content,
@@ -350,28 +313,18 @@
 :root details.activity-compaction[open] > p {
   position: relative;
   min-width: 0;
-  margin: 2px 0 8px var(--a-rail-x);
-  padding: 2px 0 2px calc(var(--a-indent) - var(--a-rail-x) - 1.5px);
+  margin: 2px 0 8px;
+  padding: 2px 0 2px 28px;
   border: 0;
-  border-left: var(--a-rail);
   border-radius: 0;
   background: transparent;
   overflow: visible;
   animation: none;
   font-size: 12.5px;
 }
-/* The elbow: a short dotted tick into the first line. */
+/* Transcript details use indentation without decorative tree rails. */
 :root .command-run-card .card-body::before,
 :root .file-result .file-result-content::before,
-:root details.trace-thought-details .trace-thought-content::before {
-  content: '';
-  position: absolute;
-  left: -1.5px;
-  top: 11px;
-  width: calc(var(--a-indent) - var(--a-rail-x) - 6px);
-  border-top: var(--a-rail);
-  pointer-events: none;
-}
 :root details.trace-thought-details .trace-thought-content::before { display: none; }
 :root .command-run-card .card-body > * { min-width: 0; }
 :root .command-run-card .card-body > p {
@@ -568,13 +521,13 @@
 /* Folded exploration groups                                           */
 /* ------------------------------------------------------------------ */
 :root .activity-summary-rows {
-  margin: 2px 0 6px var(--a-rail-x);
-  padding: 2px 0 2px calc(var(--a-indent) - var(--a-rail-x) - 1.5px);
-  border-left: var(--a-rail);
+  margin: 8px 0 12px;
+  padding: 0 0 0 28px;
+  border: 0;
   max-height: none;
   overflow: visible;
 }
-/* One shared rail: child rows drop their own to avoid double lines. */
+/* Nested tools retain one consistent indentation level. */
 :root .activity-summary-rows .command-run-card .card-body,
 :root .activity-summary-rows .file-result .file-result-content { margin-left: 0; padding-left: var(--a-indent); border-left: 0; }
 :root .activity-summary-rows .command-run-card .card-body::before,
@@ -599,7 +552,7 @@
 :root .file-result { border: 0; border-radius: 0; background: transparent; color: var(--a-dim); }
 :root .activity-feed .file-result > summary {
   display: flex; align-items: center; gap: 8px; min-height: var(--a-row-h); padding: 2px 0;
-  font-size: 13px; color: var(--a-dim); list-style: none; cursor: pointer; overflow-wrap: anywhere;
+  font-size: var(--a-target-size); color: var(--a-dim); list-style: none; cursor: pointer; overflow-wrap: anywhere;
 }
 :root .activity-feed .file-result > summary::-webkit-details-marker { display: none; }
 :root .activity-feed .file-result > summary:hover { color: var(--a-ink); background: transparent; }
@@ -627,7 +580,7 @@
   max-height: 260px;
   overflow-y: auto;
   font-size: 13.5px;
-  font-style: italic;
+  font-style: normal;
   line-height: 1.65;
   color: var(--a-dim);
   scrollbar-width: thin;
@@ -824,16 +777,7 @@
 :root .assistant-work > .work-summary > summary:hover { background: transparent; color: var(--a-ink); }
 :root .assistant-work > .work-summary > p { margin: 4px 0 0; font-size: 12.5px; color: var(--a-dim); }
 
-:root .assistant-work .file-change-list {
-  margin: 16px 0 8px;
-  padding: 10px 0 0;
-  border: 0;
-  border-top: var(--a-rail);
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-  overflow: visible;
-}
+
 :root .file-changes-header { gap: 12px; padding: 0 0 6px; flex-wrap: wrap; }
 :root .file-changes-icon { display: none; }
 :root .file-changes-title { gap: 4px 12px; font-size: 14px; color: var(--a-ink); }
@@ -857,7 +801,7 @@
 :root .assistant-work .file-change-review > summary:hover { background: transparent; }
 :root .file-change-path > span { color: var(--a-dim); font-family: var(--a-mono); font-size: 12.5px; }
 :root .assistant-work .file-change-heading strong { font-family: var(--a-mono); font-size: 12.5px; font-weight: 600; color: var(--a-ink); }
-:root .assistant-work .file-change-diff { margin: 2px 0 8px var(--a-rail-x); padding: 0 0 0 calc(var(--a-indent) - var(--a-rail-x) - 1.5px); border-left: var(--a-rail); }
+:root .assistant-work .file-change-diff { margin: 8px 0; padding: 0; border: 0; }
 
 /* Metrics and sources: quiet 12px text. */
 :root .response-metrics { margin-block: 8px; font-size: 12px; color: var(--a-dim); }
@@ -945,4 +889,80 @@
   :root .command-run-card .card-body > p { font-size: 12px; }
   :root .command-run-card .terminal-viewport { max-height: 300px; }
   :root .message-assistant .markdown .code-block-pre { padding: 8px 12px 12px; }
+}
+
+/* Working commentary follows the same plain, borderless reading flow as the log. */
+:root .activity-commentary {
+  border: 0;
+  padding-inline-start: 0;
+  margin-block: 8px 16px;
+}
+
+/* Transcript prose and the file-change disclosure. */
+:root .chat-layout:not(.chat-home) { background: var(--transcript-bg); }
+:root .activity-feed .activity-commentary { margin: 4px 0 8px; padding: 0; border: 0; }
+:root .activity-feed .message-assistant .markdown,
+:root .activity-feed details.trace-thought-details .trace-thought-content .markdown {
+  font-family: var(--chat-font);
+  font-size: calc(var(--chat-font-size, 16px) + 2px);
+  font-weight: 400;
+  line-height: 1.72;
+  color: var(--transcript-body);
+}
+:root .activity-feed .message-assistant .markdown p { margin-block: 0 16px; }
+:root .activity-feed .message-assistant .markdown p:last-child { margin-bottom: 0; }
+:root .activity-feed details.trace-thought-details .trace-thought-content {
+  margin: 18px 0 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  max-height: none;
+  overflow: visible;
+  color: var(--transcript-body);
+}
+:root .activity-feed details.trace-thought-details[open] > summary .thought-chevron { opacity: 0; }
+:root .activity-feed details.trace-thought-details > summary:is(:hover, :focus-visible) .thought-chevron { opacity: 1; }
+:root .assistant-work > .work-summary { border: 0; padding: 0; margin-block: 0 16px; }
+:root .assistant-work .file-change-list {
+  margin: 24px 0 16px;
+  padding: 0;
+  border: 1px solid var(--transcript-border);
+  border-radius: 16px;
+  background: var(--transcript-panel);
+  overflow: hidden;
+}
+:root .assistant-work .file-changes-header { padding: 0 16px; min-height: 50px; gap: 12px; }
+:root .assistant-work .file-changes-disclosure {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  min-height: 50px;
+  padding: 10px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--transcript-body);
+  font: 400 16px/1.5 var(--chat-font);
+  text-align: left;
+  cursor: pointer;
+}
+:root .assistant-work .file-changes-disclosure:hover { background: transparent; }
+:root .assistant-work .file-changes-disclosure svg { color: var(--transcript-label); }
+:root .assistant-work .file-changes-disclosure .is-open { transform: rotate(90deg); }
+:root .assistant-work .file-changes-disclosure .file-change-counts { font: inherit; gap: 4px; }
+:root .assistant-work .file-changes-body { padding: 0 16px 12px; }
+@media (max-width: 600px) {
+  :root .activity-feed { gap: 12px; }
+  :root .assistant-work .file-changes-header { padding-inline: 12px; }
+}
+
+:root .assistant-work .verification-outcome {
+  margin: 12px 0;
+  font: 400 var(--a-meta-size)/1.6 var(--chat-font);
+  color: var(--transcript-label);
+  overflow-wrap: anywhere;
 }

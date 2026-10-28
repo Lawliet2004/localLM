@@ -185,6 +185,7 @@ pub(crate) fn openai_reasoning_effort_supported(model: &str) -> bool {
 
 pub enum Backend {
     Local {
+        bonsai_profile: bool,
         client: reqwest::Client,
         endpoint: String,
         key: String,
@@ -278,11 +279,19 @@ impl Backend {
     pub fn local(endpoint: String, key: String, context_length: u32) -> Result<Self, String> {
         let client = crate::http_client::local_model()?;
         Ok(Self::Local {
+            bonsai_profile: false,
             client,
             endpoint,
             key,
             context_length,
         })
+    }
+
+    pub fn with_local_model(mut self, path: &str) -> Self {
+        if let Self::Local { bonsai_profile, .. } = &mut self {
+            *bonsai_profile = crate::bonsai::is_integrated_model(std::path::Path::new(path));
+        }
+        self
     }
 
     pub fn openai(
@@ -437,6 +446,28 @@ impl InferenceProvider for Backend {
             return Err("Model request must be an object.".into());
         }
         let mut payload = payload.clone();
+        if let Some(messages)=payload["messages"].as_array_mut() {
+            for message in messages {
+                if message["role"]=="tool" {
+                    if let Some(value)=message["content"].as_str().and_then(|text|serde_json::from_str::<Value>(text).ok()) {
+                        if value["schemaVersion"]==crate::tool_envelope::SCHEMA_VERSION {
+                            message["content"]=json!(crate::tool_envelope::model_result(&value).to_string());
+                        }
+                    } else if let Some(parts) = message["content"].as_array_mut() {
+                        for part in parts {
+                            if part["type"] == "text" {
+                                if let Some(value) = part["text"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok()) {
+                                    if value["schemaVersion"] == crate::tool_envelope::SCHEMA_VERSION {
+                                        part["text"] = json!(crate::tool_envelope::model_result(&value).to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // A missing API model limit must not inherit the local 2K default.
         // Keep explicit limits on diagnostic/structured requests unchanged.
         if matches!(self, Self::OpenAi { .. } | Self::Subscription { .. })
@@ -510,7 +541,8 @@ impl InferenceProvider for Backend {
             }
         }
         Ok(match self {
-            Self::Local { .. } => {
+            Self::Local { bonsai_profile, .. } => {
+                if *bonsai_profile { crate::bonsai::apply_sampling(&mut payload); }
                 payload
                     .as_object_mut()
                     .map(|object| object.remove("locallm_reasoning_mode"));
@@ -635,6 +667,7 @@ impl InferenceProvider for Backend {
                 endpoint,
                 key,
                 context_length,
+                ..
             } => {
                 crate::context::check(
                     client,
@@ -1039,6 +1072,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn multimodal_tool_payload_projects_only_the_text_envelope_and_preserves_images() {
+        let model = crate::providers::RemoteModel {
+            controls: None, id: "fixture".into(), context_length: Some(32768),
+            max_output_tokens: Some(1000), supports_images: true,
+            tool_support: crate::providers::ToolSupport::Supported,
+        };
+        let backend = super::Backend::openai(&provider(), "fixture".into(), &model).unwrap();
+        let envelope = crate::tool_envelope::normalize(serde_json::json!({"text":"inspected","imageArtifactIds":["image-owned"]}),crate::tool_envelope::Family::Harness);
+        let image = serde_json::json!({"type":"image_url","image_url":{"url":"data:image/png;base64,cGl4ZWw="}});
+        let payload = super::InferenceProvider::payload(&backend,&serde_json::json!({"messages":[{"role":"tool","tool_call_id":"image-call","content":[{"type":"text","text":envelope.to_string()},image]}]})).unwrap();
+        let content = &payload["messages"][0]["content"];
+        assert_eq!(content[1], image);
+        let wire: serde_json::Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(wire, crate::tool_envelope::model_result(&envelope));
+        assert!(wire.get("text").is_none());
+        assert_eq!(wire["data"]["imageArtifactIds"][0], "image-owned");
     }
 
     #[test]

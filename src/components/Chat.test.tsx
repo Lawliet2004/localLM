@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Chat } from './Chat';
-import type { Message, ProviderConnection } from '../lib/types';
+import type { Message, ProviderConnection, RunRecord } from '../lib/types';
 
 const apiMocks = vi.hoisted(() => ({
   getPresentationMode: vi.fn(async () => ({defaultMode:'auto',overrideMode:null,effectiveMode:'auto'})),
@@ -10,6 +10,7 @@ const apiMocks = vi.hoisted(() => ({
   contextPreflight: vi.fn(),
   compactConversation: vi.fn(),
   getTodos: vi.fn<() => Promise<any[]>>(async () => []),
+  getConversationRun: vi.fn<() => Promise<RunRecord | null>>(async () => null),
 }));
 vi.mock('../lib/api', () => ({
   nativeAvailable: true,
@@ -23,6 +24,7 @@ vi.mock('../lib/api', () => ({
     contextPreflight: apiMocks.contextPreflight,
     compactConversation: apiMocks.compactConversation,
     getTodos: apiMocks.getTodos,
+    getConversationRun: apiMocks.getConversationRun,
   },
 }));
 
@@ -31,6 +33,8 @@ afterEach(() => {
   apiMocks.setPresentationMode.mockResolvedValue(undefined);
   apiMocks.getTodos.mockReset();
   apiMocks.getTodos.mockResolvedValue([]);
+  apiMocks.getConversationRun.mockReset();
+  apiMocks.getConversationRun.mockResolvedValue(null);
   apiMocks.contextPreflight.mockReset();
   apiMocks.contextPreflight.mockResolvedValue({ available: false });
   apiMocks.compactConversation.mockReset();
@@ -39,6 +43,18 @@ afterEach(() => {
 
 const props = { generating: false, ready: true, loading: false, onSend: vi.fn(), onCancel: vi.fn(), onConfigure: vi.fn() };
 describe('audit regressions', () => {
+  it('explains a restart and saved progress without treating the partial response as complete', async () => {
+    apiMocks.getConversationRun.mockResolvedValue({id:'run',conversationId:'owned',status:'paused',createdAt:1,updatedAt:2,outcome:{reason:'app_restart',resumable:true,checkpoint:'run'}});
+    render(<Chat {...props} conversationKey="owned" messages={[{id:'partial',conversationId:'owned',role:'assistant',content:'Partial draft',reasoning:'',status:'interrupted',createdAt:1}]} />);
+    expect(await screen.findByText(/The app restarted before this run finished/)).toHaveTextContent('Progress is saved.');
+  });
+
+  it('keeps an uncertain action distinct from a safe retry', async () => {
+    apiMocks.getConversationRun.mockResolvedValue({id:'run',conversationId:'owned',status:'outcome_unknown',createdAt:1,updatedAt:2,outcome:{reason:'outcome_unknown',resumable:true,checkpoint:'run'}});
+    render(<Chat {...props} conversationKey="owned" messages={[{id:'partial',conversationId:'owned',role:'assistant',content:'Partial draft',reasoning:'',status:'interrupted',createdAt:1}]} />);
+    expect(await screen.findByText(/An action has no confirmed result/)).toHaveTextContent('Review its activity before running it again.');
+  });
+
   it.each([false, true])('has no response-mode selector (existing conversation: %s)', async existing => {
     const send = vi.fn();
     const { container } = render(<Chat {...props} onSend={send} conversationKey={existing ? 'owned' : 'new'} messages={existing ? [{id:'m',conversationId:'owned',role:'assistant',content:'Ready',reasoning:'',status:'complete',createdAt:1}] : []} draft="Question" />);
@@ -166,7 +182,8 @@ describe('chat action reporting and submission', () => {
     const assistant: Message = {...user,id:'a',role:'assistant',content:'Updated the styles.'};
     const tool: Message = {...user,id:'t',role:'tool',content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'styles.css'}},result:{diff:'--- a/styles.css\n+++ b/styles.css\n@@ -1 +1 @@\n-old\n+new'}})};
     render(<Chat {...props} messages={[user,assistant,tool]} />);
-    expect(screen.getByText('Edited 1 file')).toBeVisible();
+    expect(screen.getByText('1 file changed')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: /1 file changed/ }));
     expect(screen.getByRole('button', { name: 'View changes' })).toBeVisible();
   });
   it('shows send failures before the first message is saved', () => {
@@ -276,7 +293,7 @@ it('shows measured context usage in the context popover', () => {
   it.each([
     ['complete', { isError: true, message: 'Process failed' }, 'allowed', 'Failed'],
     ['complete', { isError: true }, 'denied', 'Denied'],
-    ['interrupted', 'Cancelled', 'allowed', 'Stopped · outcome unknown'],
+    ['interrupted', 'Cancelled', 'allowed', 'Outcome unknown'],
     ['complete', { isError: false }, 'allowed', 'Finished'],
   ] as const)('reports %s tool outcomes accurately (%s)', (status, result, decision, label) => {
     const message: Message = { id: 'tool', conversationId: 'chat', role: 'tool', reasoning: '', createdAt: 0, status,
@@ -307,6 +324,7 @@ it('renders an openui block from an assistant message and sends follow-up action
       content: 'Here are your stats:\n\n```openui-lang\nroot = Response([s, b])\ns = Stat("Downloaded", "2.07 GB")\nb = Button("Show details")\n```\n' },
   ];
   render(<Chat {...props} messages={messages} onSend={onSend} />);
+  await act(async () => { await vi.dynamicImportSettled(); });
   expect(await screen.findByText('Downloaded')).toBeInTheDocument();
   fireEvent.click(await screen.findByRole('button', { name: 'Show details' }));
   expect(onSend).toHaveBeenCalledWith('Show details');
@@ -501,7 +519,7 @@ it('renders reasoning block with thinking indicator while streaming and thought 
 
   const { rerender } = render(<Chat {...props} messages={[streamingMsg]} generating={true} />);
 
-  expect(screen.getByText('Reasoning')).toBeInTheDocument();
+  expect(screen.getByText('Thought')).toBeInTheDocument();
   expect(screen.getByText('Analyzing query parameters...')).toBeInTheDocument();
 
   const completedMsg: Message = {
@@ -510,7 +528,7 @@ it('renders reasoning block with thinking indicator while streaming and thought 
   };
 
   rerender(<Chat {...props} messages={[completedMsg]} generating={false} />);
-  expect(screen.getByText('Reasoning')).toBeInTheDocument();
+  expect(screen.getByText('Thought')).toBeInTheDocument();
 });
 
 it('renders copy button on markdown code blocks', async () => {

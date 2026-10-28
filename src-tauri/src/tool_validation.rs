@@ -10,17 +10,6 @@ pub struct BoundedValidator {
     inner: jsonschema::Validator,
 }
 impl BoundedValidator {
-    pub fn check(&self, value: &Value) -> Result<bool, String> {
-        if !bounded(value, 0, &mut 0) {
-            return Err("The value exceeds validation size limits.".into());
-        }
-        validation_work(&self.schema, value, &self.schema, 0, &mut 100_000)?;
-        Ok(self.inner.is_valid(value))
-    }
-    #[cfg(test)]
-    pub fn is_valid(&self, value: &Value) -> bool {
-        self.check(value).unwrap_or(false)
-    }
     fn validate(&self, value: &Value) -> Result<(), String> {
         validation_work(&self.schema, value, &self.schema, 0, &mut 100_000)?;
         self.inner.validate(value).map_err(|e| invalid("value", &e))
@@ -229,12 +218,12 @@ mod tests {
             .contains("recursion budget"));
         let schema = json!({"$ref":"#/$defs/node","$defs":{"node":{"allOf":[{"type":"object","properties":{"child":{"$ref":"#/$defs/node"}}},{"type":"object","properties":{"child":{"$ref":"#/$defs/node"}}}]}}});
         let compiled = compile(&schema).unwrap();
-        assert!(compiled.check(&json!({"child":{"child":{}}})).unwrap());
+        assert!(compiled.validate(&json!({"child":{"child":{}}})).is_ok());
         let mut value = json!({});
         for _ in 0..20 {
             value = json!({"child":value});
         }
-        assert!(compiled.check(&value).unwrap_err().contains("work budget"));
+        assert!(compiled.validate(&value).unwrap_err().contains("work budget"));
     }
     #[test]
     fn enforces_schema_constraints_refs_and_combinations() {

@@ -7,17 +7,17 @@ const assistant = (status: Message['status'] = 'complete'): Message => ({ id: 'a
 const props = { renderMessage: (m: Message) => <p>{m.content}</p>, renderTool: (m: Message) => <p>{JSON.parse(m.content).request.name}</p> };
 it('puts collapsed reasoning and activity before the final answer', () => {
   const { container } = render(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'tool_call', { name: 'web_search' }, 's'), event(2, 'tool_result', { name: 'web_search', result: {} }, 's')]} />);
-  expect(container.textContent).toMatch(/Reasoning.*web_search.*Answer first/s);
+  expect(container.textContent).toMatch(/Thought.*web_search.*Answer first/s);
   expect(screen.getByTestId('turn-reasoning')).not.toHaveAttribute('open');
   expect(screen.getByText('web_search').closest('.activity-summary')).toBeNull();
 });
 it('keeps one reasoning disclosure mounted across streaming and completed replay', () => {
   const view = render(<ActivityTimeline {...props} messages={[assistant('streaming')]} events={[]} />);
   const disclosure = screen.getByTestId('turn-reasoning');
-  fireEvent.click(screen.getByText('Reasoning'));
+  fireEvent.click(screen.getByText('Thought'));
   view.rerender(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'reasoning', { text: 'Private thought.', durationMs: 1234 })]} />);
   expect(screen.getByTestId('turn-reasoning')).toBe(disclosure);
-  expect(screen.getByText('Reasoning · 1.2s')).toBeInTheDocument();
+  expect(screen.getByText('Thought · a few seconds')).toBeInTheDocument();
 });
 it('does not fabricate durations or replay per-round text', () => {
   const { container } = render(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'reasoning', { text: 'Thought' }), event(2, 'model_response', { content: 'Earlier commentary' })]} />);
@@ -61,6 +61,19 @@ it('preserves the complete answer when journal commentary does not match', () =>
   render(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'model_response', { content: 'Stale commentary', final: false })]} />);
   expect(screen.getAllByText('Answer first.')).toHaveLength(1);
   expect(screen.queryByText('Stale commentary')).not.toBeInTheDocument();
+});
+
+it('renders separately persisted commentary beside a final-only assistant row', () => {
+  const message = { ...assistant(), content: 'Fixed it.', reasoning: '' };
+  render(<ActivityTimeline {...props} messages={[message]} events={[
+    event(1, 'model_response', { content: 'I will inspect it.', final: false }),
+    event(2, 'tool_call', { name: 'read_file' }, 'read'),
+    event(3, 'tool_result', { result: {} }, 'read'),
+    event(4, 'model_response', { content: 'Fixed it.', final: true }),
+    event(5, 'answer_committed', { messageId: message.id, content: 'Fixed it.', format: 'final_only' }),
+  ]} />);
+  expect(screen.getAllByText('I will inspect it.')).toHaveLength(1);
+  expect(screen.getAllByText('Fixed it.')).toHaveLength(1);
 });
 
 it('keeps envelope failures visible outside the collapsed group', () => {
@@ -115,4 +128,118 @@ it('mutes intermediate round commentary while the final round keeps answer styli
   // The final round renders outside the commentary wrapper.
   const final = screen.getByText('Fixed it.');
   expect(final.closest('.activity-commentary')).toBeNull();
+});
+
+it('keeps each reasoning round between its surrounding tools and commentary', () => {
+  const events = [
+    event(1, 'reasoning', { text: 'Inspect first.', durationMs: 1200 }),
+    event(2, 'model_response', { content: 'Looking at files.', final: false }),
+    event(3, 'tool_call', { name: 'read_file' }, 'read'),
+    event(4, 'tool_result', { result: {} }, 'read'),
+    event(5, 'reasoning', { text: 'Now verify.', durationMs: 2000 }),
+    event(6, 'tool_call', { name: 'execute_command' }, 'cmd'),
+    event(7, 'tool_result', { result: {} }, 'cmd'),
+  ];
+  const message = { ...assistant(), reasoning: 'Inspect first.Now verify.', content: 'Looking at files.Done.' };
+  const { container } = render(<ActivityTimeline {...props} messages={[message]} events={[...events].reverse().concat(events[0])} />);
+  expect(container.textContent).toMatch(/Inspect first.*Looking at files.*read_file.*Now verify.*execute_command.*Done/s);
+  expect(screen.getAllByTestId('turn-reasoning')).toHaveLength(2);
+  expect(screen.getAllByText('Thought · a few seconds')).toHaveLength(2);
+});
+
+it('keeps a streaming next-round thought in place when its journal arrives', () => {
+  const events = [event(1, 'reasoning', { text: 'First.' }), event(2, 'tool_call', { name: 'web_search' }, 'search'), event(3, 'tool_result', { result: {} }, 'search')];
+  const message = { ...assistant('streaming'), reasoning: 'First.Next.', content: '' };
+  const view = render(<ActivityTimeline {...props} messages={[message]} events={events} generating />);
+  const thoughts = screen.getAllByTestId('turn-reasoning');
+  expect(view.container.textContent).toMatch(/First.*web_search.*Thinking.*Next/s);
+  view.rerender(<ActivityTimeline {...props} messages={[{ ...message, status: 'complete', content: 'Done.' }]} events={[...events, event(4, 'reasoning', { text: 'Next.', durationMs: 500 })]} />);
+  expect(screen.getAllByTestId('turn-reasoning')[1]).toBe(thoughts[1]);
+  expect(screen.getAllByText('Next.')).toHaveLength(1);
+});
+
+it('preserves unmatched reasoning without fabricating per-round timing', () => {
+  render(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'reasoning', { text: 'Stale.', durationMs: 500 })]} />);
+  expect(screen.getByText('Private thought.')).toBeInTheDocument();
+  expect(screen.queryByText('Stale.')).not.toBeInTheDocument();
+  expect(screen.queryByText('Thought · a few seconds')).not.toBeInTheDocument();
+});
+
+it('summarizes mixed exploration with search and distinct file counts', () => {
+  const names = ['search_files', 'read_file', 'read_file'];
+  const messages: Message[] = names.map((name, i) => ({ ...assistant(), id: String(i), role: 'tool', content: JSON.stringify({ request: { name, arguments: { path: 'src/app.ts' } }, result: {} }) }));
+  render(<ActivityTimeline {...props} messages={messages} events={[]} />);
+  expect(screen.getByText('Explore · 1 search, 1 file')).toBeInTheDocument();
+});
+
+it('retains tools missing from a partial journal without duplicating matched rows', () => {
+  const saved = (id: string): Message => ({ ...assistant(), id: `tool-${id}`, role: 'tool', content: JSON.stringify({ request: { name: 'read_file', callId: id, runId: 'run' }, result: {} }) });
+  const first = saved('first'), next = saved('next');
+  const events = [event(1, 'tool_call', { name: 'read_file' }, 'first')];
+  expect(activityTools(events, [first, next])).toEqual([first, next]);
+});
+
+it('preserves inspected tool details when the next reasoning round is committed', () => {
+  const events = [event(1, 'reasoning', { text: 'First.' }), event(2, 'tool_call', { name: 'execute_command' }, 'cmd'), event(3, 'tool_result', { result: {} }, 'cmd')];
+  const message = { ...assistant(), reasoning: 'First.Next.' };
+  const renderTool = () => <details data-testid="inspected-tool"><summary>Command</summary>Output</details>;
+  const view = render(<ActivityTimeline {...props} renderTool={renderTool} messages={[message]} events={events} />);
+  const detail = screen.getByTestId('inspected-tool');
+  detail.setAttribute('open', '');
+  view.rerender(<ActivityTimeline {...props} renderTool={renderTool} messages={[message]} events={[...events, event(4, 'reasoning', { text: 'Next.' })]} />);
+  expect(screen.getByTestId('inspected-tool')).toBe(detail);
+  expect(detail).toHaveAttribute('open');
+});
+
+it('keeps unjournaled tools in timestamp order between recorded commentary', () => {
+  const message = { ...assistant(), reasoning: '', content: 'Starting.Middle.Done.' };
+  const missing: Message = { ...assistant(), id: 'missing', role: 'tool', createdAt: 3, content: JSON.stringify({ request: { name: 'legacy_read' }, result: {} }) };
+  const events = [event(1, 'model_response', { content: 'Starting.', final: false }), event(5, 'model_response', { content: 'Middle.', final: false }), event(8, 'tool_call', { name: 'journal_read' }, 'recorded'), event(9, 'tool_result', { result: {} }, 'recorded')];
+  const { container } = render(<ActivityTimeline {...props} messages={[message, missing]} events={events} />);
+  expect(container.textContent).toMatch(/Starting.*legacy_read.*Middle.*journal_read.*Done/s);
+});
+
+it('does not invent a thought or duration when the provider emits no reasoning', () => {
+  render(<ActivityTimeline {...props} messages={[{ ...assistant('streaming'), reasoning: '', content: '' }]} events={[]} generating />);
+  expect(screen.queryByTestId('turn-reasoning')).not.toBeInTheDocument();
+});
+
+it('keeps provider call IDs distinct when reused in different steps of the same run', () => {
+  const events = [
+    { ...event(1, 'tool_call', { name: 'first' }, 'same'), stepId: 'step-1' },
+    { ...event(2, 'tool_result', { result: { value: 'one' } }, 'same'), stepId: 'step-1' },
+    { ...event(3, 'tool_call', { name: 'second' }, 'same'), stepId: 'step-2' },
+    { ...event(4, 'tool_result', { result: { value: 'two' } }, 'same'), stepId: 'step-2' },
+  ];
+  const saved = (stepId: string, value: string, createdAt: number): Message => ({ ...assistant(), id: `tool-${stepId}`, createdAt, role: 'tool', content: JSON.stringify({ request: { name: stepId, callId: 'same', runId: 'run', stepId }, result: { value } }) });
+  const first = saved('step-1', 'one', 2), second = saved('step-2', 'two', 4);
+  expect(activityTools(events, [second, first])).toEqual([first, second]);
+  expect(activityTools(events, []).map(message => JSON.parse(message.content).result.value)).toEqual(['one', 'two']);
+});
+
+it('places a live next-round thought after prior tools and reconciles it without remounting', async () => {
+  const { appendModelDelta } = await import('../lib/agentTranscript');
+  let live = { ...assistant('streaming'), content: '', reasoning: '' };
+  live = appendModelDelta(live, { messageId: live.id, runId: 'run', stepId: 'one', seq: 2, roundIndex: 0, content: 'Inspect.', reasoning: 'Read.' });
+  live = appendModelDelta(live, { messageId: live.id, runId: 'run', stepId: 'two', seq: 20, roundIndex: 1, content: '', reasoning: 'Verify.' });
+  const journal = [
+    { ...event(1, 'step_start', {}), stepId: 'one' },
+    { ...event(2, 'reasoning', { text: 'Read.' }), stepId: 'one' },
+    { ...event(3, 'model_response', { content: 'Inspect.', final: false }), stepId: 'one' },
+    { ...event(4, 'tool_call', { name: 'read_file' }, 'read'), stepId: 'one' },
+    { ...event(5, 'tool_result', { result: {} }, 'read'), stepId: 'one' },
+    { ...event(6, 'step_start', {}), stepId: 'two' },
+  ];
+  const view = render(<ActivityTimeline {...props} messages={[live]} events={journal} generating />);
+  expect(view.container.textContent).toMatch(/Read\..*Inspect\..*read_file.*Verify\./s);
+  const thought = screen.getAllByTestId('turn-reasoning')[1];
+  view.rerender(<ActivityTimeline {...props} messages={[live]} events={[...journal, { ...event(7, 'reasoning', { text: 'Verify.', durationMs: 1000 }), stepId: 'two' }]} generating />);
+  expect(screen.getAllByTestId('turn-reasoning')[1]).toBe(thought);
+  expect(screen.getAllByText('Verify.')).toHaveLength(1);
+});
+
+it('does not fold legacy nested partial outcomes into successful exploration', () => {
+  const tools = ['one', 'two'].map(id => ({ ...assistant(), id, role: 'tool' as const, content: JSON.stringify({ request: { name: 'read_file', arguments: { path: id } }, result: { data: { status: 'partial' } } }) }));
+  const { container } = render(<ActivityTimeline {...props} events={[]} messages={tools} />);
+  expect(container.querySelector('.activity-summary')).toBeNull();
 });

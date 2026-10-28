@@ -1,9 +1,7 @@
 use crate::{
     inference::{Backend, InferenceProvider},
-    sse::SseDecoder,
     AppState,
 };
-use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -36,197 +34,13 @@ pub enum ToolStreamEvent {
     },
 }
 
-#[derive(Default, Debug, Clone)]
-pub struct ThinkFilter {
-    pub inside_think: bool,
-    pub buffer: String,
-}
-
-impl ThinkFilter {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn is_thinking(&self) -> bool {
-        self.inside_think
-    }
-
-    /// Feeds incremental tokens and returns (answer_chunk, reasoning_chunk)
-    pub fn feed(&mut self, text: &str) -> (String, String) {
-        let mut answer = String::new();
-        let mut reasoning = String::new();
-
-        for ch in text.chars() {
-            self.buffer.push(ch);
-            let target = if self.inside_think {
-                "</think>"
-            } else {
-                "<think>"
-            };
-
-            if target.starts_with(&self.buffer) {
-                if self.buffer == target {
-                    self.buffer.clear();
-                    self.inside_think = !self.inside_think;
-                }
-            } else {
-                while !self.buffer.is_empty() && !target.starts_with(&self.buffer) {
-                    let first_char = self.buffer.remove(0);
-                    if self.inside_think {
-                        reasoning.push(first_char);
-                    } else {
-                        answer.push(first_char);
-                    }
-                }
-                if self.buffer == target {
-                    self.buffer.clear();
-                    self.inside_think = !self.inside_think;
-                }
-            }
-        }
-
-        (answer, reasoning)
-    }
-
-    pub fn flush(&mut self) -> (String, String) {
-        let mut answer = String::new();
-        let mut reasoning = String::new();
-        if !self.buffer.is_empty() {
-            if self.inside_think {
-                reasoning.push_str(&self.buffer);
-            } else {
-                answer.push_str(&self.buffer);
-            }
-            self.buffer.clear();
-        }
-        (answer, reasoning)
-    }
-}
+pub use crate::agent_engine::ThinkFilter;
 
 const FINAL_ANSWER_INSTRUCTION: &str =
     "Give the user a visible final answer now, using the conversation and tool results already collected. State any unresolved work or missing evidence honestly. Do not call tools, repeat progress updates, or expose private reasoning.";
 const EMPTY_FINAL_ANSWER_ERROR: &str =
     "The model finished without a visible answer after tool work completed. Please retry the request.";
-const RESEARCH_STALLED: &str = "Research stopped because repeated web calls made no progress or reached the research budget. Give the best answer supported by the results already collected, cite each source with its URL (https://…) where available, and clearly state any unresolved questions. Do not claim the research or unfinished plan steps are complete. Do not call tools.";
-const RESEARCH_STALLED_FALLBACK: &str = "Research stopped after repeated unproductive web calls or reaching its research budget. The model could not produce a supported final answer. The collected tool results remain available; unresolved claims have not been verified.";
 
-#[derive(Default)]
-struct ResearchProgress {
-    evidence: std::collections::HashSet<u64>,
-    domains: std::collections::HashSet<String>,
-    calls: usize,
-    stagnant: usize,
-}
-
-impl ResearchProgress {
-    fn observe(&mut self, name: &str, result: &Value) {
-        if self.stopped() {
-            return;
-        }
-        if !matches!(
-            name,
-            "web_search"
-                | "web_open"
-                | "web_fetch"
-                | "web_fetch_url"
-                | "web_find"
-                | "search"
-                | "visit"
-                | "update_context"
-        ) {
-            return;
-        }
-        self.calls += 1;
-        let before = self.evidence.len();
-        let domains_before = self.domains.len();
-        if name != "update_context" && result["isError"] != true {
-            Self::collect(result, &mut self.evidence, &mut self.domains, false);
-        }
-        // Discovery calls only make progress by surfacing a new domain.
-        // Junk-but-novel hits on the same engines (e.g. fresh arxiv papers for
-        // a weather query) used to reset the counter forever.
-        // A new passage is progress even on a domain we already saw. Repeating
-        // the same passage is not. Discovery does not require a new domain.
-        let _ = domains_before;
-        let progressed = self.evidence.len() > before;
-        self.stagnant = if progressed { 0 } else { self.stagnant + 1 };
-    }
-
-    fn collect(
-        value: &Value,
-        seen: &mut std::collections::HashSet<u64>,
-        domains: &mut std::collections::HashSet<String>,
-        evidence: bool,
-    ) {
-        use std::hash::{Hash, Hasher};
-        match value {
-            Value::Object(fields) => {
-                if fields.get("isError") == Some(&Value::Bool(true)) {
-                    return;
-                }
-                for (key, value) in fields {
-                    // ponytail: explicit evidence fields ignore query IDs/timing; extend for new web result schemas.
-                    let evidence = matches!(
-                        key.as_str(),
-                        "url"
-                            | "text"
-                            | "content"
-                            | "snippet"
-                            | "excerpt"
-                            | "excerpts"
-                            | "answer"
-                            | "markdown"
-                            | "passage"
-                            | "body"
-                    );
-                    if matches!(key.as_str(), "url" | "canonicalUrl" | "source_url") {
-                        if let Some(host) = value.as_str().and_then(Self::host_of) {
-                            domains.insert(host);
-                        }
-                    }
-                    Self::collect(value, seen, domains, evidence);
-                }
-            }
-            Value::Array(values) => {
-                for value in values {
-                    Self::collect(value, seen, domains, evidence);
-                }
-            }
-            Value::String(text) if evidence => {
-                // MCP servers can wrap structured results in a text content block.
-                if let Ok(nested) = serde_json::from_str::<Value>(text) {
-                    if nested.is_object() || nested.is_array() {
-                        Self::collect(&nested, seen, domains, false);
-                        return;
-                    }
-                }
-                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                if !normalized.is_empty() {
-                    let mut hash = std::collections::hash_map::DefaultHasher::new();
-                    normalized.hash(&mut hash);
-                    seen.insert(hash.finish());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn host_of(url: &str) -> Option<String> {
-        let host = url
-            .split("://")
-            .nth(1)?
-            .split('/')
-            .next()?
-            .split(':')
-            .next()?
-            .trim();
-        (!host.is_empty()).then(|| host.to_lowercase())
-    }
-
-    fn stopped(&self) -> bool {
-        self.stagnant >= 3 || self.calls >= 16
-    }
-}
 fn tool_execution_error(value: &Value) -> Option<String> {
     let error = value["error"]
         .as_str()
@@ -250,7 +64,6 @@ const PLAN_MODE_ACTIVE: &str =
     "Plan mode is on. Phase 1 is done. Phase 2: execute the checklist one task at a time.";
 const PLAN_IMPLEMENT_INSTRUCTION: &str = "The plan above is ready. Implement it in order, one task at a time. Work only on the current in_progress task. When it is done, mark it completed with the offered todo tools (todo_write saves the whole list) and start the next pending task. Do not skip ahead or start two tasks at once. Use the offered web tools (search/visit or web_search/web_open) for facts, and local_run_code when offered for exact math or science. Continue through the plan while making progress, then summarize the answer or call finish when offered. If evidence remains unavailable, report the unresolved steps honestly.";
 const PLAN_FOCUS_MARKER: &str = "The plan above is ready.";
-const PLAN_SEPARATOR: &str = "\n\n---\n\n";
 const EMPTY_PLAN_ERROR: &str = "The model returned an empty plan. Please retry the request.";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -443,8 +256,7 @@ fn recovery_response_budget(
         .max(current)
 }
 
-const OUTPUT_RECOVERY_LIMIT: u32 = 2;
-const RETRY_TRUNCATED_CALL: &str = "The previous response hit the output token limit before completing. No tool from that response was executed. Continue the user's task now using the available tools. Retry the unfinished call as a fresh complete call; do not assume any file was saved. Keep calls small: create a minimal working file first, then use patches to add features. Do not paste the entire program in chat or ask the user to say go again.";
+use crate::agent_engine::{OUTPUT_RECOVERY_LIMIT, RETRY_TRUNCATED_CALL};
 
 pub enum TextCallDecision {
     Execute(crate::tool_calls::ToolCalls),
@@ -566,32 +378,6 @@ fn repetition_cut(text: &str) -> Option<usize> {
     (n - start >= MIN_REPEAT).then(|| map[start])
 }
 
-/// Deterministic citation footer for a stalled research answer that reached
-/// the user without URL citations: the collected evidence still identifies
-/// the sources consulted.
-fn sources_footer(evidence: &[(String, String)]) -> Option<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut urls = Vec::new();
-    for (url, _) in evidence {
-        let url = url.trim();
-        if url.is_empty() || !seen.insert(url.to_string()) {
-            continue;
-        }
-        urls.push(url.to_string());
-        if urls.len() >= 8 {
-            break;
-        }
-    }
-    if urls.is_empty() {
-        return None;
-    }
-    let mut footer = String::from("\n\nSources consulted:\n");
-    for url in urls {
-        footer.push_str(&format!("- {url}\n"));
-    }
-    Some(footer)
-}
-
 /// Deterministic claim audit shared by the `finish` path and plain-text
 /// research completions. `args` carries the answer plus any model-cited
 /// evidences. Returns the formatted footer and logs the report; failures
@@ -675,10 +461,7 @@ async fn present_research_answer(
             display.push_str(&footer);
         }
     }
-    if !answer.trim().is_empty() {
-        answer.push_str("\n\n");
-    }
-    answer.push_str(&display);
+    commit_final_answer(state, run, step_id, conversation_id, assistant_id, answer, &display)?;
     *seq += 1;
     channel
         .send(ChatEvent::new(
@@ -693,6 +476,31 @@ async fn present_research_answer(
             None,
         ))
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Commentary is already journaled by round. Store only the final answer in
+/// the assistant row, with an explicit marker for legacy-compatible rendering.
+fn commit_final_answer(
+    state: &AppState,
+    run: &crate::agent_run::RunRecord,
+    step_id: &str,
+    conversation_id: &str,
+    assistant_id: &str,
+    answer: &mut String,
+    final_answer: &str,
+) -> Result<(), String> {
+    let store = state.database()?;
+    let event = crate::sessions::SessionEvent {
+        id: uuid::Uuid::new_v4().to_string(), conversation_id: conversation_id.into(),
+        run_id: Some(run.id.clone()), seq: 0, step_id: Some(step_id.into()), tool_call_id: None,
+        event_type: "answer_committed".into(),
+        payload: json!({"messageId":assistant_id,"content":final_answer,"format":"final_only"}),
+        ignorable: false, created_at: crate::store::now(),
+    };
+    let seq = store.append_session_event(&event)?;
+    *answer = final_answer.into();
+    crate::sessions::notify_activity(conversation_id, seq);
     Ok(())
 }
 
@@ -801,6 +609,10 @@ async fn run_finish_call(
 #[serde(rename_all = "camelCase")]
 pub struct ChatEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub discard_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome:Option<crate::agent_engine::RunOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<crate::presentation::Record>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -853,6 +665,8 @@ impl ChatEvent {
             elapsed_secs: None,
             round_index: None,
             presentation: None,
+            discard_step: None,
+            outcome:None,
             tool_stream: None,
         }
     }
@@ -883,6 +697,8 @@ impl ChatEvent {
             elapsed_secs: None,
             round_index: None,
             presentation: None,
+            discard_step: None,
+            outcome:None,
             tool_stream: None,
         }
     }
@@ -931,7 +747,6 @@ pub struct TurnPlan {
     pub skill_instructions: String,
     /// The workspace's published instruction files (AGENTS.md chain).
     pub project_instructions: String,
-    pub ptc_sdk: Option<String>,
     pub preferences: crate::store::Preferences,
     /// Replayed conversation history without the current draft message.
     pub history: Vec<Value>,
@@ -1149,7 +964,7 @@ pub(crate) async fn assemble_turn(
             };
             match crate::execution::LocalExecution::new(config, &path) {
                 Ok(execution) => {
-                    let exec = std::sync::Arc::new(execution);
+                    let exec = std::sync::Arc::new(execution.supervised(state.processes.clone(),conversation_id));
                     if preset.id != crate::presets::MINIMAL && exec.code_available() && !preset.harness.iter().any(|name| name == "run_code") { tools.push(exec.clone().tool()); }
                     if preset.id != crate::presets::MINIMAL && exec.command_available() { tools.push(exec.clone().command_tool()); }
                     local_execution = Some(exec);
@@ -1327,7 +1142,7 @@ pub(crate) async fn assemble_turn(
                     }
                 }
             }
-            crate::development_tools::configure_tool(&mut tool, &*state.database()?)?;
+            crate::process_tools::configure_tool(&mut tool, &execution_config);
             if (web_disabled || offline) && alias == "web_read" {
                 if let Some(properties) = tool.tool.input_schema["properties"].as_object_mut() {
                     properties.remove("url");
@@ -1348,14 +1163,6 @@ pub(crate) async fn assemble_turn(
             ) && execution_config.bash.always_ask
             {
                 tool.tool.input_schema["x-locallm-always-ask"] = json!(true);
-            }
-            if crate::debug_tools::owns(alias) || crate::development_tools::execution_tool(alias) {
-                if !execution_config.bash.enabled && alias != "debugger_stop" {
-                    continue;
-                }
-                if execution_config.bash.always_ask {
-                    tool.tool.input_schema["x-locallm-always-ask"] = json!(true);
-                }
             }
             tools.push(tool);
         }
@@ -1494,7 +1301,7 @@ pub(crate) async fn assemble_turn(
             runtime.endpoint.clone(),
             runtime.api_key.clone(),
             runtime.context_length,
-        )?
+        )?.with_local_model(runtime.status.model_path.as_deref().unwrap_or_default())
     };
     if use_computer && !supports_images && tools.iter().any(|tool| tool.connector == "Computer") {
         return Err("Computer use requires a model with image input. Load a vision projector or select a provider model with image support, or deselect Computer use in Tools.".into());
@@ -1511,6 +1318,11 @@ pub(crate) async fn assemble_turn(
     // Volatile injections ride on the current user draft so strict templates see
     // one leading system message and the prompt cache keeps the frozen prefix.
     let mut injections: Vec<(String, String)> = Vec::new();
+    if !workspace_path.is_empty() {
+        injections.push(("workspace_root".into(), format!(
+            "The active workspace root is {workspace_path}. File paths are relative to this root. Process tools start here by default; omit cwd unless selecting a subdirectory. Instruction files may name an ancestor repository; that path does not replace the active workspace."
+        )));
+    }
     if !workspace_path.is_empty() {
         if let Ok(hits) =
             crate::document_index::retrieve(&*state.database()?, &workspace_path, content)
@@ -1605,6 +1417,7 @@ pub(crate) async fn assemble_turn(
                 &store.model_contents(conversation_id)?,
             )?,
         };
+        if let Some(checkpoint)=&checkpoint {crate::compaction::restore_checkpoint(&store,&mut history,&checkpoint.artifact_id)?;}
         crate::automation::remove_model_images(&mut history);
         if !supports_images
             && (draft_content.is_array()
@@ -1704,15 +1517,6 @@ pub(crate) async fn assemble_turn(
         injections.push(("tool_discovery".into(),"Some authorized tool schemas are deferred to keep the request bounded. Use tool_search to find names and exact input schemas, then tool_invoke to call a discovered tool. Its original validation, approvals and audit still apply. Discovery does not change the advertised schema set or broaden selected sources.".into()));
     }
     crate::prompt::sort_tools_by_alias(&mut tools);
-    let ptc_sdk = if preset.id == crate::presets::CODE {
-        let aliases: Vec<String> = crate::tool_discovery::advertised(tools.iter())
-            .into_iter()
-            .map(|tool| tool.alias.clone())
-            .collect();
-        Some(crate::presets::ts_sdk(&aliases))
-    } else {
-        None
-    };
     let selection_hash = {
         let tools_value = if exists {
             serde_json::to_value(state.database()?.conversation_tools(conversation_id)?)
@@ -1761,7 +1565,6 @@ pub(crate) async fn assemble_turn(
         injections,
         skill_instructions,
         project_instructions,
-        ptc_sdk,
         preferences,
         history,
         draft_message: json!({"role": "user", "content": draft_content}),
@@ -1781,6 +1584,7 @@ fn freeze_tool_catalog(
     hash: String,
     tools: &mut [crate::connectors::AgentTool],
 ) -> Result<Vec<Value>, String> {
+    let hash = format!("{}:{hash}", crate::tool_discovery::CONTRACT_VERSION);
     crate::prompt::sort_tools_by_alias(tools);
     let advertised = crate::tool_discovery::advertised(tools.iter());
     let aliases: Vec<String> = advertised.iter().map(|tool| tool.alias.clone()).collect();
@@ -1823,7 +1627,7 @@ fn frozen_system_for(plan: &TurnPlan) -> String {
         &plan.preferences.system_prompt,
         &plan.skill_instructions,
         &plan.project_instructions,
-        plan.ptc_sdk.as_deref(),
+        None,
         &aliases,
         false, // Specifications belong to the isolated final-answer pass.
     )
@@ -1894,7 +1698,7 @@ async fn measure_context_breakdown(
         &plan.preferences.system_prompt,
         "",
         &plan.project_instructions,
-        plan.ptc_sdk.as_deref(),
+        None,
         &aliases,
         false,
     )})];
@@ -1967,2427 +1771,9 @@ fn conversation_cache_hit_rate(
     (input > 0).then(|| cached as f64 / input as f64)
 }
 
-/// The mutable state one model turn's round loop carries.
-///
-/// The round loop was previously an inline async block inside
-/// `send_message_inner`, which made the turn orchestration a single
-/// 1,700-line function. Holding the state in one struct lets the loop be a
-/// named, testable unit and keeps the call site readable.
-struct TurnRounds<'a> {
-    state: &'a AppState,
-    channel: &'a Channel<ChatEvent>,
-    run: &'a mut crate::agent_run::RunRecord,
-    assistant: &'a crate::store::Message,
-    conversation_id: String,
-    plan: &'a TurnPlan,
-    messages: &'a mut Vec<serde_json::Value>,
-    answer: &'a mut String,
-    reasoning: &'a mut String,
-    research_fallback: Option<String>,
-    web_lookup_retried: bool,
-    finalization_retried: bool,
-    replay_answer: Option<serde_json::Value>,
-    last_model_message_id: String,
-    response_metrics: &'a mut crate::inference::ResponseMetrics,
-    active_measurement: &'a mut Option<(Instant, crate::inference::InferenceRound)>,
-    input_tokens: u64,
-    breakdown: ContextBreakdown,
-    compacted_once: Option<String>,
-    /// The event sequence counter for this turn.
-    seq: u32,
-    plan_mode: bool,
-    presentation_mode: crate::presentation::Mode,
-    cancellation: tokio::sync::watch::Receiver<bool>,
-    run_generation: u64,
-    access_mode: crate::permissions::AccessMode,
-    preset_id: String,
-    content: &'a str,
-    snapshot: &'a mut crate::subagents::BackendSnapshot,
-    response_started: Instant,
-}
-
-impl<'a> TurnRounds<'a> {
-    async fn run(&mut self) -> Result<bool, String> {
-        // Bind the turn state to locals with the names the loop body uses, so
-        // the body reads exactly as it did when it was an inline block.
-        let state = self.state;
-        let channel = self.channel;
-        let run = &mut *self.run;
-        let assistant = self.assistant;
-        let conversation_id = self.conversation_id.clone();
-        let plan = self.plan;
-        let messages = &mut *self.messages;
-        let answer = &mut *self.answer;
-        let reasoning = &mut *self.reasoning;
-        let response_metrics = &mut *self.response_metrics;
-        let mut active_measurement = &mut *self.active_measurement;
-        let plan_mode = self.plan_mode;
-        let _presentation_mode = self.presentation_mode;
-        let mut cancellation = self.cancellation.clone();
-        let run_generation = self.run_generation;
-        let _access_mode = self.access_mode;
-        let preset_id = self.preset_id.clone();
-        let content = self.content;
-        let snapshot = &mut *self.snapshot;
-        let response_started = self.response_started;
-        self.seq += 1;
-        channel
-            .send(ChatEvent::new(
-                run,
-                None,
-                self.seq,
-                "Preparing turn",
-                &assistant.id,
-                "",
-                "",
-                None,
-                None,
-            ))
-            .map_err(|error| error.to_string())?;
-
-        let mut tool_use_denied = false;
-        // Loop-hygiene streaks: consecutive identical calls, guarded centrally.
-        let mut recent_calls: Vec<(String, String)> = Vec::new();
-        let mut research_progress = ResearchProgress::default();
-        let mut research_evidence: Vec<(String, String)> = Vec::new();
-        // The turn's budget cell is shared: nested dispatch paths (plan
-        // steps, parallel reads) charge searches/fetches against the same
-        // counters before they run, so loops cannot overspend the turn.
-        let budgets = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::continuation::Budgets::default(),
-        ));
-        if let Ok(mut map) = state.turn_budgets.lock() {
-            map.insert(run.id.clone(), budgets.clone());
-        }
-        let _budget_registration = TurnBudgetRegistration {
-            map: &state.turn_budgets,
-            run_id: run.id.clone(),
-        };
-        let mut corrections_used = 0u32;
-        // Plan mode: mutating tools refuse until plan_submit is approved.
-        let mut plan_approved = false;
-        // Verify-before-finish: a successful workspace write sets this and a
-        // dispatched check_run clears it; at most one nudge per run.
-        let mut verify_dirty = false;
-        let mut check_nudged = false;
-        let check_run_offered = plan.tools.iter().any(|tool| tool.alias == "check_run");
-        let mut repairs_used = 0u32;
-        let mut output_recoveries = 0u32;
-        let mut round_preferences = plan.preferences.clone();
-        // Non-retryable signatures are shared for the run: nested dispatch
-        // paths refuse to replay them even inside a later plan in this turn.
-        let blocked_calls = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashSet::<String>::new(),
-        ));
-        if let Ok(mut map) = state.turn_blocked.lock() {
-            map.insert(run.id.clone(), blocked_calls.clone());
-        }
-        let _blocked_registration = TurnBlockedRegistration {
-            map: &state.turn_blocked,
-            run_id: run.id.clone(),
-        };
-        let mut paused_exit = false;
-        let mut evidence_note: Option<String> = None;
-        let question = content.chars().take(4000).collect::<String>();
-        let mut ledger = crate::research_tasks::ResearchTask::new(
-            &conversation_id,
-            if question.trim().is_empty() {
-                "continue"
-            } else {
-                &question
-            },
-            crate::research_tasks::TaskBudgets::default(),
-        )
-        .ok();
-        if let Some(task) = ledger.as_ref() {
-            save_ledger(state, task);
-        }
-        for round in 0..budgets.lock().map(|b| b.max_rounds).unwrap_or(64) as usize {
-            // Only the last executed round may provide the saved model content;
-            // an earlier round's value must not survive into a finishing exit.
-            self.replay_answer = None;
-            if cancel_applies(state, run_generation) {
-                return Ok(false);
-            }
-            if state
-                .run_control
-                .lock()
-                .map(|control| control.pause)
-                .unwrap_or(false)
-            {
-                if let Some(task) = ledger.as_mut() {
-                    if task.status == crate::research_tasks::TaskStatus::Running {
-                        task.pending_work.push(
-                            "Continue the interrupted request from the saved checkpoint.".into(),
-                        );
-                        let _ = task.pause();
-                        save_ledger(state, task);
-                    }
-                }
-                return Ok(false);
-            }
-            let step_id = format!("step-{round}");
-            // Capture the workspace before the step so a bad edit can be
-            // reverted to the state the user left it in. The capture is
-            // best-effort: a failed snapshot must never stop the turn.
-            let snapshot_paths = match state.database() {
-                Ok(store) => crate::snapshots::tracked_paths(&store, &conversation_id),
-                Err(_) => Vec::new(),
-            };
-            if !snapshot_paths.is_empty() && !snapshot.workspace_path.is_empty() {
-                if let Ok(store) = state.database() {
-                    let _ = crate::snapshots::capture(
-                        &store,
-                        &conversation_id,
-                        round as i64,
-                        std::path::Path::new(&snapshot.workspace_path),
-                        &snapshot_paths,
-                    );
-                }
-            }
-            // Plan mode gates mutating tools behind plan_submit approval;
-            // read-only tools stay offered for investigation, so there is no
-            // tool-free planning pass anymore.
-            let planning = false;
-            if plan_mode && round > 0 {
-                if let Ok(todos) = state.database()?.todos(&conversation_id) {
-                    refresh_plan_focus(messages, &todos);
-                }
-            }
-            let finalizing = self.research_fallback.is_some()
-                || self.finalization_retried
-                || budgets
-                    .lock()
-                    .map(|b| b.reserve_final_response())
-                    .unwrap_or(true);
-            if budgets
-                .lock()
-                .map(|b| b.reserve_final_response())
-                .unwrap_or(true)
-                && self.research_fallback.is_none()
-            {
-                self.research_fallback = Some("Partial result. The model round budget is exhausted. State the completed work and name unresolved steps without claiming completion.".into());
-                messages.push(json!({"role":"user","content":self.research_fallback.as_deref().unwrap_or_default()}));
-            }
-            if let Ok(mut b) = budgets.lock() {
-                b.note_round();
-            }
-            let _ = run.transition_to(crate::agent_run::RunState::Generating);
-            let _ = state
-                .database()?
-                .update_run_status(&run.id, run.status, None, Some(&step_id));
-            self.seq += 1;
-            let _ = state
-                .database()?
-                .append_run_event(&crate::agent_run::RunEvent {
-                    run_id: run.id.clone(),
-                    seq: self.seq as u64,
-                    step_id: step_id.clone(),
-                    tool_call_id: None,
-                    event_type: "step_start".into(),
-                    payload: json!({"round": round}),
-                    created_at: crate::store::now(),
-                });
-            if let Ok(store) = state.database() {
-                emit_session_event(
-                    &store,
-                    &conversation_id,
-                    Some(&run.id),
-                    Some(&step_id),
-                    None,
-                    "step_start",
-                    json!({"round": round}),
-                    false,
-                );
-            }
-
-            if round > 0 {
-                let (tokens, compacted, breakdown) = tokio::select! {
-                    _ = cancellation.changed() => return Ok(false),
-                    result = prepare_context(state, plan, &round_preferences, &conversation_id, messages, tool_use_denied, finalizing) => result?,
-                };
-                self.input_tokens = tokens;
-                self.breakdown = breakdown;
-                if let Some(artifact) = compacted {
-                    let store = state.database()?;
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        None,
-                        "compaction",
-                        json!({"artifact":artifact,"auto":true,"thresholdPercent":80,"inputTokens":tokens}),
-                        false,
-                    );
-                    let mut event = ChatEvent::progress(
-                        &run.id,
-                        &step_id,
-                        &assistant.id,
-                        "Context compacted · continuing…",
-                        None,
-                    );
-                    event.notice = Some("Context reached 80%. Older activity was archived; continuing this response.".into());
-                    channel.send(event).map_err(|e| e.to_string())?;
-                }
-            } else if self.compacted_once.is_some() {
-                let mut event = ChatEvent::progress(
-                    &run.id,
-                    &step_id,
-                    &assistant.id,
-                    "Context compacted · continuing…",
-                    None,
-                );
-                event.notice = Some(
-                    "Context reached 80%. Older activity was archived; continuing this response."
-                        .into(),
-                );
-                let _ = channel.send(event);
-            }
-            let payload = plan.backend.payload(&request_payload(
-                messages,
-                &plan.tool_definitions,
-                &round_preferences,
-                tool_use_denied,
-                finalizing,
-                planning,
-                plan.id_slot,
-                plan.local_arex(),
-            ))?;
-            self.seq += 1;
-            let _ = channel.send(ChatEvent::new(
-            run,
-            Some(&step_id),
-            self.seq,
-            if planning { "Creating plan…" } else { "Generating response…" },
-            &assistant.id,
-            "",
-            "",
-            Some(json!({"inputTokens":self.input_tokens,"responseReserve":round_preferences.max_tokens,"contextLength":plan.context_length,"estimated":plan.backend.context_is_estimate(),"breakdown":self.breakdown,"avgCacheHitRate":conversation_cache_hit_rate(state, &conversation_id, None)})),
-            None,
-        ));
-
-            if response_metrics.preparation_ms.is_none() {
-                response_metrics.preparation_ms =
-                    Some(response_started.elapsed().as_secs_f64() * 1000.0);
-            }
-            let round_start_time = Instant::now();
-            *active_measurement = Some((
-                round_start_time,
-                crate::inference::InferenceRound {
-                    phase: None,
-                    usage: Default::default(),
-                    first_token_ms: None,
-                    first_visible_answer_ms: None,
-                    reasoning_ms: None,
-                    duration_ms: 0.0,
-                    complete: false,
-                },
-            ));
-            let response = tokio::select! {
-                _ = cancellation.changed() => return Ok(false),
-                result = tokio::time::timeout(Duration::from_secs(600), plan.backend.stream(&payload)) => result.map_err(|_| "Model did not respond within ten minutes.")??,
-            };
-            let mut stream = response.bytes_stream();
-            let mut decoder = SseDecoder::default();
-            let mut protocol = crate::sse::ModelStream::for_backend(&plan.backend);
-            let mut usage = crate::inference::InferenceUsage::default();
-            let mut checkpoint = Instant::now();
-            let mut calls = crate::tool_calls::ToolCalls::default();
-            let mut round_answer = String::new();
-            let mut round_reasoning = String::new();
-            let mut reasoning_started: Option<Instant> = None;
-            let mut reasoning_last: Option<Instant> = None;
-            let mut finish_reason = String::new();
-            let mut think_filter = ThinkFilter::new();
-            // A call attempt on a no-tool round is not a visible answer — but
-            // its markup is stripped from the answer text all the same.
-            let mut suppressed_call = false;
-            // A finalizing round whose calls were suppressed is already
-            // recorded in the transcript. The retry path must not record the
-            // same round a second time.
-            let mut suppressed_round_recorded = false;
-            let answer_len_before_round = answer.len();
-            // The verbatim-loop detector needs enough output to compare; it
-            // then runs once per further ~1 KiB of generated text.
-            let mut next_rep_check = 1_200usize;
-            let mut repetition_stopped = false;
-            'stream: loop {
-                let next = tokio::select! {
-                    _ = cancellation.changed() => return Ok(false),
-                    next = tokio::time::timeout(Duration::from_secs(300), stream.next()) => next.map_err(|_| "Model stopped responding.")?,
-                };
-                let Some(bytes) = next else {
-                    decoder.finish()?;
-                    return Err("Model stream ended without a completion marker.".into());
-                };
-                for event in decoder.push(&bytes.map_err(|error| error.to_string())?)? {
-                    let value = protocol.push(&event)?;
-                    let Some(value) = value else {
-                        if protocol.done {
-                            break 'stream;
-                        }
-                        continue;
-                    };
-                    if let Some(error) = value.get("error") {
-                        return Err(plan.backend.stream_error(error));
-                    }
-                    usage.observe(&value);
-                    if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
-                        finish_reason = reason.to_string();
-                    }
-                    let delta = &value["choices"][0]["delta"];
-                    calls.push(delta)?;
-                    let raw_content = delta["content"].as_str().unwrap_or("");
-                    let api_thought = delta["reasoning_content"]
-                        .as_str()
-                        .or_else(|| delta["reasoning"].as_str())
-                        .unwrap_or("");
-                    if let Some((_, measurement)) = &mut active_measurement {
-                        measurement.usage = usage.clone();
-                        let tool_token = delta["tool_calls"].as_array().is_some_and(|calls| {
-                            calls.iter().any(|call| {
-                                call["function"]["arguments"]
-                                    .as_str()
-                                    .is_some_and(|s| !s.is_empty())
-                                    || call["function"]["name"]
-                                        .as_str()
-                                        .is_some_and(|s| !s.is_empty())
-                            })
-                        });
-                        if measurement.first_token_ms.is_none()
-                            && (!raw_content.is_empty() || !api_thought.is_empty() || tool_token)
-                        {
-                            measurement.first_token_ms =
-                                Some(round_start_time.elapsed().as_secs_f64() * 1000.0);
-                        }
-                    }
-
-                    let (ans_chunk, filter_thought) = think_filter.feed(raw_content);
-                    let mut thought_chunk = filter_thought;
-                    if !api_thought.is_empty() {
-                        thought_chunk.push_str(api_thought);
-                    }
-
-                    if !thought_chunk.is_empty() {
-                        let now = Instant::now();
-                        reasoning_started.get_or_insert(now);
-                        reasoning_last = Some(now);
-                    }
-                    if let Some((_, measurement)) = &mut active_measurement {
-                        if !ans_chunk.trim().is_empty()
-                            && measurement.first_visible_answer_ms.is_none()
-                        {
-                            measurement.first_visible_answer_ms =
-                                Some(response_started.elapsed().as_secs_f64() * 1000.0);
-                        }
-                        measurement.reasoning_ms = reasoning_started
-                            .zip(reasoning_last)
-                            .map(|(start, end)| end.duration_since(start).as_secs_f64() * 1000.0);
-                    }
-                    answer.push_str(&ans_chunk);
-                    round_answer.push_str(&ans_chunk);
-                    reasoning.push_str(&thought_chunk);
-                    round_reasoning.push_str(&thought_chunk);
-                    if answer.len() + reasoning.len() > 4_194_304 {
-                        return Err("Model output exceeded 4 MiB.".into());
-                    }
-                    if round_answer.len() >= next_rep_check {
-                        next_rep_check = round_answer.len() + 1024;
-                        // A loop may have re-emitted the block more than once;
-                        // keep cutting until only the first copy remains.
-                        let mut removed = 0usize;
-                        while let Some(cut) = repetition_cut(&round_answer) {
-                            removed += round_answer.len() - cut;
-                            round_answer.truncate(cut);
-                        }
-                        if removed > 0 {
-                            repetition_stopped = true;
-                            answer.truncate(answer.len().saturating_sub(removed));
-                            let mut event = ChatEvent::progress(
-                                &run.id,
-                                &step_id,
-                                &assistant.id,
-                                "Stopping repeated output…",
-                                None,
-                            );
-                            event.notice = Some("The model began repeating its earlier output verbatim; the repeated text was removed.".into());
-                            let _ = channel.send(event);
-                            break 'stream;
-                        }
-                    }
-                    if !ans_chunk.is_empty() || !thought_chunk.is_empty() {
-                        self.seq += 1;
-                        let elapsed_secs = round_start_time.elapsed().as_secs_f64();
-                        let mut evt = ChatEvent::new(
-                            run,
-                            Some(&step_id),
-                            self.seq,
-                            if think_filter.is_thinking() || !thought_chunk.is_empty() {
-                                "Thinking…"
-                            } else if planning {
-                                "Drafting plan…"
-                            } else {
-                                "Streaming response…"
-                            },
-                            &assistant.id,
-                            &ans_chunk,
-                            &thought_chunk,
-                            None,
-                            None,
-                        );
-                        evt.elapsed_secs = Some(elapsed_secs);
-                        evt.round_index = Some(round);
-                        channel.send(evt).map_err(|error| error.to_string())?;
-                    }
-                    if checkpoint.elapsed() > Duration::from_millis(500) {
-                        state.database()?.update_message(
-                            &assistant.id,
-                            answer,
-                            reasoning,
-                            "streaming",
-                        )?;
-                        checkpoint = Instant::now();
-                    }
-                    if protocol.done {
-                        break 'stream;
-                    }
-                }
-            }
-            if repetition_stopped {
-                if !calls.is_empty() {
-                    return Err("Model output repeated before its tool calls completed. Unfinished tool calls were not executed.".into());
-                }
-                finish_reason = "stop".into();
-            }
-            if let Some((start, mut measurement)) = active_measurement.take() {
-                measurement.duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-                measurement.complete = !repetition_stopped;
-                response_metrics.rounds.push(measurement);
-            }
-            if usage.reported() {
-                let mut context = usage.context(
-                    self.input_tokens,
-                    round_preferences.max_tokens,
-                    plan.context_length,
-                    plan.backend.context_is_estimate(),
-                );
-                context["breakdown"] = serde_json::to_value(self.breakdown).unwrap_or_default();
-                context["avgCacheHitRate"] = json!(conversation_cache_hit_rate(
-                    state,
-                    &conversation_id,
-                    Some(&usage)
-                ));
-                self.seq += 1;
-                let _ = channel.send(ChatEvent::new(
-                    run,
-                    Some(&step_id),
-                    self.seq,
-                    "Model usage measured",
-                    &assistant.id,
-                    "",
-                    "",
-                    Some(context),
-                    None,
-                ));
-                if let Ok(store) = state.database() {
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        None,
-                        "inference_usage",
-                        json!({"round":round,"usage":usage}),
-                        false,
-                    );
-                }
-            }
-            let (flush_ans, flush_th) = think_filter.flush();
-            if !flush_ans.is_empty() || !flush_th.is_empty() {
-                if let Some(measurement) = response_metrics.rounds.last_mut() {
-                    if measurement.first_visible_answer_ms.is_none() && !flush_ans.trim().is_empty()
-                    {
-                        measurement.first_visible_answer_ms =
-                            Some(response_started.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    if !flush_th.is_empty() {
-                        let now = Instant::now();
-                        reasoning_started.get_or_insert(now);
-                        reasoning_last = Some(now);
-                        measurement.reasoning_ms = reasoning_started
-                            .zip(reasoning_last)
-                            .map(|(start, end)| end.duration_since(start).as_secs_f64() * 1000.0);
-                    }
-                }
-                answer.push_str(&flush_ans);
-                round_answer.push_str(&flush_ans);
-                reasoning.push_str(&flush_th);
-                round_reasoning.push_str(&flush_th);
-                self.seq += 1;
-                let mut evt = ChatEvent::new(
-                    run,
-                    Some(&step_id),
-                    self.seq,
-                    "Streaming response…",
-                    &assistant.id,
-                    &flush_ans,
-                    &flush_th,
-                    None,
-                    None,
-                );
-                evt.elapsed_secs = Some(round_start_time.elapsed().as_secs_f64());
-                evt.round_index = Some(round);
-                let _ = channel.send(evt);
-            }
-            if planning {
-                // No tools were offered in this round, so its answer is the
-                // plan. Park it in the transcript, then let the ordinary tool
-                // loop run Phase 2 from the next round on.
-                check_finish_reason(&finish_reason)?;
-                begin_plan_implementation(messages, &round_answer)?;
-                // Native backends keep the planning round's own output items
-                // (including reasoning) for the implementation rounds.
-                let plan_message = protocol.assistant_message(round_answer.trim(), &[]);
-                if crate::history::saved_native_message(&plan_message).is_some() {
-                    if let Some(slot) = messages
-                        .iter_mut()
-                        .rev()
-                        .find(|message| message["role"] == "assistant")
-                    {
-                        *slot = plan_message;
-                    }
-                }
-                let plan_text = round_answer.trim();
-                if let Ok(store) = state.database() {
-                    let existing = store.todos(&conversation_id).unwrap_or_default();
-                    if existing.is_empty() {
-                        let seeded = crate::plans::parse_plan_steps(plan_text);
-                        if !seeded.is_empty() {
-                            let _ = store.save_todos(&conversation_id, &seeded);
-                        }
-                    }
-                    if let Ok(todos) = store.todos(&conversation_id) {
-                        refresh_plan_focus(messages, &todos);
-                    }
-                }
-                answer.push_str(PLAN_SEPARATOR);
-                state
-                    .database()?
-                    .update_message(&assistant.id, answer, reasoning, "streaming")?;
-                if let Ok(store) = state.database() {
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        None,
-                        "plan_created",
-                        json!({"round": round, "chars": plan_text.len(), "content": plan_text}),
-                        false,
-                    );
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        None,
-                        "step_end",
-                        json!({"round": round, "phase": "plan", "toolCallsCount": 0}),
-                        false,
-                    );
-                }
-                let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
-                state
-                    .database()?
-                    .update_run_status(&run.id, run.status, None, Some(&step_id))?;
-                self.seq += 1;
-                channel
-                    .send(ChatEvent::new(
-                        run,
-                        Some(&step_id),
-                        self.seq,
-                        "Plan ready · implementing…",
-                        &assistant.id,
-                        PLAN_SEPARATOR,
-                        "",
-                        None,
-                        None,
-                    ))
-                    .map_err(|error| error.to_string())?;
-                continue;
-            }
-            // Handle length BEFORE empty-answer finalization and text-call repair.
-            // Otherwise a thinking-only cutoff disables tools on the next round,
-            // and an unfinished file call can never become a real write.
-            if finish_reason == "length" {
-                if finalizing || tool_use_denied || output_recoveries >= OUTPUT_RECOVERY_LIMIT {
-                    check_finish_reason(&finish_reason)?;
-                }
-                output_recoveries += 1;
-                let unfinished_call = !calls.is_empty() || is_text_tool_call(&round_answer);
-                if unfinished_call {
-                    // Do not replay invalid provider items or malformed JSON, and
-                    // never dispatch any sibling calls from this truncated batch.
-                    answer.truncate(answer_len_before_round);
-                } else if !round_answer.trim().is_empty() {
-                    let continued = protocol.assistant_message(&round_answer, &[]);
-                    messages.push(
-                        if crate::history::saved_native_message(&continued).is_some() {
-                            continued
-                        } else {
-                            json!({"role":"assistant","content":round_answer})
-                        },
-                    );
-                }
-                messages.push(json!({"role":"user","content":if unfinished_call || round_answer.trim().is_empty() {
-                RETRY_TRUNCATED_CALL
-            } else {
-                crate::prompt::CONTINUE_INSTRUCTION
-            }}));
-                // API rounds already request the configured model maximum (or
-                // omit the limit for a provider-managed default). Recovery must
-                // neither override that choice nor impose the local 32K ceiling.
-                let previous_budget = round_preferences.max_tokens;
-                if matches!(&plan.backend, Backend::Local { .. }) {
-                    round_preferences.max_tokens = recovery_response_budget(
-                        previous_budget,
-                        self.input_tokens,
-                        plan.context_length,
-                        None,
-                    );
-                }
-                let store = state.database()?;
-                emit_session_event(
-                    &store,
-                    &conversation_id,
-                    Some(&run.id),
-                    Some(&step_id),
-                    None,
-                    "step_end",
-                    json!({"continuing":true,"reason":"response_token_limit",
-                    "retry":output_recoveries,"unfinishedToolCall":unfinished_call,
-                    "responseReserve":round_preferences.max_tokens}),
-                    false,
-                );
-                let mut notice = ChatEvent::progress(
-                    &run.id,
-                    &step_id,
-                    &assistant.id,
-                    "Output limit reached · retrying…",
-                    None,
-                );
-                let continuation = if round_preferences.max_tokens > previous_budget {
-                    "Continuing with a larger response budget."
-                } else {
-                    "Continuing in another response."
-                };
-                notice.notice = Some(format!(
-                    "The model reached this response's output limit. {continuation}{}",
-                    if unfinished_call {
-                        " Unfinished tool calls were not executed."
-                    } else {
-                        ""
-                    }
-                ));
-                let _ = channel.send(notice);
-                let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
-                store.update_run_status(&run.id, run.status, None, Some(&step_id))?;
-                continue;
-            }
-            let mut text_parsed_calls = false;
-            if !finalizing && calls.is_empty() {
-                match decide_text_tool_call(&round_answer, repairs_used) {
-                    // Some templates (AREX-family) emit literal tool-call text;
-                    // execute it through the normal permissioned dispatch.
-                    TextCallDecision::Execute(parsed) => {
-                        calls = parsed;
-                        text_parsed_calls = true;
-                        let stripped = crate::tool_calls::strip_text_tool_calls(&round_answer);
-                        if answer.ends_with(&round_answer) {
-                            answer.truncate(answer.len() - round_answer.len());
-                            answer.push_str(&stripped);
-                        }
-                        round_answer = stripped;
-                    }
-                    TextCallDecision::Repair { error } => {
-                        repairs_used += 1;
-                        answer.truncate(answer_len_before_round);
-                        let repaired = protocol.assistant_message(&round_answer, &[]);
-                        if crate::history::saved_native_message(&repaired).is_some() {
-                            messages.push(repaired);
-                        }
-                        messages.push(json!({"role":"user","content":format!("The previous tool call was malformed and was not executed. Validation error: {error}. Reply with one valid tool call or a final answer.")}));
-                        let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
-                        state.database()?.update_run_status(
-                            &run.id,
-                            run.status,
-                            None,
-                            Some(&step_id),
-                        )?;
-                        continue;
-                    }
-                    TextCallDecision::Fail { error } => {
-                        return Err(format!(
-                            "Tool call repair failed: {error}. Later turns can still call tools."
-                        ));
-                    }
-                    TextCallDecision::NotACall => {}
-                }
-            }
-            check_finish_reason(&finish_reason)?;
-            if !finalizing
-                && !tool_use_denied
-                && calls.is_empty()
-                && finish_reason == "stop"
-                && crate::continuation::retry_missing_web_lookup(
-                    &round_answer,
-                    content,
-                    plan.tools.iter().any(|tool| {
-                        tool.connector == "Harness"
-                            && matches!(tool.alias.as_str(), "web_search" | "search")
-                    }),
-                    budgets
-                        .lock()
-                        .map(|b| b.searches_used > 0 || b.fetches_used > 0)
-                        .unwrap_or(false),
-                    self.web_lookup_retried,
-                )
-            {
-                self.web_lookup_retried = true;
-                answer.truncate(answer_len_before_round);
-                let retry_reply = protocol.assistant_message(&round_answer, &[]);
-                if crate::history::saved_native_message(&retry_reply).is_some() {
-                    messages.push(retry_reply);
-                } else {
-                    messages.push(json!({"role":"assistant","content":round_answer}));
-                }
-                messages
-                    .push(json!({"role":"user","content":crate::continuation::WEB_LOOKUP_RETRY}));
-                if let Ok(store) = state.database() {
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        None,
-                        "web_lookup_retry",
-                        json!({"round":round,"reason":"claimed_no_live_access_without_lookup"}),
-                        false,
-                    );
-                }
-                channel
-                    .send(ChatEvent::progress(
-                        &run.id,
-                        &step_id,
-                        &assistant.id,
-                        "Checking available web sources…",
-                        None,
-                    ))
-                    .map_err(|e| e.to_string())?;
-                let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
-                state
-                    .database()?
-                    .update_run_status(&run.id, run.status, None, Some(&step_id))?;
-                continue;
-            }
-            // A final answer while a workspace write is unverified gets one
-            // corrective round, mirroring the missing-lookup retry above.
-            if !finalizing
-                && !tool_use_denied
-                && calls.is_empty()
-                && finish_reason == "stop"
-                && verify_dirty
-                && check_run_offered
-                && !check_nudged
-            {
-                check_nudged = true;
-                answer.truncate(answer_len_before_round);
-                let nudge_reply = protocol.assistant_message(&round_answer, &[]);
-                if crate::history::saved_native_message(&nudge_reply).is_some() {
-                    messages.push(nudge_reply);
-                } else {
-                    messages.push(json!({"role":"assistant","content":round_answer}));
-                }
-                messages.push(
-                    json!({"role":"user","content":crate::continuation::VERIFY_BEFORE_FINISH}),
-                );
-                if let Ok(store) = state.database() {
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        None,
-                        "verify_before_finish",
-                        json!({"round":round}),
-                        false,
-                    );
-                }
-                channel
-                    .send(ChatEvent::progress(
-                        &run.id,
-                        &step_id,
-                        &assistant.id,
-                        "Requesting checks…",
-                        None,
-                    ))
-                    .map_err(|e| e.to_string())?;
-                let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
-                state
-                    .database()?
-                    .update_run_status(&run.id, run.status, None, Some(&step_id))?;
-                continue;
-            }
-            if finalizing {
-                // AREX answers through its finish tool; the finalizing payload
-                // keeps that channel open for local AREX, but a call can still
-                // arrive as literal markup or a structured delta. A finish call
-                // runs through the same control path as the tool loop; any
-                // other call is suppressed — stripped from the answer and still
-                // judged "no visible answer" for the retry/fallback decision.
-                let has_markup = is_text_tool_call(&round_answer)
-                    || round_answer.contains("<tool_call")
-                    || round_answer.contains("<function=");
-                if has_markup {
-                    let stripped = strip_call_markup(&round_answer);
-                    if answer.ends_with(&round_answer) {
-                        answer.truncate(answer.len() - round_answer.len());
-                        answer.push_str(&stripped);
-                    }
-                    if let Some(parsed) = crate::tool_calls::parse_text_tool_calls(&round_answer) {
-                        if let Some(call) = parsed.iter().find(|call| call.name == "finish") {
-                            if let Some((row, result_text)) = run_finish_call(
-                                state,
-                                channel,
-                                run,
-                                &step_id,
-                                &conversation_id,
-                                &assistant.id,
-                                &mut self.seq,
-                                answer,
-                                &research_evidence,
-                                plan.access_mode,
-                                call,
-                                &round_answer,
-                                None,
-                            )
-                            .await?
-                            {
-                                self.last_model_message_id = row.id.clone();
-                                // Text-parsed calls are not in the native output, so this
-                                // round replays canonically — the same shape rebuild emits.
-                                messages.push(json!({"role":"assistant","content":round_answer,"tool_calls":[call.model_value()]}));
-                                messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result_text}));
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    round_answer = stripped;
-                    suppressed_call = true;
-                }
-                if !calls.is_empty() {
-                    suppressed_call = true;
-                    // Validate without consuming: a malformed call is a real
-                    // error, not an empty round, and the caller still needs to
-                    // see that this round produced calls.
-                    let finished = calls.validated()?;
-                    if let Some(call) = finished.iter().find(|call| call.name == "finish") {
-                        let finish_call_id = call.id.clone();
-                        let finish_message = {
-                            let message = protocol.assistant_message(&round_answer, &finished);
-                            // The rebuild guard rejects native rounds with more
-                            // calls than the replay cap; larger rounds keep the
-                            // canonical transcript instead of a durable native one.
-                            if finished.len() <= 8
-                                && crate::history::saved_native_message(&message).is_some()
-                            {
-                                Some(message)
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some((row, result_text)) = run_finish_call(
-                            state,
-                            channel,
-                            run,
-                            &step_id,
-                            &conversation_id,
-                            &assistant.id,
-                            &mut self.seq,
-                            answer,
-                            &research_evidence,
-                            plan.access_mode,
-                            call,
-                            &round_answer,
-                            finish_message.as_ref(),
-                        )
-                        .await?
-                        {
-                            self.last_model_message_id = row.id.clone();
-                            // Record the round exactly as rebuild will replay it: the
-                            // model's own output plus one result per emitted call —
-                            // suppressed calls keep an explicit unknown outcome rather
-                            // than a synthetic result or a missing entry.
-                            messages.push(finish_message.unwrap_or_else(|| json!({"role":"assistant","content":round_answer,"tool_calls":finished.iter().map(|finished_call| finished_call.model_value()).collect::<Vec<_>>()})));
-                            for finished_call in &finished {
-                                let content = if finished_call.id == finish_call_id {
-                                    result_text.clone()
-                                } else {
-                                    crate::tool_envelope::failure_notice("suppressed-tool-call","This call was superseded by the finish call in the same round and was not dispatched. Its outcome is unknown; do not automatically repeat it.",false,crate::tool_envelope::SIDE_UNKNOWN,&json!({})).to_string()
-                                };
-                                messages.push(json!({"role":"tool","tool_call_id":finished_call.id,"content":content}));
-                            }
-                            return Ok(true);
-                        }
-                    } else {
-                        // The round produced calls but no finish call, so they are
-                        // suppressed rather than dispatched. The round is still
-                        // recorded: the model emitted calls, and the transcript
-                        // must carry them together with an explicit
-                        // unknown-outcome result for each. Without this the next
-                        // provider request would carry a native function_call
-                        // with no matching canonical tool_call, which the
-                        // Responses adapter rejects outright and which leaves a
-                        // Claude `tool_use` without its `tool_result`.
-                        let message = protocol.assistant_message(&round_answer, &finished);
-                        messages.push(if crate::history::saved_native_message(&message).is_some() {
-                        message
-                    } else {
-                        json!({"role":"assistant","content":round_answer,"tool_calls":finished.iter().map(|finished_call| finished_call.model_value()).collect::<Vec<_>>()})
-                    });
-                        for finished_call in &finished {
-                            let content = crate::tool_envelope::failure_notice("suppressed-tool-call","This call was suppressed on a finalizing round and was not dispatched. Its outcome is unknown; do not automatically repeat it.",false,crate::tool_envelope::SIDE_UNKNOWN,&json!({})).to_string();
-                            messages.push(json!({"role":"tool","tool_call_id":finished_call.id,"content":content}));
-                        }
-                        suppressed_round_recorded = true;
-                        // The calls are recorded, not dispatched.
-                        calls = crate::tool_calls::ToolCalls::default();
-                    }
-                }
-            }
-            let mut stalled_uncited = false;
-            if needs_final_answer(finalizing, !calls.is_empty(), &round_answer) {
-                // On a finalizing round a suppressed call attempt still counts
-                // as no visible answer; retry once, then use the grounded result.
-                let final_answer = if calls.is_empty() && !suppressed_call {
-                    &round_answer
-                } else {
-                    ""
-                };
-                match finalization_action(
-                    final_answer,
-                    self.research_fallback.as_deref(),
-                    self.finalization_retried
-                        || budgets.lock().map(|b| b.exhausted()).unwrap_or(true),
-                    research_progress.stopped(),
-                ) {
-                    FinalizationAction::Complete => {
-                        // A retried stalled answer is accepted without URL
-                        // citations; the collected sources are attached
-                        // deterministically before the turn completes.
-                        stalled_uncited =
-                            research_progress.stopped() && !answer_cites_evidence(final_answer);
-                    }
-                    FinalizationAction::Retry => {
-                        self.finalization_retried = true;
-                        // The superseded draft stays in the transcript for
-                        // context but leaves the visible answer, so a
-                        // regenerated attempt does not stack a second copy.
-                        answer.truncate(answer_len_before_round);
-                        // Preserve provider-owned replay context for a completed
-                        // draft; suppressed calls never acquire synthetic results.
-                        // A round whose suppressed calls were already recorded
-                        // must not be recorded again.
-                        if !suppressed_round_recorded {
-                            let native_reply = protocol.assistant_message(&round_answer, &[]);
-                            if calls.is_empty()
-                                && crate::history::saved_native_message(&native_reply).is_some()
-                            {
-                                messages.push(native_reply);
-                            } else if !round_answer.trim().is_empty()
-                                && !is_text_tool_call(&round_answer)
-                            {
-                                messages.push(json!({"role":"assistant","content":round_answer}));
-                            }
-                        }
-                        messages.push(json!({"role":"user","content":if research_progress.stopped() { RESEARCH_STALLED } else { FINAL_ANSWER_INSTRUCTION }}));
-                        if let Ok(store) = state.database() {
-                            emit_session_event(
-                                &store,
-                                &conversation_id,
-                                Some(&run.id),
-                                Some(&step_id),
-                                None,
-                                "finalization_retry",
-                                json!({"round": round, "reason": "no_visible_answer", "finishReason": finish_reason, "reasoningLength": round_reasoning.len()}),
-                                false,
-                            );
-                        }
-                        let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
-                        state.database()?.update_run_status(
-                            &run.id,
-                            run.status,
-                            None,
-                            Some(&step_id),
-                        )?;
-                        continue;
-                    }
-                    FinalizationAction::Fallback(fallback) => {
-                        self.replay_answer = Some(json!(fallback));
-                        *answer = strip_call_markup(answer);
-                        if !answer.trim().is_empty() {
-                            answer.push_str("\n\n");
-                        }
-                        answer.push_str(&fallback);
-                        self.seq += 1;
-                        channel
-                            .send(ChatEvent::new(
-                                run,
-                                Some(&step_id),
-                                self.seq,
-                                "Using completed research answer…",
-                                &assistant.id,
-                                &fallback,
-                                "",
-                                None,
-                                None,
-                            ))
-                            .map_err(|error| error.to_string())?;
-                        if let Ok(store) = state.database() {
-                            emit_session_event(
-                                &store,
-                                &conversation_id,
-                                Some(&run.id),
-                                Some(&step_id),
-                                None,
-                                "research_answer_fallback",
-                                json!({"round": round, "answerLength": fallback.len()}),
-                                false,
-                            );
-                        }
-                        return Ok(true);
-                    }
-                    FinalizationAction::Error => return Err(EMPTY_FINAL_ANSWER_ERROR.into()),
-                }
-            }
-            let calls = calls.finish()?;
-            self.replay_answer = Some(if calls.is_empty() {
-                crate::history::saved_native_message(
-                    &protocol.assistant_message(&round_answer, &calls),
-                )
-                .unwrap_or_else(|| json!(round_answer))
-            } else {
-                Value::Null
-            });
-            crate::arex::validate_batch(&calls)?;
-            if !calls.is_empty() && matches!(&plan.backend, Backend::Local { .. }) {
-                state.database()?.record_local_tool_calling_support(
-                    &plan.preferences.runtime_path,
-                    &plan.preferences.model_path,
-                    true,
-                )?;
-            }
-            if let Ok(store) = state.database() {
-                if !round_reasoning.is_empty() {
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        None,
-                        "reasoning",
-                        json!({"text": round_reasoning, "durationMs": reasoning_started.zip(reasoning_last).map(|(start, end)| end.duration_since(start).as_secs_f64() * 1000.0)}),
-                        true,
-                    );
-                }
-            }
-            {
-                let store = state.database()?;
-                emit_session_event(
-                    &store,
-                    &conversation_id,
-                    Some(&run.id),
-                    Some(&step_id),
-                    None,
-                    "model_response",
-                    json!({"content":round_answer,"final":calls.is_empty()}),
-                    false,
-                );
-            }
-            if calls.is_empty() {
-                if round_answer.trim().is_empty() {
-                    return Err(EMPTY_FINAL_ANSWER_ERROR.into());
-                }
-                if stalled_uncited {
-                    if let Some(footer) = sources_footer(&research_evidence) {
-                        answer.push_str(&footer);
-                        self.seq += 1;
-                        channel
-                            .send(ChatEvent::new(
-                                run,
-                                Some(&step_id),
-                                self.seq,
-                                "Attaching collected sources",
-                                &assistant.id,
-                                &footer,
-                                "",
-                                None,
-                                None,
-                            ))
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
-                // Plain-text completions skip `finish`, so the claim audit
-                // would never run — apply it here when the turn did research.
-                if plan.local_arex() && !research_evidence.is_empty() {
-                    let audit_args = json!({"answer": answer, "evidences": []});
-                    if let Some(footer) = claim_audit_footer(
-                        state,
-                        &audit_args,
-                        &research_evidence,
-                        run,
-                        &step_id,
-                        &conversation_id,
-                        &mut self.seq,
-                    )
-                    .await
-                    {
-                        answer.push_str(&footer);
-                        self.seq += 1;
-                        channel
-                            .send(ChatEvent::new(
-                                run,
-                                Some(&step_id),
-                                self.seq,
-                                "Claim audit",
-                                &assistant.id,
-                                &footer,
-                                "",
-                                None,
-                                None,
-                            ))
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
-                let _ = run.transition_to(crate::agent_run::RunState::Completed);
-                let _ =
-                    state
-                        .database()?
-                        .update_run_status(&run.id, run.status, None, Some(&step_id));
-                crate::hooks::run_finished(
-                    state,
-                    conversation_id.clone(),
-                    json!({"status":"completed"}),
-                );
-                if let Ok(store) = state.database() {
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        None,
-                        "step_end",
-                        json!({"round": round, "content": round_answer, "toolCallsCount": 0}),
-                        false,
-                    );
-                }
-                return Ok(true);
-            }
-            if tool_use_denied {
-                return Err("Tool use stopped after your denial. Send a new message to authorize further actions.".into());
-            }
-            let mut round_model_message = protocol.assistant_message(&round_answer, &calls);
-            if text_parsed_calls {
-                // Calls parsed from literal text are absent from the native
-                // output; keeping it would fail replay parity and, for Claude,
-                // fabricate tool_use blocks the provider never emitted.
-                if let Some(object) = round_model_message.as_object_mut() {
-                    object.remove("locallm_responses_output");
-                    object.remove("locallm_claude_content");
-                }
-            }
-            let mut round_model_saved = false;
-            messages.push(round_model_message.clone());
-            if let Ok(store) = state.database() {
-                for call in &calls {
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        Some(&call.id),
-                        "tool_call",
-                        json!({
-                            "callId": call.id,
-                            "name": call.name,
-                            "arguments": call.arguments,
-                        }),
-                        false,
-                    );
-                }
-            }
-            let tool_calls_count = calls.len();
-            let mut explicit_finish = None;
-            let mut finish_args: Option<Value> = None;
-            let research_calls_before = research_progress.calls;
-            // Bounded concurrency for independent reads: consecutive
-            // auto-allowed trusted reads are dispatched as a group; every
-            // other call is an ordered barrier on the sequential path.
-            let mut prefetched: std::collections::HashMap<String, Prefetched> =
-                std::collections::HashMap::new();
-            let mut call_index = 0usize;
-            while call_index < calls.len() {
-                let mut call = calls[call_index].clone();
-                let resolved = if crate::tool_discovery::visible(&plan.tool_definitions, &call.name)
-                {
-                    crate::tool_discovery::resolve(
-                        plan.tools.iter(),
-                        &call.name,
-                        call.arguments.clone(),
-                    )
-                } else {
-                    Err("Tool schema is deferred or unavailable. Use tool_search and tool_invoke for authorized deferred tools.".into())
-                };
-                let (tool, arguments) = match resolved {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        let result = crate::tool_envelope::failure_notice(
-                            "unavailable-tool",
-                            &error,
-                            false,
-                            crate::tool_envelope::SIDE_NONE,
-                            &json!({}),
-                        );
-                        let store = state.database()?;
-                        let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":"Unavailable","name":call.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"unavailable"},"result":result}).to_string(),"complete")?;
-                        crate::history::remember_native_round(
-                            &store,
-                            &row,
-                            &round_model_message,
-                            &mut round_model_saved,
-                        )?;
-                        messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
-                        call_index += 1;
-                        continue;
-                    }
-                };
-                let discovery_invocation = call.name != tool.alias;
-                call.name = tool.alias.clone();
-                call.arguments = arguments;
-                // Group dispatch honours every pre-dispatch gate the sequential
-                // path applies: an already-recorded cancellation, a pending
-                // pause, a call the repetition guard would suppress, and the
-                // per-call eligibility check all decide BEFORE any dispatch.
-                let group_end = if !discovery_invocation
-                    && !prefetched.contains_key(&call.id)
-                    && !(*cancellation.borrow() && cancel_applies(state, run_generation))
-                    && crate::sandbox::check_repetition(
-                        &recent_calls,
-                        &call.name,
-                        &call.arguments.to_string(),
-                    )
-                    .is_none()
-                {
-                    blocked_calls.lock().ok().and_then(|blocked| {
-                        if concurrent_read_ok(&call, plan, state, &blocked, tool_use_denied) {
-                            Some(read_group_end(
-                                &calls,
-                                call_index,
-                                plan,
-                                state,
-                                &blocked,
-                                tool_use_denied,
-                                &recent_calls,
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                };
-                if let Some(end) = group_end.filter(|end| *end > call_index + 1) {
-                    let reserved = crate::history::reserve_native_read_round(
-                        &*state.database()?,
-                        &conversation_id,
-                        &json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":"allowed","accessMode":plan.access_mode,"authorization":"auto-approved read group (reserved before dispatch)","callId":call.id,"stepId":step_id,"assistantContent":round_answer}),
-                        &round_model_message,
-                        &mut round_model_saved,
-                    )?;
-                    prefetch_read_group(
-                        state,
-                        plan,
-                        snapshot,
-                        &conversation_id,
-                        run,
-                        &step_id,
-                        &assistant.id,
-                        round,
-                        channel,
-                        &cancellation,
-                        &mut ledger,
-                        &calls[call_index..end],
-                        &mut prefetched,
-                    )
-                    .await;
-                    if let Some(entry) = prefetched.get_mut(&call.id) {
-                        entry.audit_row = reserved;
-                    }
-                }
-                let was_prefetched = prefetched.contains_key(&call.id);
-                call_index += 1;
-
-                // Capability kills are re-checked at dispatch: a frozen catalog
-                // entry offered before the kill must still deny visibly. A
-                // prefetched member passed this exact gate at dispatch — its
-                // real outcome is already recorded, so it is never re-labelled.
-                let capability_denial = if was_prefetched {
-                    None
-                } else {
-                    crate::capabilities::tool_capability(tool).and_then(|capability| {
-                        crate::capabilities::ToolPolicy::guard(state.database()).denial(capability)
-                    })
-                };
-                if let Some(reason) = capability_denial {
-                    let result = crate::tool_envelope::failure_notice(
-                        "capability-disabled",
-                        &reason,
-                        false,
-                        crate::tool_envelope::SIDE_NONE,
-                        &json!({}),
-                    );
-                    let store = state.database()?;
-                    let recorded=store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"capability disabled"},"result":result}).to_string(), "complete")?;
-                    crate::history::remember_native_round(
-                        &store,
-                        &recorded,
-                        &round_model_message,
-                        &mut round_model_saved,
-                    )?;
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        Some(&call.id),
-                        "tool_result",
-                        result.clone(),
-                        false,
-                    );
-                    messages.push(
-                        json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}),
-                    );
-                    continue;
-                }
-                if plan_mode
-                    && !plan_approved
-                    && !tool.trusted_read()
-                    && !matches!(
-                        call.name.as_str(),
-                        "plan_submit"
-                            | "ask_user"
-                            | "todo_write"
-                            | "todo_add"
-                            | "todo_update"
-                            | "finish"
-                    )
-                {
-                    let result = crate::tool_envelope::failure_notice("plan-approval-required", "Plan mode: call plan_submit and get the plan approved before running mutating tools. Read-only tools, todos and plan_submit stay available.", true, crate::tool_envelope::SIDE_NONE, &json!({}));
-                    let store = state.database()?;
-                    let recorded = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"plan approval pending"},"result":result}).to_string(), "complete")?;
-                    crate::history::remember_native_round(
-                        &store,
-                        &recorded,
-                        &round_model_message,
-                        &mut round_model_saved,
-                    )?;
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        Some(&call.id),
-                        "tool_result",
-                        result.clone(),
-                        false,
-                    );
-                    messages.push(
-                        json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}),
-                    );
-                    continue;
-                }
-                // A finish attempt while a workspace write is unverified gets
-                // one refusal carrying the nudge; the retry is accepted.
-                if call.name == "finish" && verify_dirty && check_run_offered && !check_nudged {
-                    check_nudged = true;
-                    let result = crate::tool_envelope::failure_notice(
-                        "verify-before-finish",
-                        crate::continuation::VERIFY_BEFORE_FINISH,
-                        true,
-                        crate::tool_envelope::SIDE_NONE,
-                        &json!({}),
-                    );
-                    let store = state.database()?;
-                    let recorded = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"verify before finish nudge"},"result":result}).to_string(), "complete")?;
-                    crate::history::remember_native_round(
-                        &store,
-                        &recorded,
-                        &round_model_message,
-                        &mut round_model_saved,
-                    )?;
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        Some(&call.id),
-                        "tool_result",
-                        result.clone(),
-                        false,
-                    );
-                    messages.push(
-                        json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}),
-                    );
-                    continue;
-                }
-                if *cancellation.borrow() && cancel_applies(state, run_generation) {
-                    settle_unconsumed_reads(
-                        state,
-                        plan,
-                        &conversation_id,
-                        run,
-                        &step_id,
-                        &mut ledger,
-                        &calls,
-                        &mut prefetched,
-                        messages,
-                        &mut self.seq,
-                    );
-                    return Ok(false);
-                }
-                if state
-                    .run_control
-                    .lock()
-                    .map(|control| crate::agent_run::pause_blocks_new_tool(control.pause))
-                    .unwrap_or(false)
-                {
-                    let notice = crate::agent_run::pause_notice(false);
-                    if let Some(task) = ledger.as_mut() {
-                        let _ = task.pause_before_new_tool(&call.id, &call.name);
-                        save_ledger(state, task);
-                    }
-                    let paused = crate::tool_envelope::failure_notice(
-                        "paused",
-                        notice,
-                        false,
-                        crate::tool_envelope::SIDE_NONE,
-                        &json!({"paused":true}),
-                    );
-                    messages.push(
-                        json!({"role":"tool","tool_call_id":call.id,"content":paused.to_string()}),
-                    );
-                    paused_exit = true;
-                    settle_unconsumed_reads(
-                        state,
-                        plan,
-                        &conversation_id,
-                        run,
-                        &step_id,
-                        &mut ledger,
-                        &calls,
-                        &mut prefetched,
-                        messages,
-                        &mut self.seq,
-                    );
-                    break;
-                }
-                match tool.prepare_arguments(call.arguments.clone()) {
-                    Ok(arguments) => call.arguments = arguments,
-                    Err(error) => {
-                        let result = crate::tool_envelope::failure_notice(
-                            "invalid-arguments",
-                            &error,
-                            false,
-                            crate::tool_envelope::SIDE_NONE,
-                            &json!({}),
-                        );
-                        let store = state.database()?;
-                        let recorded=store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"invalid"},"result":result}).to_string(), "complete")?;
-                        crate::history::remember_native_round(
-                            &store,
-                            &recorded,
-                            &round_model_message,
-                            &mut round_model_saved,
-                        )?;
-                        emit_session_event(
-                            &store,
-                            &conversation_id,
-                            Some(&run.id),
-                            Some(&step_id),
-                            Some(&call.id),
-                            "tool_result",
-                            result.clone(),
-                            false,
-                        );
-                        messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
-                        continue;
-                    }
-                }
-                let signature = crate::continuation::tool_signature(tool, &call.arguments);
-                // A prefetched member is never "re-dispatched": its outcome is
-                // real, so an uncertain sibling cannot retroactively suppress it.
-                if !was_prefetched
-                    && blocked_calls
-                        .lock()
-                        .map(|set| set.contains(&signature))
-                        .unwrap_or(true)
-                {
-                    let skipped = crate::tool_envelope::failure_notice(
-                        "uncertain-outcome-not-repeated",
-                        "Not repeated: the previous attempt had an uncertain outcome.",
-                        false,
-                        crate::tool_envelope::SIDE_UNKNOWN,
-                        &json!({}),
-                    );
-                    let store = state.database()?;
-                    let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"turn replay protection"},"result":skipped}).to_string(),"complete")?;
-                    crate::history::remember_native_round(
-                        &store,
-                        &row,
-                        &round_model_message,
-                        &mut round_model_saved,
-                    )?;
-                    messages.push(
-                        json!({"role":"tool","tool_call_id":call.id,"content":skipped.to_string()}),
-                    );
-                    continue;
-                }
-                // Permission rules are evaluated before the access mode: a
-                // user's explicit rule is authoritative, and the access mode
-                // only decides the calls no rule matched. Rules come from
-                // persisted settings only — never from model output.
-                let rule_set = crate::permission_rules::load(&*state.database()?);
-                let (rule_action, rule_resource) =
-                    crate::permission_rules::classify(&call.name, &call.arguments);
-                let rule_decision = crate::permission_rules::decide_for_tool(
-                    &rule_set,
-                    plan.access_mode,
-                    rule_action,
-                    &rule_resource,
-                    tool.trusted_read(),
-                    tool.requires_approval(&call.arguments),
-                );
-                let automatic_reason = match rule_decision {
-                    crate::permission_rules::Decision::Allow(reason) => Some(reason),
-                    crate::permission_rules::Decision::Ask => None,
-                    crate::permission_rules::Decision::Deny(reason) => {
-                        let skipped = crate::tool_envelope::failure_notice(
-                            "permission-denied",
-                            &reason,
-                            false,
-                            crate::tool_envelope::SIDE_NONE,
-                            &json!({}),
-                        );
-                        let store = state.database()?;
-                        let row = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"permission rule"},"result":skipped}).to_string(), "complete")?;
-                        crate::history::remember_native_round(
-                            &store,
-                            &row,
-                            &round_model_message,
-                            &mut round_model_saved,
-                        )?;
-                        messages.push(json!({"role":"tool","tool_call_id":call.id,"content":skipped.to_string()}));
-                        tool_use_denied = true;
-                        continue;
-                    }
-                };
-                let blocked_by_denial = tool_use_denied;
-                let allow = if blocked_by_denial {
-                    false
-                } else if automatic_reason.is_some() {
-                    true
-                } else {
-                    let _ = run.transition_to(crate::agent_run::RunState::AwaitingApproval);
-                    let _ = state.database()?.update_run_status(
-                        &run.id,
-                        run.status,
-                        None,
-                        Some(&step_id),
-                    );
-                    let purpose = state
-                        .database()?
-                        .todos(&conversation_id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .find(|todo| todo.status == crate::plans::IN_PROGRESS)
-                        .map(|todo| todo.text);
-                    let (approval_id, decision) = state.approvals.request()?;
-                    let _pending = state.approvals.guard(&approval_id);
-                    self.seq += 1;
-                    let sent = channel.send(ChatEvent::new(
-                    run,
-                    Some(&step_id),
-                    self.seq,
-                    &format!("Awaiting approval: {}", tool.tool.name),
-                    &assistant.id,
-                    "",
-                    "",
-                    None,
-                    Some(json!({"id":approval_id,"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"purpose":purpose})),
-                ));
-                    if sent.is_err() {
-                        state.approvals.remove(&approval_id);
-                        return Err("The approval interface disconnected.".into());
-                    }
-                    let approval_started = Instant::now();
-                    let allow = tokio::select! {
-                        _ = cancellation.changed() => None,
-                        result = tokio::time::timeout(Duration::from_secs(600),decision) => Some(result.ok().and_then(Result::ok).unwrap_or(false)),
-                    };
-                    response_metrics.approval_ms = Some(
-                        response_metrics.approval_ms.unwrap_or(0.0)
-                            + approval_started.elapsed().as_secs_f64() * 1000.0,
-                    );
-                    state.approvals.remove(&approval_id);
-                    self.seq += 1;
-                    channel
-                        .send(ChatEvent::new(
-                            run,
-                            Some(&step_id),
-                            self.seq,
-                            "Approval decision recorded",
-                            &assistant.id,
-                            "",
-                            "",
-                            None,
-                            Some(Value::Null),
-                        ))
-                        .map_err(|error| error.to_string())?;
-                    let Some(allow) = allow else {
-                        settle_unconsumed_reads(
-                            state,
-                            plan,
-                            &conversation_id,
-                            run,
-                            &step_id,
-                            &mut ledger,
-                            &calls,
-                            &mut prefetched,
-                            messages,
-                            &mut self.seq,
-                        );
-                        return Ok(false);
-                    };
-                    allow
-                };
-                if !allow {
-                    tool_use_denied = true;
-                }
-                let budget_error = if allow && !was_prefetched {
-                    crate::continuation::admit_tool(state, &run.id, &call.name, &call.arguments)
-                        .err()
-                } else {
-                    None
-                };
-                let authorization = if budget_error.is_some() {
-                    "turn tool-budget admission denied"
-                } else if blocked_by_denial {
-                    "blocked by an earlier denial in this turn"
-                } else {
-                    automatic_reason.unwrap_or("user approval decision")
-                };
-                let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":if allow&&budget_error.is_none() { "allowed" } else { "denied" },"accessMode":plan.access_mode,"authorization":authorization,"callId":call.id,"stepId":step_id,"assistantContent":round_answer});
-                let row = if let Some(row) = prefetched
-                    .get_mut(&call.id)
-                    .and_then(|entry| entry.audit_row.take())
-                {
-                    state.database()?.update_message(
-                        &row.id,
-                        &audit.to_string(),
-                        "",
-                        "streaming",
-                    )?;
-                    row
-                } else {
-                    state.database()?.append_message(
-                        &conversation_id,
-                        "tool",
-                        &audit.to_string(),
-                        if allow && budget_error.is_none() {
-                            "streaming"
-                        } else {
-                            "complete"
-                        },
-                    )?
-                };
-                self.last_model_message_id = row.id.clone();
-                crate::history::remember_native_round(
-                    &*state.database()?,
-                    &row,
-                    &round_model_message,
-                    &mut round_model_saved,
-                )?;
-
-                let _ = run.transition_to(crate::agent_run::RunState::ExecutingTools);
-                let _ =
-                    state
-                        .database()?
-                        .update_run_status(&run.id, run.status, None, Some(&step_id));
-                self.seq += 1;
-                channel
-                    .send(ChatEvent::new(
-                        run,
-                        Some(&step_id),
-                        self.seq,
-                        &format!(
-                            "{} {}",
-                            if budget_error.is_some() {
-                                "Blocked"
-                            } else {
-                                "Executing"
-                            },
-                            tool.tool.name
-                        ),
-                        &assistant.id,
-                        "",
-                        "",
-                        None,
-                        None,
-                    ))
-                    .map_err(|error| error.to_string())?;
-
-                let tool_exec_start = Instant::now();
-                if allow && budget_error.is_none() {
-                    let cmd_arg = if tool.tool.name == "execute_command" {
-                        call.arguments
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    } else {
-                        call.arguments
-                            .get("code")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    };
-                    let lang_arg = call
-                        .arguments
-                        .get("language")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let cwd_arg = call
-                        .arguments
-                        .get("cwd")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    self.seq += 1;
-                    let _ = channel.send(ChatEvent {
-                        run_id: Some(run.id.clone()),
-                        step_id: Some(step_id.clone()),
-                        seq: Some(self.seq),
-                        state: Some(run.status.as_str().to_string()),
-                        activity: Some(format!("Running {}", tool.tool.name)),
-                        context: None,
-                        notice: None,
-                        message_id: assistant.id.clone(),
-                        content: String::new(),
-                        reasoning: String::new(),
-                        approval: None,
-                        elapsed_secs: Some(0.0),
-                        round_index: Some(round),
-                        presentation: None,
-                        tool_stream: Some(ToolStreamEvent::Started {
-                            tool_call_id: call.id.clone(),
-                            tool_name: tool.tool.name.clone(),
-                            command: cmd_arg,
-                            language: lang_arg,
-                            cwd: cwd_arg,
-                        }),
-                    });
-                }
-
-                let mut result = if let Some(error) = budget_error {
-                    crate::tool_envelope::failure_notice(
-                        "tool-budget-blocked",
-                        &error,
-                        false,
-                        crate::tool_envelope::SIDE_NONE,
-                        &json!({"budget":true}),
-                    )
-                } else if !allow {
-                    crate::tool_envelope::failure_notice("denied", "The user denied this tool request. Do not repeat it without a new instruction.", false, crate::tool_envelope::SIDE_NONE, &json!({"denied":true}))
-                } else {
-                    let args_text = call.arguments.to_string();
-                    // User pre_tool_use hooks may veto before dispatch; a block
-                    // is a failure envelope, other failures are notices.
-                    let hook_verdict =
-                        crate::hooks::pre_use(state, &conversation_id, &call.name, &call.arguments)
-                            .await;
-                    for notice in &hook_verdict.notices {
-                        let _ = channel.send(ChatEvent::progress(
-                            &run.id,
-                            &step_id,
-                            &assistant.id,
-                            notice,
-                            None,
-                        ));
-                    }
-                    if let Some(blocked) = hook_verdict.blocked {
-                        crate::tool_envelope::failure_notice(
-                            "hook-blocked",
-                            &blocked,
-                            false,
-                            crate::tool_envelope::SIDE_NONE,
-                            &json!({"hookBlocked":true}),
-                        )
-                    // Guard: three identical calls in a row end loudly, not in a loop.
-                    } else if let Some(note) =
-                        crate::sandbox::check_repetition(&recent_calls, &call.name, &args_text)
-                    {
-                        recent_calls.push((call.name.clone(), args_text));
-                        json!({"isError":true,"message":note})
-                    } else {
-                        recent_calls.push((call.name.clone(), args_text));
-                        let timeout_secs = state
-                            .database()
-                            .map(|store| {
-                                crate::sandbox::effective_timeout_secs(
-                                    &store,
-                                    tool.timeout().as_secs(),
-                                )
-                            })
-                            .unwrap_or(tool.timeout().as_secs());
-                        let app_state: &AppState = state;
-                        let mut pending_events: Vec<crate::harness::PendingEvent> = Vec::new();
-                        let emit_tool_channel = channel.clone();
-                        let emit_tool_call_id = call.id.clone();
-                        let emit_tool_run_id = run.id.clone();
-                        let emit_tool_step_id = step_id.clone();
-                        let emit_tool_msg_id = assistant.id.clone();
-                        let emit_tool_state = run.status.as_str().to_string();
-                        let emit_tool_act = format!("Executing {}", tool.tool.name);
-                        let tool_chunk_cb: crate::execution::ChunkCallback =
-                            std::sync::Arc::new(move |stream_name, chunk_text| {
-                                let _ = emit_tool_channel.send(ChatEvent {
-                                    run_id: Some(emit_tool_run_id.clone()),
-                                    step_id: Some(emit_tool_step_id.clone()),
-                                    seq: Some(0),
-                                    state: Some(emit_tool_state.clone()),
-                                    activity: Some(emit_tool_act.clone()),
-                                    context: None,
-                                    notice: None,
-                                    message_id: emit_tool_msg_id.clone(),
-                                    content: String::new(),
-                                    reasoning: String::new(),
-                                    approval: None,
-                                    elapsed_secs: Some(tool_exec_start.elapsed().as_secs_f64()),
-                                    round_index: Some(round),
-                                    presentation: None,
-                                    tool_stream: Some(ToolStreamEvent::OutputChunk {
-                                        tool_call_id: emit_tool_call_id.clone(),
-                                        stream: stream_name.to_string(),
-                                        chunk: chunk_text.to_string(),
-                                    }),
-                                });
-                            });
-                        let catalog_name =
-                            matches!(call.name.as_str(), "run_code" | "file_write" | "file_read");
-                        if allow && catalog_name {
-                            if let Some(task) = ledger.as_mut() {
-                                if let Ok(store) = state.database() {
-                                    begin_catalog_op(&store, task, &call.id, &call.name);
-                                }
-                            }
-                        }
-                        let catalog_db = state.db_path.clone();
-                        let catalog_task = ledger
-                            .as_ref()
-                            .map(|task| task.id.clone())
-                            .unwrap_or_default();
-                        // The outcome keeps the Elapsed variant so timeout is
-                        // normalized with a typed cause, not a magic string.
-                        // A prefetched group member consumes its already
-                        // dispatched outcome; the durable catalog op settles
-                        // here on the shared ledger in call order.
-                        let outcome = if let Some(pre) = prefetched.remove(&call.id) {
-                            pending_events.extend(pre.events);
-                            if pre.catalog {
-                                if let Some(task) = ledger.as_mut() {
-                                    if let Ok(store) = state.database() {
-                                        if let Ok(Some(fresh)) = store.research_task(&task.id) {
-                                            *task = fresh;
-                                        }
-                                        match &pre.outcome {
-                                            Some(Ok(Ok(value))) => {
-                                                settle_catalog_op(&store, task, &call.id, value)
-                                            }
-                                            _ => {
-                                                let _ = store.save_research_task(task);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            pre.outcome
-                        } else {
-                            tokio::select! {
-                                _ = cancellation.changed() => None,
-                                result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
-                                    if tool.is_harness() {
-                                        let emit_run = run.id.clone();
-                                        let emit_step = step_id.clone();
-                                        let emit_message = assistant.id.clone();
-                                        let emit_channel = channel.clone();
-                                        let emit: std::sync::Arc<dyn Fn(String, Option<Value>) + Send + Sync> =
-                                            std::sync::Arc::new(move |activity, approval| {
-                                                // Channel-only progress (self.seq 0); durability comes from audit rows.
-                                                let _ = emit_channel.send(ChatEvent::progress(
-                                                    &emit_run,
-                                                    &emit_step,
-                                                    &emit_message,
-                                                    &activity,
-                                                    approval,
-                                                ));
-                                            });
-                                        let ctx = crate::harness::HarnessCtx {
-                                            state: app_state,
-                                            snapshot: snapshot.clone(),
-                                            conversation_id: conversation_id.clone(),
-                                            run_id: run.id.clone(),
-                                            step_id: step_id.clone(),
-                                            access_mode: plan.access_mode,
-                                            depth: 0,
-                                            preset_id: preset_id.clone(),
-                                            inherit_tools: &plan.tools,
-                                            emit,
-                                        };
-                                        let catalog = matches!(call.name.as_str(), "run_code" | "file_write" | "file_read");
-                                        if catalog {
-                                            let config = state.database()?.execution_config()?;
-                                            let path = snapshot.workspace_path.clone();
-                                            let value = run_catalog_and_record(&catalog_db, &catalog_task, &path, config, &call.id, &call.name, call.arguments.clone()).await?;
-                                            if let Some(task) = ledger.as_mut() {
-                                                if let Ok(store) = state.database() {
-                                                    if let Ok(Some(fresh)) = store.research_task(&task.id) {
-                                                        *task = fresh;
-                                                    }
-                                                }
-                                            }
-                                            Ok(value)
-                                        } else {
-                                            match crate::harness::execute(&ctx, &call.name, call.arguments.clone()).await {
-                                                Ok(outcome) => {
-                                                    pending_events.extend(outcome.events);
-                                                    Ok(outcome.value)
-                                                }
-                                                Err(error) => Err(error),
-                                            }
-                                        }
-                                    } else {
-                                        let mcp_ui = tool.is_mcp().then(|| {
-                                            crate::mcp_input::CallUi::new(
-                                                state.mcp_inputs.clone(),
-                                                progress_emit(channel, &run.id, &step_id, &assistant.id),
-                                            )
-                                        });
-                                        tool.call_with_input(call.arguments.clone(), Some(tool_chunk_cb), mcp_ui).await
-                                    }
-                                }) => Some(result),
-                            }
-                        };
-                        for event in pending_events.drain(..) {
-                            self.seq += 1;
-                            let _ =
-                                state
-                                    .database()?
-                                    .append_run_event(&crate::agent_run::RunEvent {
-                                        run_id: run.id.clone(),
-                                        seq: self.seq as u64,
-                                        step_id: step_id.clone(),
-                                        tool_call_id: Some(call.id.clone()),
-                                        event_type: event.event_type,
-                                        payload: event.payload,
-                                        created_at: crate::store::now(),
-                                    });
-                        }
-                        let duration_ms = tool_exec_start.elapsed().as_millis();
-                        response_metrics.tools_ms = Some(
-                            response_metrics.tools_ms.unwrap_or(0.0)
-                                + tool_exec_start.elapsed().as_secs_f64() * 1000.0,
-                        );
-                        let exit_code = match &outcome {
-                            Some(Ok(Ok(val))) => val
-                                .get("exitCode")
-                                .and_then(|v| v.as_i64())
-                                .map(|c| c as i32),
-                            _ => None,
-                        };
-                        let error_info = match &outcome {
-                            Some(Ok(Ok(val))) => tool_execution_error(val),
-                            Some(Ok(Err(err))) => Some(err.clone()),
-                            Some(Err(_)) => Some("Tool request timed out.".into()),
-                            None => Some("Cancelled".into()),
-                        };
-                        self.seq += 1;
-                        let _ = channel.send(ChatEvent {
-                            run_id: Some(run.id.clone()),
-                            step_id: Some(step_id.clone()),
-                            seq: Some(self.seq),
-                            state: Some(run.status.as_str().to_string()),
-                            activity: Some(format!("Finished {}", tool.tool.name)),
-                            context: None,
-                            notice: None,
-                            message_id: assistant.id.clone(),
-                            content: String::new(),
-                            reasoning: String::new(),
-                            approval: None,
-                            elapsed_secs: Some(tool_exec_start.elapsed().as_secs_f64()),
-                            round_index: Some(round),
-                            presentation: None,
-                            tool_stream: Some(ToolStreamEvent::Finished {
-                                tool_call_id: call.id.clone(),
-                                exit_code,
-                                duration_ms,
-                                error: error_info,
-                            }),
-                        });
-                        match outcome {
-                        None => {
-                            let _ = run.transition_to(crate::agent_run::RunState::Cancelled);
-                            let _ = state.database()?.update_run_status(&run.id, run.status, Some("Cancelled; the action may already have changed data."), Some(&step_id));
-                            state.database()?.update_message(&row.id,&json!({"request":audit,"result":"Cancelled; the action may already have changed data."}).to_string(),"","interrupted")?;
-                            settle_unconsumed_reads(state, plan, &conversation_id, run, &step_id, &mut ledger, &calls, &mut prefetched, messages, &mut self.seq);
-                            return Ok(false);
-                        },
-                        // Model-visible results normalize once at this
-                        // boundary: backend values keep their typed data
-                        // (envelopes pass through), dispatch errors become
-                        // failure envelopes, and caller-side timeouts are
-                        // explicitly unknown-side-effect outcomes.
-                        Some(Ok(Ok(value))) => crate::tool_envelope::normalize(value, tool.envelope_family()),
-                        Some(Ok(Err(error))) => crate::tool_envelope::normalize_error(&error, crate::tool_envelope::Cause::default(), tool.envelope_family()),
-                        Some(Err(_)) => crate::tool_envelope::normalize_error("Tool request timed out. Its remote outcome may be unknown; do not automatically retry.", crate::tool_envelope::Cause { timeout: true, ..Default::default() }, tool.envelope_family()),
-                    }
-                    }
-                };
-
-                research_progress.observe(&tool.tool.name, &result);
-                // The taste profile learns from DECISIONS the user made, not
-                // from calls the access mode approved on their own. An
-                // auto-approved call carries no signal about the user's
-                // taste, so it is deliberately not recorded.
-                if !matches!(rule_decision, crate::permission_rules::Decision::Allow(_)) {
-                    let decision = if allow {
-                        crate::taste::Decision::Accepted
-                    } else {
-                        crate::taste::Decision::Rejected
-                    };
-                    if let Ok(store) = state.database() {
-                        let _ = crate::taste::record(
-                            &store,
-                            &conversation_id,
-                            &tool.tool.name,
-                            decision,
-                            &call.arguments,
-                            &result,
-                        );
-                    }
-                }
-                if matches!(
-                    tool.tool.name.as_str(),
-                    "weather"
-                        | "get_weather"
-                        | "search"
-                        | "visit"
-                        | "web_search"
-                        | "web_open"
-                        | "web_find"
-                        | "web_fetch"
-                        | "web_fetch_url"
-                ) {
-                    crate::arex::collect_evidence(&result, &mut research_evidence);
-                }
-                if plan_mode
-                    && !plan_approved
-                    && call.name == "plan_submit"
-                    && result["data"]["approved"] == Value::Bool(true)
-                {
-                    plan_approved = true;
-                    let submitted = call.arguments["plan"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    let _ = begin_plan_implementation(messages, &submitted);
-                    if let Ok(store) = state.database() {
-                        if store.todos(&conversation_id).unwrap_or_default().is_empty() {
-                            let seeded = crate::plans::parse_plan_steps(&submitted);
-                            if !seeded.is_empty() {
-                                let _ = store.save_todos(&conversation_id, &seeded);
-                            }
-                        }
-                        if let Ok(todos) = store.todos(&conversation_id) {
-                            refresh_plan_focus(messages, &todos);
-                        }
-                    }
-                }
-                if call
-                    .name
-                    .strip_prefix("workspace_")
-                    .is_some_and(crate::workspace::is_write_call)
-                    && !crate::tool_envelope::failed(&result)
-                {
-                    verify_dirty = true;
-                }
-                if matches!(call.name.as_str(), "worktree_enter" | "worktree_exit")
-                    && !crate::tool_envelope::failed(&result)
-                {
-                    if let Ok(store) = state.database() {
-                        if let Ok(Some(path)) =
-                            crate::workspace_ui::task_workspace(&store, &conversation_id)
-                        {
-                            snapshot.workspace_path = path;
-                        }
-                    }
-                }
-                if call.name == "check_run"
-                    && !matches!(
-                        result.pointer("/error/code").and_then(Value::as_str),
-                        Some("denied" | "unavailable-tool" | "plan-approval-required")
-                    )
-                {
-                    verify_dirty = false;
-                }
-                let control = if tool.connector == "Harness"
-                    && matches!(call.name.as_str(), "update_context" | "finish")
-                {
-                    Some(result.clone())
-                } else {
-                    None
-                };
-                let deliverable_missing = matches!(
-                    call.name.as_str(),
-                    "file_write" | "create_file" | "run_code"
-                ) && result["isError"] == Value::Bool(true);
-                let mut follow_up: Option<String> = None;
-                let budget_snapshot = budgets.lock().map(|b| b.clone()).unwrap_or_default();
-                match crate::continuation::continuation_after_tool(
-                    plan_mode,
-                    &call.name,
-                    &result,
-                    &budget_snapshot,
-                    corrections_used,
-                    deliverable_missing,
-                ) {
-                    crate::continuation::Continuation::Proceed { evidence } => {
-                        if evidence_note.is_none() {
-                            evidence_note = evidence;
-                        }
-                    }
-                    crate::continuation::Continuation::CorrectOnce { reason } => {
-                        corrections_used = corrections_used.saturating_add(1);
-                        follow_up = Some(format!("{reason} Fix it once with the tools still available, then stop. Do not start an open-ended review."));
-                    }
-                    crate::continuation::Continuation::Partial { unresolved } => {
-                        let named = unresolved.join("; ");
-                        self.research_fallback =
-                            Some(format!("Partial result. Unresolved: {named}"));
-                        self.finalization_retried = false;
-                        follow_up = Some(format!("Budget or checklist limit reached. Answer from the results already collected and name this unresolved work: {named}. Do not call tools."));
-                    }
-                    crate::continuation::Continuation::Stop { message, retryable } => {
-                        if !retryable {
-                            if let Ok(mut set) = blocked_calls.lock() {
-                                set.insert(crate::continuation::tool_signature(
-                                    tool,
-                                    &call.arguments,
-                                ));
-                            }
-                        }
-                        if result["denied"] == Value::Bool(true) {
-                            tool_use_denied = true;
-                        }
-                        let _ = message;
-                    }
-                }
-
-                // Image bytes never enter the audit row or the model transcript:
-                // automation captures and workspace document reads both strip
-                // image parts into conversation-owned artifacts that
-                // add_model_images rehydrates only for vision-capable models.
-                if matches!(tool.connector.as_str(), "Browser" | "Computer")
-                    || (tool.connector == "Workspace"
-                        && matches!(tool.tool.name.as_str(), "document_read" | "view_image"))
-                {
-                    if let Err(error) = crate::automation::capture_images(
-                        &mut result,
-                        &*state.database()?,
-                        &conversation_id,
-                        &run.id,
-                        &tool.tool.name,
-                    ) {
-                        result = crate::tool_envelope::normalize_error(
-                            &error,
-                            crate::tool_envelope::Cause::default(),
-                            tool.envelope_family(),
-                        );
-                    }
-                }
-
-                // Excerpt size follows the tokens still free after the counted
-                // input and response reserve; full results stay in artifacts.
-                let catalog_recorded =
-                    matches!(call.name.as_str(), "run_code" | "file_write" | "file_read") && allow;
-                let excerpt_chars = crate::artifacts::excerpt_budget(
-                    plan.context_length,
-                    self.input_tokens,
-                    round_preferences.max_tokens,
-                );
-                let (bounded_val, maybe_artifact) = crate::artifacts::bound_tool_result(
-                    result,
-                    &tool.tool.name,
-                    &conversation_id,
-                    Some(&run.id),
-                    excerpt_chars,
-                );
-                if let Some(artifact) = &maybe_artifact {
-                    let _ = state.database()?.save_artifact(artifact);
-                }
-                let mut bounded_val = bounded_val;
-                if let Some(note) = crate::hooks::post_use(
-                    state,
-                    &conversation_id,
-                    &call.name,
-                    &call.arguments,
-                    &bounded_val,
-                    "approved",
-                )
-                .await
-                {
-                    // Survives artifact bounding: applied after it, separate field.
-                    bounded_val["hookNote"] = json!(note);
-                }
-                state.database()?.update_message(
-                    &row.id,
-                    &json!({"request":audit,"result":bounded_val}).to_string(),
-                    "",
-                    "complete",
-                )?;
-                messages.push(
-                    json!({"role":"tool","tool_call_id":call.id,"content":bounded_val.to_string()}),
-                );
-                if !catalog_recorded {
-                    if let Some(task) = ledger.as_mut() {
-                        let store = state.database()?;
-                        persist_completed_tool(&store, task, &call.name, Some(call.id.clone()))?;
-                    }
-                }
-                if let Some(follow_up) = follow_up {
-                    messages.push(json!({"role":"user","content":follow_up}));
-                }
-                if let Some(control) = control {
-                    explicit_finish = crate::arex::apply_control(
-                        &call.name,
-                        &control,
-                        &*state.database()?,
-                        &conversation_id,
-                        &run.id,
-                        messages,
-                    )?;
-                    if explicit_finish.is_some() {
-                        finish_args = Some(call.arguments.clone());
-                    }
-                }
-                if let Ok(store) = state.database() {
-                    emit_session_event(
-                        &store,
-                        &conversation_id,
-                        Some(&run.id),
-                        Some(&step_id),
-                        Some(&call.id),
-                        "tool_result",
-                        json!({
-                            "callId": call.id,
-                            "name": tool.tool.name,
-                            "decision": if allow { "allowed" } else { "denied" },
-                            "result": bounded_val,
-                            "artifactId": maybe_artifact.as_ref().map(|a| a.id.clone()),
-                        }),
-                        false,
-                    );
-                }
-            }
-            if plan.supports_images {
-                crate::automation::add_model_images(
-                    messages,
-                    &*state.database()?,
-                    &conversation_id,
-                )?;
-            }
-            if let Some(final_answer) = explicit_finish {
-                let finish_args = finish_args.take();
-                present_research_answer(
-                    state,
-                    channel,
-                    run,
-                    &step_id,
-                    &conversation_id,
-                    &assistant.id,
-                    &mut self.seq,
-                    answer,
-                    &final_answer,
-                    finish_args.as_ref(),
-                    &research_evidence,
-                )
-                .await?;
-                return Ok(true);
-            }
-            if paused_exit {
-                return Ok(false);
-            }
-            if !tool_use_denied && research_progress.stopped() {
-                let unresolved =
-                    "Unresolved: the research budget is exhausted before every source was read.";
-                self.research_fallback =
-                    Some(format!("{RESEARCH_STALLED_FALLBACK}\n\n{unresolved}"));
-                messages.push(
-                    json!({"role":"user","content":format!("{RESEARCH_STALLED}\n\n{unresolved}")}),
-                );
-                let mut event = ChatEvent::progress(
-                    &run.id,
-                    &step_id,
-                    &assistant.id,
-                    "Research stopped · preparing answer…",
-                    None,
-                );
-                event.notice = Some("Research is no longer making progress or has reached its budget. Preparing an answer from the collected results.".into());
-                channel.send(event).map_err(|e| e.to_string())?;
-            } else if !tool_use_denied
-                && research_progress.calls > research_calls_before
-                && research_progress.stagnant == 2
-            {
-                messages.push(json!({"role":"user","content":"The last web calls added no new evidence. Do not rephrase the same search. Read an unvisited source, change the source or research approach, or answer from existing evidence and explain the gap."}));
-            }
-            let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
-            let _ = state
-                .database()?
-                .update_run_status(&run.id, run.status, None, Some(&step_id));
-            if let Ok(store) = state.database() {
-                emit_session_event(
-                    &store,
-                    &conversation_id,
-                    Some(&run.id),
-                    Some(&step_id),
-                    None,
-                    "step_end",
-                    json!({"round": round, "content": round_answer, "toolCallsCount": tool_calls_count}),
-                    false,
-                );
-            }
-        }
-        Err("Tool round limit reached.".into())
-    }
-}
+#[path = "agent_engine/foreground.rs"]
+mod foreground;
+use foreground::TurnRounds;
 
 #[tauri::command]
 pub fn cancel_generation(state: State<'_, AppState>) {
@@ -4732,6 +2118,8 @@ fn tool_chunk_callback(
             elapsed_secs: Some(started.elapsed().as_secs_f64()),
             round_index: Some(round),
             presentation: None,
+            discard_step: None,
+            outcome:None,
             tool_stream: Some(ToolStreamEvent::OutputChunk {
                 tool_call_id: call_id.clone(),
                 stream: stream_name.to_string(),
@@ -4792,7 +2180,9 @@ async fn prefetch_read_group(
             }
             let tool = tool.expect("grouped calls passed concurrent_read_ok");
             let arguments = tool.prepare_arguments(call.arguments.clone()).unwrap_or_else(|_| call.arguments.clone());
-            let timeout = timeout_secs(tool);
+            let _timeout = timeout_secs(tool);
+            let configured=state.database().ok().and_then(|store| store.setting::<Option<u64>>(crate::sandbox::TOOL_TIMEOUT_KEY).ok()).flatten();
+            let deadline=crate::agent_engine::tool_deadline(tool,&arguments,configured);
             let mut cancellation = cancellation.clone();
             let catalog_db = catalog_db.clone();
             let workspace_path = workspace_path.clone();
@@ -4807,7 +2197,7 @@ async fn prefetch_read_group(
                 }
                 let outcome = tokio::select! {
                     _ = cancellation.changed() => None,
-                    result = tokio::time::timeout(std::time::Duration::from_secs(timeout), async {
+                    result = crate::agent_engine::await_tool(deadline, async {
                         if let Err(error)=crate::continuation::admit_tool(state,&run.id,&call.name,&call.arguments){return Ok(crate::tool_envelope::failure_notice("tool-budget-blocked",&error,false,crate::tool_envelope::SIDE_NONE,&json!({"budget":true})));}
                         if let Some(blocked)=crate::hooks::pre_use(state,conversation_id,&call.name,&call.arguments).await.blocked{return Ok(crate::tool_envelope::failure_notice("hook-blocked",&blocked,false,crate::tool_envelope::SIDE_NONE,&json!({"hookBlocked":true})));}
                         if tool.is_harness() {
@@ -4930,7 +2320,7 @@ fn settle_unconsumed_reads(
             Some(Err(_)) => crate::tool_envelope::normalize_error("Tool request timed out. Its remote outcome may be unknown; do not automatically retry.", crate::tool_envelope::Cause { timeout: true, ..Default::default() }, tool.envelope_family()),
             None => crate::tool_envelope::normalize_error("The read group was interrupted before this call produced a result.", crate::tool_envelope::Cause { cancelled: true, ..Default::default() }, tool.envelope_family()),
         };
-        let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
+        let (mut bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
             result,
             &tool.tool.name,
             conversation_id,
@@ -4938,8 +2328,9 @@ fn settle_unconsumed_reads(
             crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
         );
         if let Some(artifact) = &maybe_artifact {
-            if let Ok(store) = state.database() {
-                let _ = store.save_artifact(artifact);
+            if let Err(error) = state.database().and_then(|store|store.save_artifact(artifact)) {
+                bounded = crate::tool_envelope::failure_notice("artifact-save-failed", &error, false,
+                    crate::tool_envelope::SIDE_NONE, &json!({}));
             }
         }
         let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":"allowed","accessMode":plan.access_mode,"authorization":"auto-approved read group (settled at turn interrupt)","callId":call.id,"stepId":step_id});
@@ -4994,11 +2385,15 @@ pub fn stage_paused_resume(
     store: &crate::store::Store,
     conversation_id: &str,
 ) -> Result<StagedResume, String> {
-    let mut task = store
-        .recoverable_research_tasks(conversation_id)?
-        .into_iter()
-        .find(|task| task.status == crate::research_tasks::TaskStatus::Paused)
-        .ok_or("No paused checkpoint to resume.")?;
+    let recoverable=store.recoverable_research_tasks(conversation_id)?;
+    let Some(mut task)=recoverable.into_iter().find(|task|task.status==crate::research_tasks::TaskStatus::Paused) else {
+        let run=store.latest_run(conversation_id)?.filter(|run|run.status==crate::agent_run::RunState::Paused)
+            .ok_or("No paused checkpoint to resume.")?;
+        let checkpoint=store.run_checkpoint(&run.id)?.ok_or("The paused run has no recoverable checkpoint.")?;
+        let note=checkpoint.resume_note();
+        store.save_setting(&format!("pending_resume:{conversation_id}"),&note)?;
+        return Ok(StagedResume {question:checkpoint.request,pending:vec!["Continue the original request after reviewing preserved results.".into()],completed:checkpoint.operations.iter().map(|op|op.call_id.clone()).collect(),checkpoint:note});
+    };
     task.resume()?;
     let completed: Vec<String> = task
         .operations
@@ -5157,14 +2552,13 @@ async fn prepare_context(
                 // This window did not help; try a smaller one.
                 continue;
             }
-            let mut accepted = compaction.kept;
-            artifact = crate::compaction::compact_model_messages(
+            artifact = crate::compaction::apply_compaction(
                 &*state.database()?,
                 conversation_id,
-                &mut accepted,
+                messages,
+                compaction,
                 window,
             )?;
-            *messages = accepted;
             tokens = candidate_tokens;
             if !crate::compaction::should_compact(
                 tokens,
@@ -5306,7 +2700,8 @@ pub(crate) async fn send_message_inner(
         error: None,
         created_at: now,
         updated_at: now,
-    };
+    outcome: None,
+};
     state.database()?.save_run(&run)?;
     if let Ok(store) = state.database() {
         emit_session_event(
@@ -5437,6 +2832,7 @@ pub(crate) async fn send_message_inner(
         answer: &mut answer,
         reasoning: &mut reasoning,
         research_fallback,
+        stop_reason:None,
         web_lookup_retried,
         finalization_retried,
         replay_answer,
@@ -5461,6 +2857,8 @@ pub(crate) async fn send_message_inner(
     // post-turn bookkeeping.
     replay_answer = rounds.replay_answer;
     last_model_message_id = rounds.last_model_message_id;
+    let partial = rounds.research_fallback.is_some();
+    let fallback_reason=rounds.stop_reason;
     if let Some((start, mut measurement)) = active_measurement.take() {
         measurement.duration_ms = start.elapsed().as_secs_f64() * 1000.0;
         response_metrics.rounds.push(measurement);
@@ -5471,7 +2869,7 @@ pub(crate) async fn send_message_inner(
             .database()?
             .save_message_metrics(&assistant.id, &response_metrics)?;
     }
-    let final_run_state = crate::agent_run::settled_state(
+    let mut final_run_state = crate::agent_run::settled_state(
         result.as_ref().ok().copied(),
         state
             .run_control
@@ -5480,9 +2878,17 @@ pub(crate) async fn send_message_inner(
             .unwrap_or(false),
         cancel_applies(state, run_generation),
     );
+    if partial && matches!(result, Ok(true)) {
+        final_run_state = crate::agent_run::RunState::Paused;
+    }
+    if final_run_state != crate::agent_run::RunState::Cancelled {
+        if let Some(reason) = fallback_reason {
+            final_run_state = reason.run_state();
+        }
+    }
     let paused = final_run_state == crate::agent_run::RunState::Paused;
-    let status = if paused {
-        "paused"
+    let status = if paused || final_run_state==crate::agent_run::RunState::OutcomeUnknown {
+        "interrupted"
     } else {
         match &result {
             Ok(true) => "complete",
@@ -5490,39 +2896,6 @@ pub(crate) async fn send_message_inner(
             Err(_) => "error",
         }
     };
-    // A delivered answer means nothing is still in progress. Models routinely
-    // finish without todo bookkeeping, so close out open items here — the
-    // checklist must not sit on a stale "Now" badge after the turn ends.
-    if matches!(result, Ok(true)) {
-        if let Ok(store) = state.database() {
-            if let Ok(mut todos) = store.todos(&conversation_id) {
-                if todos
-                    .iter()
-                    .any(|todo| todo.status != crate::plans::COMPLETED)
-                {
-                    let now = crate::store::now();
-                    for todo in &mut todos {
-                        if todo.status != crate::plans::COMPLETED {
-                            todo.status = crate::plans::COMPLETED.into();
-                            todo.updated_at = now;
-                        }
-                    }
-                    if store.save_todos(&conversation_id, &todos).is_ok() {
-                        emit_session_event(
-                            &store,
-                            &conversation_id,
-                            Some(&run.id),
-                            None,
-                            None,
-                            "plan",
-                            json!({"kind": "todos", "count": todos.len(), "closed": true}),
-                            false,
-                        );
-                    }
-                }
-            }
-        }
-    }
     state.database()?.finish_message(
         &assistant.id,
         &answer,
@@ -5590,14 +2963,30 @@ pub(crate) async fn send_message_inner(
     let _ = run.transition_to(final_run_state);
     let _ = state.database()?.update_run_status(
         &run.id,
-        run.status,
+        final_run_state,
         if paused {
-            Some(crate::agent_run::pause_notice(false))
+            result.as_ref().err().map(String::as_str).or(Some(crate::agent_run::pause_notice(false)))
         } else {
             result.as_ref().err().map(String::as_str)
         },
         None,
     );
+    use crate::agent_engine::StopReason;
+    let reason = if final_run_state==crate::agent_run::RunState::Cancelled { StopReason::UserCancelled }
+        else if let Some(reason)=fallback_reason {reason}
+        else if paused { StopReason::UserPaused }
+        else if result.is_err() { StopReason::ProviderFailure }
+        else { StopReason::Completed };
+    let outcome = crate::agent_engine::RunOutcome { reason,
+        resumable: !matches!(reason, StopReason::Completed | StopReason::UserCancelled),
+        checkpoint: Some(run.id.clone()) };
+    state.database()?.save_run_outcome(&run.id, &outcome)?;
+    crate::hooks::run_finished(state, conversation_id.clone(), json!({
+        "status":final_run_state.as_str(),"outcome":outcome,
+    }));
+    let mut terminal_event=ChatEvent::progress(&run.id,"turn_end",&assistant.id,"Turn ended",None);
+    terminal_event.state=Some(final_run_state.as_str().into());terminal_event.outcome=Some(outcome.clone());
+    let _=channel.send(terminal_event);
     if let Ok(store) = state.database() {
         emit_session_event(
             &store,
@@ -5611,6 +3000,7 @@ pub(crate) async fn send_message_inner(
                 "error": result.as_ref().err().map(String::as_str),
                 "answerLength": answer.len(),
                 "reasoningLength": reasoning.len(),
+                "outcome": outcome,
             }),
             false,
         );
@@ -6037,6 +3427,22 @@ mod finish_tests {
     }
 
     #[tokio::test]
+    async fn productive_foreground_turn_commits_more_than_sixty_four_tool_rounds() {
+        let dir=tempfile::tempdir().unwrap(); let state=crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state,dir.path());
+        let mut responses=(0..67).map(|i|sse_completed(vec![fixture_call(&i.to_string(),"workspace_create_file",
+            &serde_json::json!({"path":format!("part-{i}.txt"),"content":i.to_string()}).to_string())])).collect::<Vec<_>>();
+        responses.push(sse_completed(vec![fixture_answer("All 67 parts saved.")]));
+        let (base,requests,server)=crate::test_support::scripted_sse(responses).await;
+        let conversation=scripted_conversation(&state,base).await;
+        super::send_message_inner(&state,conversation.clone(),"Create all 67 parts".into(),Some(vec!["__workspace".into()]),Some(vec![]),None,None,tauri::ipc::Channel::new(|_|Ok(()))).await.unwrap();
+        server.await.unwrap();
+        for i in 0..67 { assert_eq!(std::fs::read_to_string(dir.path().join(format!("part-{i}.txt"))).unwrap(),i.to_string()); }
+        assert_eq!(requests.lock().unwrap().len(),68);
+        let store=state.database().unwrap(); let run=store.latest_run(&conversation).unwrap().unwrap();
+        assert_eq!(run.outcome.unwrap().reason,crate::agent_engine::StopReason::Completed);
+    }
+    #[tokio::test]
     async fn plan_mode_refuses_writes_until_plan_submit_approval() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::test_support::app_state(dir.path());
@@ -6093,6 +3499,46 @@ mod finish_tests {
             .filter(|row| row.role == "tool" && row.content.contains("plan-approval-required"))
             .count();
         assert_eq!(denied, 1);
+    }
+
+    #[tokio::test]
+    async fn finishing_after_a_write_does_not_force_redundant_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![
+            sse_completed(vec![fixture_answer("Writing the file."), fixture_call(
+                "1",
+                "workspace_create_file",
+                "{\"path\":\"made.txt\",\"content\":\"hi\"}",
+            )]),
+            sse_completed(vec![fixture_answer("All done.")]),
+        ])
+        .await;
+        let conversation = scripted_conversation(&state, base).await;
+        let channel = tauri::ipc::Channel::<super::ChatEvent>::new(|_| Ok(()));
+        super::send_message_inner(
+            &state,
+            conversation.clone(),
+            "Write the file".into(),
+            Some(vec!["__workspace".into(), "__execution".into()]),
+            Some(vec![]),
+            None,
+            None,
+            channel,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(dir.path().join("made.txt").exists());
+        let store = state.database().unwrap();
+        assert_eq!(store.messages(&conversation).unwrap().iter().find(|message| message.role == "assistant").unwrap().content, "All done.");
+        let events = store.session_events(&conversation, None, None).unwrap();
+        assert!(events.iter().any(|event| event.event_type == "model_response" && event.payload["final"] == false && event.payload["content"] == "Writing the file."));
+        assert!(events.iter().any(|event| event.event_type == "answer_committed" && event.payload["content"] == "All done."));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[1].body.to_string().contains(crate::continuation::VERIFY_BEFORE_FINISH));
     }
 
     #[tokio::test]
@@ -6197,46 +3643,6 @@ mod finish_tests {
     }
 
     #[tokio::test]
-    async fn verify_before_finish_nudges_once_after_an_unchecked_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = crate::test_support::app_state(dir.path());
-        crate::test_support::select_fixture_model(&state, dir.path());
-        let (base, requests, server) = crate::test_support::scripted_sse(vec![
-            sse_completed(vec![fixture_call(
-                "1",
-                "workspace_create_file",
-                "{\"path\":\"made.txt\",\"content\":\"hi\"}",
-            )]),
-            sse_completed(vec![fixture_answer("All done.")]),
-            sse_completed(vec![fixture_answer("Final answer.")]),
-        ])
-        .await;
-        let conversation = scripted_conversation(&state, base).await;
-        let channel = tauri::ipc::Channel::<super::ChatEvent>::new(|_| Ok(()));
-        super::send_message_inner(
-            &state,
-            conversation.clone(),
-            "Write the file".into(),
-            Some(vec!["__workspace".into(), "__execution".into()]),
-            Some(vec![]),
-            None,
-            None,
-            channel,
-        )
-        .await
-        .unwrap();
-        server.await.unwrap();
-        assert!(dir.path().join("made.txt").exists());
-        // Exactly one corrective round: request 3 replays the second answer
-        // plus the nudge asking the model to run checks before finishing.
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        let third = requests[2].body.to_string();
-        assert!(third.contains("have not run checks"), "{third}");
-        assert!(third.contains("All done."), "{third}");
-    }
-
-    #[tokio::test]
     async fn no_write_or_a_later_check_run_skips_the_verify_nudge() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::test_support::app_state(dir.path());
@@ -6263,7 +3669,7 @@ mod finish_tests {
         let rows = state.database().unwrap().messages(&conversation).unwrap();
         assert!(!rows
             .iter()
-            .any(|row| row.content.contains("have not run checks")));
+            .any(|row| row.content.contains(crate::continuation::VERIFY_BEFORE_FINISH)));
     }
 
     #[test]
@@ -6442,104 +3848,17 @@ mod finish_tests {
             "incomplete tool calls must still fail"
         );
     }
-    #[test]
-    fn arex_context_rewrites_do_not_reset_research_progress() {
-        let mut progress = super::ResearchProgress::default();
-        progress.observe(
-            "search",
-            &serde_json::json!({"results":[{"url":"https://example.org"}]}),
-        );
-        for i in 0..4 {
-            progress.observe("update_context", &serde_json::json!({"context":format!("reworded notes {i}"),"text":format!("new wording {i}")}));
-        }
-        assert!(progress.stopped());
-    }
 
-    #[test]
-    fn research_progress_ignores_mcp_metadata_and_stays_stopped() {
-        let mut progress = super::ResearchProgress::default();
-        for i in 0..5 {
-            let wrapped = serde_json::json!({"content":[{"type":"text","text":serde_json::json!({"request_id":i,"results":[{"url":"https://example.org","excerpts":["same passage"]}]}).to_string()}]});
-            progress.observe("web_fetch", &wrapped);
-        }
-        assert!(progress.stopped());
-        progress.observe("web_open", &serde_json::json!({"text":"late new evidence"}));
-        assert!(progress.stopped());
-        let payload = super::request_payload(
-            &[],
-            &[serde_json::json!({"type":"function"})],
-            &crate::store::Preferences::default(),
-            false,
-            true,
-            false,
-            None,
-            false,
-        );
-        assert!(payload.get("tools").is_some());
-        assert_eq!(payload["tool_choice"], "none");
-    }
 
-    #[test]
-    fn research_progress_has_a_budget_even_when_results_keep_changing() {
-        let mut progress = super::ResearchProgress::default();
-        for i in 0..16 {
-            // Each hit on a genuinely new domain is progress; the call budget
-            // is the only brake left once domains keep changing.
-            let result = serde_json::json!({"results":[{"url":format!("https://site{i}.example.com/page"),"text":format!("result {i}")}]});
-            progress.observe("web_search", &result);
-            assert_eq!(progress.stopped(), i == 15);
-        }
-    }
 
-    #[test]
-    fn research_progress_stops_reworded_searches_with_repeated_evidence() {
-        let mut progress = super::ResearchProgress::default();
-        for i in 0..5 {
-            let result = serde_json::json!({"requestId":i,"query":format!("query {i}"),"results":[{"url":"https://example.org","text":"same evidence"}]});
-            progress.observe("web_search", &result);
-            assert_eq!(progress.stopped(), i >= 3);
-        }
-    }
 
-    #[test]
-    fn research_progress_counts_new_passages_without_a_new_domain() {
-        let mut progress = super::ResearchProgress::default();
-        for i in 0..4 {
-            let result = serde_json::json!({"results":[{"url":format!("https://arxiv.org/abs/{i}"),"text":format!("novel snippet {i}")}]});
-            progress.observe("search", &result);
-            assert!(
-                !progress.stopped(),
-                "a new passage is progress without a new domain"
-            );
-        }
-        for _ in 0..3 {
-            progress.observe("search", &serde_json::json!({"results":[{"url":"https://arxiv.org/abs/1","text":"novel snippet 1"}]}));
-        }
-        assert!(progress.stopped());
-    }
 
-    #[test]
-    fn research_progress_allows_new_reading_and_ignores_other_tools() {
-        let mut progress = super::ResearchProgress::default();
-        for _ in 0..10 {
-            progress.observe("read_file", &serde_json::json!({}));
-        }
-        assert!(!progress.stopped());
-        for i in 0..10 {
-            progress.observe(
-                "web_open",
-                &serde_json::json!({"text":format!("new passage {i}")}),
-            );
-            assert!(!progress.stopped());
-        }
-        for _ in 0..4 {
-            progress.observe(
-                "web_fetch",
-                &serde_json::json!({"isError":true,"message":"failed"}),
-            );
-        }
-        assert!(progress.stopped());
-    }
+
+
+
+
+
+
 
     #[test]
     fn request_payload_keeps_id_slot_and_cache_prompt() {
@@ -6771,21 +4090,6 @@ mod finish_tests {
             .unwrap()
             .save_setting(crate::capabilities::DISABLED_KEY, &Vec::<String>::new())
             .unwrap();
-    }
-
-    #[test]
-    fn sources_footer_dedupes_and_caps_evidence_urls() {
-        let evidence = vec![
-            ("https://a.example/1".to_string(), "text a".to_string()),
-            ("".to_string(), "no url".to_string()),
-            ("https://a.example/1".to_string(), "dup".to_string()),
-            ("https://b.example/2".to_string(), "text b".to_string()),
-        ];
-        let footer = super::sources_footer(&evidence).unwrap();
-        assert!(footer.contains("https://a.example/1") && footer.contains("https://b.example/2"));
-        assert_eq!(footer.matches("https://a.example/1").count(), 1);
-        assert!(super::sources_footer(&[]).is_none());
-        assert!(super::sources_footer(&[("".into(), "x".repeat(60))]).is_none());
     }
 
     #[test]
@@ -7465,9 +4769,10 @@ mod read_group_tests {
             error: None,
             created_at: now,
             updated_at: now,
-        };
+        outcome: None,
+};
         store.save_run(&run).unwrap();
-        run
+       run
     }
 
     #[tokio::test]
@@ -7483,7 +4788,7 @@ mod read_group_tests {
             crate::permissions::AccessMode::AutoApprove
         );
         let blocked = std::collections::HashSet::new();
-        let list = |id: &str| call(id, "workspace_list_files", json!({"path": "."}));
+        let list = |id: &str| call(id, "workspace_read_file", json!({"path": "."}));
         let read = |id: &str| call(id, "workspace_read_file", json!({"path": "a.txt"}));
         // Every member and only members classify as trusted concurrent reads.
         for alias in [
@@ -7524,10 +4829,10 @@ mod read_group_tests {
             ),
             list("c"),
             read("d"),
-            list("e"),
-            list("f"),
-            list("g"),
-            list("h"),
+            call("e", "workspace_read_file", json!({"path":"e.txt"})),
+            call("f", "workspace_read_file", json!({"path":"f.txt"})),
+            call("g", "workspace_read_file", json!({"path":"g.txt"})),
+            call("h", "workspace_read_file", json!({"path":"h.txt"})),
         ];
         assert_eq!(
             super::read_group_end(&calls, 0, &plan, &state, &blocked, false, &[]),
@@ -7555,7 +4860,7 @@ mod read_group_tests {
         );
         // A prior identical history also suppresses the second member.
         let history = vec![(
-            "workspace_list_files".to_string(),
+            "workspace_read_file".to_string(),
             json!({"path": "."}).to_string(),
         )];
         assert_eq!(
@@ -8161,7 +5466,7 @@ mod read_group_tests {
                 "process_poll",
                 json!({"id": ids[1], "wait_ms": 1000, "max_bytes": 8192}),
             ),
-            ("tc-x2", "workspace_list_files", json!({"path": "."})),
+            ("tc-x2", "workspace_read_file", json!({"path": "missing.txt"})),
         ];
         let (base_url, served) = scripted_model_server(vec![
             tool_calls_wire(
@@ -8295,10 +5600,7 @@ mod output_recovery_tests {
             "workspace_open_preview",
         ] {
             assert!(plan.tools.iter().any(|t| t.alias == name), "{name}");
-            assert!(
-                crate::tool_discovery::visible(&plan.tool_definitions, name),
-                "{name} must be advertised directly"
-            );
+            assert!(crate::tool_discovery::visible(&plan.tool_definitions, "tool_invoke"));
         }
         assert!(!plan
             .tools
@@ -8314,7 +5616,7 @@ mod output_recovery_tests {
         let again = assemble(selected.clone()).await.unwrap();
         assert!(crate::tool_discovery::visible(
             &again.tool_definitions,
-            "workspace_open_preview"
+            "tool_invoke"
         ));
         for sources in [
             vec!["__workspace".into()],
@@ -8387,6 +5689,314 @@ mod output_recovery_tests {
 
     #[tokio::test]
     #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn early_permission_denials_survive_unrelated_success_and_final_text() {
+        for kill_capability in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = crate::test_support::app_state(dir.path());
+            crate::test_support::select_fixture_model(&state, dir.path());
+            if !kill_capability {
+                crate::permission_rules::save(&state.database().unwrap(), &crate::permission_rules::RuleSet {
+                    rules:vec![crate::permission_rules::Rule {
+                        action:crate::permission_rules::Action::Path,
+                        resource:"forbidden.txt".into(), effect:crate::permission_rules::Effect::Deny,
+                    }],
+                }).unwrap();
+            }
+            let db = state.db_path.clone();
+            let mut round = 0;
+            let (base, requests, server) = crate::test_support::scripted_sse_with(4, move |_| {
+                let wire = match round {
+                    0 | 1 => {
+                        if kill_capability && round == 0 {
+                            crate::store::Store::open(&db).unwrap()
+                                .save_setting(crate::capabilities::DISABLED_KEY, &vec!["workspace_files"]).unwrap();
+                        }
+                        call_wire(&format!("denied-{round}"), r#"{"path":"forbidden.txt","content":"must not run"}"#, "tool_calls")
+                    }
+                    2 => call_wire("other", "{}", "tool_calls").replace("workspace_create_file", "system_time"),
+                    _ => text_wire("The file action was refused. The unrelated action finished.", "stop"),
+                };
+                round += 1;
+                wire
+            }).await;
+            let id = conversation(&state, base).await;
+            let delivered = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let observed = delivered.clone();
+            let channel = Channel::new(move |body| {
+                if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                    observed.lock().unwrap().push(serde_json::from_str(&text).unwrap());
+                }
+                Ok(())
+            });
+            send_message_inner(&state, id.clone(), "Create forbidden.txt".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, channel).await.unwrap();
+            server.await.unwrap();
+            assert!(!dir.path().join("forbidden.txt").exists());
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert_ne!(requests[2].body["tool_choice"], "none");
+            drop(requests);
+            let store = state.database().unwrap();
+            let run = store.latest_run(&id).unwrap().unwrap();
+            assert_eq!(run.status, crate::agent_run::RunState::Paused);
+            assert_eq!(run.outcome.unwrap().reason, crate::agent_engine::StopReason::PermissionDenied);
+            assert!(delivered.lock().unwrap().iter().all(|event|event["state"]!="completed"));
+            let rows = store.messages(&id).unwrap();
+            let results:Vec<Value> = rows.iter().filter(|row| row.role=="tool")
+                .map(|row| serde_json::from_str::<Value>(&row.content).unwrap()["result"].clone()).collect();
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[2]["status"], "success");
+            if !kill_capability {
+                assert_eq!(results[1]["error"]["code"], "action-blocked");
+                assert_eq!(results[1]["error"]["sideEffects"], crate::tool_envelope::SIDE_NONE);
+            }
+            assert!(store.session_events(&id, None, None).unwrap().iter()
+                .any(|event| event.event_type=="tool_result" && event.payload["error"]["code"]==if kill_capability {"capability-disabled"} else {"permission-denied"}));
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn observed_process_failure_can_be_repaired_without_an_uncertain_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let mut stage = 0;
+        let (base, requests, server) = crate::test_support::scripted_sse_with(4, move |request| {
+            let call = |name: &str, args: Value| call_wire("command", &args.to_string(), "tool_calls")
+                .replace("workspace_create_file", name);
+            let wire = match stage {
+                0 => call("process_start", json!({"command":"printf first >> observed.txt; exit 7","yield_ms":0})),
+                1 => {
+                    let row = request["messages"].as_array().unwrap().iter().rev().find(|m|m["role"]=="tool").unwrap();
+                    let result:Value = serde_json::from_str(row["content"].as_str().unwrap()).unwrap();
+                    call("process_poll", json!({"id":result["data"]["id"]}))
+                }
+                2 => {
+                    let row = request["messages"].as_array().unwrap().iter().rev().find(|m|m["role"]=="tool").unwrap();
+                    let result:Value = serde_json::from_str(row["content"].as_str().unwrap()).unwrap();
+                    assert_eq!(result["status"], "failure");
+                    assert_eq!(result["data"]["exitCode"], 7);
+                    call("process_start", json!({"command":"printf repaired >> observed.txt","yield_ms":1000}))
+                }
+                _ => text_wire("The first command failed with exit 7; the repair command succeeded.", "stop"),
+            };
+            stage += 1;
+            wire
+        }).await;
+        let id = conversation(&state, base).await;
+        send_message_inner(&state, id.clone(), "Run the command, inspect its failure and repair it.".into(),
+            Some(vec!["__execution".into()]), Some(vec![]), None, None, Channel::new(|_|Ok(()))).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        assert_eq!(std::fs::read_to_string(dir.path().join("observed.txt")).unwrap(), "firstrepaired");
+        let store = state.database().unwrap();
+        let run = store.latest_run(&id).unwrap().unwrap();
+        assert_eq!(run.status, crate::agent_run::RunState::Completed);
+        assert_eq!(run.outcome.unwrap().reason, crate::agent_engine::StopReason::Completed);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn coding_workflow_reads_edits_fails_repairs_and_verifies_through_real_dispatch() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("value.txt"), "broken\n").unwrap();
+        std::fs::write(workspace.join("check.sh"), "printf '1..1\\n'\nif [ \"$(cat value.txt)\" = fixed ]; then printf 'ok 1 - value\\n'; else printf 'not ok 1 - value\\n'; exit 1; fi\n").unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let mut stage = 0;
+        let (base, requests, server) = crate::test_support::scripted_sse_with(8, move |request| {
+            let messages = request["messages"].as_array().unwrap();
+            let last_result = || -> Value {
+                let row = messages.iter().rev().find(|row| row["role"] == "tool").unwrap();
+                serde_json::from_str(row["content"].as_str().unwrap()).unwrap()
+            };
+            let call = |name: &str, args: Value| -> String {
+                // Reuse the provider ID across every step on purpose.
+                if request["tools"].as_array().unwrap().iter().any(|tool|tool["function"]["name"]==name) {
+                    call_wire("reused", &args.to_string(), "tool_calls").replace("workspace_create_file", name)
+                } else {
+                    call_wire("reused", &json!({"name":name,"arguments":args}).to_string(), "tool_calls").replace("workspace_create_file", crate::tool_discovery::INVOKE)
+                }
+            };
+            let response = match stage {
+                0 => call("workspace_read_file", json!({"path":"value.txt"})),
+                1 => {
+                    assert!(last_result().to_string().contains("broken"));
+                    call("workspace_edit_file", json!({"path":"value.txt","expected_sha256":format!("{:x}",Sha256::digest(b"broken\n")),"old_text":"broken","new_text":"still-broken"}))
+                }
+                2 => call("check_run", json!({"command":"sh check.sh","format":"tap","yield_ms":1000})),
+                3 | 6 => {
+                    let result = last_result();
+                    let id = result["data"]["processId"].as_str().unwrap();
+                    call("check_report", json!({"id":id,"format":"tap","wait_ms":1000}))
+                }
+                4 => {
+                    let result = last_result();
+                    assert_eq!(result["data"]["report"]["verdict"], "failed");
+                    call("workspace_edit_file", json!({"path":"value.txt","expected_sha256":format!("{:x}",Sha256::digest(b"still-broken\n")),"old_text":"still-broken","new_text":"fixed"}))
+                }
+                5 => call("check_run", json!({"command":"sh check.sh","format":"tap","yield_ms":1000})),
+                7 => {
+                    let result = last_result();
+                    assert_eq!(result["data"]["report"]["verdict"], "passed");
+                    assert_eq!(result["data"]["report"]["testsPassed"], true);
+                    text_wire("Fixed value.txt. The first check failed; after repair, one test passed.", "stop")
+                }
+                _ => unreachable!(),
+            };
+            stage += 1;
+            response
+        }).await;
+        let id = conversation(&state, base).await;
+        state.database().unwrap().save_workspace_path(workspace.to_str().unwrap()).unwrap();
+        let delivered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = delivered.clone();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                observed.lock().unwrap().push(serde_json::from_str::<Value>(&json).unwrap());
+            }
+            Ok(())
+        });
+        tokio::time::timeout(Duration::from_secs(45), send_message_inner(&state, id.clone(), "Read value.txt, attempt a fix, run check.sh, repair any failure and verify again.".into(), Some(vec!["__workspace".into(), "__execution".into()]), Some(vec![]), None, None, channel)).await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 8);
+        assert_eq!(std::fs::read_to_string(workspace.join("value.txt")).unwrap(), "fixed\n");
+        let store = state.database().unwrap();
+        let rows = store.messages(&id).unwrap();
+        assert_eq!(rows.iter().filter(|row| row.role == "tool").count(), 7);
+        let journal = store.session_events(&id, Some(0), Some(1000)).unwrap();
+        let calls: Vec<_> = journal.iter().filter(|event| event.event_type == "tool_call").collect();
+        assert_eq!(calls.len(), 7);
+        assert!(calls.iter().all(|event| event.tool_call_id.as_deref() == Some("reused")));
+        let steps: std::collections::HashSet<_> = calls.iter().map(|event| event.step_id.clone()).collect();
+        assert_eq!(steps.len(), 7);
+        let verification = journal.iter().rev().find(|event| event.event_type == "verification_status").unwrap();
+        assert_eq!(verification.payload["status"], "passed");
+        let stream = delivered.lock().unwrap();
+        assert!(stream.iter().any(|event| event["toolStream"]["type"] == "started"));
+        for event in stream.iter().filter(|event| event.get("toolStream").is_some_and(|value| !value.is_null())) {
+            assert!(event["runId"].as_str().is_some_and(|id| !id.is_empty()));
+            assert!(event["stepId"].as_str().is_some_and(|id| !id.is_empty()));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn ordinary_question_without_reasoning_completes_without_tool_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![text_wire("Four.", "stop")]).await;
+        let id = conversation(&state, base).await;
+        send_message_inner(&state, id.clone(), "What is two plus two?".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, Channel::new(|_| Ok(()))).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let rows = state.database().unwrap().messages(&id).unwrap();
+        assert!(!rows.iter().any(|message| message.role == "tool"));
+        let answer = rows.iter().find(|message| message.role == "assistant").unwrap();
+        assert_eq!(answer.content, "Four.");
+        assert_eq!(answer.status, "complete");
+        assert!(answer.reasoning.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn model_loop_advertises_and_rejects_timeouts_above_the_saved_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let call = call_wire("limit", r#"{"name":"check_run","arguments":{"command":"echo must-not-run","timeout_seconds":180}}"#, "tool_calls").replace("workspace_create_file", "tool_invoke");
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![call, text_wire("The check did not run: the timeout exceeds the configured 60 second limit.", "stop")]).await;
+        let id = conversation(&state, base).await;
+        send_message_inner(&state, id.clone(), "Run a check".into(), Some(vec!["__execution".into()]), Some(vec![]), None, None, Channel::new(|_| Ok(()))).await.unwrap();
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].body["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "tool_invoke"));
+        let mut tool=crate::connectors::AgentTool::harness("check_run").unwrap();
+        crate::process_tools::configure_tool(&mut tool, &state.database().unwrap().execution_config().unwrap());
+        assert_eq!(tool.tool.input_schema["properties"]["timeout_seconds"]["maximum"],60);
+        let rows = state.database().unwrap().messages(&id).unwrap();
+        assert!(rows.iter().any(|message| message.role == "tool" && message.content.contains("invalid-arguments") && message.content.contains("60")));
+        assert!(!state.processes.has_owned(&id, dir.path().to_str().unwrap()).unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn truncated_round_after_write_retries_only_the_provider_and_replays_native_reasoning() {
+        let dir=tempfile::tempdir().unwrap();let state=crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state,dir.path());
+        let first=format!("data: {}\n\n{}",json!({"choices":[{"delta":{"reasoning_content":"native state"}}]}),call_wire("committed",r#"{"path":"kept.txt","content":"written once"}"#,"tool_calls"));
+        // A whole-looking call in an unfinished batch must never dispatch.
+        let truncated=call_wire("unfinished",r#"{"path":"never.txt","content":"must not dispatch"}"#,"tool_calls").split("data: {\"choices\":[{\"delta\":{},").next().unwrap().to_string();
+        let truncated=truncated.split("data: [DONE]").next().unwrap().replace("\"finish_reason\":\"tool_calls\"","\"finish_reason\":null");
+        let (base,requests,server)=crate::test_support::scripted_sse(vec![first,truncated,"data: {\"error\":{\"code\":\"server_error\"}}\n\n".into(),text_wire("The file is saved.","stop")]).await;
+        let id=conversation(&state,base).await;
+        send_message_inner(&state,id.clone(),"Save kept.txt".into(),Some(vec!["__workspace".into()]),Some(vec![]),None,None,Channel::new(|_|Ok(()))).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("kept.txt")).unwrap(),"written once");assert!(!dir.path().join("never.txt").exists());
+        let requests=requests.lock().unwrap();assert_eq!(requests.len(),4);
+        for request in requests.iter().skip(1) {
+            let messages=request.body["messages"].as_array().unwrap();
+            assert_eq!(messages.iter().filter(|message|message["role"]=="tool").count(),1);
+            assert!(messages.iter().any(|message|message["role"]=="assistant" && message["reasoning_content"]=="native state"));
+            let result:Value=serde_json::from_str(messages.iter().find(|message|message["role"]=="tool").unwrap()["content"].as_str().unwrap()).unwrap();
+            assert!(result.get("isError").is_none());assert_eq!(result["schemaVersion"],crate::tool_envelope::SCHEMA_VERSION);
+        }
+        let store=state.database().unwrap();assert_eq!(store.messages(&id).unwrap().iter().filter(|m|m.role=="tool").count(),1);
+        assert!(store.session_events(&id,None,None).unwrap().iter().any(|event|event.event_type=="provider_attempt_failed"));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn a_provider_failure_after_tool_work_keeps_the_file_and_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        // Closing the isolated provider after one round makes the subsequent
+        // request fail without waiting for a long network timeout.
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![call_wire("saved", r#"{"path":"kept.txt","content":"saved once"}"#, "tool_calls")]).await;
+        let id = conversation(&state, base).await;
+        let error = send_message_inner(&state, id.clone(), "Create a file".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, Channel::new(|_| Ok(()))).await.unwrap_err();
+        server.await.unwrap();
+        assert!(error.contains("model round 2"), "{error}");
+        assert!(error.contains("Earlier tool results are preserved"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("kept.txt")).unwrap(), "saved once");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let store = state.database().unwrap();
+        assert_eq!(store.messages(&id).unwrap().iter().filter(|message| message.role == "tool").count(), 1);
+        let events = store.session_events(&id, None, None).unwrap();
+        assert!(events.iter().any(|event| event.event_type == "model_step_failed" && event.payload["toolWorkPreserved"] == true));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn repeated_identical_invalid_tool_calls_stop_without_creating_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let invalid = call_wire("bad", r#"{"path":"never.txt","content":12}"#, "tool_calls");
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![invalid.clone(), invalid.clone(), invalid, text_wire("The file was not created because the arguments were invalid.", "stop")]).await;
+        let id = conversation(&state, base).await;
+        send_message_inner(&state, id.clone(), "Create a file".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, Channel::new(|_| Ok(()))).await.unwrap();
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_ne!(requests[2].body["tool_choice"], "none", "one invalid action must not disable unrelated tools");
+        assert!(!dir.path().join("never.txt").exists());
+        let rows = state.database().unwrap().messages(&id).unwrap();
+        assert_eq!(rows.iter().filter(|message| message.role == "tool" && message.content.contains("invalid-arguments")).count(), 2);
+        assert_eq!(rows.iter().filter(|message| message.role == "tool" && message.content.contains("action-blocked")).count(), 1);
+        assert_ne!(state.database().unwrap().latest_run(&id).unwrap().unwrap().outcome.unwrap().reason, crate::agent_engine::StopReason::OutcomeUnknown);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
     async fn real_turn_recovers_empty_or_truncated_tool_output_and_actually_saves_the_file() {
         for first in [
             text_wire("", "length"),
@@ -8430,7 +6040,9 @@ mod output_recovery_tests {
             );
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 3);
-            assert_eq!(requests[0].body["max_tokens"], 2048);
+            // Remote requests use the provider model's configured response
+            // limit, independently of the local generation preference.
+            assert_eq!(requests[0].body["max_tokens"], 8192);
             assert_eq!(requests[1].body["max_tokens"], 8192);
             assert_ne!(requests[1].body["tool_choice"], "none");
             assert!(
@@ -8479,7 +6091,7 @@ mod output_recovery_tests {
         let rows = state.database().unwrap().messages(&id).unwrap();
         assert!(rows
             .iter()
-            .any(|m| m.role == "assistant" && m.status == "error"));
+            .any(|m| m.role == "assistant" && m.status == "interrupted"));
         let status: String = state
             .database()
             .unwrap()
@@ -8490,7 +6102,33 @@ mod output_recovery_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(status, "failed");
+        assert_eq!(status, "paused");
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn repeated_output_is_a_resumable_blocker_and_never_a_completed_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let mut block = String::from("## Findings\n\n");
+        for i in 0..8 {
+            block.push_str(&format!("A substantive sentence of results with distinct wording number {i} for this case. "));
+        }
+        block.push('\n');
+        let (base, _, server) = crate::test_support::scripted_sse(vec![text_wire(&block.repeat(4), "stop")]).await;
+        let id = conversation(&state, base).await;
+        let result = send_message_inner(&state, id.clone(), "Write the requested document".into(), Some(vec![]), Some(vec![]), None, None, Channel::new(|_| Ok(()))).await;
+        server.await.unwrap();
+        assert!(result.unwrap_err().contains("repeated before"));
+        let store = state.database().unwrap();
+        let run = store.connection.query_row("SELECT id FROM runs WHERE conversation_id=?1", [&id], |row| row.get::<_, String>(0)).unwrap();
+        let run = store.run(&run).unwrap().unwrap();
+        assert_eq!(run.status, crate::agent_run::RunState::Paused);
+        let outcome = run.outcome.unwrap();
+        assert_eq!(outcome.reason, crate::agent_engine::StopReason::Blocked);
+        assert!(outcome.resumable);
+        assert!(store.messages(&id).unwrap().iter().any(|message| message.role == "assistant" && message.status == "interrupted"));
     }
 }
 
@@ -8523,7 +6161,6 @@ mod context_breakdown_tests {
             injections: vec![("memory".into(), "remembered fact ".repeat(40))],
             skill_instructions: "Answer only in haiku form. ".repeat(30),
             project_instructions: String::new(),
-            ptc_sdk: None,
             preferences: Default::default(),
             history: vec![
                 json!({"role": "user", "content": "What changed in the repo this week?"}),
@@ -8560,7 +6197,6 @@ mod context_breakdown_tests {
             .unwrap()
     }
 
-    use super::*;
     #[tokio::test]
     async fn breakdown_categories_sum_to_the_measured_input() {
         let plan = fixture_plan(estimate_backend());
@@ -8655,7 +6291,8 @@ mod context_breakdown_tests {
             working_directory: dir.path().to_string_lossy().into_owned(),
             environment: Default::default(),
         };
-        crate::local_mcp_config::save(&state.daytona_vault, &[server.clone()]).unwrap();
+        crate::local_mcp_config::save(&state.daytona_vault, std::slice::from_ref(&server)).unwrap();
+        let conversation = {
         let store = state.database().unwrap();
         let conversation = store.create_conversation().unwrap();
         store
@@ -8674,7 +6311,8 @@ mod context_breakdown_tests {
                 },
             )
             .unwrap();
-        drop(store);
+            conversation
+        };
         // Saved but never started: the plan notice must name the server and
         // the one action that helps, not a bare `local-<uuid>`.
         let plan = assemble_turn(

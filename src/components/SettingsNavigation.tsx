@@ -15,7 +15,6 @@ export const settingsItems: { page: Page; label: string; group: string; keywords
   { page: 'python', label: 'Python', group: 'Execution', keywords: 'scripts virtual environment venv interpreter timeout approval', icon: FileCode2, sub: true },
   { page: 'language-servers', label: 'Language servers', group: 'Execution', keywords: 'lsp diagnostics symbols references rename executable', icon: FileCode2, sub: true },
   { page: 'hooks', label: 'Hooks', group: 'Execution', keywords: 'hooks pre post tool use shell commands', icon: SquareTerminal, sub: true },
-  { page: 'development-tools', label: 'Development tools', group: 'Execution', keywords: 'debugger profiling database postgres mysql http credentials openapi', icon: SquareTerminal, sub: true },
   { page: 'web-search', label: 'Web Search', group: 'Execution', keywords: 'searxng search retrieval cache fast balanced deep connection provider', icon: Search, sub: true },
   { page: 'weather', label: 'Weather', group: 'Execution', keywords: 'forecast temperature celsius fahrenheit location units', icon: CloudSun, sub: true },
   { page: 'browser-use', label: 'Browser Use', group: 'Execution', keywords: 'automation playwright chrome edge headless websites tabs engine', icon: Compass, sub: true },

@@ -187,6 +187,15 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, projectorPath, o
         </dl>
       </div><button type="button" className="secondary" disabled={busy || Boolean(model && recommendationIssue(model, hardware, recommended, projectorBytes))} onClick={() => { setConfig(recommended); setError(''); }}>Use recommended settings</button></div>}
     </section>
+    {modelPath?.split(/[\\/]/).pop() === 'Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf' && <section className="catalog-notice" aria-labelledby="mtp-heading">
+      <h2 id="mtp-heading">Multi-token prediction</h2>
+      <p>Bonsai includes its draft head in the model file. Auto enables MTP with the compatible Prism build. If MTP fails to start, choose Off and save configuration to run the same weights without it.</p>
+      <label>MTP<select value={config.mtpMode ?? 'auto'} disabled={busy} onChange={e => update('mtpMode', e.target.value as 'auto' | 'off')}>
+        <option value="auto">Auto · enable for Bonsai</option><option value="off">Off · run without MTP</option>
+      </select></label>
+      {config.mtpMode !== 'off' && !config.flashAttention && <p className="selection-warning">Enable Flash Attention in Advanced settings to use MTP, or choose Off.</p>}
+      {loadedModel && <p>Loaded setting: {runtime?.loadedConfig?.mtpMode === 'off' ? 'MTP off' : runtime?.loadedConfig ? 'MTP auto' : 'Unavailable'}. Changes apply after reload.</p>}
+    </section>}
     <details className="runtime-advanced">
       <summary>Advanced memory and batch settings</summary>
       <fieldset disabled={busy}>

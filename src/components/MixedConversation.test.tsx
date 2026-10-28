@@ -121,7 +121,7 @@ describe('mixed conversation fixture', () => {
       { ...base, id: 'a1', role: 'assistant', content: 'Stopped.', createdAt: 3 },
     ];
     render(<Chat {...props} messages={messages} />);
-    expect(screen.getByTestId('status-interrupted')).toBeInTheDocument();
+    expect(screen.getByTestId('status-unknown')).toHaveTextContent('Outcome unknown');
   });
 
   it('renders no reasoning disclosure when the model supplied none', () => {

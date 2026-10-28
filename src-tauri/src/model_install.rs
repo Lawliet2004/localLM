@@ -6,6 +6,7 @@ use tokio::sync::watch;
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
+    pub profile_id: Option<String>,
     pub busy: bool,
     pub phase: String,
     pub received: u64,

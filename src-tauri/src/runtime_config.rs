@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeConfig {
+    /// Auto enables MTP only for the pinned, integrated-head Bonsai profile.
+    #[serde(default)]
+    pub mtp_mode: MtpMode,
     pub context_length: u32,
     pub gpu_layers: i32,
     pub cpu_threads: u32,
@@ -23,6 +26,14 @@ pub struct RuntimeConfig {
     /// parent KV when a subagent runs and roughly doubles cache memory.
     #[serde(default = "default_inference_slots")]
     pub inference_slots: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MtpMode {
+    #[default]
+    Auto,
+    Off,
 }
 
 fn default_inference_slots() -> u32 {
@@ -53,6 +64,7 @@ impl CacheType {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            mtp_mode: MtpMode::Auto,
             // 32k keeps the KV cache small enough for 4 GB-class GPUs; larger
             // contexts push the cache into host memory and slow every round.
             context_length: 32768,
@@ -278,6 +290,7 @@ mod tests {
             value_length: None,
             file_bytes: 4 * 1024 * 1024 * 1024,
             thinking_control: None,
+            chat_template: None,
         };
         let config = RuntimeConfig {
             context_length: 8192,

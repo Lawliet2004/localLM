@@ -82,6 +82,7 @@ pub struct Runtime {
     pub supports_images: bool,
     log_path: PathBuf,
     log_tasks: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    template_override: Option<tempfile::NamedTempFile>,
 }
 impl Runtime {
     pub fn new(log_path: PathBuf) -> Self {
@@ -94,6 +95,7 @@ impl Runtime {
             supports_images: false,
             log_path,
             log_tasks: Vec::new(),
+            template_override: None,
         }
     }
     pub fn inspect(&mut self) -> RuntimeStatus {
@@ -101,6 +103,7 @@ impl Runtime {
             match child.try_wait() {
                 Ok(Some(code)) => {
                     self.child = None;
+                    self.template_override = None;
                     self.supports_images = false;
                     self.status = RuntimeStatus {
                         phase: "error".into(),
@@ -140,6 +143,7 @@ impl Runtime {
         self.api_key.clear();
         self.endpoint.clear();
         self.supports_images = false;
+        self.template_override = None;
         Ok(self.status.clone())
     }
     #[cfg(test)]
@@ -169,6 +173,8 @@ impl Runtime {
         // projector file is configured.
         let projector = configured_projector(preferences, config)?;
         let flags = inspect_runtime(&executable).await?;
+        let bonsai_args = bonsai_arguments(&model, config, &flags)?;
+        if crate::bonsai::requires_prism(&model) { verify_prism_build(&executable).await?; }
         // Validate requested projector controls before stopping a working model.
         let projector_args = projector_arguments(config, projector.as_deref(), &flags)?;
         let projector_bytes = projector
@@ -178,7 +184,9 @@ impl Runtime {
             .unwrap_or(0);
         let launch =
             resolve_launch_config(config, &model, &executable, flags.fit, projector_bytes).await?;
-        let model_bytes = crate::gguf::model_metadata(&model)?.file_bytes;
+        let metadata = crate::gguf::model_metadata(&model)?;
+        let template_override = compatible_template(metadata.chat_template.as_deref(), &flags)?;
+        let model_bytes = metadata.file_bytes;
         let attempts = startup_attempts(model_bytes);
         self.stop().await?;
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -194,6 +202,7 @@ impl Runtime {
         let mut command = runtime_command(&executable);
         command.args(launch.arguments()?).arg("--model").arg(&model);
         command.args(projector_args);
+        command.args(&bonsai_args);
         command.args([
             "--host",
             "127.0.0.1",
@@ -204,6 +213,9 @@ impl Runtime {
             "--log-verbosity",
             "4",
         ]);
+        if let Some(template) = &template_override {
+            command.arg("--chat-template-file").arg(template.path());
+        }
         if flags.fit {
             command
                 .arg("--fit")
@@ -246,6 +258,7 @@ impl Runtime {
         self.log_tasks
             .push(tokio::spawn(crate::runtime_log::drain(stderr, log)));
         self.child = Some(child);
+        self.template_override = template_override;
         self.status = RuntimeStatus {
             phase: "loading".into(),
             message: "Loading model into memory".into(),
@@ -288,6 +301,14 @@ impl Runtime {
                     if let Ok(health) = client.get(format!("{}/health", self.endpoint)).send().await
                     {
                         if health.status().is_success() {
+                            if self.template_override.is_some() {
+                                if let Err(error) = validate_template(&client, &self.endpoint, &self.api_key).await {
+                                    self.stop().await?;
+                                    self.status.phase = "error".into();
+                                    self.status.message = error;
+                                    return Err(self.status.message.clone());
+                                }
+                            }
                             self.context_length = config.context_length;
                             self.supports_images = projector.is_some();
                             self.status.loaded_config = Some(config.clone());
@@ -307,6 +328,12 @@ impl Runtime {
                             } else {
                                 "Model ready".into()
                             };
+                            if crate::bonsai::requires_prism(&model) {
+                                self.status.message.push_str(" · Prism b10826-c9c34bc");
+                            }
+                            if crate::bonsai::is_integrated_model(&model) {
+                                self.status.message.push_str(if config.mtp_mode == crate::runtime_config::MtpMode::Off { " · MTP off" } else { " · MTP enabled" });
+                            }
                             return Ok(self.status.clone());
                         }
                     }
@@ -321,6 +348,75 @@ impl Runtime {
     }
 }
 
+/// The installed Jinja implementation cannot evaluate this particular mapped
+/// filter. Expand only the known expression, preserving the embedded formatter,
+/// delimiters and whitespace. This depends on template content, never a model
+/// name, and leaves GGUF metadata untouched.
+fn compatible_template(
+    template: Option<&str>,
+    flags: &RuntimeFlags,
+) -> Result<Option<tempfile::NamedTempFile>, String> {
+    use std::io::Write;
+    const ORIGINAL: &str = "{{ format_argument(item_value | map('upper') | list) }}";
+    const EXPANDED: &str = "[{%- for type_name in item_value -%}{{- format_argument(type_name | upper) -}}{%- if not loop.last %},{% endif -%}{%- endfor -%}]";
+    let Some(template) = template.filter(|text| text.contains(ORIGINAL)) else {
+        return Ok(None);
+    };
+    if !flags.chat_template_file {
+        return Err("The model template needs a compatibility override. Select a llama-server runtime supporting --chat-template-file in Models.".into());
+    }
+    let mut file = tempfile::Builder::new()
+        .prefix("locallm-template-")
+        .suffix(".jinja")
+        .tempfile()
+        .map_err(|error| format!("Cannot prepare the model template: {error}"))?;
+    file.write_all(template.replace(ORIGINAL, EXPANDED).as_bytes())
+        .and_then(|_| file.flush())
+        .map_err(|error| format!("Cannot write the model template: {error}"))?;
+    Ok(Some(file))
+}
+
+fn template_probe() -> serde_json::Value {
+    serde_json::json!({
+        "messages":[
+            {"role":"user","content":"Read the supplied values."},
+            {"role":"assistant","content":"","tool_calls":[{"id":"probe-call","type":"function","function":{"name":"locallm_template_probe","arguments":"{\"values\":[\"text\",3,true,null]}"}}]},
+            {"role":"tool","tool_call_id":"probe-call","content":"{\"ok\":true}"},
+            {"role":"user","content":"Continue."}
+        ],
+        "tools":[{"type":"function","function":{
+            "name":"locallm_template_probe","description":"Format-only compatibility check; never executed.",
+            "parameters":{"type":"object","properties":{"values":{"type":"array","items":{"type":["string","number","boolean","null"]}}},"required":["values"]}
+        }}]
+    })
+}
+
+/// Render only: loading a model never generates a response or invokes a tool.
+async fn validate_template(
+    client: &reqwest::Client,
+    endpoint: &str,
+    key: &str,
+) -> Result<(), String> {
+    let failure = "The selected runtime cannot render this model's tool template. Update llama-server in Models; the model was not marked ready.";
+    let response = client
+        .post(format!("{endpoint}/apply-template"))
+        .bearer_auth(key)
+        .json(&template_probe())
+        .send()
+        .await
+        .map_err(|_| failure.to_string())?;
+    if !response.status().is_success() {
+        return Err(failure.into());
+    }
+    let value: serde_json::Value = response.json().await.map_err(|_| failure.to_string())?;
+    if !value["prompt"]
+        .as_str()
+        .is_some_and(|text| text.contains("locallm_template_probe"))
+    {
+        return Err(failure.into());
+    }
+    Ok(())
+}
 fn runtime_command(executable: &Path) -> Command {
     let mut command = Command::new(executable);
     #[cfg(target_os = "linux")]
@@ -353,12 +449,14 @@ fn runtime_command(executable: &Path) -> Command {
 }
 
 struct RuntimeFlags {
+    mtp: bool,
     no_agent: bool,
     fit: bool,
     no_mmproj: bool,
     mmproj: bool,
     mmproj_offload: bool,
     no_mmproj_offload: bool,
+    chat_template_file: bool,
 }
 
 impl RuntimeFlags {
@@ -369,14 +467,93 @@ impl RuntimeFlags {
                 .any(|word| word == flag)
         };
         Self {
+            mtp: has("--spec-type")
+                && help.contains("draft-mtp")
+                && has("--spec-draft-n-max")
+                && has("--spec-draft-n-min")
+                && has("--spec-draft-p-min"),
             no_agent: has("--no-agent"),
             fit: has("--fit"),
             no_mmproj: has("--no-mmproj"),
             mmproj: has("--mmproj"),
             mmproj_offload: has("--mmproj-offload"),
             no_mmproj_offload: has("--no-mmproj-offload"),
+            chat_template_file: has("--chat-template-file"),
         }
     }
+}
+
+fn bonsai_arguments(
+    model: &Path,
+    config: &RuntimeConfig,
+    flags: &RuntimeFlags,
+) -> Result<Vec<&'static str>, String> {
+    if !crate::bonsai::is_integrated_model(model) {
+        return Ok(Vec::new());
+    }
+    let mut args = vec![
+        "--top-k",
+        "20",
+        "--min-p",
+        "0",
+        "--presence-penalty",
+        "1",
+        "--repeat-penalty",
+        "1",
+        "--repeat-last-n",
+        "64",
+    ];
+    if config.mtp_mode != crate::runtime_config::MtpMode::Off {
+        if !flags.mtp {
+            return Err("This runtime does not expose the required Bonsai MTP controls. Install the managed Prism runtime, or set MTP to Off in Runtime settings.".into());
+        }
+        if !config.flash_attention {
+            return Err("Bonsai MTP requires Flash Attention in this profile. Enable it or set MTP to Off in Runtime settings.".into());
+        }
+        args.extend([
+            "--spec-type",
+            "draft-mtp",
+            "--spec-draft-n-max",
+            "2",
+            "--spec-draft-n-min",
+            "0",
+            "--spec-draft-p-min",
+            "0",
+        ]);
+    } else if flags.mtp {
+        args.extend(["--spec-type", "none"]);
+    }
+    Ok(args)
+}
+async fn verify_prism_build(executable: &Path) -> Result<(), String> {
+    let mut command = runtime_command(executable);
+    command.arg("--version").kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .map_err(|_| "Prism version check timed out.")?
+        .map_err(|e| e.to_string())?;
+    let version = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() || !version.contains("c9c34bc") {
+        return Err("PQ2_0/PTQ1_0 requires the pinned Prism b10826-c9c34bc runtime. Install Prism from Models or choose that build in Model files. Stock llama.cpp cannot load this packing.".into());
+    }
+    Ok(())
+}
+pub(crate) async fn preflight_bonsai(
+    executable: &Path,
+    model: &Path,
+    config: &RuntimeConfig,
+) -> Result<(), String> {
+    validate_model(model)?;
+    validate_model_context(model, config)?;
+    let flags = inspect_runtime(executable).await?;
+    bonsai_arguments(model, config, &flags)?;
+    verify_prism_build(executable).await
 }
 
 fn configured_projector(
@@ -578,6 +755,137 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn template_override_is_scoped_and_render_failure_never_reports_ready() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("llama-server");
+        let original = "before{{ format_argument(item_value | map('upper') | list) }}after";
+        let flags = RuntimeFlags::from_help("--chat-template-file FILE");
+        assert!(compatible_template(None, &flags).unwrap().is_none());
+        assert!(compatible_template(Some("unrelated template"), &flags)
+            .unwrap()
+            .is_none());
+        assert!(compatible_template(Some(original), &RuntimeFlags::from_help("")).is_err());
+        let file = compatible_template(Some(original), &flags)
+            .unwrap()
+            .unwrap();
+        let expanded = std::fs::read_to_string(file.path()).unwrap();
+        assert!(expanded.starts_with("before[") && expanded.ends_with("]after"));
+        assert!(!expanded.contains("map('upper')"));
+        drop(file);
+        std::fs::write(&executable, r#"#!/usr/bin/env python3
+import http.server,json,os,pathlib,sys
+if '--help' in sys.argv:
+    print('--chat-template-file FILE --no-mmproj --fit --no-agent')
+    sys.exit(0)
+template=pathlib.Path(sys.argv[sys.argv.index('--chat-template-file')+1])
+assert 'for type_name in item_value' in template.read_text()
+pathlib.Path(__file__).with_suffix('.template-path').write_text(str(template))
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200);self.end_headers();self.wfile.write(b'{"data":[]}')
+    def do_POST(self):
+        assert self.path=='/apply-template'
+        assert self.headers.get('Authorization')=='Bearer '+os.environ['LLAMA_API_KEY']
+        value=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        assert value['messages'][2]['role']=='tool'
+        assert value['tools'][0]['function']['parameters']['properties']['values']['items']['type']==['string','number','boolean','null']
+        pathlib.Path(__file__).with_suffix('.probe.json').write_text(json.dumps(value))
+        failure=pathlib.Path(__file__).with_suffix('.fail').exists()
+        self.send_response(500 if failure else 200);self.end_headers()
+        self.wfile.write(b'{}' if failure else b'{"prompt":"locallm_template_probe rendered"}')
+    def log_message(self,*args): pass
+http.server.HTTPServer(('127.0.0.1',int(sys.argv[sys.argv.index('--port')+1])),Handler).serve_forever()
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut bytes = metadata_fixture();
+        bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        for value in ["tokenizer.chat_template", original] {
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+            if value == "tokenizer.chat_template" {
+                bytes.extend_from_slice(&8u32.to_le_bytes());
+            }
+        }
+        let model = directory.path().join("arbitrary-model-name.gguf");
+        std::fs::write(&model, &bytes).unwrap();
+        let preferences = Preferences {
+            runtime_path: executable.to_string_lossy().into_owned(),
+            model_path: model.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let mut runtime = Runtime::new(directory.path().join("runtime.log"));
+        let config = RuntimeConfig {
+            vision_enabled: false,
+            gpu_layers: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            runtime.load(&preferences, &config).await.unwrap().phase,
+            "ready"
+        );
+        assert!(executable.with_extension("probe.json").exists());
+        let path =
+            PathBuf::from(std::fs::read_to_string(executable.with_extension("template-path")).unwrap());
+        assert!(path.exists());
+        runtime.stop().await.unwrap();
+        assert!(!path.exists());
+        std::fs::write(executable.with_extension("fail"), b"").unwrap();
+        assert!(runtime
+            .load(&preferences, &config)
+            .await
+            .err()
+            .unwrap()
+            .contains("cannot render"));
+        assert_eq!(runtime.inspect().phase, "error");
+        assert!(runtime.child.is_none() && runtime.template_override.is_none());
+        assert_eq!(std::fs::read(model).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicitly supplied installed runtime/model and free device memory"]
+    async fn installed_runtime_renders_model_tool_template() {
+        let executable =
+            std::env::var("LOCALLM_TEMPLATE_TEST_RUNTIME").expect("Set the runtime executable");
+        let model = std::env::var("LOCALLM_TEMPLATE_TEST_MODEL").expect("Set the GGUF model");
+        let directory = tempfile::tempdir().unwrap();
+        let preferences = Preferences {
+            runtime_path: executable,
+            model_path: model,
+            ..Default::default()
+        };
+        let config = RuntimeConfig {
+            vision_enabled: false,
+            gpu_layers: 12,
+            cpu_threads: 4,
+            ..Default::default()
+        };
+        let mut runtime = Runtime::new(directory.path().join("runtime.log"));
+        let result = runtime.load(&preferences, &config).await;
+        if let Err(error) = &result {
+            eprintln!(
+                "{error}\n{}",
+                std::fs::read_to_string(directory.path().join("runtime.log")).unwrap_or_default()
+            );
+        }
+        assert_eq!(result.unwrap().phase, "ready");
+        assert!(runtime.template_override.is_some());
+        validate_template(
+            &reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+            &runtime.endpoint,
+            &runtime.api_key,
+        )
+        .await
+        .unwrap();
+        runtime.stop().await.unwrap();
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn download_preflight_rejects_missing_runtime_and_known_missing_projector_support() {
@@ -602,6 +910,39 @@ mod tests {
         preflight_download(executable.to_str().unwrap(), true)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn mtp_launch_is_profile_scoped_and_rejects_unsupported_flags_before_loading() {
+        let model = Path::new(crate::model_catalog::BONSAI_FILENAME);
+        let help =
+            "--spec-type none,draft-mtp --spec-draft-n-max --spec-draft-n-min --spec-draft-p-min";
+        let flags = RuntimeFlags::from_help(help);
+        let config = RuntimeConfig::default();
+        let args = bonsai_arguments(model, &config, &flags).unwrap();
+        assert!(args.windows(2).any(|a| a == ["--spec-type", "draft-mtp"]));
+        assert!(args.windows(2).any(|a| a == ["--spec-draft-n-max", "2"]));
+        assert!(bonsai_arguments(
+            model,
+            &config,
+            &RuntimeFlags::from_help("--spec-type draft-simple")
+        )
+        .is_err());
+        assert!(bonsai_arguments(Path::new("other.gguf"), &config, &flags)
+            .unwrap()
+            .is_empty());
+        let off = RuntimeConfig {
+            mtp_mode: crate::runtime_config::MtpMode::Off,
+            ..config.clone()
+        };
+        let args = bonsai_arguments(model, &off, &flags).unwrap();
+        assert!(args.windows(2).any(|a| a == ["--spec-type", "none"]));
+        assert!(!args.contains(&"draft-mtp"));
+        let no_flash = RuntimeConfig {
+            flash_attention: false,
+            ..config
+        };
+        assert!(bonsai_arguments(model, &no_flash, &flags).is_err());
     }
 
     #[test]

@@ -1,0 +1,107 @@
+[
+  {
+    "id": "prism-linux-cpu",
+    "os": "linux",
+    "arch": "x86_64",
+    "backend": "CPU",
+    "build": "prism-b10826-c9c34bc",
+    "executable": "llama-server",
+    "assets": [
+      {
+        "name": "llama-prism-b10826-c9c34bc-bin-ubuntu-x64.tar.gz",
+        "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10826-c9c34bc/llama-prism-b10826-c9c34bc-bin-ubuntu-x64.tar.gz",
+        "sha256": "66a250f38c3f8e2064e2f913b3a26ff5bae10955b67e8ff38c72ab48cbecf28c",
+        "bytes": 17912930,
+        "files": []
+      }
+    ]
+  },
+  {
+    "id": "prism-linux-cuda",
+    "os": "linux",
+    "arch": "x86_64",
+    "backend": "CUDA 12.4",
+    "build": "prism-b10826-c9c34bc",
+    "executable": "llama-server",
+    "assets": [
+      {
+        "name": "llama-prism-b10826-c9c34bc-bin-linux-cuda-12.4-x64.tar.gz",
+        "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10826-c9c34bc/llama-prism-b10826-c9c34bc-bin-linux-cuda-12.4-x64.tar.gz",
+        "sha256": "6584425fab485f4227990954cc37e6d0eb9e4e73bafa19a04a06103a06884f34",
+        "bytes": 337882681,
+        "files": []
+      }
+    ]
+  },
+  {
+    "id": "prism-macos-metal",
+    "os": "macos",
+    "arch": "aarch64",
+    "backend": "Metal",
+    "build": "prism-b10826-c9c34bc",
+    "executable": "llama-server",
+    "assets": [
+      {
+        "name": "llama-prism-b10826-c9c34bc-bin-macos-arm64.tar.gz",
+        "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10826-c9c34bc/llama-prism-b10826-c9c34bc-bin-macos-arm64.tar.gz",
+        "sha256": "abc1fc31852e6dbd72e2214fef52cefe2c588a6ee659a02ab3bf2883f937da5f",
+        "bytes": 11586615,
+        "files": []
+      }
+    ]
+  },
+  {
+    "id": "prism-windows-cpu",
+    "os": "windows",
+    "arch": "x86_64",
+    "backend": "CPU",
+    "build": "prism-b10826-c9c34bc",
+    "executable": "llama-server.exe",
+    "assets": [
+      {
+        "name": "llama-prism-b10826-c9c34bc-bin-win-cpu-x64.zip",
+        "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10826-c9c34bc/llama-prism-b10826-c9c34bc-bin-win-cpu-x64.zip",
+        "sha256": "1e88ab9e858b5c2dbc30cf847947a9f923b53511ba0baf0b265353ebe1f4daa6",
+        "bytes": 19559127,
+        "files": []
+      }
+    ]
+  },
+  {
+    "id": "prism-windows-cuda",
+    "os": "windows",
+    "arch": "x86_64",
+    "backend": "CUDA 12.4",
+    "build": "prism-b10826-c9c34bc",
+    "executable": "llama-server.exe",
+    "assets": [
+      {
+        "name": "llama-prism-b10826-c9c34bc-bin-win-cuda-12.4-x64.zip",
+        "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10826-c9c34bc/llama-prism-b10826-c9c34bc-bin-win-cuda-12.4-x64.zip",
+        "sha256": "d96396b2fc5f0960bf47f8d3298fc45627b1283518f796102056d833a40094fe",
+        "bytes": 324705079,
+        "files": []
+      },
+      {
+        "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+        "url": "https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b10826-c9c34bc/cudart-llama-bin-win-cuda-12.4-x64.zip",
+        "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+        "bytes": 391443627,
+        "files": [
+          {
+            "name": "cublas64_12.dll",
+            "bytes": 100033536
+          },
+          {
+            "name": "cublasLt64_12.dll",
+            "bytes": 473551360
+          },
+          {
+            "name": "cudart64_12.dll",
+            "bytes": 553984
+          }
+        ]
+      }
+    ]
+  }
+]
