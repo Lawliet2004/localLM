@@ -116,7 +116,7 @@ export function RuntimeForm({ initial, onSave, busy, modelPath, projectorPath, o
           </div>}
         </article>
         <article className="runtime-card">
-          <div className="runtime-card-head"><Sparkles size={18} /><div><small>Context window</small><strong>{model?.contextLength ? `${model.contextLength.toLocaleString()} token model maximum` : 'Context limit unknown'}</strong></div></div>
+          <div className="runtime-card-head"><Sparkles size={18} /><div><small>Context window per inference slot</small><strong>{model?.contextLength ? `${model.contextLength.toLocaleString()} token model maximum` : 'Context limit unknown'}</strong></div></div>
           <dl className="runtime-stats">
             <div><dt>Full model context</dt><dd>{model?.contextLength ? `${model.contextLength.toLocaleString()} tokens` : 'Unknown'}</dd></div>
             {model?.contextLength && model.contextLength > contextSafetyLimit && <div><dt>Harness safety cap</dt><dd>{contextSafetyLimit.toLocaleString()} tokens</dd></div>}

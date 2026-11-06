@@ -33,7 +33,7 @@ pub fn assistant_from_saved(content: &Value) -> Result<Value, String> {
         let message = &content["message"];
         if message["role"] != "assistant"
             || !message.is_object()
-            || content.to_string().len() > 5 * 1024 * 1024
+            || content.to_string().len() > 2 * crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES
         {
             return Err("Saved native assistant context is invalid or oversized.".into());
         }

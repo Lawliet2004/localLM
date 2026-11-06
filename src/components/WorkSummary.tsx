@@ -36,11 +36,25 @@ export function WorkSummary({ messages, events = [], run, children, showActivity
   const elapsed = run ? ['completed', 'failed', 'cancelled', 'outcome_unknown', 'paused'].includes(run.status) ? run.updatedAt - run.createdAt : null : start && end ? end.createdAt - start.createdAt : null;
   const seconds = elapsed === null ? null : Math.max(0, Math.round(elapsed / 1000));
   const duration = seconds === null ? null : seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds}s`;
-  const status = run?.status ?? (end?.payload as { status?: string } | undefined)?.status;
+  const outcome = end?.payload as { status?: string; delivered?: boolean; partial?: boolean; verification?: { status?: string }; unfinishedTodos?: unknown[] } | undefined;
+  const status = run?.status ?? outcome?.status;
+  const verification = outcome?.verification?.status;
+  const remaining = outcome?.unfinishedTodos?.length ?? 0;
+  const delivered = outcome?.delivered === true;
   const verb = status && !['completed', 'complete'].includes(status) ? status === 'paused' ? 'Paused' : 'Stopped' : 'Worked';
   return <div className="assistant-work">
-    {showActivity && (tools.length > 0 || duration) && <details className="work-summary"><summary>{duration ? `${verb} for ${duration}` : 'Work details'}</summary><p>{tools.length} recorded tool {tools.length === 1 ? 'action' : 'actions'}{run ? ` · ${run.status.replace(/_/g, ' ')}` : ''}. Expand the activity rows to inspect their arguments and results.</p></details>}
+    {showActivity && (tools.length > 0 || duration) && <div className="work-summary" aria-label="Recorded work summary">
+      <span>{duration ? `${verb} for ${duration}` : 'Work details'}</span>
+      {tools.length > 0 && <span> · {tools.length} {tools.length === 1 ? 'action' : 'actions'}</span>}
+      {files.length > 0 && <span> · {files.length} {files.length === 1 ? 'file' : 'files'} changed <span className="diff-added">+{totals.added}</span> <span className="diff-removed">−{totals.removed}</span></span>}
+    </div>}
     {children}
+    {delivered && (outcome?.partial || verification === 'verified') && <div className="work-summary" aria-label="Task outcome">
+      {outcome?.partial && <span>Partial work</span>}
+      {remaining > 0 && <span> · {remaining} unfinished {remaining === 1 ? 'task' : 'tasks'}</span>}
+      {verification === 'verified' && <span>{outcome?.partial ? ' · ' : ''}Checks passed for recorded changes</span>}
+      {verification === 'unverified' && <span> · Changes unverified</span>}
+    </div>}
     {files.length > 0 && <section className="file-change-list" aria-label="File changes">
       <div className="file-changes-header"><span className="file-changes-icon" aria-hidden="true"><FileDiff size={22} /></span><div className="file-changes-title"><span>Edited {files.length} {files.length === 1 ? 'file' : 'files'}</span><span className="file-change-counts" title="Recorded additions and deletions across these edits"><span className="diff-added">+{totals.added}</span> <span className="diff-removed">−{totals.removed}</span></span></div><button type="button" className="secondary file-changes-view" aria-expanded={reviewOpen} onClick={() => { setReviewOpen(!reviewOpen); setFilesOpen(true); }}>{reviewOpen ? 'Hide changes' : 'View changes'}</button></div>
       {filesOpen && <div className="file-changes-body">{files.map(edit => {

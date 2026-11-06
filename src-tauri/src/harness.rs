@@ -666,7 +666,7 @@ async fn execute_inner(
         "tool_invoke" => Err("tool_invoke must resolve to its original authorized tool before dispatch.".into()),
         name if crate::development_tools::owns(name) => {
             if let Some(reason)=crate::capabilities::ToolPolicy::guard(ctx.state.database()).denial("workspace_files"){return Err(reason);}
-            let mut cancel=ctx.state.cancel.subscribe();
+            let mut cancel=ctx.state.cancel_signal().subscribe();
             if *cancel.borrow(){return Err("Development call cancelled before dispatch.".into());}
             tokio::select! {
                 _=cancel.changed()=>Err("Development call cancelled; do not replay an uncertain action.".into()),
@@ -678,7 +678,7 @@ async fn execute_inner(
 
             let config=ctx.state.database()?.execution_config()?;
             if config.bash.always_ask&&!ctx.inherit_tools.iter().any(|t|t.alias==name&&t.tool.input_schema["x-locallm-always-ask"]==true){return Err("Shell approval policy changed; refresh tools before debugging.".into());}
-            let mut cancel=ctx.state.cancel.subscribe();
+            let mut cancel=ctx.state.cancel_signal().subscribe();
             if *cancel.borrow(){return Err("Debugger cancelled before dispatch.".into());}
             let policy=crate::debug_tools::load_policy(&*ctx.state.database()?)?;
             tokio::select! {
@@ -687,7 +687,7 @@ async fn execute_inner(
             }
         },
         name if crate::lsp_tools::owns(name) => {
-            let mut cancel=ctx.state.cancel.subscribe();
+            let mut cancel=ctx.state.cancel_signal().subscribe();
             if *cancel.borrow(){return Err("Language server call cancelled before dispatch.".into());}
             let pin=ctx.inherit_tools.iter().find(|t|t.alias==name).is_some_and(|t|t.tool.input_schema["x-locallm-always-ask"]==true);
             tokio::select! {
@@ -715,7 +715,7 @@ async fn execute_inner(
             if execution.bash.always_ask && !ctx.inherit_tools.iter().any(|tool| tool.alias == alias && tool.tool.input_schema["x-locallm-always-ask"] == true) {
                 return Err("Execution approval policy changed; refresh tools before opening a preview.".into());
             }
-            if *ctx.state.cancel.borrow() {
+            if *ctx.state.cancel_signal().borrow() {
                 return Err("Preview cancelled before launch.".into());
             }
             let config = crate::automation::load(&*ctx.state.database()?)?;
@@ -1006,7 +1006,8 @@ async fn execute_inner(
             if ctx.snapshot.workspace_path.is_empty() {
                 return Err("Choose a workspace folder before file_search.".into());
             }
-            let hits = crate::sandbox::file_search(std::path::Path::new(&ctx.snapshot.workspace_path), &query)?;
+            let rules = crate::permission_rules::load_checked(&*ctx.state.database()?)?;
+            let hits = crate::sandbox::file_search_with_rules(std::path::Path::new(&ctx.snapshot.workspace_path), &query, &rules)?;
             Ok(HarnessOutcome::value(json!({"hits": hits})))
         }
         "web_read" => {
@@ -1201,7 +1202,7 @@ fn research_control(ctx: &HarnessCtx<'_>, alias: &str) -> Result<(Value, Value),
                 "taskAction": "progress",
                 "applied": true,
                 "runState": run_status.as_str(),
-                "paused": ctx.state.run_control.lock().map_err(|_| "Run control is unavailable; progress cannot confirm pause state.")?.pause,
+                "paused": ctx.state.with_run_control(|control| control.pause)?,
             });
             body["task"] = progress(task.as_ref());
             body
@@ -1217,12 +1218,7 @@ fn research_control(ctx: &HarnessCtx<'_>, alias: &str) -> Result<(Value, Value),
                 )
             } else {
                 {
-                    let mut control = ctx
-                        .state
-                        .run_control
-                        .lock()
-                        .map_err(|_| "Run control is unavailable; pause was not confirmed.")?;
-                    crate::agent_run::apply_model_pause(&mut control);
+                    ctx.state.with_run_control(crate::agent_run::apply_model_pause)?;
                 }
                 if let Some(task) = task.as_mut() {
                     if task.status == crate::research_tasks::TaskStatus::Running {
@@ -1249,12 +1245,7 @@ fn research_control(ctx: &HarnessCtx<'_>, alias: &str) -> Result<(Value, Value),
                 refuse(&mut audit, "There is no active run to resume.")
             } else {
                 let released = {
-                    let mut control = ctx
-                        .state
-                        .run_control
-                        .lock()
-                        .map_err(|_| "Run control is unavailable; resume was not confirmed.")?;
-                    crate::agent_run::release_model_pause(&mut control)
+                    ctx.state.with_run_control(crate::agent_run::release_model_pause)?
                 };
                 if released {
                     if let Some(task) = task.as_mut() {
@@ -1283,14 +1274,9 @@ fn research_control(ctx: &HarnessCtx<'_>, alias: &str) -> Result<(Value, Value),
                 refuse(&mut audit, "The run has already settled; a tool call cannot revive or cancel a terminal run.")
             } else {
                 {
-                    let mut control = ctx
-                        .state
-                        .run_control
-                        .lock()
-                        .map_err(|_| "Run control is unavailable; cancel was not confirmed.")?;
-                    crate::agent_run::request_cancel(&mut control);
+                    ctx.state.with_run_control(crate::agent_run::request_cancel)?;
                 }
-                ctx.state.cancel.send_replace(true);
+                ctx.state.cancel_signal().send_replace(true);
                 if let Some(task) = task.as_mut() {
                     if !task.is_terminal() {
                         task.cancel()?;
@@ -1491,12 +1477,16 @@ async fn execute_ptc(ctx: &HarnessCtx<'_>, args: Value) -> Result<HarnessOutcome
         }
         let call_id = format!("ptc-{index}");
         let tool_args = tool.prepare_arguments(tool_args)?;
-        let automatic = !tool.requires_approval(&tool_args)
-            && ctx
-                .access_mode
-                .automatic_reason(tool.trusted_read())
-                .is_some();
-        let allow = if automatic {
+        let rule_decision = crate::permission_rules::decide_nested_call(ctx.state, ctx.access_mode, tool, &tool_args)
+            .unwrap_or_else(crate::permission_rules::Decision::Deny);
+        let automatic = matches!(rule_decision, crate::permission_rules::Decision::Allow(_));
+        let mut denial_reason = match &rule_decision {
+            crate::permission_rules::Decision::Deny(reason) => Some(reason.clone()),
+            _ => None,
+        };
+        let allow = if denial_reason.is_some() {
+            false
+        } else if automatic {
             true
         } else {
             let (approval_id, decision) = ctx.state.approvals.request()?;
@@ -1519,9 +1509,31 @@ async fn execute_ptc(ctx: &HarnessCtx<'_>, args: Value) -> Result<HarnessOutcome
             (ctx.emit)("Approval decision recorded".into(), Some(Value::Null));
             allow
         };
+        let allow = if allow {
+            match crate::permission_rules::recheck_nested_call(ctx.state, ctx.access_mode, tool, &tool_args, !automatic) {
+                Ok(()) => true,
+                Err(reason) => { denial_reason = Some(reason); false }
+            }
+        } else { false };
+        let mut hook_blocked = false;
+        let allow = if allow {
+            let verdict = crate::hooks::pre_use(ctx.state, &ctx.conversation_id, &ctx.snapshot.workspace_path, &tool.alias, &tool_args).await;
+            for notice in verdict.notices { (ctx.emit)(notice, None); }
+            if let Some(reason) = verdict.blocked {
+                denial_reason = Some(reason);
+                hook_blocked = true;
+                false
+            } else { true }
+        } else { false };
+        let allow = if allow {
+            match crate::permission_rules::recheck_nested_call(ctx.state, ctx.access_mode, tool, &tool_args, !automatic) {
+                Ok(()) => true,
+                Err(reason) => { denial_reason = Some(reason); false }
+            }
+        } else { false };
         let audit = json!({"connector": tool.connector, "name": tool.tool.name, "arguments": tool_args,
             "decision": if allow { "allowed" } else { "denied" }, "accessMode": ctx.access_mode,
-            "authorization": if automatic { "auto-approved program step" } else { "user approval decision" }, "program": true,
+            "authorization": if hook_blocked { "pre-use hook" } else if denial_reason.is_some() { "permission rule" } else if automatic { "auto-approved program step" } else { "user approval decision" }, "program": true,
             "callId": call_id, "stepId": ctx.step_id});
         let row = {
             let store = ctx.state.database()?;
@@ -1534,8 +1546,8 @@ async fn execute_ptc(ctx: &HarnessCtx<'_>, args: Value) -> Result<HarnessOutcome
         };
         if !allow {
             let denied = crate::tool_envelope::failure_notice(
-                "denied",
-                "The user denied this program step. Remaining steps were skipped.",
+                if hook_blocked { "hook-blocked" } else { "denied" },
+                denial_reason.as_deref().unwrap_or("The user denied this program step. Remaining steps were skipped."),
                 false,
                 crate::tool_envelope::SIDE_NONE,
                 &json!({"denied":true}),
@@ -1567,24 +1579,20 @@ async fn execute_ptc(ctx: &HarnessCtx<'_>, args: Value) -> Result<HarnessOutcome
             let mcp_ui = tool.is_mcp().then(|| {
                 crate::mcp_input::CallUi::new(ctx.state.mcp_inputs.clone(), ctx.emit.clone())
             });
-            match tokio::time::timeout(tool.timeout(), tool.call_with_input(tool_args.clone(), None, mcp_ui)).await {
+            match tokio::time::timeout(tool.call_deadline(tool.timeout(), mcp_ui.is_some()), tool.call_with_input(tool_args.clone(), None, mcp_ui)).await {
                 Ok(Ok(value)) => crate::tool_envelope::normalize(value, tool.envelope_family()),
                 Ok(Err(error)) => crate::tool_envelope::normalize_error(&error, crate::tool_envelope::Cause::default(), tool.envelope_family()),
                 Err(_) => crate::tool_envelope::normalize_error("Program step timed out. Its outcome may be unknown; do not automatically retry.", crate::tool_envelope::Cause { timeout: true, ..Default::default() }, tool.envelope_family()),
             }
         };
-        let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
+        let (bounded, _) = crate::artifacts::capture_tool_result(
             outcome,
             &tool.tool.name,
             &ctx.conversation_id,
             Some(&ctx.run_id),
             crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
+            |artifact| ctx.state.database()?.save_artifact(artifact),
         );
-        if let Some(artifact) = &maybe_artifact {
-            if let Ok(store) = ctx.state.database() {
-                let _ = store.save_artifact(artifact);
-            }
-        }
         {
             let store = ctx.state.database()?;
             store.update_message(
@@ -1656,6 +1664,107 @@ impl<'a> HarnessCtx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn flat_program_steps_enforce_rules_and_recheck_approval() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        for (effect, approve, change_to_deny, visible) in [
+            (Effect::Deny, false, false, false),
+            (Effect::Ask, false, false, false),
+            (Effect::Ask, true, false, true),
+            (Effect::Ask, true, true, false),
+            (Effect::Allow, false, false, true),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(crate::test_support::app_state(state_dir.path()));
+            std::fs::write(workspace.path().join("secret.txt"), "flat-step-secret").unwrap();
+            let owner = state.database().unwrap().create_conversation().unwrap().id;
+            state.database().unwrap().save_workspace_path(workspace.path().to_str().unwrap()).unwrap();
+            state.database().unwrap().save_setting(crate::hooks::HOOKS_KEY, &vec![crate::hooks::Hook {
+                id: "marker".into(), event: crate::hooks::EVENT_PRE_TOOL.into(), matcher: "workspace_read_file".into(),
+                command: "printf x > hook-started".into(), timeout_secs: 5, enabled: true,
+            }]).unwrap();
+            let rule = |effect| RuleSet { rules: vec![Rule { action: Action::Path, resource: "secret.txt".into(), effect }] };
+            crate::permission_rules::save(&state.database().unwrap(), &rule(effect)).unwrap();
+            let tools = Arc::new(crate::workspace::Workspace::open(workspace.path().to_str().unwrap()).unwrap()).tools();
+            let mut ctx = research_fixture(&state, workspace.path(), &owner, "flat-run", 0, &tools);
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            ctx.emit = {
+                let state = state.clone();
+                let seen = seen.clone();
+                Arc::new(move |_, payload| {
+                    if let Some(id) = payload.as_ref().and_then(|value| value["id"].as_str()) {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if change_to_deny { crate::permission_rules::save(&state.database().unwrap(), &rule(Effect::Deny)).unwrap(); }
+                        state.approvals.resolve(id, approve).unwrap();
+                    }
+                })
+            };
+            let result = execute_ptc(&ctx, json!({"steps":[{"tool":"workspace_read_file","args":{"path":"secret.txt"}}]})).await.unwrap().value;
+            assert_eq!(result.to_string().contains("flat-step-secret"), visible, "{result}");
+            assert_eq!(workspace.path().join("hook-started").exists(), visible, "hook ran without authorization");
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), usize::from(effect == Effect::Ask));
+            let rows = state.database().unwrap().messages(&owner).unwrap();
+            let audit: Value = serde_json::from_str(&rows.iter().find(|row| row.role == "tool").unwrap().content).unwrap();
+            assert_eq!(audit["request"]["decision"], if visible { "allowed" } else { "denied" });
+        }
+    }
+
+    #[tokio::test]
+    async fn flat_program_pre_hook_vetoes_and_rechecks_rule_changes() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        for block_hook in [true, false] {
+            let workspace = tempfile::tempdir().unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let state = crate::test_support::app_state(state_dir.path());
+            std::fs::write(workspace.path().join("secret.txt"), "flat-hook-secret").unwrap();
+            let owner = state.database().unwrap().create_conversation().unwrap().id;
+            state.database().unwrap().save_workspace_path(workspace.path().to_str().unwrap()).unwrap();
+            let hook = crate::hooks::Hook { id: "guard".into(), event: crate::hooks::EVENT_PRE_TOOL.into(), matcher: "workspace_read_file".into(),
+                command: if block_hook { "exit 2" } else { "printf x > started; sleep 1" }.into(), timeout_secs: 5, enabled: true };
+            state.database().unwrap().save_setting(crate::hooks::HOOKS_KEY, &vec![hook]).unwrap();
+            let tools = Arc::new(crate::workspace::Workspace::open(workspace.path().to_str().unwrap()).unwrap()).tools();
+            let ctx = research_fixture(&state, workspace.path(), &owner, "flat-hook-run", 0, &tools);
+            let task = execute_ptc(&ctx, json!({"steps":[{"tool":"workspace_read_file","args":{"path":"secret.txt"}}]}));
+            let update = async {
+                if !block_hook {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while !workspace.path().join("started").exists() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+                    }).await.expect("pre-use hook did not start");
+                    crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+                        action: Action::Path, resource: "secret.txt".into(), effect: Effect::Deny,
+                    }] }).unwrap();
+                }
+            };
+            let (outcome, ()) = tokio::join!(task, update);
+            assert!(!outcome.unwrap().value.to_string().contains("flat-hook-secret"));
+            let rows = state.database().unwrap().messages(&owner).unwrap();
+            let audit: Value = serde_json::from_str(&rows.iter().find(|row| row.role == "tool").unwrap().content).unwrap();
+            assert_eq!(audit["request"]["decision"], "denied");
+            assert_eq!(audit["result"]["error"]["sideEffects"], "none");
+            assert_eq!(audit["request"]["authorization"], if block_hook { "pre-use hook" } else { "permission rule" });
+        }
+    }
+    #[tokio::test]
+    async fn foreground_harness_search_filters_denied_descendants() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let workspace = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(state_dir.path());
+        std::fs::create_dir(workspace.path().join("private")).unwrap();
+        std::fs::write(workspace.path().join("public.txt"), "needle public").unwrap();
+        std::fs::write(workspace.path().join("private/secret.txt"), "needle protected").unwrap();
+        let conversation = state.database().unwrap().create_conversation().unwrap().id;
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+            action: Action::Path, resource: "private/**".into(), effect: Effect::Deny,
+        }] }).unwrap();
+        let tools = vec![crate::connectors::AgentTool::harness("file_search").unwrap()];
+        let mut ctx = research_fixture(&state, workspace.path(), &conversation, "search-run", 0, &tools);
+        ctx.preset_id = crate::presets::CODE.into();
+        let result = execute(&ctx, "file_search", json!({"query":"needle"})).await.unwrap().value.to_string();
+        assert!(result.contains("public.txt") && result.contains("permission rules"), "{result}");
+        assert!(!result.contains("protected") && !result.contains("secret.txt"), "{result}");
+    }
     #[tokio::test]
     async fn plan_submit_waits_for_approval_and_returns_the_decision() {
         let directory = tempfile::tempdir().unwrap();

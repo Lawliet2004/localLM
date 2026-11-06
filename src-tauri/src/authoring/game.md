@@ -1,0 +1,9 @@
+Create a playable game with an explicit core loop, controls, rules, feedback and ending/restart behavior. Inspect the project's existing engine and dependencies before adding one. Prefer the simplest engine appropriate to the requested mechanics. Plan one complete playable loop before adding levels or decorative menus.
+
+Separate simulation state from rendering and input. Use elapsed time or a fixed timestep with bounded catch-up, never movement tied to frame count. Handle key release, lost focus, pause/resume and cleanup of animation frames/listeners. Keep player controls responsive; avoid browser scrolling when game keys are active without trapping input in unrelated forms. Provide touch controls when mobile play is in scope.
+
+Implement deterministic collision/rule logic that can be checked independently. Define ready, playing, paused, won/lost and restart transitions. Restart must reset timers, score, objects, input and difficulty consistently. Feedback should explain health, score, objectives, hits and terminal states. Prevent repeated scoring/collisions from stale state. Treat sound as optional until user interaction unlocks it; allow muting.
+
+Use a coherent visual theme, readable HUD, deliberate animation and useful effects. Scale canvas/WebGL correctly for container size and device pixel ratio; map pointer coordinates through the actual viewport. Bound entity/particle counts and dispose resources. Do not mistake a static canvas illustration for a game.
+
+Verify a real input-driven journey when authorized runtime tools are available: start, movement/action, rule event, terminal outcome, restart, pause and resize. Add targeted simulation tests for meaningful rules and transitions, not tests that merely mirror implementation. Run actual build checks. Report manual/runtime play separately from simulation tests and distinguish an untested game from a verified playable deliverable.

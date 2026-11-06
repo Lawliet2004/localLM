@@ -665,7 +665,8 @@ mod tests {
         );
         reply.claimed = Some(10000);
         let fixture = server(vec![reply]).await;
-        let response = backend("openai", &fixture.url)
+        let model = backend("openai", &fixture.url);
+        let response = model
             .stream(&json!({"stream":true}))
             .await
             .unwrap();
@@ -673,7 +674,13 @@ mod tests {
             response.extensions().get::<RetryTrace>().unwrap().attempts,
             1
         );
-        assert!(response.text().await.is_err());
+        let error = response.text().await.unwrap_err();
+        let cause = std::error::Error::source(&error).unwrap().to_string();
+        let diagnostic = model.stream_read_error(error);
+        assert!(diagnostic.contains("HTTP response body"), "{diagnostic}");
+        assert!(diagnostic.contains(&cause), "{diagnostic}");
+        assert!(diagnostic.contains("unfinished tool calls were not executed"));
+        assert!(!diagnostic.contains("fixture-secret"));
         assert_eq!(fixture.count(), 1);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -697,5 +704,25 @@ mod tests {
         );
         assert!(error.contains("1 bounded pre-stream HTTP retry"), "{error}");
         assert!(!error.contains("Retry-After exceeds"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stream_body_timeout_is_classified_and_not_replayed() {
+        let mut reply = Reply::new(200, "Content-Type: text/event-stream\r\n", "");
+        reply.claimed = Some(10000);
+        reply.hold_body = true;
+        let fixture = server(vec![reply]).await;
+        let mut model = backend("openai", &fixture.url);
+        if let Backend::OpenAi { client, .. } = &mut model {
+            *client = reqwest::Client::builder().no_proxy()
+                .timeout(Duration::from_secs(1)).build().unwrap();
+        }
+        let response = model.stream(&json!({"stream":true})).await.unwrap();
+        let error = response.text().await.unwrap_err();
+        assert!(error.is_timeout());
+        let diagnostic = model.stream_read_error(error);
+        assert!(diagnostic.contains("timed out while reading the stream"), "{diagnostic}");
+        assert!(diagnostic.contains("unfinished tool calls were not executed"));
+        assert_eq!(fixture.count(), 1);
     }
 }

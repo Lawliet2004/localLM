@@ -98,6 +98,10 @@ impl Vault {
             .lock
             .lock()
             .map_err(|_| "Credential vault lock unavailable.")?;
+        self.load_locked(id)
+    }
+
+    fn load_locked(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
         let path = self.directory.join(format!("{id}.sealed"));
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
@@ -116,6 +120,10 @@ impl Vault {
             .lock
             .lock()
             .map_err(|_| "Credential vault lock unavailable.")?;
+        self.save_locked(id, secret)
+    }
+
+    fn save_locked(&self, id: &str, secret: &[u8]) -> Result<(), String> {
         let bytes = seal(&self.cipher()?, id, secret)?;
         std::fs::create_dir_all(&self.directory).map_err(|error| error.to_string())?;
         let temporary = self.directory.join(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -163,6 +171,24 @@ impl Vault {
         tokio::task::spawn_blocking(move || vault.save(&id, &secret))
             .await
             .map_err(|error| error.to_string())?
+    }
+
+    /// Commit a rotated credential only if this is still the same login.
+    pub(crate) async fn replace_blocking(
+        self: &std::sync::Arc<Self>,
+        id: &'static str,
+        expected: Vec<u8>,
+        secret: Vec<u8>,
+    ) -> Result<(), String> {
+        validate_id(id)?;
+        let vault = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = vault.lock.lock().map_err(|_| "Credential vault lock unavailable.")?;
+            if vault.load_locked(id)?.as_deref() != Some(expected.as_slice()) {
+                return Err("The saved login changed during credential refresh.".into());
+            }
+            vault.save_locked(id, &secret)
+        }).await.map_err(|error| error.to_string())?
     }
 
     /// Remove a credential without blocking the async worker.

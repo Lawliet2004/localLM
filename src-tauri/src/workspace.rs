@@ -26,7 +26,9 @@ pub const TOOL_COUNT: usize = 28;
 pub struct Workspace {
     directory: Dir,
     root: std::path::PathBuf,
+    selected_root: std::path::PathBuf,
     transaction_lock: Arc<std::sync::RwLock<()>>,
+    permission_db: Option<std::path::PathBuf>,
 }
 
 /// Mutations and recovery take the exclusive root guard; pure reads share it.
@@ -51,6 +53,23 @@ pub(crate) fn is_write_call(name: &str) -> bool {
             | "copy_directory"
             | "notebook_edit"
     )
+}
+
+/// Compare an already authorized absolute spelling with a canonical path.
+pub(crate) fn same_canonical_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        fn comparable(path: &Path) -> String {
+            let text = path.to_string_lossy().to_lowercase();
+            if let Some(unc) = text.strip_prefix(r"\\?\unc\") {
+                return format!(r"\\{unc}");
+            }
+            text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+        }
+        comparable(left) == comparable(right)
+    }
+    #[cfg(not(windows))]
+    { left == right }
 }
 
 /// Open each parent separately without following links. Holding the parent
@@ -184,6 +203,8 @@ fn search_in(
     results: &mut Vec<String>,
     include_generated: bool,
     limits: &SearchLimits,
+    permissions: Option<&crate::permission_rules::SearchPermissions>,
+    restricted: &mut bool,
 ) -> Result<Truncation, String> {
     for entry in directory.entries().map_err(|error| error.to_string())? {
         if results.len() >= limits.results {
@@ -224,10 +245,14 @@ fn search_in(
                 results,
                 include_generated,
                 limits,
+                permissions,
+                restricted,
             )?;
             if child_limit != Truncation::None {
                 return Ok(child_limit);
             }
+        } else if permissions.is_some_and(|policy| !policy.allows(&path)) {
+            *restricted = true;
         } else if path.to_lowercase().contains(needle) {
             results.push(path);
         }
@@ -374,6 +399,9 @@ fn unified_diff(path: &str, before: &str, after: &str) -> String {
     diff
 }
 impl Workspace {
+    pub(crate) fn permission_roots(&self) -> (&Path, &Path) {
+        (&self.selected_root, &self.root)
+    }
     /// Static preview reads share the transaction lock and the same scoped,
     /// no-follow opens as model file reads. Never publish arbitrary documents,
     /// dotfiles, directory listings, devices or unbounded file contents.
@@ -512,14 +540,21 @@ impl Workspace {
     }
     /// Bounded binary snapshot using the shared no-follow, identity and recovery policy.
     pub(crate) fn development_bytes(&self, path: &str, max: usize) -> Result<Vec<u8>, String> {
+        self.development_optional_bytes(path, max)?
+            .ok_or_else(|| "Development input does not exist.".into())
+    }
+    pub(crate) fn development_optional_bytes(&self, path: &str, max: usize) -> Result<Option<Vec<u8>>, String> {
         let _guard = self
             .transaction_lock
             .read()
             .map_err(|_| "Workspace transaction lock unavailable.")?;
         patch::ensure_clear(&self.directory)?;
         valid_path(path, false)?;
-        let file = open_file_no_links(&self.directory, path, OpenOptions::new().read(true))
-            .map_err(|e| e.to_string())?;
+        let file = match open_file_no_links(&self.directory, path, OpenOptions::new().read(true)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
         patch::file_identity::single_link_identity(&file)?;
         let mut bytes = Vec::new();
         file.take(max as u64 + 1)
@@ -528,7 +563,7 @@ impl Workspace {
         if bytes.len() > max {
             return Err("Development input exceeds the byte limit.".into());
         }
-        Ok(bytes)
+        Ok(Some(bytes))
     }
     pub fn output_artifact(&self, path: &str) -> Result<(Vec<u8>, &'static str), String> {
         let _guard = self
@@ -588,14 +623,35 @@ impl Workspace {
         if path.is_empty() || !Path::new(path).is_absolute() {
             return Err("Choose an absolute workspace directory.".into());
         }
+        let root = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
         Ok(Self {
-            directory: Dir::open_ambient_dir(path, ambient_authority())
+            directory: Dir::open_ambient_dir(&root, ambient_authority())
                 .map_err(|error| format!("Could not open workspace: {error}"))?,
-            root: std::fs::canonicalize(path).map_err(|error| error.to_string())?,
-            transaction_lock: patch::root_lock(Path::new(path))?,
+            transaction_lock: patch::root_lock(&root)?,
+            root,
+            selected_root: Path::new(path).to_path_buf(),
+            permission_db: None,
         })
     }
+    /// Bind model-facing searches to current saved permissions. Native editor
+    /// operations use `open` without this model-tool policy.
+    pub fn with_permission_store(mut self, database: &Path) -> Self {
+        self.permission_db = Some(database.to_path_buf());
+        self
+    }
+    fn search_permissions(&self, name: &str) -> Result<Option<crate::permission_rules::SearchPermissions>, String> {
+        self.permission_db.as_ref().map(|database| {
+            crate::permission_rules::search_permissions_from_db(database, &self.selected_root, &self.root, &format!("workspace_{name}"))
+        }).transpose()
+    }
     pub fn call(&self, name: &str, arguments: Value) -> Result<Value, String> {
+        self.call_with_cancellation(name, arguments, None)
+    }
+
+    pub(crate) fn call_with_cancellation(
+        &self, name: &str, arguments: Value, cancel: Option<&tokio::sync::watch::Receiver<()>>,
+    ) -> Result<Value, String> {
+        crate::tool_spec::check_argument_bytes(name, arguments.to_string().len())?;
         // Reads share the root guard; writes and recovery take it exclusively
         // so a transaction can never overlap a native reader.
         let _write_guard;
@@ -614,6 +670,9 @@ impl Workspace {
                     .map_err(|_| "Workspace transaction lock unavailable.")?,
             );
             _write_guard = None;
+        }
+        if cancel.is_some_and(|signal| signal.has_changed().is_err()) {
+            return Err("Workspace operation cancelled before dispatch.".into());
         }
         if name != "recover_patch" {
             patch::ensure_clear(&self.directory)?;
@@ -635,12 +694,15 @@ impl Workspace {
                         | "multi_edit"
                         | "edit_lines"
                 ) {
-                    self.format_changed_file(&mut result);
+                    self.format_changed_file(&mut result, cancel);
                 }
                 Ok(result)
             }
-            "search_content" => self.search_content(arguments),
-            "glob_files" => self.glob_files(arguments),
+            "search_content" | "glob_files" => {
+                let permissions = self.search_permissions(name)?;
+                if name == "search_content" { self.search_content(arguments, permissions.as_ref()) }
+                else { self.glob_files(arguments, permissions.as_ref()) }
+            }
             "list_files" => {
                 let request: PathRequest =
                     serde_json::from_value(arguments).map_err(|error| error.to_string())?;
@@ -654,17 +716,26 @@ impl Workspace {
                 .map_err(|error| error.to_string())?;
                 let mut entries = Vec::new();
                 let mut truncated = false;
-                for entry in directory.entries().map_err(|error| error.to_string())? {
-                    if entries.len() >= 500 {
+                let permissions = self.search_permissions("list_files")?;
+                let mut restricted = false;
+                for (scanned, entry) in directory.entries().map_err(|error| error.to_string())?.enumerate() {
+                    if scanned >= 500 {
                         truncated = true;
                         break;
                     }
                     let entry = entry.map_err(|error| error.to_string())?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let path = if request.path == "." { name.clone() } else { format!("{}/{}", request.path, name) };
+                    if permissions.as_ref().is_some_and(|permissions| !permissions.allows(&path)) {
+                        restricted = true;
+                        continue;
+                    }
                     let kind = entry.file_type().map_err(|error| error.to_string())?;
-                    entries.push(json!({"name":entry.file_name().to_string_lossy(),"kind":if kind.is_symlink() { "link" } else if kind.is_dir() { "directory" } else { "file" }}));
+                    entries.push(json!({"name":name,"kind":if kind.is_symlink() { "link" } else if kind.is_dir() { "directory" } else { "file" }}));
                 }
                 entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-                Ok(json!({"entries":entries,"truncated":truncated}))
+                Ok(json!({"entries":entries,"truncated":truncated || restricted,"incomplete":truncated || restricted,
+                    "warnings":if restricted { vec!["Some entries were excluded by permission rules; results are incomplete."] } else { vec![] }}))
             }
             "read_file" => {
                 let request: ReadRequest =
@@ -741,7 +812,7 @@ impl Workspace {
                 let path = request.path.clone();
                 let pre_format_sha256 = format!("{:x}", Sha256::digest(request.content.as_bytes()));
                 let mut result = json!({"path":path,"bytesWritten":request.content.len(),"sha256":pre_format_sha256.clone()});
-                self.apply_auto_format(&mut result, &path, &pre_format_sha256);
+                self.apply_auto_format(&mut result, &path, &pre_format_sha256, cancel);
                 Ok(result)
             }
             "create_directory" => {
@@ -815,7 +886,7 @@ impl Workspace {
                 let pre_format_sha256 = format!("{:x}", Sha256::digest(updated.as_bytes()));
                 let path = request.path.clone();
                 let mut result = json!({"path":path,"replacements":replacements,"bytesWritten":updated.len(),"sha256":pre_format_sha256.clone(),"diff":unified_diff(&path,&text,&updated),"match":kind.as_str()});
-                self.apply_auto_format(&mut result, &path, &pre_format_sha256);
+                self.apply_auto_format(&mut result, &path, &pre_format_sha256, cancel);
                 Ok(result)
             }
             "search_files" => {
@@ -833,6 +904,8 @@ impl Workspace {
                 let needle = needle.to_lowercase();
                 let mut results = Vec::new();
                 let mut scanned = 0usize;
+                let permissions = self.search_permissions(name)?;
+                let mut restricted = false;
                 let limits = SearchLimits {
                     scan: SEARCH_MAX_SCANNED,
                     results: SEARCH_MAX_RESULTS,
@@ -847,6 +920,8 @@ impl Workspace {
                     &mut results,
                     request.include_generated,
                     &limits,
+                    permissions.as_ref(),
+                    &mut restricted,
                 )?;
                 results.sort();
                 let results = results
@@ -854,7 +929,7 @@ impl Workspace {
                     .map(|path| json!({"path":path,"kind":"file"}))
                     .collect::<Vec<_>>();
                 Ok(
-                    json!({"results":results,"truncated":truncation != Truncation::None,"truncation":truncation.as_str()}),
+                    json!({"results":results,"truncated":truncation != Truncation::None || restricted,"truncation":truncation.as_str(),"incomplete":restricted || truncation != Truncation::None,"warnings":if restricted {vec!["Some files were excluded by permission rules; results are incomplete."]} else {vec![]}}),
                 )
             }
             "notebook_read" | "notebook_edit" => self.notebook_call(name, arguments),
@@ -869,11 +944,12 @@ impl Workspace {
     /// Formatting never fails the write: the bytes are already on disk. A
     /// formatter that fails is reported in the tool result, not raised, so a
     /// broken toolchain cannot lose a successful write.
-    fn auto_format(&self, relative: &str) -> Option<crate::formatter::FormatOutcome> {
+    fn auto_format(&self, relative: &str, cancel: Option<&tokio::sync::watch::Receiver<()>>) -> Option<crate::formatter::FormatOutcome> {
         match crate::formatter::format_file_detailed(
             &self.root,
             relative,
             crate::formatter::AUTO_TIMEOUT_SECONDS,
+            cancel,
         ) {
             Ok(None) => None,
             Ok(Some(detailed)) => Some(detailed.outcome),
@@ -915,8 +991,8 @@ impl Workspace {
     /// though nothing else touched the file. The pre-format hash is kept as
     /// `preFormatSha256` so the write itself stays auditable, and
     /// `reformatted` says whether the formatter changed anything.
-    fn apply_auto_format(&self, result: &mut Value, path: &str, pre_format_sha256: &str) {
-        let outcome = self.auto_format(path);
+    fn apply_auto_format(&self, result: &mut Value, path: &str, pre_format_sha256: &str, cancel: Option<&tokio::sync::watch::Receiver<()>>) {
+        let outcome = self.auto_format(path, cancel);
         let changed = outcome.as_ref().map(|outcome| outcome.changed).unwrap_or(false);
         let post_format_sha256 = self
             .current_sha256(path)
@@ -954,7 +1030,7 @@ impl Workspace {
         }
     }
     /// Format the single file a journalled write changed.
-    fn format_changed_file(&self, result: &mut Value) {
+    fn format_changed_file(&self, result: &mut Value, cancel: Option<&tokio::sync::watch::Receiver<()>>) {
         let Some(change) = result
             .get("changes")
             .and_then(|changes| changes.as_array())
@@ -972,7 +1048,7 @@ impl Workspace {
             return;
         };
         let (path, pre_format_sha256) = (path.to_string(), pre_format_sha256.to_string());
-        self.apply_auto_format(result, &path, &pre_format_sha256);
+        self.apply_auto_format(result, &path, &pre_format_sha256, cancel);
     }
     pub fn tools(self: Arc<Self>) -> Vec<crate::connectors::AgentTool> {
         let mut definitions=vec![
@@ -1007,7 +1083,7 @@ pub async fn set_workspace(
 ) -> Result<(), String> {
     let _operation = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the current model operation to finish.")?;
     if !path.is_empty() {
         Workspace::open(&path)?;
@@ -1419,6 +1495,8 @@ mod tests {
                 results: 50,
                 depth: 8,
             },
+            None,
+            &mut false,
         )
         .unwrap();
         assert_eq!(scan, Truncation::Scan);

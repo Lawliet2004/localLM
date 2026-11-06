@@ -13,6 +13,8 @@
 .desktop-app .menubar-sidebar-toggle { display: grid; }
 .desktop-app .workspace { grid-column: 2; grid-row: 2; position: relative; container-type: inline-size; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
 .desktop-app.sidebar-collapsed .workspace { grid-column: 1; }
+/* Expanded tools must stay beside the persistent navigation dock. */
+.desktop-app .workspace-panel.panel-expanded { left: 52px; }
 .desktop-app .sidebar { grid-column: 1; grid-row: 2; border: 1px solid var(--border); border-radius: 14px; background: var(--sidebar); padding: 20px 14px 14px; }
 .desktop-app .workspace-header { background: var(--surface); padding: 0 24px; min-height: 54px; border-bottom-color: var(--border); }
 .desktop-app .workspace-header-minimal { min-height: 54px; border-bottom-color: transparent; }
@@ -338,6 +340,7 @@ input[type=checkbox].switch:disabled { opacity: .5; cursor: not-allowed; }
 }
 @media (max-width: 760px) {
   .desktop-app { grid-template-columns: minmax(0, 1fr); padding: 0 6px 66px; gap: 6px; }
+  .desktop-app .workspace-panel.panel-expanded { left: 0; bottom: 66px; }
   .desktop-app .workspace { grid-column: 1; border-radius: 11px; }
   .desktop-app:not(.sidebar-collapsed) .sidebar { display: flex; position: absolute; top: 48px; left: 6px; bottom: 72px; width: min(284px, calc(100vw - 24px)); border-radius: 14px; z-index: 50; box-shadow: var(--shadow-lg); }
   .app-dock { inset: auto auto 8px 50%; width: auto; height: auto; transform: translateX(-50%); flex-direction: row; padding: 5px 7px; gap: 2px; max-width: calc(100vw - 16px); overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-pill); background: var(--elevated); box-shadow: var(--shadow-lg); }
@@ -504,7 +507,7 @@ input[type=checkbox].switch:disabled { opacity: .5; cursor: not-allowed; }
 .desktop-app .code-block-wrapper { background: var(--code-bg); border-radius: 12px; }
 .desktop-app .code-block-header { background: var(--code-header-bg); color: var(--code-fg); padding: 8px 12px; }
 .desktop-app .code-block-lang, .desktop-app .code-block-copy-btn { color: var(--text); font-size: 12px; }
-.desktop-app .markdown .code-block-pre { margin: 0; padding: 18px; border: 0; border-radius: 0; background: var(--code-bg); color: var(--code-fg); box-shadow: none; line-height: 1.65; }
+.desktop-app .markdown .code-block-pre { margin: 0; padding: 18px; border: 0; border-radius: 0; background: var(--code-bg); color: var(--code-fg); box-shadow: none; line-height: 1.65; font-size: var(--code-font-size, 13px); }
 .desktop-app .markdown .code-block-pre code { background: transparent; color: inherit; padding: 0; }
 .desktop-app .tool-result-json { color: var(--text); background: var(--surface); overflow: auto; margin: 0; padding: 12px; }
 .desktop-app .model-capabilities { display: block; position: static; max-width: none; color: var(--secondary); font-size: 12px; }

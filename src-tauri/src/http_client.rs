@@ -121,10 +121,11 @@ pub fn builder(policy: Policy) -> reqwest::ClientBuilder {
 ///
 /// Redirects are refused so a provider cannot silently redirect a request
 /// carrying an API key to another host, and the timeout is generous because
-/// a long generation is a normal outcome.
+/// a long generation is a normal outcome. This deadline includes the entire
+/// response body; keep it aligned with the chat's ten-minute request budget.
 pub fn model_provider() -> Result<reqwest::Client, String> {
     client(
-        Policy::no_redirects(Duration::from_secs(180)),
+        Policy::no_redirects(Duration::from_secs(600)),
         "Could not create the provider HTTP client.",
     )
 }

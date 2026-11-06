@@ -99,6 +99,19 @@ fn endpoint_fingerprint(format: &str, base: &str, model_id: &str) -> String {
     )
 }
 
+/// River documents required reasoning and these effort values for these two
+/// models: https://docs.river.ai/guides/inference-controls/. Match the exact
+/// hosted endpoint rather than guessing from a model name at another provider.
+pub fn documented_river_reasoning(base: &str, model: &str, mode: &str) -> Option<&'static str> {
+    if !matches!(model, "zai-org/GLM-5.3-Flash" | "GLM-5.3") { return None; }
+    let url = reqwest::Url::parse(base).ok()?;
+    if url.scheme() != "https" || url.host_str() != Some("api.river.ai")
+        || url.port_or_known_default() != Some(443) || !url.username().is_empty()
+        || url.password().is_some() || url.query().is_some() || url.fragment().is_some()
+        || !matches!(url.path().trim_end_matches('/'), "" | "/v1") { return None; }
+    match mode { "quick" => Some("low"), "auto" => Some("high"), "think" => Some("max"), _ => None }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelCapabilities {
@@ -203,9 +216,7 @@ pub async fn probe_model_tools(
     provider_id: &str,
     model_id: &str,
 ) -> Result<ToolProbe, String> {
-    // Store guards are not Send; keep every database/vault read synchronous
-    // and scoped so nothing non-Send crosses an await.
-    let (provider, model, key) = {
+    let (provider, model) = {
         let store = state.database()?;
         let provider = store.provider(provider_id)?.ok_or("Unknown provider.")?;
         let model = provider
@@ -221,14 +232,7 @@ pub async fn probe_model_tools(
                 supports_images: false,
                 tool_support: ToolSupport::Unknown,
             });
-        let key = crate::providers::resolve_api_key(
-            &provider,
-            state
-                .daytona_vault
-                .load(&crate::providers::credential_id(&provider.id))?,
-        )
-        .unwrap_or_default();
-        (provider, model, key)
+        (provider, model)
     };
     let backend = if crate::providers::is_subscription_format(&provider.api_format) {
         let kind = if provider.api_format == crate::providers::CHATGPT_SUBSCRIPTION
@@ -238,10 +242,8 @@ pub async fn probe_model_tools(
         } else {
             "grok"
         };
-        let token =
-            crate::subscription_auth::get_valid_access_token(&state.daytona_vault, kind).await?;
-        let account_id = crate::subscription_auth::load_session(&state.daytona_vault, kind)?
-            .and_then(|s| s.account_id);
+        let session = crate::subscription_auth::get_valid_session(&state.daytona_vault, kind).await?;
+        let (token, account_id) = (session.access_token, session.account_id);
         crate::inference::Backend::subscription(
             "subscription",
             &provider.base_url,
@@ -250,6 +252,8 @@ pub async fn probe_model_tools(
             &model,
         )?
     } else {
+        let credential = state.daytona_vault.load_blocking(&crate::providers::credential_id(&provider.id)).await?;
+        let key = crate::providers::resolve_api_key(&provider, credential).unwrap_or_default();
         crate::inference::Backend::openai(&provider, key, &model)?
     };
     let request = json!({

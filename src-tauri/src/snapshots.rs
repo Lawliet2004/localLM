@@ -13,7 +13,8 @@
 //! the target's own directory followed by a rename, so a crash cannot leave a
 //! half-written file behind, and a symbolic link is never written through.
 
-use cap_fs_ext::DirExt;
+use cap_fs_ext::{DirExt, MetadataExt};
+use cap_std::fs::{Dir, File, OpenOptions, Permissions};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
@@ -224,7 +225,7 @@ fn validate_path(path: &str) -> Result<(), String> {
     if path.is_empty() || path.len() > 4096 {
         return Err("Snapshot paths must name a file inside the workspace.".into());
     }
-    if path.contains('\0') || path.contains('\\') {
+    if path.contains(['\0', '\\', ':']) || path.split('/').any(|part| matches!(part, "" | "." | "..")) {
         return Err(
             "Snapshot paths use forward slashes and cannot contain backslashes.".into(),
         );
@@ -759,14 +760,23 @@ pub fn commit(
     root: &std::path::Path,
     staged_id: &str,
 ) -> Result<RevertReport, String> {
+    let canonical = std::fs::canonicalize(root).map_err(|e| format!("Cannot open the workspace: {e}"))?;
+    if !crate::workspace::same_canonical_path(&canonical, root) {
+        return Err("The workspace path changed; the revert remains staged.".into());
+    }
+    let root = canonical;
+    let lock = crate::workspace::patch::root_lock(&root)?;
+    let _guard = lock.write().map_err(|_| "Workspace transaction lock unavailable.")?;
     let staged = staged_revert(store, staged_id)?
         .ok_or("No staged revert with that id.".to_string())?;
     let snapshot = load_snapshot(store, &staged.snapshot_id)?
         .ok_or("The snapshot for that revert is no longer available.".to_string())?;
+    let directory = Dir::open_ambient_dir(&root, cap_std::ambient_authority())
+        .map_err(|e| format!("Cannot open the workspace: {e}"))?;
     let blobs = content_root(store);
     let mut report = RevertReport::default();
     for file in &snapshot.files {
-        match restore(root, &blobs, file, staged_id) {
+        match restore(&directory, &blobs, file) {
             Ok(Restored::Written { overwritten }) => {
                 report.restored.push(file.path.clone());
                 if overwritten {
@@ -781,10 +791,8 @@ pub fn commit(
     if report.failed.is_empty() {
         // The revert is done. A revert with failures stays staged so the user
         // can retry it after fixing the cause.
-        let _ = store
-            .connection
-            .execute("DELETE FROM staged_reverts WHERE id=?1", [staged_id])
-            .map_err(db_error);
+        store.connection.execute("DELETE FROM staged_reverts WHERE id=?1", [staged_id])
+            .map_err(|error| format!("Files were restored, but the staged revert could not be cleared: {error}"))?;
     }
     Ok(report)
 }
@@ -792,142 +800,121 @@ pub fn commit(
 /// Restore one captured file. The target is never written through a symbolic
 /// link, and the content is published with a rename so a crash cannot leave a
 /// half-written file.
-fn restore(
-    root: &Path,
-    blobs: &Path,
-    file: &SnapshotFile,
-    staged_id: &str,
-) -> Result<Restored, String> {
+fn restore(root: &Dir, blobs: &Path, file: &SnapshotFile) -> Result<Restored, String> {
     validate_path(&file.path)?;
-    let target = root.join(&file.path);
-    let metadata = match std::fs::symlink_metadata(&target) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("Cannot inspect '{}': {error}", file.path)),
-    };
-    if let Some(metadata) = &metadata {
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "Refusing to write through the symbolic link '{}'.",
-                file.path
-            ));
-        }
-    }
-    if file.deleted {
-        let Some(metadata) = metadata else {
+    crate::sandbox::check_fs_path("", &file.path, true)?;
+    let (parent, leaf) = match crate::workspace::parent_no_links(root, &file.path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && file.deleted => {
             return Ok(Restored::Unchanged);
-        };
-        if !metadata.is_file() {
-            return Err(format!(
-                "'{}' is not a regular file; it was left alone.",
-                file.path
-            ));
         }
-        std::fs::remove_file(&target)
-            .map_err(|error| format!("Cannot delete '{}': {error}", file.path))?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut parent = root.try_clone().map_err(|e| e.to_string())?;
+            let mut parts = file.path.split('/').peekable();
+            loop {
+                let part = parts.next().ok_or("Missing restore target name.")?;
+                if parts.peek().is_none() {
+                    break (parent, part.to_string());
+                }
+                parent = match parent.open_dir_nofollow(part) {
+                    Ok(next) => next,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match parent.create_dir(part) {
+                            Ok(()) => (),
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+                            Err(error) => return Err(error.to_string()),
+                        }
+                        parent.open_dir_nofollow(part).map_err(|e| e.to_string())?
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+            }
+        }
+        Err(error) => return Err(format!("Cannot open restore parent without following links: {error}")),
+    };
+    let target = open_restore_target(&parent, &leaf)?;
+    let verify_target = || -> Result<(), String> {
+        let (current_parent, _) = crate::workspace::parent_no_links(root, &file.path)
+            .map_err(|e| format!("Restore parent changed: {e}"))?;
+        let expected = parent.dir_metadata().map_err(|e| e.to_string())?;
+        let current = current_parent.dir_metadata().map_err(|e| e.to_string())?;
+        if (expected.dev(), expected.ino()) != (current.dev(), current.ino()) {
+            return Err("Restore parent changed; the target was preserved.".into());
+        }
+        if let Some(original) = &target {
+            use crate::workspace::patch::file_identity::single_link_identity;
+            let current = open_restore_target(&parent, &leaf)?.ok_or("Restore target disappeared.")?;
+            if single_link_identity(original)? != single_link_identity(&current)? {
+                return Err("Restore target changed identity; it was preserved.".into());
+            }
+        }
+        Ok(())
+    };
+    if file.deleted {
+        if target.is_none() {
+            return Ok(Restored::Unchanged);
+        }
+        verify_target()?;
+        parent.remove_file(&leaf).map_err(|e| format!("Cannot delete '{}': {e}", file.path))?;
         return Ok(Restored::Removed);
     }
-    let overwritten = match &metadata {
-        None => false,
-        Some(metadata) if metadata.is_file() => match current_digest(&target) {
-            Ok(digest) => digest != file.sha256,
-            // The current content cannot be read, so it cannot be the
-            // captured one. The snapshot is still the older truth.
-            Err(_) => true,
-        },
-        Some(_) => {
-            return Err(format!(
-                "'{}' is not a regular file; it was left alone.",
-                file.path
-            ))
-        }
-    };
-    let permissions = metadata
-        .as_ref()
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.permissions());
+    let permissions = target.as_ref().map(|f| f.metadata().map(|m| m.permissions()))
+        .transpose().map_err(|e| e.to_string())?;
+    let overwritten = target.as_ref().map(current_digest).transpose()?
+        .is_some_and(|digest| digest != file.sha256);
     let bytes = read_blob(blobs, &file.sha256)?;
-    write_atomic(&target, &bytes, staged_id, permissions)?;
+    write_atomic(&parent, &leaf, &bytes, permissions, verify_target)?;
     Ok(Restored::Written { overwritten })
 }
 
-/// The sha256 of the file as it is on disk now, or an empty string when it
-/// cannot be read (which counts as "changed" for the caller).
-fn current_digest(target: &Path) -> Result<String, String> {
-    let mut file = match std::fs::File::open(target) {
-        Ok(file) => file,
-        Err(error) => return Err(format!("Cannot read the current file: {error}")),
-    };
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 65_536];
-    let mut read = 0u64;
-    loop {
-        let count = match file.read(&mut buffer) {
-            Ok(count) => count,
-            Err(error) => return Err(format!("Cannot read the current file: {error}")),
-        };
-        if count == 0 {
-            break;
-        }
-        read += count as u64;
-        if read > MAX_FILE_BYTES {
-            // Bigger than any captured content: it cannot be the same file.
-            return Ok(String::new());
-        }
-        hasher.update(&buffer[..count]);
+fn open_restore_target(parent: &Dir, leaf: &str) -> Result<Option<File>, String> {
+    match crate::workspace::open_file_no_links(parent, leaf, OpenOptions::new().read(true)) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Cannot open '{leaf}' as a regular file without following symbolic links: {error}")),
     }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Publish bytes at the target through a temporary file in the target's own
-/// directory and a rename, so the target is never half-written. The target's
-/// current permissions are kept when it still exists; a file that is created
-/// from scratch gets the default permissions of the directory.
+fn current_digest(file: &File) -> Result<String, String> {
+    let mut data = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut data)
+        .map_err(|e| format!("Cannot read the current file: {e}"))?;
+    Ok(if data.len() as u64 > MAX_FILE_BYTES {
+        String::new()
+    } else {
+        format!("{:x}", Sha256::digest(&data))
+    })
+}
+
 fn write_atomic(
-    target: &Path,
+    parent: &Dir,
+    leaf: &str,
     bytes: &[u8],
-    staged_id: &str,
-    permissions: Option<std::fs::Permissions>,
+    permissions: Option<Permissions>,
+    verify_target: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let parent = target
-        .parent()
-        .ok_or("The restored file has no parent directory.")?;
-    if !parent.exists() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Cannot create the directory for '{}': {error}",
-                target.display()
-            )
-        })?;
-    }
-    let leaf = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("The restored file has no usable name.")?;
-    let temporary = parent.join(format!(
-        ".{leaf}.locallm-snap-{staged_id}-{}.tmp",
-        uuid::Uuid::new_v4()
-    ));
-    let write = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
+    let temporary = format!(".locallm-snap-{}.tmp", uuid::Uuid::new_v4());
+    let mut file = parent.open_with(&temporary, OpenOptions::new().write(true).create_new(true))
+        .map_err(|e| format!("Cannot stage restored file: {e}"))?;
+    let replace = permissions.is_some();
+    let result = (|| {
+        file.write_all(bytes).map_err(|e| e.to_string())?;
         if let Some(permissions) = permissions {
-            file.set_permissions(permissions)?;
+            file.set_permissions(permissions).map_err(|e| e.to_string())?;
         }
-        file.sync_all()
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        verify_target()?;
+        if replace {
+            parent.rename(&temporary, parent, leaf)
+        } else {
+            // An external file created after inspection must be preserved.
+            parent.hard_link(&temporary, parent, leaf)
+        }
+        .map_err(|e| format!("Cannot publish the restored file: {e}"))
     })();
-    if let Err(error) = write {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(format!("Cannot write the restored file: {error}"));
-    }
-    if let Err(error) = std::fs::rename(&temporary, target) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(format!("Cannot publish the restored file: {error}"));
-    }
-    Ok(())
+    let _ = parent.remove_file(&temporary);
+    result
 }
 
 /// The snapshots for a conversation, newest first.
@@ -1503,4 +1490,28 @@ mod tests {
         assert_eq!(listed[1].id, ids[1]);
         assert_eq!(listed[2].id, ids[0]);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_never_follows_a_parent_link_for_writes_or_deletes() {
+        let store = store();
+        let owner = conversation(&store);
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("restore.txt"), "captured").unwrap();
+        let snapshot = capture(&store, &owner, 1, root.path(),
+            &["nested/restore.txt".into(), "nested/delete.txt".into()]).unwrap();
+        let staged = stage(&store, &owner, &snapshot.id).unwrap();
+        std::fs::rename(&nested, root.path().join("previous")).unwrap();
+        std::fs::write(outside.path().join("restore.txt"), "outside").unwrap();
+        std::fs::write(outside.path().join("delete.txt"), "preserve").unwrap();
+        std::os::unix::fs::symlink(outside.path(), nested).unwrap();
+        let report = commit(&store, root.path(), &staged.id).unwrap();
+        assert_eq!(report.failed.len(), 2, "{report:?}");
+        assert_eq!(std::fs::read_to_string(outside.path().join("restore.txt")).unwrap(), "outside");
+        assert_eq!(std::fs::read_to_string(outside.path().join("delete.txt")).unwrap(), "preserve");
+    }
+
 }

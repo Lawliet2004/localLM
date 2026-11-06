@@ -1,4 +1,6 @@
 pub mod agent_run;
+pub mod session_runs;
+pub mod turn_items;
 mod api_tools;
 pub mod approval;
 mod arex;
@@ -8,6 +10,8 @@ mod automation;
 pub mod capabilities;
 mod chat;
 mod check_tools;
+mod authoring;
+mod verification_progress;
 mod claude_adapter;
 mod commands;
 pub mod compaction;
@@ -252,6 +256,7 @@ pub struct AppState {
     turns: TurnLocks,
     cancel: tokio::sync::watch::Sender<bool>,
     pub run_control: std::sync::Mutex<agent_run::RunControl>,
+    pub session_runs: session_runs::Registry,
     connectors: tokio::sync::Mutex<connectors::McpHub>,
     oauth_operation: tokio::sync::Mutex<()>,
     oauth_cancel: tokio::sync::watch::Sender<bool>,
@@ -292,7 +297,13 @@ impl AppState {
             .map_err(|_| "Database lock is unavailable. Restart the application.".into())
     }
     pub fn cancel_requested(&self) -> bool {
-        *self.cancel.borrow()
+        *self.cancel_signal().borrow()
+    }
+    pub fn cancel_signal(&self) -> tokio::sync::watch::Sender<bool> {
+        session_runs::cancellation(&self.cancel)
+    }
+    pub fn with_run_control<T>(&self, f: impl FnOnce(&mut agent_run::RunControl) -> T) -> Result<T, String> {
+        session_runs::with_control(&self.run_control, f)
     }
 }
 
@@ -405,6 +416,7 @@ pub fn run() {
                 turns: TurnLocks::default(),
                 cancel: tokio::sync::watch::channel(false).0,
                 run_control: std::sync::Mutex::new(agent_run::RunControl::default()),
+                session_runs: session_runs::Registry::default(),
                 connectors: tokio::sync::Mutex::new(connectors::McpHub::new(vault)),
                 oauth_operation: tokio::sync::Mutex::new(()),
                 oauth_cancel: tokio::sync::watch::channel(false).0,
@@ -555,6 +567,9 @@ pub fn run() {
             commands::cancel_subscription_sign_in,
             commands::get_run,
             commands::get_conversation_run,
+            commands::get_pending_turn,
+            commands::discard_pending_turn,
+            commands::list_active_runs,
             commands::get_run_events,
             commands::get_conversation_runs,
             capabilities::list_capabilities,
@@ -651,6 +666,9 @@ pub fn run() {
             hooks::get_hooks,
             hooks::save_hooks,
             provider_capabilities::probe_model_tools_command,
+            git_tools::conversation_worktree,
+            git_tools::enter_conversation_worktree,
+            git_tools::exit_conversation_worktree,
             mcp_input::resolve_mcp_input,
             connectors::list_connectors,
             connectors::list_local_connectors,
@@ -679,6 +697,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
                 state.cancel.send_replace(true);
+                state.session_runs.cancel_all();
                 if let Ok(mut sessions) = state.pty_sessions.lock() {
                     for (_, session) in sessions.drain() {
                         session.kill();

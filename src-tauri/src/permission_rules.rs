@@ -12,9 +12,9 @@
 //! 1. **A rule may only ever come from the user's persisted settings.**
 //!    Nothing in this module writes a rule from model output, tool output or
 //!    a tool argument. `save` is only reachable from the settings command.
-//! 2. **An unreadable rule set is empty, never permissive.** A corrupted or
-//!    missing entry yields no rules at all, so the access mode keeps deciding
-//!    exactly as it did before rules existed.
+//! 2. **An unreadable rule set refuses dispatch.** A missing entry is an
+//!    empty rule set, but a corrupted or inaccessible entry cannot grant
+//!    automatic authorization.
 //!
 //! The wire format is the persisted JSON in [`RULES_KEY`]:
 //!
@@ -151,6 +151,7 @@ impl RuleView {
     }
 }
 
+#[cfg(test)]
 impl RuleSet {
     /// Whether any rule matches. The LAST matching rule decides.
     pub fn evaluate(&self, action: Action, resource: &str) -> Option<Effect> {
@@ -164,10 +165,83 @@ impl RuleSet {
     }
 }
 
-/// Read the persisted rule set. A missing or unparsable entry yields an
-/// empty set — never a permissive default.
+/// Legacy tolerant reader used only by regression tests.
+#[cfg(test)]
 pub fn load(store: &crate::store::Store) -> RuleSet {
     store.setting::<RuleSet>(RULES_KEY).unwrap_or_default()
+}
+
+/// Search must fail closed when saved rules cannot be read or parsed.
+pub fn load_checked(store: &crate::store::Store) -> Result<RuleSet, String> {
+    store.setting::<RuleSet>(RULES_KEY)
+}
+
+/// A search may not expose files covered by Ask or Deny. A search approval
+/// authorizes the search itself, not a blanket approval of every descendant.
+pub struct SearchPermissions {
+    rules: RuleSet,
+    root: std::path::PathBuf,
+    canonical_root: std::path::PathBuf,
+    alias: String,
+}
+
+impl SearchPermissions {
+    pub fn with_canonical_root(rules: RuleSet, root: std::path::PathBuf, canonical_root: std::path::PathBuf, alias: &str) -> Self {
+        Self { rules, root, canonical_root, alias: alias.to_owned() }
+    }
+
+    pub fn allows(&self, relative: &str) -> bool {
+        let mut decision = None;
+        for rule in &self.rules.rules {
+            // A tool-level Ask is handled by the dispatcher. It must neither
+            // exclude every file after approval nor override a path exclusion.
+            if rule.action == Action::Tool && rule.effect == Effect::Ask { continue; }
+            let matched = match rule.action {
+                Action::Tool => tool_matches(&rule.resource, &self.alias),
+                Action::Path => {
+                    // Include directory ancestors, while still letting a later
+                    // child-specific rule override an earlier directory rule.
+                    let mut part = std::path::Path::new(relative);
+                    let mut found = false;
+                    while !part.as_os_str().is_empty() {
+                        let local = part.to_string_lossy();
+                        let absolute = self.root.join(part);
+                        let canonical = self.canonical_root.join(part);
+                        if path_matches(&rule.resource, &local)
+                            || path_matches(&rule.resource, &absolute.to_string_lossy())
+                            || path_matches(&rule.resource, &canonical.to_string_lossy())
+                        {
+                            found = true;
+                            break;
+                        }
+                        part = part.parent().unwrap_or_else(|| std::path::Path::new(""));
+                    }
+                    found || path_matches(&rule.resource, &self.root.to_string_lossy())
+                        || path_matches(&rule.resource, &self.canonical_root.to_string_lossy())
+                }
+                _ => false,
+            };
+            if matched { decision = Some(rule.effect); }
+        }
+        !matches!(decision, Some(Effect::Ask | Effect::Deny))
+    }
+}
+
+/// Read a search policy without opening a writable store or running migrations.
+pub fn search_permissions_from_db(
+    database: &std::path::Path,
+    root: &std::path::Path,
+    canonical_root: &std::path::Path,
+    alias: &str,
+) -> Result<SearchPermissions, String> {
+    use rusqlite::OptionalExtension;
+    let connection = rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "Search permission settings are unavailable.")?;
+    let value: Option<String> = connection.query_row("SELECT value FROM settings WHERE key=?1", [RULES_KEY], |row| row.get(0))
+        .optional().map_err(|_| "Search permission settings are unavailable.")?;
+    let rules = value.map(|value| serde_json::from_str(&value).map_err(|_| "Search permission settings are invalid."))
+        .transpose()?.unwrap_or_default();
+    Ok(SearchPermissions::with_canonical_root(rules, root.to_path_buf(), canonical_root.to_path_buf(), alias))
 }
 
 /// Persist the rule set.
@@ -218,6 +292,7 @@ pub fn validate_views(views: &[RuleView]) -> Result<RuleSet, String> {
 ///
 /// CRITICAL: a rule may never be created or changed by model output. Rules
 /// come only from the user's persisted settings.
+#[cfg(test)]
 pub fn decide(
     rules: &RuleSet,
     mode: crate::permissions::AccessMode,
@@ -242,6 +317,7 @@ pub fn decide(
 /// `x-locallm-always-ask` pin, or a shell policy that demands a prompt) keeps
 /// that requirement: an `allow` rule narrows nothing away from it and the
 /// call is still confirmed by the user.
+#[cfg(test)]
 pub fn decide_for_tool(
     rules: &RuleSet,
     mode: crate::permissions::AccessMode,
@@ -250,10 +326,119 @@ pub fn decide_for_tool(
     trusted_read: bool,
     tool_requires_approval: bool,
 ) -> Decision {
-    if tool_requires_approval && matches!(rules.evaluate(action, resource), Some(Effect::Allow)) {
+    if tool_requires_approval && !matches!(rules.evaluate(action, resource), Some(Effect::Deny)) {
         return Decision::Ask;
     }
     decide(rules, mode, action, resource, trusted_read)
+}
+
+/// Evaluate both the tool alias and its resource in one ordered rule set.
+/// Later matching rules win regardless of which of those two forms they use.
+#[cfg(test)]
+pub fn decide_for_call(
+    rules: &RuleSet,
+    mode: crate::permissions::AccessMode,
+    alias: &str,
+    args: &Value,
+    trusted_read: bool,
+    tool_requires_approval: bool,
+) -> Decision {
+    decide_for_call_with_roots(rules, mode, alias, args, trusted_read, tool_requires_approval, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decide_for_call_with_roots(
+    rules: &RuleSet,
+    mode: crate::permissions::AccessMode,
+    alias: &str,
+    args: &Value,
+    trusted_read: bool,
+    tool_requires_approval: bool,
+    roots: Option<(&std::path::Path, &std::path::Path)>,
+) -> Decision {
+    let resources = classify_resources(alias, args);
+    let mut ask = tool_requires_approval;
+    let mut automatic_reason = None;
+    let mut rule_allowed = false;
+    for (action, resource) in &resources {
+        let mut matched = None;
+        for rule in &rules.rules {
+            if rule.action == Action::Tool && resource_matches(Action::Tool, &rule.resource, alias) {
+                matched = Some((rule.effect, Action::Tool, alias));
+            } else if rule.action == *action && (resource_matches(*action, &rule.resource, resource)
+                || (*action == Action::Path && roots.is_some_and(|(selected, canonical)| {
+                    [selected, canonical].iter().any(|root| path_matches(&rule.resource, &root.join(resource).to_string_lossy()))
+                }))) {
+                matched = Some((rule.effect, *action, resource.as_str()));
+            }
+        }
+        match matched {
+            Some((Effect::Deny, matched_action, matched_resource)) => return Decision::Deny(deny_reason(matched_action, matched_resource)),
+            Some((Effect::Ask, _, _)) => ask = true,
+            Some((Effect::Allow, _, _)) => rule_allowed = true,
+            None => match mode.automatic_reason(trusted_read) {
+                Some(automatic) => automatic_reason = Some(automatic),
+                None => ask = true,
+            },
+        }
+    }
+    if ask { Decision::Ask } else { Decision::Allow(automatic_reason.unwrap_or(if rule_allowed { RULE_ALLOW_REASON } else { "allowed" })) }
+}
+
+pub(crate) fn decide_for_agent_tool(
+    rules: &RuleSet,
+    mode: crate::permissions::AccessMode,
+    tool: &crate::connectors::AgentTool,
+    args: &Value,
+) -> Decision {
+    decide_for_call_with_roots(rules, mode, &tool.alias, args, tool.trusted_read(),
+        tool.requires_approval(args), tool.workspace_permission_roots())
+}
+
+/// Each explicit path has its own ordered decision. A broad Allow for one
+/// target cannot erase a later Deny or Ask on another target.
+fn classify_resources(alias: &str, args: &Value) -> Vec<(Action, String)> {
+    let paths: Vec<String> = match alias {
+        "workspace_apply_patch" => args.get("changes").and_then(Value::as_array)
+            .into_iter().flatten().filter_map(|change| change.get("path").and_then(Value::as_str))
+            .filter(|path| !path.is_empty()).map(str::to_string).collect(),
+        "workspace_copy_file" | "workspace_move_file" | "workspace_copy_directory" | "workspace_move_directory" =>
+            ["path", "destination"].iter().filter_map(|key| args.get(*key).and_then(Value::as_str))
+                .filter(|path| !path.is_empty()).map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    if paths.is_empty() { vec![classify(alias, args)] }
+    else { paths.into_iter().map(|path| (Action::Path, path)).collect() }
+}
+
+/// Evaluate a nested call against the current saved rules after resolving its
+/// real target and validating its arguments. An unreadable rule set refuses
+/// dispatch rather than silently falling back to the access mode.
+pub(crate) fn decide_nested_call(
+    state: &crate::AppState,
+    mode: crate::permissions::AccessMode,
+    tool: &crate::connectors::AgentTool,
+    arguments: &Value,
+) -> Result<Decision, String> {
+    let store = state.database()?;
+    let rules = load_checked(&store)?;
+    Ok(decide_for_agent_tool(&rules, mode, tool, arguments))
+}
+
+/// An explicit one-call approval covers Ask, but cannot override a newer Deny.
+/// Automatic authorization cannot cover an Ask introduced after the check.
+pub(crate) fn recheck_nested_call(
+    state: &crate::AppState,
+    mode: crate::permissions::AccessMode,
+    tool: &crate::connectors::AgentTool,
+    arguments: &Value,
+    approved: bool,
+) -> Result<(), String> {
+    match decide_nested_call(state, mode, tool, arguments)? {
+        Decision::Deny(reason) => Err(reason),
+        Decision::Ask if !approved => Err("Permission changed; this call now requires approval. Retry it under the current settings.".into()),
+        _ => Ok(()),
+    }
 }
 
 /// The rule action and resource that describe a tool call.
@@ -272,11 +457,31 @@ pub fn classify(alias: &str, args: &Value) -> (Action, String) {
         "workspace_edit_file"
         | "workspace_write_file"
         | "workspace_create_file"
+        | "workspace_read_file"
+        | "workspace_list_files"
+        | "workspace_document_inspect"
+        | "workspace_document_read"
+        | "workspace_view_image"
+        | "workspace_create_directory"
+        | "workspace_write_file_base64"
+        | "workspace_append_file"
+        | "workspace_multi_edit"
+        | "workspace_edit_lines"
+        | "workspace_delete_file"
+        | "workspace_copy_file"
+        | "workspace_move_file"
+        | "workspace_file_info"
+        | "workspace_list_tree"
+        | "workspace_delete_directory"
+        | "workspace_copy_directory"
+        | "workspace_move_directory"
+        | "workspace_notebook_read"
+        | "workspace_notebook_edit"
         | "workspace_open_preview"
         | "file_write"
         | "file_read"
         | "file_search" => (Action::Path, string_arg(args, &["path"])),
-        // A patch touches several files; the first changed path decides.
+        // `decide_for_call` also checks every later changed path.
         "workspace_apply_patch" => (Action::Path, patch_path(args)),
         "web_fetch" | "web_fetch_url" | "web_read" => (Action::Host, host_arg(args)),
         // Everything else — web_search included — is addressed by its alias.
@@ -288,7 +493,7 @@ pub fn classify(alias: &str, args: &Value) -> (Action, String) {
 #[tauri::command]
 pub fn list_permission_rules(state: State<'_, crate::AppState>) -> Result<Vec<RuleView>, String> {
     let store = state.database()?;
-    Ok(load(&store).rules.iter().map(RuleView::from_rule).collect())
+    Ok(load_checked(&store)?.rules.iter().map(RuleView::from_rule).collect())
 }
 
 /// Replace the persisted rules.
@@ -850,6 +1055,25 @@ mod tests {
             false,
         );
         assert_eq!(without_pin, Decision::Allow(RULE_ALLOW_REASON));
+        assert_eq!(decide_for_tool(&RuleSet::default(), crate::permissions::AccessMode::FullAccess,
+            Action::Tool, "git_commit", false, true), Decision::Ask);
+        let deny = rules(vec![rule(Action::Tool, "git_commit", Effect::Deny)]);
+        assert!(matches!(decide_for_tool(&deny, crate::permissions::AccessMode::FullAccess,
+            Action::Tool, "git_commit", false, true), Decision::Deny(_)));
+    }
+
+    #[test]
+    fn call_rules_combine_alias_and_path_in_user_order_and_preserve_always_ask() {
+        let mode = crate::permissions::AccessMode::FullAccess;
+        let args = json!({"path":"private/secret.txt"});
+        let alias = "workspace_read_file";
+        let path_deny = rule(Action::Path, "private/**", Effect::Deny);
+        let tool_allow = rule(Action::Tool, alias, Effect::Allow);
+        assert!(matches!(decide_for_call(&rules(vec![tool_allow.clone(), path_deny.clone()]), mode, alias, &args, true, false), Decision::Deny(_)));
+        assert_eq!(decide_for_call(&rules(vec![path_deny, tool_allow]), mode, alias, &args, true, false), Decision::Allow(RULE_ALLOW_REASON));
+        assert_eq!(decide_for_call(&RuleSet::default(), mode, alias, &args, true, true), Decision::Ask);
+        let deny = rules(vec![rule(Action::Tool, alias, Effect::Deny)]);
+        assert!(matches!(decide_for_call(&deny, mode, alias, &args, true, true), Decision::Deny(_)));
     }
 
     #[test]
@@ -942,6 +1166,11 @@ mod tests {
             "workspace_edit_file",
             "workspace_write_file",
             "workspace_create_file",
+            "workspace_read_file",
+            "workspace_list_files",
+            "workspace_document_inspect",
+            "workspace_document_read",
+            "workspace_view_image",
             "file_write",
             "file_read",
             "file_search",
@@ -982,5 +1211,30 @@ mod tests {
             classify("todo_write", &json!({})),
             (Action::Tool, "todo_write".to_string())
         );
+    }
+
+    #[test]
+    fn multi_path_decisions_check_every_target_and_preserve_rule_order() {
+        let mode = crate::permissions::AccessMode::FullAccess;
+        let patch = json!({"changes":[{"path":"public.txt"},{"path":"private.txt"}]});
+        let transfer = json!({"path":"public.txt","destination":"private.txt"});
+        for (alias, args) in [("workspace_apply_patch", &patch), ("workspace_copy_file", &transfer),
+            ("workspace_move_file", &transfer), ("workspace_copy_directory", &transfer), ("workspace_move_directory", &transfer)] {
+            for effect in [Effect::Deny, Effect::Ask] {
+                let rules = RuleSet { rules: vec![Rule { action: Action::Path, resource: "private.txt".into(), effect }] };
+                let result = decide_for_call(&rules, mode, alias, args, false, false);
+                assert_eq!(matches!(result, Decision::Deny(_)), effect == Effect::Deny, "{alias}: {result:?}");
+                assert_eq!(result == Decision::Ask, effect == Effect::Ask, "{alias}: {result:?}");
+            }
+            let allow_first = RuleSet { rules: vec![
+                Rule { action: Action::Tool, resource: alias.into(), effect: Effect::Allow },
+                Rule { action: Action::Path, resource: "private.txt".into(), effect: Effect::Deny },
+            ] };
+            assert!(matches!(decide_for_call(&allow_first, mode, alias, args, false, false), Decision::Deny(_)), "{alias}");
+            let mut deny_first = allow_first.clone(); deny_first.rules.reverse();
+            assert!(matches!(decide_for_call(&deny_first, mode, alias, args, false, false), Decision::Allow(_)), "{alias}");
+            let only_public = RuleSet { rules: vec![Rule { action: Action::Path, resource: "public.txt".into(), effect: Effect::Allow }] };
+            assert_eq!(decide_for_call(&only_public, crate::permissions::AccessMode::Ask, alias, args, false, false), Decision::Ask, "{alias}: an Allow for one path cannot grant the other");
+        }
     }
 }

@@ -86,6 +86,7 @@ struct Walk {
     warnings: Vec<String>,
     excluded: usize,
     started: Option<Instant>,
+    restricted: bool,
 }
 
 impl Walk {
@@ -195,6 +196,7 @@ fn walk(
     args: &ContentArgs,
     filter: Option<&Regex>,
     output: &mut Walk,
+    permissions: Option<&crate::permission_rules::SearchPermissions>,
 ) {
     if depth > MAX_DEPTH {
         output.warning("Directory depth limit reached; narrow path to search deeper.");
@@ -203,7 +205,11 @@ fn walk(
     let entries = match directory.entries() {
         Ok(entries) => entries,
         Err(error) => {
-            output.warning(format!("Could not enumerate {prefix}: {error}"));
+            if permissions.is_some_and(|policy| !policy.allows(prefix)) {
+                output.restricted = true;
+            } else {
+                output.warning(format!("Could not enumerate {prefix}: {error}"));
+            }
             return;
         }
     };
@@ -256,7 +262,11 @@ fn walk(
         let metadata = match directory.symlink_metadata(&name) {
             Ok(metadata) => metadata,
             Err(error) => {
-                output.warning(format!("Could not inspect {path}: {error}"));
+                if permissions.is_some_and(|policy| !policy.allows(&path)) {
+                    output.restricted = true;
+                } else {
+                    output.warning(format!("Could not inspect {path}: {error}"));
+                }
                 continue;
             }
         };
@@ -270,10 +280,17 @@ fn walk(
                 continue;
             }
             match directory.open_dir_nofollow(&name) {
-                Ok(child) => walk(&child, &path, depth + 1, args, filter, output),
-                Err(error) => output.warning(format!("Could not open {path}: {error}")),
+                Ok(child) => walk(&child, &path, depth + 1, args, filter, output, permissions),
+                Err(error) => {
+                    if permissions.is_some_and(|policy| !policy.allows(&path)) { output.restricted = true; }
+                    else { output.warning(format!("Could not open {path}: {error}")); }
+                },
             }
         } else if metadata.is_file() {
+            if permissions.is_some_and(|policy| !policy.allows(&path)) {
+                output.restricted = true;
+                continue;
+            }
             if filter.is_some_and(|pattern| !pattern.is_match(&path)) {
                 continue;
             }
@@ -318,13 +335,13 @@ fn excerpt(line: &str, column: usize, size: usize) -> (String, usize, bool) {
 }
 
 impl Workspace {
-    pub(super) fn search_content(&self, arguments: Value) -> Result<Value, String> {
+    pub(super) fn search_content(&self, arguments: Value, permissions: Option<&crate::permission_rules::SearchPermissions>) -> Result<Value, String> {
         let args: ContentArgs =
             serde_json::from_value(arguments).map_err(|error| error.to_string())?;
-        self.search_page(args, false)
+        self.search_page(args, false, permissions)
     }
 
-    pub(super) fn glob_files(&self, arguments: Value) -> Result<Value, String> {
+    pub(super) fn glob_files(&self, arguments: Value, permissions: Option<&crate::permission_rules::SearchPermissions>) -> Result<Value, String> {
         let args: GlobArgs =
             serde_json::from_value(arguments).map_err(|error| error.to_string())?;
         self.search_page(
@@ -341,10 +358,11 @@ impl Workspace {
                 include_generated: args.include_generated,
             },
             true,
+            permissions,
         )
     }
 
-    fn search_page(&self, args: ContentArgs, files_only: bool) -> Result<Value, String> {
+    fn search_page(&self, args: ContentArgs, files_only: bool, permissions: Option<&crate::permission_rules::SearchPermissions>) -> Result<Value, String> {
         if (!files_only && args.query.is_empty())
             || args.query.len() > 4096
             || !(1..=200).contains(&args.limit)
@@ -401,7 +419,15 @@ impl Workspace {
             &args,
             pattern.as_ref(),
             &mut walked,
+            permissions,
         );
+        if walked.restricted {
+            // Reserve a warning slot even when scan errors filled the cap.
+            if walked.warnings.len() >= 16 {
+                walked.warnings.pop();
+            }
+            walked.warning("Some files were excluded by permission rules; results are incomplete.");
+        }
         walked.files.sort();
         if cursor
             .as_ref()
@@ -883,6 +909,78 @@ mod tests {
         assert!(workspace
             .call("search_content", json!({"query":"needle","path":"linked"}))
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn model_searches_filter_descendants_using_current_ordered_rules() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(state_dir.path());
+        std::fs::create_dir(directory.path().join("private")).unwrap();
+        std::fs::create_dir(directory.path().join("review")).unwrap();
+        for (path, text) in [("public.txt", "needle PUBLIC"), ("private/secret.txt", "needle SECRET"),
+            ("private/allowed.txt", "needle ALLOWED"), ("review/ask.txt", "needle ASKED"),
+            ("absolute.txt", "needle ABSOLUTE")] {
+            std::fs::write(directory.path().join(path), text).unwrap();
+        }
+        let rules = RuleSet { rules: vec![
+            Rule { action: Action::Tool, resource: "workspace_search_content".into(), effect: Effect::Ask },
+            Rule { action: Action::Path, resource: "private".into(), effect: Effect::Deny },
+            Rule { action: Action::Path, resource: "private/allowed.txt".into(), effect: Effect::Allow },
+            Rule { action: Action::Path, resource: "review/**".into(), effect: Effect::Ask },
+            Rule { action: Action::Path, resource: directory.path().join("absolute.txt").to_string_lossy().into_owned(), effect: Effect::Deny },
+        ] };
+        crate::permission_rules::save(&state.database().unwrap(), &rules).unwrap();
+        crate::test_support::select_fixture_model(&state, directory.path());
+        let plan = crate::chat::assemble_turn(&state, "", "Search source", vec!["__workspace".into()], Some(vec![]), Some(crate::presets::STANDARD), None).await.unwrap();
+        for (name, args) in [("workspace_search_content", json!({"query":"needle","limit":200})),
+            ("workspace_search_files", json!({"query":"txt"})),
+            ("workspace_glob_files", json!({"pattern":"**/*.txt","limit":200}))] {
+            let tool = plan.tools.iter().find(|tool| tool.alias == name).unwrap();
+            let result = tool.call(args).await.unwrap();
+            let text = result.to_string();
+            assert!(text.contains("public.txt") && text.contains("private/allowed.txt"), "{name}: {text}");
+            assert!(!text.contains("secret.txt") && !text.contains("ask.txt") && !text.contains("absolute.txt"), "{name}: {text}");
+            assert!(text.contains("permission rules") && result["incomplete"] == true, "{name}: {text}");
+        }
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet::default()).unwrap();
+        let tool = plan.tools.iter().find(|tool| tool.alias == "workspace_search_content").unwrap();
+        let fresh = tool.call(json!({"query":"needle","limit":200})).await.unwrap();
+        assert!(fresh.to_string().contains("SECRET"), "settings must be read on each search");
+
+        // A bad saved rule set must not silently turn into an unrestricted search.
+        state.database().unwrap().connection.execute(
+            "UPDATE settings SET value=?1 WHERE key=?2",
+            rusqlite::params!["invalid json", crate::permission_rules::RULES_KEY],
+        ).unwrap();
+        assert!(tool.call(json!({"query":"needle"})).await.unwrap_err().contains("permission settings are invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_rules_cover_selected_and_canonical_workspace_roots() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let actual = temp.path().join("actual");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir(&actual).unwrap();
+        symlink(&actual, &selected).unwrap();
+        std::fs::write(actual.join("secret.txt"), "needle secret").unwrap();
+        let state = crate::test_support::app_state(temp.path());
+        let workspace = Workspace::open(selected.to_str().unwrap()).unwrap().with_permission_store(&state.db_path);
+        for root in [&actual, &selected] {
+            crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+                action: Action::Path, resource: root.join("secret.txt").to_string_lossy().into_owned(), effect: Effect::Deny,
+            }] }).unwrap();
+            let result = workspace.call("search_content", json!({"query":"needle"})).unwrap().to_string();
+            assert!(!result.contains("secret.txt") && !result.contains("needle secret"), "{result}");
+            assert!(result.contains("permission rules"), "{result}");
+            let rules = crate::permission_rules::load_checked(&state.database().unwrap()).unwrap();
+            let result = crate::sandbox::file_search_with_rules(&selected, "needle", &rules).unwrap().join("\n");
+            assert!(!result.contains("secret.txt") && !result.contains("needle secret"), "{result}");
+        }
     }
 
     #[tokio::test]

@@ -509,6 +509,17 @@ pub struct VettedTarget {
     pub addrs: Vec<std::net::SocketAddr>,
 }
 
+// Test-only authority for one exact, explicitly scoped loopback fixture. It
+// cannot be configured by tools, environment variables, or production builds.
+#[cfg(test)]
+tokio::task_local! { pub(crate) static HTTP_TEST_ORIGIN: reqwest::Url; }
+
+#[cfg(test)]
+pub(crate) fn is_http_test_origin(url: &reqwest::Url) -> bool {
+    url.host_str() == Some("127.0.0.1")
+        && HTTP_TEST_ORIGIN.try_with(|origin| origin.origin() == url.origin()).unwrap_or(false)
+}
+
 /// Resolve a URL's host once and refuse private, loopback, link-local and
 /// cloud-metadata answers.
 ///
@@ -525,6 +536,8 @@ pub async fn vet_fetch_target(
         return Err("web_fetch requires HTTP(S) without embedded credentials.".into());
     }
     let host = url.host_str().ok_or("web_fetch needs a host.")?;
+    #[cfg(test)]
+    let allow_private = allow_private || is_http_test_origin(url);
     let port = url.port_or_known_default().unwrap_or(443);
     // IPv6 literals arrive bracketed (host_str gives "[::1]"); validate the
     // literal address rather than attempting a DNS lookup on the brackets.
@@ -821,7 +834,12 @@ pub async fn web_fetch_with_flag(
 /// candidate file, and per-file/aggregate read budgets keep total work
 /// bounded. Skips hidden dirs, target-style build output, and dependency
 /// folders.
+#[cfg(test)]
 pub fn file_search(root: &std::path::Path, needle: &str) -> Result<Vec<String>, String> {
+    file_search_with_rules(root, needle, &crate::permission_rules::RuleSet::default())
+}
+
+pub fn file_search_with_rules(root: &std::path::Path, needle: &str, rules: &crate::permission_rules::RuleSet) -> Result<Vec<String>, String> {
     use std::io::Read;
     if needle.is_empty() || needle.len() > 200 {
         return Err("Search text must be 1-200 characters.".into());
@@ -839,13 +857,16 @@ pub fn file_search(root: &std::path::Path, needle: &str) -> Result<Vec<String>, 
     const MAX_FILE_BYTES: u64 = 524_288;
     const MAX_DEPTH: usize = 32;
     const READ_BUDGET: usize = 8 * 1024 * 1024;
-    let root_dir = Dir::open_ambient_dir(root, ambient_authority())
+    let canonical_root = std::fs::canonicalize(root).map_err(|_| "Could not identify search workspace.")?;
+    let root_dir = Dir::open_ambient_dir(&canonical_root, ambient_authority())
         .map_err(|error| format!("Could not search workspace: {error}"))?;
+    let permissions = crate::permission_rules::SearchPermissions::with_canonical_root(rules.clone(), root.to_path_buf(), canonical_root, "file_search");
     let mut hits = Vec::new();
     let mut files_seen = 0usize;
     let mut entries_seen = 0usize;
     let mut bytes_read = 0usize;
     let mut budget_exhausted = false;
+    let mut restricted = false;
     let mut stack = vec![(root_dir, String::new(), 0usize)];
     'walk: while let Some((dir, prefix, depth)) = stack.pop() {
         let entries = dir
@@ -883,6 +904,10 @@ pub fn file_search(root: &std::path::Path, needle: &str) -> Result<Vec<String>, 
                 continue;
             }
             if !kind.is_file() {
+                continue;
+            }
+            if !permissions.allows(&relative) {
+                restricted = true;
                 continue;
             }
             files_seen += 1;
@@ -960,6 +985,9 @@ pub fn file_search(root: &std::path::Path, needle: &str) -> Result<Vec<String>, 
             "… (file_search stopped at its aggregate read budget; results may be incomplete)"
                 .to_string(),
         );
+    }
+    if restricted {
+        hits.push("… (some files were excluded by permission rules; search results are incomplete)".into());
     }
     Ok(hits)
 }

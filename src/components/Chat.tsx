@@ -5,7 +5,7 @@ import { WorkSummary } from './WorkSummary';
 import { AnswerSources, collectAnswerSources } from './AnswerSources';
 import { ScreenshotPreview } from './ScreenshotPreview';
 import { type Dispatch, type SetStateAction, type ReactNode, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, Check, ChevronDown, ChevronRight, Copy, Cpu, FileText, Folder, Play, Plus, SendHorizontal, Settings, Square, X } from 'lucide-react';
+import { ArrowDown, Check, ChevronDown, Copy, Cpu, FileText, Folder, Play, Plus, SendHorizontal, Settings, Square, X } from 'lucide-react';
 import { attachmentAccept, composeMessage, readAttachment, type Attachment } from '../lib/attachments';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
 import { prefersReducedMotion } from '../lib/appearance';
@@ -16,14 +16,15 @@ import { ResponseMetrics } from './ResponseMetrics';
 import { ToolResultExtras } from './ToolResultExtras';
 import type { InstalledModel } from '../lib/types';
 import { ActivityTimeline, useSessionActivity } from './ActivityTimeline';
-import { TraceIcon } from './TraceIcon';
+import { ActivityIndicator } from './ActivityIndicator';
+import { ReasoningDisclosure } from './ReasoningDisclosure';
 import { ContextControl } from './ContextControl';
 import { CommandRunCard } from './CommandRunCard';
 import { PlanChecklist, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
+import { AnswerNavigation } from './AnswerNavigation';
 import { CanvasPanel } from './CanvasPanel';
 import { artifactVersions, extractArtifacts, findArtifact } from '../lib/canvas';
-import type { RunRecord } from '../lib/types';
-import { MarkdownView } from './MarkdownView';
+import type { PendingTurn, RunRecord } from '../lib/types';
 import { MessageRenderer } from '../genui/MessageRenderer';
 import { ResearchContext, type HostClaim } from '../genui/grounding';
 import { usePresentationMode } from '../hooks/usePresentationMode';
@@ -36,6 +37,10 @@ interface Props {
   composerPermissions?: ReactNode;
   reasoningMode?: 'auto' | 'quick' | 'think';
   conversationKey?: string;
+  pendingTurn?: PendingTurn | null;
+  recoveryBusy?: boolean;
+  onRecoverPending?: () => void;
+  onDiscardPending?: () => void;
   attachmentDrafts?: Record<string, Attachment[]>;
   onAttachmentDraftsChange?: Dispatch<SetStateAction<Record<string, Attachment[]>>>;
   contextUsage?: ContextUsage;
@@ -44,6 +49,7 @@ interface Props {
   selectionIssue?: boolean;
   draft?: string;
   onDraftChange?: (value: string | ((previous: string) => string)) => void;
+  onRestoreDraft?: (conversationId: string, value: string) => void;
   messages: Message[];
   generating: boolean;
   ready: boolean;
@@ -55,6 +61,7 @@ interface Props {
   onSend: (content: string) => Promise<void>;
   onCancel: () => void;
   onResume?: () => void;
+  onContinueFailed?: (messageId: string) => void;
   paused?: boolean;
   onConfigure: () => void;
   planMode?: boolean;
@@ -108,7 +115,7 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
   const errorCode = typeof errorRecord?.code === 'string' ? errorRecord.code : undefined;
   const envelopeStatus = resultRecord && typeof resultRecord.status === 'string' ? resultRecord.status : undefined;
   const isError = resultRecord !== null && resultRecord.isError === true;
-  const failed = message.status === 'error' || isError || Boolean(error) || (exitCode !== null && exitCode !== 0) || ['error', 'failed', 'failure', 'denied', 'cancelled', 'unknown', 'partial'].includes(envelopeStatus ?? '');
+  const failed = message.status === 'error' || isError || Boolean(error) || (exitCode !== null && exitCode !== 0) || ['error', 'failed', 'failure', 'denied', 'cancelled', 'unknown'].includes(envelopeStatus ?? '');
   const decision = typeof request.decision === 'string' ? request.decision : undefined;
   const status = message.status === 'interrupted'
     ? 'interrupted'
@@ -181,41 +188,27 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
   );
 });
 
-const MessageBody = memo(function MessageBody({ message, suppressReasoning = false, sourceLinks = '{}', onSendPrompt, onOpenCanvas }: { message: Message; suppressReasoning?: boolean; sourceLinks?: string; onSendPrompt?: (text: string) => void; onOpenCanvas?: (code: string, language: string) => void }) {
+const MessageBody = memo(function MessageBody({ message, suppressReasoning = false, commentary = false, sourceLinks = '{}', onSendPrompt, onOpenCanvas }: { message: Message; suppressReasoning?: boolean; commentary?: boolean; sourceLinks?: string; onSendPrompt?: (text: string) => void; onOpenCanvas?: (code: string, language: string) => void }) {
   let attached: { name: string; imageUrl?: string; content?: string }[] = [];
   let displayContent = message.content;
   if (message.role === 'user') {
     try { const envelope = JSON.parse(message.content); if (envelope.kind === 'locallm-attachments-v1') { displayContent = envelope.text; attached = envelope.attachments; } } catch { /* Ordinary text message. */ }
   }
   const [copied, setCopied] = useState(false);
+  const article = useRef<HTMLElement>(null);
   const [copyError, setCopyError] = useState('');
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const [isOpen, setIsOpen] = useState(false);
   useEffect(() => () => clearTimeout(timer.current), []);
 
-  const thoughtSummary = message.status === 'streaming' ? 'Thinking…' : 'Thought';
   const streaming = message.status === 'streaming';
 
   return (
-    <article data-message-id={message.id} className={`message message-${message.role}`} aria-label={`${message.role} message`}>
+    <article ref={article} data-message-id={message.id} className={`message message-${message.role}${commentary ? ' message-commentary' : ''}`} aria-label={commentary ? 'Assistant update' : `${message.role} message`}>
       <div className="message-byline">{message.role === 'user' ? 'You' : <><span className="mini-mark">L</span>LocalLM</>}</div>
+      {commentary && <div className="commentary-label">Update</div>}
+      {message.role === 'assistant' && !commentary && <AnswerNavigation article={article} content={streaming ? '' : displayContent} />}
       {message.reasoning && !suppressReasoning && (
-        <details
-          className="reasoning trace-thought-details"
-          open={isOpen}
-          onToggle={e => {
-            setIsOpen((e.currentTarget as HTMLDetailsElement).open);
-          }}
-        >
-          <summary className="trace-thought-pill">
-            <TraceIcon kind="thought" size={12}>
-              {streaming ? <span className="thinking-pulsar" /> : undefined}
-            </TraceIcon>
-            <span className="trace-thought-label">{thoughtSummary}</span>
-            <ChevronRight size={13} className="thought-chevron" />
-          </summary>
-          <div className="reasoning-content trace-thought-content"><MarkdownView content={message.reasoning} assistant={false} streaming={streaming} /></div>
-        </details>
+        <ReasoningDisclosure text={message.reasoning} active={streaming && !displayContent.trim()} />
       )}
       <MessageRenderer
         message={{...message, content:displayContent}}
@@ -230,7 +223,7 @@ const MessageBody = memo(function MessageBody({ message, suppressReasoning = fal
       {(message.status === 'interrupted' || message.status === 'error') && (
         <p className="message-state">{message.error || (message.status === 'interrupted' ? 'Response stopped' : 'Response interrupted by an error')}</p>
       )}
-      {message.content && (
+      {message.content && !commentary && (
         <button
           className="icon-button copy-message"
           aria-label="Copy message"
@@ -247,6 +240,7 @@ const MessageBody = memo(function MessageBody({ message, suppressReasoning = fal
           }}
         >
           {copied ? <Check size={14} /> : <Copy size={14} />}
+          {message.role === 'assistant' && <span>{copied ? 'Copied' : 'Copy answer'}</span>}
         </button>
       )}
       {copyError && <small role="alert">{copyError}</small>}
@@ -274,13 +268,19 @@ export function Chat({
   connectorTools = EMPTY_TOOLS,
   onSend,
   onCancel,
+  pendingTurn,
+  recoveryBusy = false,
+  onRecoverPending,
+  onDiscardPending,
   onResume,
+  onContinueFailed,
   paused = false,
   onConfigure,
   planMode = false,
   onConfigureLocalModel,
   draft: controlledDraft,
   onDraftChange,
+  onRestoreDraft,
   liveActivity,
   providers,
   onSelectModel,
@@ -344,7 +344,7 @@ export function Chat({
   const reading = useRef(false);
 
   async function attach(files: File[]) {
-    if (reading.current || generating || loading || disabled || submitting.current) return;
+    if (reading.current || generating || loading || disabled || submitting.current.has(conversationKey)) return;
     if (attachments.length + files.length > 8) {
       setAttachmentError('Attach up to 8 files per message.');
       return;
@@ -378,7 +378,7 @@ export function Chat({
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
   const input = useRef<HTMLTextAreaElement>(null);
-  const submitting = useRef(false);
+  const submitting = useRef(new Set<string>());
 
   async function handleCompact() {
     if (conversationKey === 'new' || compacting || loading || generating) return;
@@ -411,11 +411,17 @@ export function Chat({
     return grouped;
   }, [messages]);
   const turnActivity = useMemo(() => partitionActivity(turns, sessionActivity), [turns, sessionActivity]);
+  const recoverable = lastResponse?.status === 'error' && sessionActivity.some(event => {
+    if (event.eventType !== 'turn_end') return false;
+    const payload = event.payload as { messageId?: string; recoveryAvailable?: boolean };
+    return payload.messageId === lastResponse.id && payload.recoveryAvailable === true;
+  });
+
 
 
   // Buttons rendered by generated UI submit a follow-up like a typed message.
   const sendFromUi = useCallback((text: string) => {
-    if (!text.trim() || !ready || generating || loading || disabled || submitting.current) return;
+    if (!text.trim() || !ready || generating || loading || disabled || submitting.current.has(conversationKey)) return;
     void onSend(text);
   }, [ready, generating, loading, disabled, onSend]);
 
@@ -438,14 +444,14 @@ export function Chat({
   }, []);
 
   async function retry() {
-    if (!lastPrompt || !ready || generating || loading || disabled || submitting.current) return;
-    submitting.current = true;
+    if (!lastPrompt || !ready || generating || loading || disabled || submitting.current.has(conversationKey)) return;
+    submitting.current.add(conversationKey);
     try {
       await onSend(lastPrompt.content);
     } catch {
       /* App retains and displays the send error. */
     } finally {
-      submitting.current = false;
+      submitting.current.delete(conversationKey);
     }
   }
 
@@ -492,7 +498,7 @@ export function Chat({
   }, [draft, attachments, ready, conversationKey, connectorIds, connectorTools, preset, planMode, reasoningMode, modelIdentity, preflightRevision, presentation.effectiveMode]);
 
   async function submit() {
-    if ((!draft.trim() && !attachments.length) || !ready || generating || loading || disabled || preflightIssue || reading.current || submitting.current) return;
+    if ((!draft.trim() && !attachments.length) || !ready || generating || loading || disabled || preflightIssue || reading.current || submitting.current.has(conversationKey)) return;
     let content: string;
     try {
       content = composeMessage(draft, attachments);
@@ -500,26 +506,29 @@ export function Chat({
       setAttachmentError((error as Error).message);
       return;
     }
-    submitting.current = true;
+    submitting.current.add(conversationKey);
     const originalDraft = draft;
     setAttachmentError('');
     setAttachmentDrafts(current => ({ ...current, [conversationKey]: [] }));
     setDraft('');
     try {
       await onSend(content);
-    } catch {
-      setDraft(current => current || originalDraft);
-      setAttachmentDrafts(current => ({ ...current, [conversationKey === 'new' ? latestConversation.current : conversationKey]: attachments }));
+    } catch (error) {
+      const owner = error && typeof error === 'object' && 'conversationId' in error && typeof error.conversationId === 'string' ? error.conversationId : conversationKey;
+      if (onRestoreDraft) onRestoreDraft(owner, originalDraft);
+      else if (latestConversation.current === conversationKey) setDraft(current => current || originalDraft);
+      setAttachmentDrafts(current => ({ ...current, [owner]: attachments }));
     } finally {
-      submitting.current = false;
+      submitting.current.delete(conversationKey);
     }
-    input.current?.focus();
+    if (latestConversation.current === conversationKey) input.current?.focus();
   }
 
-  const isHome = !loading && !messages.length && !generating;
+  const isHome = !loading && !messages.length && !generating && !pendingTurn;
+  const genericActivity = !liveActivity?.activity || /^(Thinking|Generating response|Streaming response)[….]*$/.test(liveActivity.activity);
 
   return (
-    <div className="chat-shell">
+    <div className="chat-shell" id="active-session-content" role="tabpanel" aria-label="Active conversation">
     <div className={`chat-layout ${isHome ? 'chat-home' : ''}`} style={{ position: 'relative' }}>
       <div
         className="chat-scroll"
@@ -543,7 +552,7 @@ export function Chat({
       >
         {loading ? (
           <p className="loading-state" role="status">Opening conversation…</p>
-        ) : messages.length || generating ? (
+        ) : messages.length || generating || pendingTurn ? (
           <div className="messages">
             {turns.map((turn, turnIndex) => {
               const user = turn.find(message => message.role === 'user');
@@ -556,16 +565,25 @@ export function Chat({
               const sourceLinks = JSON.stringify(Object.fromEntries(evidenceSources.flatMap(source => source.ids.map(id => [id, source.url]))));
               return <div key={turn[0].id} className="conversation-turn">
                 {user && <MessageBody message={user} />}
-                <ResearchContext.Provider value={{sources:evidenceSources,claims:hostClaims}}><WorkSummary messages={turn} events={activity} run={turnIndex === turns.length - 1 ? latestRun : undefined}><ActivityTimeline events={activity} messages={turn} generating={generating && turnIndex === turns.length - 1} renderMessage={m => <MessageBody message={m} suppressReasoning sourceLinks={sourceLinks} onSendPrompt={sendFromUi} onOpenCanvas={openCanvas} />} renderTool={m => <ToolMessage message={m} onStop={onCancel} />} /></WorkSummary></ResearchContext.Provider>
+                <ResearchContext.Provider value={{sources:evidenceSources,claims:hostClaims}}><WorkSummary messages={turn} events={activity} run={turnIndex === turns.length - 1 ? latestRun : undefined}><ActivityTimeline events={activity} messages={turn} generating={generating && turnIndex === turns.length - 1} renderMessage={(m, variant) => <MessageBody message={m} suppressReasoning commentary={variant === 'commentary'} sourceLinks={sourceLinks} onSendPrompt={sendFromUi} onOpenCanvas={openCanvas} />} renderTool={m => <ToolMessage message={m} onStop={onCancel} />} /></WorkSummary></ResearchContext.Provider>
                 <AnswerSources messages={turn} events={activity} />
                 {turnIndex === turns.length - 1 && latestRun && ['failed', 'outcome_unknown', 'paused', 'cancelled'].includes(latestRun.status) && <p role="status" className="run-outcome">Run {latestRun.status.replace(/_/g, ' ')}. Review the activity above before retrying.</p>}
               </div>;
             })}
+            {pendingTurn && !generating && <section className="saved-request" aria-label="Saved unsent request">
+              <h2>Unsent request saved</h2>
+              <p>This request was saved before sending. Review it, then send it with the current model and tool settings or discard it.</p>
+              <details><summary>Review request</summary><MessageBody message={{ id: pendingTurn.id, conversationId: pendingTurn.conversationId, role: 'user', content: pendingTurn.content, reasoning: '', status: 'complete', createdAt: pendingTurn.createdAt }} /></details>
+              <div className="saved-request-actions">
+                <button type="button" className="secondary" disabled={!ready || loading || recoveryBusy} onClick={onRecoverPending}>Send saved request</button>
+                <button type="button" className="secondary" disabled={loading || recoveryBusy} onClick={onDiscardPending}>Discard saved request</button>
+              </div>
+            </section>}
             {generating && (
               <div className="activity-live" role="status">
-                <span className="activity-dot" />
-                <span className="activity-live-text">{liveActivity?.activity || 'Generating response…'}</span>
-                {liveActivity?.state && <span className="activity-badge">{liveActivity.state}</span>}
+                <ActivityIndicator />
+                <span className={genericActivity ? "sr-only" : "activity-live-text"}>{liveActivity?.activity || 'Generating response…'}</span>
+                {!genericActivity && liveActivity?.state && <span className="activity-badge">{liveActivity.state}</span>}
               </div>
             )}
           </div>
@@ -615,6 +633,7 @@ export function Chat({
         )}
         {canRetry && !generating && (
           <div className="setup-hint">
+            {recoverable && onContinueFailed && <button disabled={!ready || loading || disabled} onClick={() => onContinueFailed(lastResponse.id)}>Continue from saved results</button>}
             <span>Retry sends the last prompt as a new message. Enabled tool actions may run again.</span>
             <button disabled={!ready || loading || disabled} onClick={() => void retry()}>Retry last prompt</button>
           </div>
@@ -638,6 +657,7 @@ export function Chat({
               <Folder size={14} className="composer-meta-icon" />
               <span>{projectName || 'No workspace'}</span>
             </div>
+            {planMode && <span className="composer-plan-label">Plan before acting</span>}
             <button type="button" className="icon-button composer-tray-settings" aria-label="Model settings" title="Models & runtime" onClick={onConfigure}><Settings size={15} /></button>
           </div>
           <form

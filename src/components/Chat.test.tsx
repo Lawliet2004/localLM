@@ -10,6 +10,7 @@ const apiMocks = vi.hoisted(() => ({
   contextPreflight: vi.fn(),
   compactConversation: vi.fn(),
   getTodos: vi.fn<() => Promise<any[]>>(async () => []),
+  getSessionEvents: vi.fn<() => Promise<any[]>>(async () => []),
 }));
 vi.mock('../lib/api', () => ({
   nativeAvailable: true,
@@ -23,6 +24,7 @@ vi.mock('../lib/api', () => ({
     contextPreflight: apiMocks.contextPreflight,
     compactConversation: apiMocks.compactConversation,
     getTodos: apiMocks.getTodos,
+    getSessionEvents: apiMocks.getSessionEvents,
   },
 }));
 
@@ -31,6 +33,8 @@ afterEach(() => {
   apiMocks.setPresentationMode.mockResolvedValue(undefined);
   apiMocks.getTodos.mockReset();
   apiMocks.getTodos.mockResolvedValue([]);
+  apiMocks.getSessionEvents.mockReset();
+  apiMocks.getSessionEvents.mockResolvedValue([]);
   apiMocks.contextPreflight.mockReset();
   apiMocks.contextPreflight.mockResolvedValue({ available: false });
   apiMocks.compactConversation.mockReset();
@@ -107,6 +111,42 @@ describe('home composer surface', () => {
   });
 });
 describe('chat action reporting and submission', () => {
+  it('disables saved-request actions while another operation is busy', () => {
+    render(<Chat {...props} messages={[]} pendingTurn={{ id: 'pending', conversationId: 'c1', content: 'Unsent', createdAt: 1 }} recoveryBusy onRecoverPending={vi.fn()} onDiscardPending={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Send saved request' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Discard saved request' })).toBeDisabled();
+  });
+  it('labels intermediate commentary as an update and reserves answer actions for the final response', async () => {
+    apiMocks.getSessionEvents.mockResolvedValue([{ id: 'event', conversationId: 'c1', runId: 'run', seq: 1, eventType: 'model_response', payload: { content: 'Inspecting.', final: false }, createdAt: 2, ignorable: false }]);
+    const messages: Message[] = [
+      { id: 'u', conversationId: 'c1', role: 'user', status: 'complete', content: 'Fix it', reasoning: '', createdAt: 1 },
+      { id: 'a', conversationId: 'c1', role: 'assistant', status: 'complete', content: 'Inspecting.Fixed.', reasoning: '', createdAt: 3 },
+    ];
+    render(<Chat {...props} conversationKey="c1" messages={messages} />);
+    const update = await screen.findByRole('article', { name: 'Assistant update' });
+    expect(within(update).getByText('Update')).toBeVisible();
+    expect(within(update).getByText('Inspecting.')).toBeVisible();
+    expect(within(update).queryByRole('button', { name: 'Copy message' })).not.toBeInTheDocument();
+    const answer = screen.getByRole('article', { name: 'assistant message' });
+    expect(within(answer).getByText('Fixed.')).toBeVisible();
+    expect(within(answer).getByRole('button', { name: 'Copy message' })).toHaveTextContent('Copy answer');
+  });
+  it('shows a journal-backed approval as awaiting rather than a running edit', async () => {
+    apiMocks.getSessionEvents.mockResolvedValue([
+      { id: 'call', conversationId: 'c1', runId: 'run', stepId: 'step', toolCallId: 'edit', seq: 1, eventType: 'tool_call', payload: { name: 'workspace_edit_file', arguments: { path: 'app.ts' } }, createdAt: 2, ignorable: false },
+      { id: 'approval', conversationId: 'c1', runId: 'run', stepId: 'step', seq: 2, eventType: 'item.started', payload: { item: { id: 'item', runId: 'run', round: 0, kind: 'approval', status: 'awaiting', startedAt: 2, payload: { callId: 'edit', stepId: 'step', name: 'workspace_edit_file' } } }, createdAt: 2, ignorable: false },
+    ]);
+    const messages: Message[] = [
+      { id: 'u', conversationId: 'c1', role: 'user', status: 'complete', content: 'Fix it', reasoning: '', createdAt: 1 },
+      { id: 'a', conversationId: 'c1', role: 'assistant', status: 'streaming', content: '', reasoning: '', createdAt: 2 },
+    ];
+    const view = render(<Chat {...props} conversationKey="c1" messages={messages} generating />);
+    expect(await screen.findByTestId('status-awaiting')).toBeInTheDocument();
+    expect(screen.getByText('Edit')).toBeInTheDocument();
+    expect(screen.queryByTestId('status-running')).not.toBeInTheDocument();
+    view.rerender(<Chat {...props} conversationKey="c1" messages={messages} generating={false} />);
+    expect(screen.getByTestId('status-interrupted')).toBeInTheDocument();
+  });
   it.each([
     { motion: 'reduced', systemReduced: false, expected: 'instant' },
     { motion: 'system', systemReduced: true, expected: 'instant' },
@@ -291,6 +331,8 @@ it('shows measured context usage in the context popover', () => {
     ['complete', { isError: true }, 'denied', 'Denied'],
     ['interrupted', 'Cancelled', 'allowed', 'Stopped · outcome unknown'],
     ['complete', { isError: false }, 'allowed', 'Finished'],
+    ['complete', { status: 'partial', error: null, data: { excerpt: 'Saved output page' }, metadata: { truncated: true } }, 'allowed', 'Finished'],
+    ['complete', { status: 'partial', error: { code: 'call-failed', message: 'Some work failed' } }, 'allowed', 'Failed'],
   ] as const)('reports %s tool outcomes accurately (%s)', (status, result, decision, label) => {
     const message: Message = { id: 'tool', conversationId: 'chat', role: 'tool', reasoning: '', createdAt: 0, status,
       content: JSON.stringify({ request: { connector: 'Local', name: 'run_code', decision }, result }) };
@@ -576,4 +618,26 @@ it('closes the canvas when the conversation changes', async () => {
   expect(await screen.findByRole('complementary', { name: /Canvas:/ })).toBeInTheDocument();
   view.rerender(<Chat {...props} conversationKey="c2" messages={[]} />);
   expect(screen.queryByRole('complementary', { name: /Canvas:/ })).not.toBeInTheDocument();
+});
+
+it('navigates completed answer sections using canonical rendered headings', async () => {
+  const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollIntoView');
+  const scroll = vi.fn();
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scroll });
+  try {
+    const message: Message = { id: 'outline', conversationId: 'outline-chat', role: 'assistant', reasoning: '# Internal notes', status: 'complete', createdAt: 1, content: '## Findings\n\nThe result.\n\n## Evidence\n\nThe sources.\n\n### Limits\n\nA limitation.\n\n```md\n## Not a section\n```' };
+    render(<Chat {...props} conversationKey="outline-chat" messages={[message]} />);
+    fireEvent.click(await screen.findByText('In this answer'));
+    const navigation = screen.getByRole('navigation', { name: 'Answer sections' });
+    expect(within(navigation).getAllByRole('button')).toHaveLength(3);
+    expect(within(navigation).queryByText('Internal notes')).not.toBeInTheDocument();
+    expect(within(navigation).queryByText('Not a section')).not.toBeInTheDocument();
+    fireEvent.click(within(navigation).getByRole('button', { name: 'Evidence' }));
+    expect(screen.getByRole('heading', { name: 'Evidence' })).toHaveFocus();
+    expect(scroll).toHaveBeenCalledWith(expect.objectContaining({ block: 'start' }));
+    expect(screen.getByRole('button', { name: 'Copy message' })).toHaveTextContent('Copy answer');
+  } finally {
+    if (original) Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', original);
+    else Reflect.deleteProperty(HTMLElement.prototype, 'scrollIntoView');
+  }
 });

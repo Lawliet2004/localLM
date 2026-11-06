@@ -96,6 +96,7 @@ pub fn freshness(root: &str, snapshot: &Value) -> Value {
 }
 pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     let mut tools: Vec<crate::tool_spec::ToolSpec> = crate::verification_tools::registry();
+    tools.extend(crate::authoring::registry());
     tools.extend(crate::impact_tools::registry());
     tools.extend(crate::api_tools::registry());
     tools.extend(crate::database_tools::registry());
@@ -103,7 +104,7 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     tools
 }
 pub fn owns(alias: &str) -> bool {
-    matches!(
+    crate::authoring::owns(alias) || matches!(
         alias,
         "verification_run"
             | "verification_report"
@@ -128,7 +129,7 @@ pub fn owns(alias: &str) -> bool {
     )
 }
 pub fn read_only(alias: &str) -> bool {
-    matches!(
+    crate::authoring::owns(alias) || matches!(
         alias,
         "verification_report"
             | "verification_compare"
@@ -177,6 +178,12 @@ pub async fn execute(
         }
     }
     match alias {
+        name if crate::authoring::owns(name) => {
+            let root = ctx.snapshot.workspace_path.clone();
+            let name = name.to_string();
+            tokio::task::spawn_blocking(move || crate::authoring::execute(&root, &name, args))
+                .await.map_err(|_| "Authoring reader failed.".to_string())?
+        }
         "verification_run" | "verification_report" | "verification_compare" => {
             crate::verification_tools::execute(ctx, alias, args).await
         }

@@ -10,9 +10,10 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Notify},
 };
 
+const MIN_PAGE_BYTES: usize = 8192;
 const OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_PROCESSES: usize = 64;
 const MAX_ACTIVE_PER_OWNER: usize = 8;
@@ -125,16 +126,22 @@ impl Default for Output {
 
 impl Output {
     fn push(&mut self, stream: &'static str, text: String) {
-        if text.is_empty() {
-            return;
+        let mut remaining = text.as_str();
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(MIN_PAGE_BYTES);
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (frame, rest) = remaining.split_at(end);
+            self.bytes += frame.len();
+            self.frames.push_back(Frame {
+                cursor: self.next,
+                stream,
+                text: frame.to_owned(),
+            });
+            self.next += 1;
+            remaining = rest;
         }
-        self.bytes += text.len();
-        self.frames.push_back(Frame {
-            cursor: self.next,
-            stream,
-            text,
-        });
-        self.next += 1;
         while self.bytes > OUTPUT_BYTES {
             if let Some(frame) = self.frames.pop_front() {
                 self.bytes -= frame.text.len();
@@ -195,6 +202,7 @@ struct Process {
     workspace: String,
     created: std::time::Instant,
     output: Arc<Mutex<Output>>,
+    changed: Arc<Notify>,
     control: mpsc::Sender<Control>,
 }
 
@@ -427,8 +435,9 @@ impl ProcessRegistry {
                 started_at,
                 ..Output::default()
             }));
-            let out_reader = tokio::spawn(read_output(stdout, "stdout", output.clone()));
-            let err_reader = tokio::spawn(read_output(stderr, "stderr", output.clone()));
+            let changed = Arc::new(Notify::new());
+            let out_reader = tokio::spawn(read_output(stdout, "stdout", output.clone(), changed.clone()));
+            let err_reader = tokio::spawn(read_output(stderr, "stderr", output.clone(), changed.clone()));
             let (control, receiver) = mpsc::channel(8);
             processes.insert(
                 id.clone(),
@@ -437,11 +446,12 @@ impl ProcessRegistry {
                     workspace: workspace.into(),
                     created: std::time::Instant::now(),
                     output: output.clone(),
+                    changed: changed.clone(),
                     control,
                 }),
             );
             tokio::spawn(supervise(
-                child, stdin, receiver, output, out_reader, err_reader, timeout, completion,
+                child, stdin, receiver, output, changed, out_reader, err_reader, timeout, completion,
             ));
         }
         let mut pending = PendingStart {
@@ -503,6 +513,7 @@ impl ProcessRegistry {
                         "Process control queue is unavailable; stop was not acknowledged.".into(),
                     );
                 }
+                process.changed.notify_waiters();
             }
         }
     }
@@ -522,11 +533,24 @@ impl ProcessRegistry {
         if !(8192..=65536).contains(&limit) || wait > 1000 {
             return Err("Process max_bytes must be 8192–65536 and wait_ms 0–1000.".into());
         }
-        self.owned(owner, workspace, &args.id)?;
-        if wait > 0 {
-            tokio::time::sleep(Duration::from_millis(wait)).await;
+        let process = self.owned(owner, workspace, &args.id)?;
+        let cursor = args.cursor.unwrap_or(0);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
+        loop {
+            let notified = process.changed.notified();
+            tokio::pin!(notified);
+            // Subscribe before inspecting output so a write or exit between the
+            // snapshot and the await cannot be missed.
+            notified.as_mut().enable();
+            let page = process.output.lock().map_err(|_| "Process output is unavailable.")?
+                .poll(&args.id, cursor, limit)?;
+            if page["state"] != "running" || page["nextCursor"].as_u64() != Some(cursor)
+                || page["truncated"] == true || tokio::time::Instant::now() >= deadline
+            {
+                return Ok(page);
+            }
+            let _ = tokio::time::timeout_at(deadline, notified).await;
         }
-        self.snapshot(owner, workspace, &args.id, args.cursor.unwrap_or(0), limit)
     }
 
     pub async fn write(&self, owner: &str, workspace: &str, args: Value) -> Result<Value, String> {
@@ -579,52 +603,59 @@ impl ProcessRegistry {
         let mut stderr = String::new();
         let mut truncated = false;
         let mut cursor = 0u64;
+        let mut next_cursor = 0u64;
+        let mut capped = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(wait_secs);
-        let mut state = String::from("running");
-        loop {
+        let page = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
             let wait_ms = remaining.as_millis().min(1000) as u64;
-            let page = self
-                .poll(
-                    owner,
-                    workspace,
-                    json!({"id":id,"cursor":cursor,"max_bytes":65536,"wait_ms":wait_ms}),
-                )
-                .await?;
-            for frame in page["output"].as_array().into_iter().flatten() {
-                let sink = if frame["stream"] == "stderr" {
-                    &mut stderr
-                } else {
-                    &mut stdout
-                };
-                if sink.len() < OUTPUT_BYTES {
-                    sink.push_str(frame["text"].as_str().unwrap_or(""));
-                } else {
-                    truncated = true;
+            let page = self.poll(
+                owner,
+                workspace,
+                json!({"id":id,"cursor":cursor,"max_bytes":65536,"wait_ms":wait_ms}),
+            ).await?;
+            truncated |= page["truncated"] == true;
+            cursor = page["nextCursor"].as_u64().unwrap_or(cursor);
+            if !capped {
+                next_cursor = next_cursor.max(page["firstAvailableCursor"].as_u64().unwrap_or(0));
+                for frame in page["output"].as_array().into_iter().flatten() {
+                    let text = frame["text"].as_str().unwrap_or("");
+                    if stdout.len() + stderr.len() + text.len() > OUTPUT_BYTES {
+                        capped = true;
+                        break;
+                    }
+                    if frame["stream"] == "stderr" {
+                        stderr.push_str(text);
+                    } else {
+                        stdout.push_str(text);
+                    }
+                    next_cursor = frame["cursor"].as_u64().unwrap_or(next_cursor) + 1;
                 }
             }
-            cursor = page["nextCursor"].as_u64().unwrap_or(cursor);
-            truncated = truncated || page["truncated"] == true;
-            state = page["state"].as_str().unwrap_or("unknown").to_string();
-            if state != "running" {
-                break;
+            if (page["state"] != "running" || remaining.is_zero()) && page["hasMore"] != true {
+                break page;
             }
-        }
-        let duration_ms = started.elapsed().as_millis() as u64;
+            if remaining.is_zero() && page["state"] == "running" {
+                // The producer may still be running; bound the wait even if
+                // it keeps adding pages as we consume them.
+                break page;
+            }
+        };
+        let state = page["state"].as_str().unwrap_or("unknown");
+        let has_more = capped || page["hasMore"] == true;
+        let mut result = json!({
+            "status":state, "processId":id,
+            "stdout":stdout, "stderr":stderr, "truncated":truncated || has_more,
+            "nextCursor":next_cursor, "hasMore":has_more,
+            "durationMs":started.elapsed().as_millis() as u64,
+        });
         if state == "running" {
-            return Ok(
-                json!({"status":"running","processId":id,"stdout":stdout,"stderr":stderr,"truncated":truncated,"durationMs":duration_ms,
-                "message":"Still running; continue with process_poll or stop it with process_stop."}),
-            );
+            result["message"] = json!("Still running; continue with process_poll or stop it with process_stop.");
+        } else {
+            result["exitCode"] = page["exitCode"].clone();
+            result["isError"] = json!(page["isError"] == true || state != "exited");
         }
-        let exit_code = self.snapshot(owner, workspace, &id, 0, 8192)?["exitCode"].clone();
-        Ok(
-            json!({"status":state,"processId":id,"exitCode":exit_code,"stdout":stdout,"stderr":stderr,"truncated":truncated,"durationMs":duration_ms,
-            "isError":exit_code.as_i64() != Some(0) || state != "exited"}),
-        )
+        Ok(result)
     }
 
     pub async fn stop(&self, owner: &str, workspace: &str, args: Value) -> Result<Value, String> {
@@ -663,6 +694,7 @@ async fn read_output(
     mut reader: impl AsyncRead + Unpin,
     stream: &'static str,
     output: Arc<Mutex<Output>>,
+    changed: Arc<Notify>,
 ) {
     let mut bytes = [0; 4096];
     let mut pending = Vec::new();
@@ -673,6 +705,7 @@ async fn read_output(
                 if let Ok(mut state) = output.lock() {
                     state.push(stream, text);
                 }
+                changed.notify_waiters();
                 if count == 0 {
                     break;
                 }
@@ -682,6 +715,7 @@ async fn read_output(
                     state.error = Some(format!("Could not read {stream}: {error}"));
                     state.incomplete = true;
                 }
+                changed.notify_waiters();
                 break;
             }
         }
@@ -711,6 +745,7 @@ async fn supervise(
     stdin: tokio::process::ChildStdin,
     mut receiver: mpsc::Receiver<Control>,
     output: Arc<Mutex<Output>>,
+    changed: Arc<Notify>,
     out_reader: tokio::task::JoinHandle<()>,
     err_reader: tokio::task::JoinHandle<()>,
     timeout: u64,
@@ -800,6 +835,7 @@ async fn supervise(
             state.error = error;
         }
     }
+    changed.notify_waiters();
 }
 
 #[cfg(test)]
@@ -885,6 +921,7 @@ mod tests {
             workspace: "root".into(),
             created: std::time::Instant::now(),
             output: output.clone(),
+            changed: Arc::new(Notify::new()),
             control,
         });
         let registry = ProcessRegistry::default();
@@ -1014,19 +1051,23 @@ mod tests {
         .await
         .unwrap();
         let mut result = Value::Null;
+        let mut cursor = 0;
+        let mut output = String::new();
         for _ in 0..100 {
-            result = harness_call(&ctx, "process_poll", json!({"id":id,"wait_ms":20}))
+            result = harness_call(&ctx, "process_poll", json!({"id":id,"cursor":cursor,"wait_ms":20}))
                 .await
                 .unwrap();
-            if result["state"] != "running" {
+            for frame in result["output"].as_array().unwrap() {
+                output.push_str(frame["text"].as_str().unwrap());
+            }
+            cursor = result["nextCursor"].as_u64().unwrap();
+            if result["state"] != "running" && result["hasMore"] == false {
                 break;
             }
         }
         assert_eq!(result["state"], "exited", "{result}");
         assert_eq!(result["exitCode"], 0, "{result}");
-        assert!(result["output"]
-            .to_string()
-            .contains("model fixture output"));
+        assert!(output.contains("model fixture output"));
         assert!(harness_call(
             &ctx,
             "process_start",
@@ -1202,14 +1243,16 @@ mod tests {
     }
 
     async fn finished(registry: &ProcessRegistry, root: &str, id: &str) -> Value {
+        let mut cursor = 0;
         for _ in 0..100 {
             let result = registry
-                .poll("owner", root, json!({"id":id,"wait_ms":20}))
+                .poll("owner", root, json!({"id":id,"cursor":cursor,"wait_ms":20}))
                 .await
                 .unwrap();
             if result["state"] != "running" {
-                return result;
+                return registry.retained_output("owner", root, id).unwrap();
             }
+            cursor = result["nextCursor"].as_u64().unwrap();
         }
         panic!("Process did not finish promptly")
     }
@@ -1679,4 +1722,41 @@ mod tests {
             "{result}"
         );
     }
+
+    #[test]
+    fn minimum_page_advances_over_replacement_decoded_output() {
+        let mut output = Output::default();
+        let text = String::from_utf8_lossy(&vec![0xff; 4096]).into_owned();
+        output.push("stdout", text.clone());
+        let first = output.poll("test", 0, MIN_PAGE_BYTES).unwrap();
+        assert_eq!(first["hasMore"], true);
+        let next = first["nextCursor"].as_u64().unwrap();
+        assert!(next > 0);
+        let second = output.poll("test", next, MIN_PAGE_BYTES).unwrap();
+        let actual = [&first, &second].into_iter().flat_map(|page| page["output"].as_array().unwrap())
+            .map(|frame| frame["text"].as_str().unwrap()).collect::<String>();
+        assert_eq!(actual, text);
+        assert_eq!(second["hasMore"], false);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_run_drains_final_pages_and_returns_without_mandatory_sleep() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = ProcessRegistry::default();
+        let result = registry.shell_run("owner", root.path().to_str().unwrap(),
+            crate::execution::ExecutionConfig::default(),
+            json!({"command":r"head -c 150000 /dev/zero | tr '\000' x", "timeout_secs":10}),
+        ).await.unwrap();
+        assert_eq!(result["stdout"].as_str().unwrap().len(), 150000);
+        assert_eq!(result["hasMore"], false);
+        assert_eq!(result["truncated"], false);
+        let start = std::time::Instant::now();
+        let page = registry.poll("owner", root.path().to_str().unwrap(), json!({
+            "id":result["processId"], "wait_ms":1000, "cursor":result["nextCursor"],
+        })).await.unwrap();
+        assert_eq!(page["state"], "exited");
+        assert!(start.elapsed() < Duration::from_millis(800));
+    }
+
 }

@@ -51,7 +51,7 @@ const MAX_ANSWER_BYTES: usize = 64 * 1024;
 /// Global pending-question bound across every connector session.
 const MAX_PENDING: usize = 64;
 /// How long a form may await a decision before it cancels itself.
-const FORM_WAIT: Duration = Duration::from_secs(600);
+pub(crate) const FORM_WAIT: Duration = Duration::from_secs(600);
 /// How long a call may wait for the per-session input gate.
 const GATE_WAIT: Duration = Duration::from_secs(120);
 
@@ -81,7 +81,7 @@ fn approval_event(
     operation: &str,
     form: Option<Value>,
 ) -> Value {
-    json!({"approval": {
+    json!({
         "id": id,
         "kind": "mcp_input",
         "connector": connector,
@@ -90,7 +90,7 @@ fn approval_event(
         "arguments": {},
         "form": form,
         "closed": form.is_none(),
-    }})
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -223,6 +223,7 @@ impl Registry {
 pub struct CallUi {
     pub registry: Arc<Registry>,
     pub emit: Arc<dyn Fn(String, Option<Value>) + Send + Sync>,
+    budget: Option<Arc<CallBudget>>,
 }
 
 impl CallUi {
@@ -230,11 +231,105 @@ impl CallUi {
         registry: Arc<Registry>,
         emit: Arc<dyn Fn(String, Option<Value>) + Send + Sync>,
     ) -> Self {
-        Self { registry, emit }
+        Self { registry, emit, budget: None }
+    }
+
+    pub(crate) fn share_budget(mut self, budget: Arc<CallBudget>) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    pub(crate) fn with_budget(mut self, execution: Duration) -> (Self, Arc<CallBudget>) {
+        let budget = self.budget.take().unwrap_or_else(|| Arc::new(CallBudget::new(execution)));
+        self.budget = Some(budget.clone());
+        (self, budget)
+    }
+}
+
+/// Execution time stops only for a validated, live form. Successive forms
+/// share one bounded human-input allowance for the entire call.
+pub(crate) struct CallBudget {
+    clock: Mutex<BudgetClock>,
+    changed: tokio::sync::Notify,
+}
+
+struct BudgetClock {
+    execution_left: Duration,
+    human_left: Duration,
+    since: tokio::time::Instant,
+    waiting: bool,
+}
+
+impl CallBudget {
+    pub(crate) fn new(execution: Duration) -> Self {
+        Self {
+            clock: Mutex::new(BudgetClock {
+                execution_left: execution, human_left: FORM_WAIT,
+                since: tokio::time::Instant::now(), waiting: false,
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn form(&self) -> Result<(Duration, FormTime<'_>), String> {
+        let mut clock = lock(&self.clock);
+        if clock.waiting {
+            return Err("A form is already open for this connector call.".into());
+        }
+        clock.execution_left = clock.execution_left.saturating_sub(clock.since.elapsed());
+        if clock.execution_left.is_zero() {
+            return Err("Connector execution expired before the form could open.".into());
+        }
+        clock.waiting = true;
+        clock.since = tokio::time::Instant::now();
+        self.changed.notify_waiters();
+        Ok((clock.human_left, FormTime(self)))
+    }
+
+    pub(crate) fn expired(&self) -> bool {
+        let clock = lock(&self.clock);
+        !clock.waiting && clock.since.elapsed() >= clock.execution_left
+    }
+
+    pub(crate) async fn execution_expired(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let deadline = {
+                let clock = lock(&self.clock);
+                (!clock.waiting).then_some(clock.since + clock.execution_left)
+            };
+            if let Some(deadline) = deadline {
+                tokio::select! {
+                    biased;
+                    _ = &mut changed => (),
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if self.expired() {
+                            return;
+                        }
+                    }
+                }
+            } else {
+                changed.await;
+            }
+        }
+    }
+}
+
+struct FormTime<'a>(&'a CallBudget);
+impl Drop for FormTime<'_> {
+    fn drop(&mut self) {
+        let mut clock = lock(&self.0.clock);
+        clock.human_left = clock.human_left.saturating_sub(clock.since.elapsed());
+        clock.since = tokio::time::Instant::now();
+        clock.waiting = false;
+        self.0.changed.notify_waiters();
     }
 }
 
 struct ActiveUi {
+    budget: Option<Arc<CallBudget>>,
     emit: Arc<dyn Fn(String, Option<Value>) + Send + Sync>,
     registry: Arc<Registry>,
 }
@@ -286,6 +381,7 @@ impl SessionInput {
             token,
             operation: operation.chars().take(256).collect(),
             ui: ui.map(|ui| ActiveUi {
+                budget: ui.budget,
                 emit: ui.emit,
                 registry: ui.registry,
             }),
@@ -361,7 +457,7 @@ impl SessionInput {
         let spec = form_spec(message, schema)?;
         let schema_json = serde_json::to_value(schema)
             .map_err(|error| format!("The server input schema could not be encoded: {error}"))?;
-        let (emit, registry) = {
+        let (emit, registry, budget) = {
             let mut active = lock(&self.active);
             let Some(call) = active.as_mut().filter(|call| call.token == token) else {
                 return Err(
@@ -380,8 +476,19 @@ impl SessionInput {
                     "This operation requires interactive input that is unavailable here.".into(),
                 );
             };
-            (ui.emit.clone(), ui.registry.clone())
+            (ui.emit.clone(), ui.registry.clone(), ui.budget.clone())
         };
+        let (wait, _form_time) = if let Some(budget) = budget.as_ref() {
+            let (wait, time) = budget.form()?;
+            (wait, Some(time))
+        } else {
+            (FORM_WAIT, None)
+        };
+        if wait.is_zero() {
+            self.note_decision(token, InputAction::Cancel);
+            emit("MCP input expired".into(), None);
+            return Ok(ElicitResult::new(ElicitationAction::Cancel));
+        }
         let (id, receiver) = registry.begin(token, schema_json)?;
         emit(
             format!("MCP input requested by {}", self.source),
@@ -400,7 +507,7 @@ impl SessionInput {
             source: &self.source,
             local_name: self.local_name.as_deref(),
         };
-        let answer = match tokio::time::timeout(FORM_WAIT, receiver).await {
+        let answer = match tokio::time::timeout(wait, receiver).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => {
                 return Err("The input request was closed before a decision arrived.".into())
@@ -408,6 +515,7 @@ impl SessionInput {
             Err(_) => {
                 self.note_decision(token, InputAction::Cancel);
                 drop(guard);
+                emit("MCP input expired".into(), None);
                 return Ok(ElicitResult::new(ElicitationAction::Cancel));
             }
         };
@@ -950,6 +1058,18 @@ pub async fn resolve_mcp_input(
 mod tests {
     use super::*;
 
+    #[test]
+    fn approval_payload_is_directly_usable_by_chat_and_close_is_id_scoped() {
+        let open = approval_event("request", "connector", None, "operation", Some(json!({"fields":[]})));
+        assert_eq!(open["id"], "request");
+        assert_eq!(open["kind"], "mcp_input");
+        assert_eq!(open["closed"], false);
+        assert!(open.get("approval").is_none());
+        let close = approval_event("request", "connector", None, "operation", None);
+        assert_eq!(close["id"], "request");
+        assert_eq!(close["closed"], true);
+    }
+
     /// Build a schema the way a server sends it: as raw JSON, exercising the
     /// same wire deserialization the handler path uses.
     fn schema_with(properties: Value, required: Vec<&str>) -> ElicitationSchema {
@@ -1061,4 +1181,17 @@ mod tests {
         );
         assert_eq!(registry.remove_scope(second), vec![second_id]);
     }
+
+    #[tokio::test]
+    async fn active_form_pauses_execution_and_uses_a_separate_budget() {
+        let budget = CallBudget::new(Duration::from_millis(60));
+        let (allowance, form) = budget.form().unwrap();
+        assert_eq!(allowance, FORM_WAIT);
+        assert!(budget.form().is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(100), budget.execution_expired()).await.is_err());
+        drop(form);
+        assert!(budget.form().unwrap().0 < FORM_WAIT);
+        tokio::time::timeout(Duration::from_secs(1), budget.execution_expired()).await.unwrap();
+    }
+
 }

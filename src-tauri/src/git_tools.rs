@@ -168,7 +168,7 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
         ("git_commit".into(),"Request an explicitly approved commit of the reviewed staged tree with a message. Requires expected_tree from git_diff(kind=staged); rejects a stale pin or workspace subdirectory. Always asks for user approval, even in Full Access. The model cannot supply confirmation. Uses normal Git hooks/configuration; no automatic retry after uncertain outcomes.".into(),commit),
         ("git_branch".into(),"Create a local branch or switch to an existing branch without force/reset/discard flags. Git refuses conflicting disk changes. No remote push, fetch, deletion or shell interpolation.".into(),schema(json!({"action":{"type":"string","enum":["create","switch"]},"name":{"type":"string","minLength":1,"maxLength":240}}),&["action","name"])),
         ("git_history".into(),"Read the latest at most50 local commits as structured IDs, authors, dates and subjects. Empty repositories return an empty list. limitReached means older history may exist.".into(),schema(json!({}),&[])),
-        ("worktree_enter".into(),"Create an isolated Git worktree under app data on a new locallm/<name> branch and switch this conversation's task workspace to it, so further file and shell work happens there until worktree_exit. Always asks for approval.".into(),{
+        ("worktree_enter".into(),"Create an isolated Git worktree under app data on a new conversation-specific locallm branch and switch this conversation's task workspace to it, so further file and shell work happens there until worktree_exit. Always asks for approval.".into(),{
             let mut schema=schema(json!({"name":{"type":"string","pattern":"^[a-z0-9-]{1,40}$"},"base":{"type":"string","maxLength":200,"default":"HEAD"}}),&["name"]);
             schema["x-locallm-always-ask"]=json!(true);schema}),
         ("worktree_exit".into(),"Switch the conversation's task workspace back to the original directory and optionally remove the created worktree. Removal refuses uncommitted changes; the locallm branch is kept. Always asks for approval.".into(),{
@@ -196,6 +196,37 @@ fn worktree_key(conversation_id: &str) -> String {
     format!("worktree:{conversation_id}")
 }
 
+/// Prevent a second conversation from attaching while Git is removing the
+/// directory. Persisted reservations survive a crash and can be cleared by
+/// returning to the original folder with the worktree kept.
+struct WorktreeRemoval<'a> {
+    state: &'a crate::AppState,
+    path: String,
+    owner: String,
+    released: bool,
+}
+
+impl WorktreeRemoval<'_> {
+    fn release(&mut self) -> Result<(), String> {
+        crate::workspace_ui::release_worktree_removal(&*self.state.database()?, &self.path, &self.owner)?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for WorktreeRemoval<'_> {
+    fn drop(&mut self) {
+        if !self.released { let _ = self.release(); }
+    }
+}
+
+pub(crate) fn ensure_no_conversation_worktree(store: &crate::store::Store, conversation_id: &str) -> Result<(), String> {
+    if store.setting::<Option<Value>>(&worktree_key(conversation_id))?.is_some() {
+        return Err("Return from this conversation's worktree before deleting the conversation; choose whether to keep or remove it in Work.".into());
+    }
+    Ok(())
+}
+
 /// Enter/exit an isolated git worktree for a conversation. Not in ALIASES:
 /// it needs live state (data dir, store, workspace switching) and detached
 /// children must never reach it.
@@ -206,6 +237,10 @@ pub async fn execute_worktree(
     alias: &str,
     value: Value,
 ) -> Result<Value, String> {
+    if conversation_id.is_empty() || conversation_id.len() > 128
+        || !conversation_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        return Err("Invalid conversation ID for worktree isolation.".into());
+    }
     if workspace.is_empty() {
         return Err("Select a workspace before using worktrees.".into());
     }
@@ -218,19 +253,20 @@ pub async fn execute_worktree(
         "worktree_enter" => {
             let args: WorktreeEnter = args(value)?;
             let base = args.base.clone().unwrap_or_else(|| "HEAD".into());
-            if base.chars().any(|c| c == ' ' || c == '\0') {
+            if args.name.is_empty() || args.name.len() > 40
+                || !args.name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-') {
+                return Err("Worktree name must be 1–40 lowercase letters, digits or hyphens.".into());
+            }
+            if base.is_empty() || base.len() > 200 || base.starts_with('-') || base.chars().any(|c| c.is_whitespace() || c.is_control()) {
                 return Err("Invalid base.".into());
             }
             let repo = git(workspace, &["rev-parse", "--show-toplevel"])
                 .await
                 .map_err(|e| format!("Not a git repository: {e}"))?;
             let repo = std::fs::canonicalize(repo.trim()).map_err(|e| e.to_string())?;
-            if state
-                .database()?
-                .setting::<Value>(&key)
-                .unwrap_or_default()
-                .is_object()
-            {
+            let selected = std::fs::canonicalize(workspace).map_err(|e| e.to_string())?;
+            if !selected.starts_with(&repo) { return Err("The selected workspace is outside the repository worktree.".into()); }
+            if state.database()?.setting::<Option<Value>>(&key)?.is_some() {
                 return Err(
                     "This conversation already has an active worktree; run worktree_exit first."
                         .into(),
@@ -244,8 +280,24 @@ pub async fn execute_worktree(
             if dir.exists() {
                 return Err(format!("Worktree path {} already exists.", dir.display()));
             }
-            std::fs::create_dir_all(dir.parent().unwrap()).map_err(|e| e.to_string())?;
-            let branch = format!("locallm/{}", args.name);
+            let parent = dir.parent().ok_or("Invalid worktree directory.")?;
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            let data_root = std::fs::canonicalize(&state.data_dir).map_err(|e| e.to_string())?;
+            if !std::fs::canonicalize(parent).map_err(|e| e.to_string())?.starts_with(&data_root) {
+                return Err("Worktree directory resolves outside application data.".into());
+            }
+            let branch = format!("locallm/{}-{}", args.name, conversation_id);
+            let base_commit = git(repo.to_str().ok_or("Repository path is not UTF-8.")?, &["rev-parse", "--verify", "--end-of-options", &format!("{base}^{{commit}}")]).await
+                .map_err(|e| format!("Cannot resolve the worktree base: {e}"))?;
+            let previous = {
+                let store = state.database()?;
+                if !store.conversation_exists(conversation_id)? { return Err("Conversation no longer exists.".into()); }
+                let previous = crate::workspace_ui::task_workspace(&store, conversation_id)?.unwrap_or_else(|| workspace.to_string());
+                // Persist the intended location before Git changes disk, so an
+                // interrupted creation is discoverable and can be recovered.
+                store.save_setting(&key, &json!({"original":previous,"path":dir.to_string_lossy(),"branch":branch,"state":"creating"}))?;
+                previous
+            };
             git(
                 repo.to_str().unwrap_or_default(),
                 &[
@@ -254,23 +306,20 @@ pub async fn execute_worktree(
                     "-b",
                     &branch,
                     &dir.to_string_lossy(),
-                    &base,
+                    base_commit.trim(),
                 ],
             )
             .await
             .map_err(|e| format!("git worktree add failed: {e}"))?;
             let store = state.database()?;
-            let previous = crate::workspace_ui::task_workspace(&store, conversation_id)?
-                .unwrap_or_else(|| workspace.to_string());
-            store.save_setting(
-                &key,
-                &json!({"original":previous,"path":dir.to_string_lossy(),"branch":branch}),
-            )?;
-            crate::workspace_ui::select_task_workspace(
+            let actual_path = std::fs::canonicalize(&dir).map_err(|e| format!("Cannot verify created worktree: {e}"))?.to_string_lossy().into_owned();
+            let existing_project = crate::workspace_ui::project_at_path(&store, &actual_path)?.is_some();
+            let selection = crate::workspace_ui::select_task_workspace(
                 &store,
                 &dir.to_string_lossy(),
                 Some(conversation_id),
             )?;
+            store.save_setting(&key, &json!({"original":previous,"path":dir.to_string_lossy(),"branch":branch,"state":"active","projectId":selection.project.id,"createdProject":!existing_project}))?;
             Ok(
                 json!({"path":dir.to_string_lossy(),"branch":branch,"previousWorkspace":previous,
                 "note":"Further file and shell work in this conversation now happens inside the worktree."}),
@@ -278,17 +327,35 @@ pub async fn execute_worktree(
         }
         "worktree_exit" => {
             let args: WorktreeExit = args(value)?;
+            if !matches!(args.action.as_str(), "keep" | "remove") { return Err("Worktree action must be keep or remove.".into()); }
             let record: Value = state
                 .database()?
                 .setting::<Option<Value>>(&key)?
                 .ok_or("No active worktree for this conversation.")?;
+            if args.action == "remove" && record["state"] == "creating" {
+                return Err("Worktree creation is not marked complete; return and keep it, then inspect its path before removing anything.".into());
+            }
             let path = record["path"].as_str().unwrap_or_default().to_string();
             let original = record["original"].as_str().unwrap_or_default().to_string();
             let branch = record["branch"].as_str().unwrap_or_default().to_string();
+            let owned_parent = state.data_dir.join("worktrees").join(conversation_id);
+            let recorded_path = std::path::Path::new(&path);
+            if recorded_path.parent() != Some(owned_parent.as_path()) || recorded_path.file_name().is_none() || original.is_empty() {
+                return Err("Saved worktree record is invalid; no files were removed.".into());
+            }
+            let mut removal = None;
             if args.action == "remove" {
+                let actual_parent = std::fs::canonicalize(&owned_parent).map_err(|e| format!("Cannot verify worktree location: {e}"))?;
+                let actual_path = std::fs::canonicalize(recorded_path).map_err(|e| format!("Cannot verify worktree location: {e}"))?;
+                let data_root = std::fs::canonicalize(&state.data_dir).map_err(|e| format!("Cannot verify application data: {e}"))?;
+                if !actual_parent.starts_with(&data_root) || actual_path.parent() != Some(actual_parent.as_path()) {
+                    return Err("Worktree location changed; no files were removed.".into());
+                }
+                crate::workspace_ui::reserve_worktree_removal(&*state.database()?, &actual_path, conversation_id)?;
+                removal = Some(WorktreeRemoval { state, path: actual_path.to_string_lossy().into_owned(), owner: conversation_id.to_string(), released: false });
                 let status = git(&path, &["status", "--porcelain"])
                     .await
-                    .unwrap_or_default();
+                    .map_err(|e| format!("Cannot verify worktree status; no files were removed: {e}"))?;
                 if !status.trim().is_empty() {
                     let reason = if args.expected_clean == Some(true) {
                         "expected_clean asserted but the worktree has uncommitted changes"
@@ -307,7 +374,14 @@ pub async fn execute_worktree(
                 git(&original, &["worktree", "remove", &path])
                     .await
                     .map_err(|e| format!("git worktree remove failed: {e}"))?;
+                if record["createdProject"] == true {
+                    if let (Some(id), Some(reservation)) = (record["projectId"].as_str(), removal.as_ref()) {
+                        crate::workspace_ui::prune_isolation_project(&*state.database()?, id, &reservation.path)?;
+                    }
+                }
             }
+            if let Some(reservation) = removal.as_mut() { reservation.release()?; }
+            else { crate::workspace_ui::release_worktree_removal(&*state.database()?, &path, conversation_id)?; }
             state.database()?.save_setting(&key, &Value::Null)?;
             Ok(
                 json!({"restored":original,"removed":args.action=="remove","branch":branch,
@@ -316,6 +390,55 @@ pub async fn execute_worktree(
         }
         _ => Err("Unknown worktree tool.".into()),
     }
+}
+
+/// These commands represent explicit user actions. Model-triggered worktree
+/// operations still go through the separately approved harness dispatcher.
+#[tauri::command]
+pub fn conversation_worktree(state: tauri::State<'_, crate::AppState>, conversation_id: String) -> Result<Option<Value>, String> {
+    let store = state.database()?;
+    worktree_status(&store, &conversation_id)
+}
+
+fn worktree_status(store: &crate::store::Store, conversation_id: &str) -> Result<Option<Value>, String> {
+    if !store.conversation_exists(conversation_id)? { return Err("Conversation no longer exists.".into()); }
+    let mut record: Option<Value> = store.setting(&worktree_key(conversation_id))?;
+    if let Some(value) = record.as_mut() {
+        if !value.is_object() || ["original", "path", "branch"].iter().any(|field| value.get(field).and_then(Value::as_str).is_none_or(str::is_empty)) {
+            return Err("Saved worktree record is invalid; no files were changed.".into());
+        }
+        if value["state"] != "creating" {
+            let attached = crate::workspace_ui::task_workspace(store, conversation_id)?
+                .zip(value["path"].as_str())
+                .is_some_and(|(workspace, path)| std::fs::canonicalize(workspace).ok().zip(std::fs::canonicalize(path).ok()).is_some_and(|(a,b)| a == b));
+            if !attached { value["state"] = json!("detached"); }
+        }
+    }
+    Ok(record)
+}
+
+#[tauri::command]
+pub async fn enter_conversation_worktree(state: tauri::State<'_, crate::AppState>, conversation_id: String, name: String) -> Result<Value, String> {
+    let _operation = state.operation.try_shared().map_err(|_| "Wait for the active operation.")?;
+    let _turn = state.turns.acquire(&conversation_id)?;
+    let workspace = {
+        let store = state.database()?;
+        crate::workspace_ui::task_workspace(&store, &conversation_id)?
+            .ok_or("Choose a project folder for this conversation first.")?
+    };
+    execute_worktree(&state, &conversation_id, &workspace, "worktree_enter", json!({"name":name})).await
+}
+
+#[tauri::command]
+pub async fn exit_conversation_worktree(state: tauri::State<'_, crate::AppState>, conversation_id: String, action: String) -> Result<Value, String> {
+    let _operation = state.operation.try_shared().map_err(|_| "Wait for the active operation.")?;
+    let _turn = state.turns.acquire(&conversation_id)?;
+    let workspace = {
+        let store = state.database()?;
+        crate::workspace_ui::task_workspace(&store, &conversation_id)?
+            .ok_or("Choose a project folder for this conversation first.")?
+    };
+    execute_worktree(&state, &conversation_id, &workspace, "worktree_exit", json!({"action":action})).await
 }
 
 pub async fn execute(root: &str, alias: &str, value: Value) -> Result<Value, String> {
@@ -586,6 +709,169 @@ mod tests {
             tool.prepare_arguments(value)?,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn conversation_worktrees_are_isolated_and_dirty_removal_is_refused() {
+        let repo = fixture().await;
+        let root = repo.path().to_str().unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "committed\n").unwrap();
+        crate::workspace_ui::git(root, &["add", "tracked.txt"]).await.unwrap();
+        crate::workspace_ui::git(root, &["commit", "-m", "initial"]).await.unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "unsaved original\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(data.path());
+        let (first, second) = {
+            let store = state.database().unwrap();
+            let first = store.create_conversation().unwrap().id;
+            let second = store.create_conversation().unwrap().id;
+            crate::workspace_ui::select_task_workspace(&store, root, Some(&first)).unwrap();
+            crate::workspace_ui::select_task_workspace(&store, root, Some(&second)).unwrap();
+            (first, second)
+        };
+        let a = execute_worktree(&state, &first, root, "worktree_enter", json!({"name":"task"})).await.unwrap();
+        let b = execute_worktree(&state, &second, root, "worktree_enter", json!({"name":"task"})).await.unwrap();
+        let a_path = a["path"].as_str().unwrap();
+        let b_path = b["path"].as_str().unwrap();
+        let b_record = worktree_status(&state.database().unwrap(), &second).unwrap().unwrap();
+        assert_eq!(b_record["createdProject"], true);
+        let b_project = b_record["projectId"].as_str().unwrap().to_string();
+        assert_ne!(a_path, b_path);
+        assert_ne!(a["branch"], b["branch"]);
+        assert_eq!(worktree_status(&state.database().unwrap(), &first).unwrap().unwrap()["state"], "active");
+        assert_eq!(std::fs::read_to_string(std::path::Path::new(a_path).join("tracked.txt")).unwrap(), "committed\n");
+        assert_eq!(std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(), "unsaved original\n");
+        std::fs::write(std::path::Path::new(a_path).join("tracked.txt"), "uncommitted in worktree\n").unwrap();
+        assert!(execute_worktree(&state, &first, a_path, "worktree_exit", json!({"action":"remove"})).await.unwrap_err().contains("uncommitted"));
+        assert!(std::path::Path::new(a_path).exists());
+        crate::workspace_ui::select_task_workspace(&state.database().unwrap(), root, Some(&first)).unwrap();
+        assert_eq!(worktree_status(&state.database().unwrap(), &first).unwrap().unwrap()["state"], "detached");
+        execute_worktree(&state, &first, a_path, "worktree_exit", json!({"action":"keep"})).await.unwrap();
+        assert!(std::path::Path::new(a_path).exists());
+        assert_eq!(crate::workspace_ui::task_workspace(&state.database().unwrap(), &first).unwrap().as_deref(), Some(root));
+        let subdirectory = std::path::Path::new(b_path).join("nested");
+        std::fs::create_dir(&subdirectory).unwrap();
+        let third = {
+            let store = state.database().unwrap();
+            let third = store.create_conversation().unwrap().id;
+            crate::workspace_ui::select_task_workspace(&store, subdirectory.to_str().unwrap(), Some(&third)).unwrap();
+            third
+        };
+        let error = execute_worktree(&state, &second, b_path, "worktree_exit", json!({"action":"remove"})).await.unwrap_err();
+        assert!(error.contains("Another conversation uses this worktree"));
+        assert!(subdirectory.exists());
+        crate::workspace_ui::prune_isolation_project(&state.database().unwrap(), &b_project, b_path).unwrap();
+        assert!(crate::workspace_ui::project_at_path(&state.database().unwrap(), b_path).unwrap().is_some());
+        crate::workspace_ui::select_task_workspace(&state.database().unwrap(), root, Some(&third)).unwrap();
+        {
+            let store = state.database().unwrap();
+            crate::workspace_ui::reserve_worktree_removal(&store, std::path::Path::new(b_path), &second).unwrap();
+            assert!(crate::workspace_ui::select_task_workspace(&store, subdirectory.to_str().unwrap(), Some(&third)).err().unwrap().contains("being removed"));
+            assert!(crate::workspace_ui::inherit_task_meta(&store, &second, &third).unwrap_err().contains("being removed"));
+            let mut index: crate::workspace_ui::WorkspaceIndex = store.setting("workspace_index_v1").unwrap();
+            let project = index.projects.iter().find(|project| project.path == subdirectory.to_str().unwrap()).unwrap();
+            assert!(crate::workspace_ui::file_task(&store, &third, Some(&project.id)).unwrap_err().contains("being removed"));
+            index.projects.sort_by_key(|project| project.path != b_path);
+            store.save_setting("workspace_index_v1", &index).unwrap();
+            let fourth = store.create_conversation().unwrap().id;
+            let auto_filed = crate::workspace_ui::task_workspace(&store, &fourth).unwrap().unwrap();
+            assert!(!std::path::Path::new(&auto_filed).starts_with(b_path));
+            crate::workspace_ui::release_worktree_removal(&store, b_path, &second).unwrap();
+        }
+        execute_worktree(&state, &second, b_path, "worktree_exit", json!({"action":"remove"})).await.unwrap();
+        assert!(!std::path::Path::new(b_path).exists());
+        assert!(crate::workspace_ui::project_at_path(&state.database().unwrap(), b_path).unwrap().is_none());
+        assert!(crate::workspace_ui::project_at_path(&state.database().unwrap(), a_path).unwrap().is_some());
+        assert!(crate::workspace_ui::project_at_path(&state.database().unwrap(), root).unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(), "unsaved original\n");
+    }
+
+    #[tokio::test]
+    async fn invalid_worktree_arguments_and_broken_git_status_fail_closed() {
+        let repo = fixture().await;
+        let root = repo.path().to_str().unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "initial\n").unwrap();
+        crate::workspace_ui::git(root, &["add", "tracked.txt"]).await.unwrap();
+        crate::workspace_ui::git(root, &["commit", "-m", "initial"]).await.unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(data.path());
+        let id = {
+            let store = state.database().unwrap();
+            let id = store.create_conversation().unwrap().id;
+            crate::workspace_ui::select_task_workspace(&store, root, Some(&id)).unwrap();
+            id
+        };
+        assert!(execute_worktree(&state, &id, root, "worktree_enter", json!({"name":"../escape"})).await.is_err());
+        assert!(execute_worktree(&state, "../escape", root, "worktree_enter", json!({"name":"safe"})).await.is_err());
+        assert!(execute_worktree(&state, &id, root, "worktree_enter", json!({"name":"safe","base":"--force"})).await.is_err());
+        state.database().unwrap().save_setting(&worktree_key(&id), &json!("damaged record")).unwrap();
+        assert!(execute_worktree(&state, &id, root, "worktree_enter", json!({"name":"safe"})).await.unwrap_err().contains("already has"));
+        state.database().unwrap().save_setting(&worktree_key(&id), &Value::Null).unwrap();
+        let result = execute_worktree(&state, &id, root, "worktree_enter", json!({"name":"safe"})).await.unwrap();
+        let path = result["path"].as_str().unwrap();
+        std::fs::write(std::path::Path::new(path).join(".git"), "broken git metadata\n").unwrap();
+        let error = execute_worktree(&state, &id, path, "worktree_exit", json!({"action":"remove"})).await.unwrap_err();
+        assert!(error.contains("no files were removed"), "{error}");
+        assert!(std::path::Path::new(path).exists());
+        assert!(state.database().unwrap().setting::<Option<Value>>(&worktree_key(&id)).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn removing_worktree_preserves_preexisting_project_entry() {
+        let repo = fixture().await;
+        let root = repo.path().to_str().unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "initial\n").unwrap();
+        crate::workspace_ui::git(root, &["add", "tracked.txt"]).await.unwrap();
+        crate::workspace_ui::git(root, &["commit", "-m", "initial"]).await.unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(data.path());
+        let (id, old_path) = {
+            let store = state.database().unwrap();
+            let id = store.create_conversation().unwrap().id;
+            crate::workspace_ui::select_task_workspace(&store, root, Some(&id)).unwrap();
+            let path = state.data_dir.join("worktrees").join(&id).join("task");
+            let mut index: crate::workspace_ui::WorkspaceIndex = store.setting("workspace_index_v1").unwrap();
+            index.projects.push(crate::workspace_ui::Project { id: "previous-project".into(), name: "Previously saved".into(), path: path.to_string_lossy().into_owned() });
+            store.save_setting("workspace_index_v1", &index).unwrap();
+            (id, path)
+        };
+        let entered = execute_worktree(&state, &id, root, "worktree_enter", json!({"name":"task"})).await.unwrap();
+        let path = entered["path"].as_str().unwrap();
+        let record = worktree_status(&state.database().unwrap(), &id).unwrap().unwrap();
+        assert_eq!(record["createdProject"], false);
+        execute_worktree(&state, &id, path, "worktree_exit", json!({"action":"remove"})).await.unwrap();
+        assert!(crate::workspace_ui::project_at_path(&state.database().unwrap(), &old_path.to_string_lossy()).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn interrupted_creation_can_return_to_the_original_without_removing_files() {
+        let repo = fixture().await;
+        let root = repo.path().to_str().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(data.path());
+        let id = {
+            let store = state.database().unwrap();
+            let id = store.create_conversation().unwrap().id;
+            crate::workspace_ui::select_task_workspace(&store, root, Some(&id)).unwrap();
+            let path = state.data_dir.join("worktrees").join(&id).join("pending");
+            std::fs::create_dir_all(&path).unwrap();
+            store.save_setting(&worktree_key(&id), &json!({"original":root,"path":path.to_string_lossy(),"branch":"locallm/pending","state":"creating"})).unwrap();
+            crate::workspace_ui::reserve_worktree_removal(&store, &path, &id).unwrap();
+            assert!(crate::workspace_ui::ensure_workspace_available(&store, &path.to_string_lossy()).is_err());
+            id
+        };
+        assert_eq!(worktree_status(&state.database().unwrap(), &id).unwrap().unwrap()["state"], "creating");
+        assert!(ensure_no_conversation_worktree(&state.database().unwrap(), &id).is_err());
+        let error = execute_worktree(&state, &id, root, "worktree_exit", json!({"action":"remove"})).await.unwrap_err();
+        assert!(error.contains("not marked complete"));
+        assert!(worktree_status(&state.database().unwrap(), &id).unwrap().is_some());
+        execute_worktree(&state, &id, root, "worktree_exit", json!({"action":"keep"})).await.unwrap();
+        assert!(worktree_status(&state.database().unwrap(), &id).unwrap().is_none());
+        assert!(ensure_no_conversation_worktree(&state.database().unwrap(), &id).is_ok());
+        let pending = state.data_dir.join("worktrees").join(&id).join("pending");
+        assert!(pending.exists());
+        assert!(crate::workspace_ui::ensure_workspace_available(&state.database().unwrap(), &pending.to_string_lossy()).is_ok());
+        assert_eq!(crate::workspace_ui::task_workspace(&state.database().unwrap(), &id).unwrap().as_deref(), Some(root));
     }
     #[tokio::test]
     async fn literal_stage_unstage_stale_pin_commit_branch_history_preserve_disk() {

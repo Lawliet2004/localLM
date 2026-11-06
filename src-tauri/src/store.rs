@@ -1,3 +1,4 @@
+use serde_json::json;
 use crate::providers::{ModelSelection, ProviderConnection, RemoteModel};
 use crate::runtime_config::RuntimeConfig;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -52,6 +53,15 @@ pub struct Message {
     pub content: String,
     pub reasoning: String,
     pub status: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingTurn {
+    pub id: String,
+    pub conversation_id: String,
+    pub content: String,
     pub created_at: i64,
 }
 
@@ -140,6 +150,131 @@ pub struct Store {
     #[allow(dead_code)]
     scratch: Option<tempfile::TempDir>,
 }
+
+fn remap_fork_run(value: &mut serde_json::Value, old: &str, new: &str) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(key.as_str(), "runId" | "parentRunId") && value.as_str() == Some(old) {
+                    *value = json!(new);
+                } else {
+                    remap_fork_run(value, old, new);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items { remap_fork_run(item, old, new); }
+        }
+        _ => (),
+    }
+}
+
+fn replay_legacy_plan_result(
+    name: &str,
+    args: &serde_json::Value,
+    result: &serde_json::Value,
+    created_at: i64,
+    todos: Option<&mut Vec<crate::plans::Todo>>,
+    goal: Option<&mut Option<String>>,
+) {
+    if crate::tool_envelope::failed(result) || result.is_null() {
+        return;
+    }
+    let data = if crate::tool_envelope::is_envelope(result) { &result["data"] } else { result };
+    match name {
+        "todo_write" if data["saved"].is_u64() => {
+            if let (Some(todos), Ok(mut saved)) = (todos, crate::plans::parse_todo_write(args)) {
+                for todo in &mut saved { todo.updated_at = created_at; }
+                *todos = saved;
+            }
+        }
+        "todo_add" => {
+            if let (Some(todos), Ok(todo)) = (todos, serde_json::from_value(data["added"].clone())) {
+                if todos.len() < 50 && crate::plans::validate_todos(std::slice::from_ref(&todo)).is_ok() {
+                    todos.push(todo);
+                }
+            }
+        }
+        "todo_update" if data["saved"].is_u64() => {
+            if let (Some(todos), Some(index)) = (todos, args["index"].as_u64()) {
+                if let Some(todo) = todos.get_mut(index as usize) {
+                    let mut update = todo.clone();
+                    if let Some(text) = args["text"].as_str() { update.text = text.into(); }
+                    if let Some(status) = args["status"].as_str() { update.status = status.into(); }
+                    update.updated_at = created_at;
+                    if crate::plans::validate_todos(std::slice::from_ref(&update)).is_ok() { *todo = update; }
+                }
+            }
+        }
+        "goal_set" => {
+            if let (Some(goal), Some(objective)) = (goal, data["goal"].as_str()) {
+                if crate::plans::validate_objective(objective).is_ok() { *goal = Some(objective.into()); }
+            }
+        }
+        "goal_clear" if data["cleared"] == true => {
+            if let Some(goal) = goal { *goal = None; }
+        }
+        _ => (),
+    }
+}
+
+/// Copy only references reachable from the selected branch prefix.
+struct ForkArtifacts<'a> {
+    store: &'a Store,
+    source: &'a str,
+    target: &'a str,
+    ids: std::collections::HashMap<String, String>,
+}
+
+impl ForkArtifacts<'_> {
+    fn rewrite(&mut self, text: &str) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        static IDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\bart_[A-Za-z0-9_-]{1,124}\b").expect("artifact id pattern")
+        });
+        let mut result = String::with_capacity(text.len());
+        let mut end = 0;
+        for matched in IDS.find_iter(text) {
+            let old = matched.as_str();
+            if !self.ids.contains_key(old) {
+                let record = self.store.artifact(old)?.filter(|record| record.conversation_id == self.source);
+                let id = if record.is_some() { format!("art_{}", uuid::Uuid::new_v4().simple()) } else { old.to_string() };
+                self.ids.insert(old.to_string(), id.clone());
+                if let Some(mut record) = record {
+                    record.id = id;
+                    record.conversation_id = self.target.into();
+                    record.run_id = None;
+                    if record.mime_type == "application/json" {
+                        record.content = self.rewrite(&record.content)?;
+                        record.size_bytes = record.content.len();
+                        record.sha256 = format!("{:x}", Sha256::digest(record.content.as_bytes()));
+                    }
+                    self.store.save_artifact(&record)?;
+                }
+            }
+            result.push_str(&text[end..matched.start()]);
+            result.push_str(&self.ids[old]);
+            end = matched.end();
+        }
+        result.push_str(&text[end..]);
+        Ok(result)
+    }
+
+    fn rewrite_value(&mut self, value: &mut serde_json::Value) -> Result<()> {
+        match value {
+            serde_json::Value::String(text) => *text = self.rewrite(text)?,
+            serde_json::Value::Array(items) => {
+                for item in items { self.rewrite_value(item)?; }
+            }
+            serde_json::Value::Object(fields) => {
+                for item in fields.values_mut() { self.rewrite_value(item)?; }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationTools {
@@ -295,7 +430,7 @@ impl Store {
     /// The version lives in SQLite's `PRAGMA user_version`, so the store can
     /// tell which additive steps have already run and can refuse to open a
     /// database written by a **newer** build instead of corrupting it.
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 
     /// The schema version recorded in the database.
     fn schema_version(connection: &Connection) -> Result<u32> {
@@ -528,6 +663,14 @@ impl Store {
                 Self::SCHEMA_VERSION
             ));
         }
+        if version < 2 {
+            connection.execute_batch("CREATE TABLE IF NOT EXISTS pending_turns (
+                conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+                id TEXT NOT NULL UNIQUE,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );").map_err(db_error)?;
+        }
         let has_error: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='error')",
@@ -595,6 +738,36 @@ impl Store {
             .map_err(db_error)?;
         crate::presentation_store::recover_interrupted(&self.connection)?;
         Ok(())
+    }
+    /// Reconcile an abandoned foreground turn while its conversation lock is
+    /// held and the live registry has been checked by the caller. A tool may
+    /// have escaped the dropped future, so leave its streaming audit row alone:
+    /// changing that status could invalidate native context if it later settles.
+    pub fn recover_orphaned_turn(&self, conversation_id: &str) -> Result<()> {
+        let needs_recovery: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE conversation_id=?1
+             AND (checkpoint IS NULL OR checkpoint != 'subagent') AND status IN
+             ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round')
+             UNION ALL SELECT 1 FROM messages WHERE conversation_id=?1 AND role='assistant' AND status='streaming')",
+            params![conversation_id], |row| row.get(0),
+        ).map_err(db_error)?;
+        if !needs_recovery { return Ok(()); }
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        tx.execute(
+            "UPDATE runs SET status=CASE WHEN status='executing_tools' OR EXISTS (
+               SELECT 1 FROM messages WHERE conversation_id=?1 AND role='tool' AND status='streaming'
+             ) THEN 'outcome_unknown' ELSE 'cancelled' END,
+             error='The response connection ended unexpectedly. Review activity before retrying.', updated_at=?2
+             WHERE conversation_id=?1 AND (checkpoint IS NULL OR checkpoint != 'subagent') AND status IN
+             ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round')",
+            params![conversation_id, now()],
+        ).map_err(db_error)?;
+        tx.execute(
+            "UPDATE messages SET status='interrupted', error='The response connection ended unexpectedly.'
+             WHERE conversation_id=?1 AND role='assistant' AND status='streaming'",
+            params![conversation_id],
+        ).map_err(db_error)?;
+        tx.commit().map_err(db_error)
     }
     /// One-time migration: without a saved preference, seed the remembered
     /// selection from the most recently updated conversation that stored one,
@@ -848,6 +1021,16 @@ impl Store {
             .map_err(db_error)
     }
     pub fn save_artifact(&self, artifact: &crate::artifacts::ArtifactRecord) -> Result<()> {
+        if artifact.tool_name == "compact_conversation" {
+            let archived: i64 = self.connection.query_row(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM artifacts
+                 WHERE conversation_id=?1 AND tool_name='compact_conversation' AND id<>?2",
+                params![artifact.conversation_id, artifact.id], |row| row.get(0),
+            ).map_err(db_error)?;
+            if archived.saturating_add(artifact.size_bytes as i64) > Self::ARTIFACT_BUDGET_BYTES {
+                return Err("This conversation reached its durable compaction archive limit.".into());
+            }
+        }
         self.connection
             .execute(
                 "INSERT INTO artifacts(id, conversation_id, run_id, tool_name, mime_type, size_bytes, sha256, content, created_at)
@@ -921,15 +1104,14 @@ impl Store {
                 .execute(
                     "DELETE FROM artifacts WHERE id = (
                          SELECT id FROM artifacts
-                         WHERE conversation_id=?1 AND id IS NOT ?2
+                         WHERE conversation_id=?1 AND id IS NOT ?2 AND tool_name<>'compact_conversation'
                          ORDER BY created_at ASC, rowid ASC LIMIT 1
                      )",
                     params![conversation_id, newest],
                 )
                 .map_err(db_error)?;
             if removed == 0 {
-                // Only the newest artifact is left, and it alone is over the
-                // budget. Keep it: the transcript must stay readable.
+                // The newest artifact and durable compaction archives stay readable.
                 break;
             }
         }
@@ -1094,21 +1276,27 @@ impl Store {
             rusqlite::TransactionBehavior::Immediate,
         )
         .map_err(db_error)?;
-        transaction
+        self.replace_todos(conversation_id, todos)?;
+        self.record_plan_state(conversation_id, json!({"todos":todos}))?;
+        transaction.commit().map_err(db_error)?;
+        Ok(())
+    }
+
+    fn replace_todos(&self, conversation_id: &str, todos: &[crate::plans::Todo]) -> Result<()> {
+        self.connection
             .execute(
                 "DELETE FROM todos WHERE conversation_id=?1",
                 [conversation_id],
             )
             .map_err(db_error)?;
         for (index, todo) in todos.iter().enumerate() {
-            transaction
+            self.connection
                 .execute(
                     "INSERT INTO todos(conversation_id, idx, text, status, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![conversation_id, index as i64, todo.text, todo.status, todo.updated_at],
                 )
                 .map_err(db_error)?;
         }
-        transaction.commit().map_err(db_error)?;
         Ok(())
     }
     /// Append one todo item without re-emitting the full list (~30 tokens).
@@ -1175,22 +1363,35 @@ impl Store {
     }
     pub fn save_goal(&self, conversation_id: &str, objective: &str) -> Result<()> {
         crate::plans::validate_objective(objective)?;
-        self.connection
-            .execute(
-                "INSERT INTO goals(conversation_id, objective, updated_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(conversation_id) DO UPDATE SET objective=excluded.objective, updated_at=excluded.updated_at",
-                params![conversation_id, objective, now()],
-            )
-            .map_err(db_error)?;
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        self.set_goal_row(conversation_id, objective)?;
+        self.record_plan_state(conversation_id, json!({"goal":objective}))?;
+        tx.commit().map_err(db_error)
+    }
+
+    fn set_goal_row(&self, conversation_id: &str, objective: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO goals(conversation_id, objective, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(conversation_id) DO UPDATE SET objective=excluded.objective, updated_at=excluded.updated_at",
+            params![conversation_id, objective, now()],
+        ).map_err(db_error)?;
         Ok(())
     }
+
     pub fn clear_goal(&self, conversation_id: &str) -> Result<()> {
-        self.connection
-            .execute(
-                "DELETE FROM goals WHERE conversation_id=?1",
-                [conversation_id],
-            )
-            .map_err(db_error)?;
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        self.connection.execute("DELETE FROM goals WHERE conversation_id=?1", [conversation_id]).map_err(db_error)?;
+        self.record_plan_state(conversation_id, json!({"goal":null}))?;
+        tx.commit().map_err(db_error)
+    }
+
+    fn record_plan_state(&self, conversation_id: &str, payload: serde_json::Value) -> Result<()> {
+        let event = crate::sessions::SessionEvent {
+            id: uuid::Uuid::new_v4().to_string(), conversation_id: conversation_id.into(),
+            run_id: None, seq: self.next_session_event_seq(conversation_id)?, step_id: None,
+            tool_call_id: None, event_type: "plan_state".into(), payload, ignorable: true, created_at: now(),
+        };
+        self.insert_session_event(&event, event.seq)?;
         Ok(())
     }
     /// Store one code-review finding. Findings are durable per conversation,
@@ -1650,6 +1851,7 @@ impl Store {
         } else {
             None
         };
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
         let mut forked = self.create_conversation()?;
         forked.title = format!("Fork of {}", source.title);
         forked.provider_id = source.provider_id;
@@ -1669,27 +1871,21 @@ impl Store {
                 ..freeze
             });
         }
+        let mut artifacts = ForkArtifacts { store: self, source: source_id, target: &forked.id, ids: Default::default() };
+        let model_contents = self.model_contents(source_id)?;
         for message in prefix {
-            let id = uuid::Uuid::new_v4().to_string();
-            self.connection
-                .execute(
-                    "INSERT INTO messages(id, conversation_id, role, content, reasoning, status, created_at, error)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![id, forked.id, message.role, message.content, message.reasoning, message.status, message.created_at, message.error],
-                )
-                .map_err(db_error)?;
-            if let Some(metrics) = &message.metrics {
-                self.save_message_metrics(&id, metrics)?;
-            }
+            let id = self.copy_fork_message(&message, &forked.id, &mut artifacts, model_contents.get(&message.id))?;
             if message.id == through_message_id {
-                self.copy_model_content(&message.id, &id)?;
-                if let Some(snapshot) = &snapshot {
-                    self.save_model_history(&forked.id, &id, snapshot)?;
+                if let Some(mut snapshot) = snapshot {
+                    for content in &mut snapshot {
+                        artifacts.rewrite_value(content)?;
+                    }
+                    self.save_model_history(&forked.id, &id, &snapshot)?;
                 }
                 break;
             }
-            self.copy_model_content(&message.id, &id)?;
         }
+        tx.commit().map_err(db_error)?;
         Ok(forked)
     }
     /// Bounded cross-conversation search over message content and tool audits.
@@ -1774,11 +1970,11 @@ impl Store {
                 .collect();
 
             let mut seq: i64 = 1;
-            for (_id, role, content, reasoning, _status, created_at) in messages {
+            for (id, role, content, reasoning, _status, created_at) in messages {
                 if role == "user" {
                     let ev_id = uuid::Uuid::new_v4().to_string();
                     let payload =
-                        serde_json::json!({"role": "user", "content": content}).to_string();
+                        json!({"role": "user", "content": content, "messageId":id}).to_string();
                     let _ = connection.execute(
                         "INSERT INTO session_events (id, conversation_id, run_id, seq, step_id, tool_call_id, event_type, payload, ignorable, created_at)
                          VALUES (?1, ?2, NULL, ?3, 'user_input', NULL, 'user_msg', ?4, 0, ?5)",
@@ -1798,7 +1994,7 @@ impl Store {
                     }
                     let ev_id = uuid::Uuid::new_v4().to_string();
                     let payload =
-                        serde_json::json!({"role": "assistant", "content": content}).to_string();
+                        json!({"role": "assistant", "content": content, "messageId":id}).to_string();
                     let _ = connection.execute(
                         "INSERT INTO session_events (id, conversation_id, run_id, seq, step_id, tool_call_id, event_type, payload, ignorable, created_at)
                          VALUES (?1, ?2, NULL, ?3, 'step_end', NULL, 'step_end', ?4, 0, ?5)",
@@ -1807,7 +2003,7 @@ impl Store {
                     seq += 1;
                 } else if role == "tool" {
                     let ev_id = uuid::Uuid::new_v4().to_string();
-                    let payload = serde_json::json!({"result": content}).to_string();
+                    let payload = json!({"result": content,"messageId":id}).to_string();
                     let _ = connection.execute(
                         "INSERT INTO session_events (id, conversation_id, run_id, seq, step_id, tool_call_id, event_type, payload, ignorable, created_at)
                          VALUES (?1, ?2, NULL, ?3, 'tool_result', NULL, 'tool_result', ?4, 0, ?5)",
@@ -1923,6 +2119,30 @@ impl Store {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_error)
     }
+    /// Read a fixed journal prefix in pages. Replay snapshots the high-water
+    /// mark before reading; a live writer cannot extend the replay.
+    pub(crate) fn session_event_prefix(
+        &self,
+        conversation_id: &str,
+        cutoff: Option<u64>,
+    ) -> Result<Vec<crate::sessions::SessionEvent>> {
+        const PAGE: u32 = 5000;
+        let cutoff = cutoff.unwrap_or(self.next_session_event_seq(conversation_id)?.saturating_sub(1));
+        let mut from = 0;
+        let mut events = Vec::new();
+        while from <= cutoff {
+            let mut page = self.session_events(conversation_id, Some(from), Some(PAGE))?;
+            page.retain(|event| event.seq <= cutoff);
+            let last = page.last().map(|event| event.seq);
+            events.append(&mut page);
+            match last {
+                Some(seq) if seq < cutoff && seq < i64::MAX as u64 => from = seq + 1,
+                _ => break,
+            }
+        }
+        Ok(events)
+    }
+
     pub fn fork_session_events(
         &self,
         source_id: &str,
@@ -1965,105 +2185,250 @@ impl Store {
             .map_err(db_error)?
             .ok_or_else(|| "Source conversation no longer exists.".to_string())?;
 
-        let events = self.session_events(source_id, Some(0), Some(10000))?;
-        let filtered: Vec<_> = events.into_iter().filter(|e| e.seq <= up_to_seq).collect();
-        if filtered.is_empty() {
+        let events = self.session_event_prefix(source_id, Some(up_to_seq))?;
+        if events.is_empty() {
             return Err("No events found up to the specified sequence number.".into());
         }
-
         let mut forked = self.create_conversation()?;
         forked.title = format!("Fork of {}", source.title);
         forked.provider_id = source.provider_id;
         forked.model_id = source.model_id;
-        self.connection
-            .execute(
-                "UPDATE conversations SET title=?1, updated_at=?2, provider_id=?3, model_id=?4 WHERE id=?5",
-                params![forked.title, now(), forked.provider_id, forked.model_id, forked.id],
-            )
-            .map_err(db_error)?;
-
-        if let Ok(tools) = self.conversation_tools(source_id) {
-            let _ = self.save_conversation_tools(&forked.id, &tools);
+        forked.provider_selection_required = source.provider_selection_required;
+        self.connection.execute(
+            "UPDATE conversations SET title=?1, provider_id=?2, model_id=?3, provider_selection_required=?4 WHERE id=?5",
+            params![forked.title, forked.provider_id, forked.model_id, forked.provider_selection_required, forked.id],
+        ).map_err(db_error)?;
+        self.save_conversation_tools(&forked.id, &self.conversation_tools(source_id)?)?;
+        if let Some(preset) = self.connection.query_row(
+            "SELECT preset FROM conversation_presets WHERE conversation_id=?1",
+            [source_id], |row| row.get::<_, String>(0),
+        ).optional().map_err(db_error)? {
+            self.save_conversation_preset(&forked.id, &preset)?;
         }
-        if let Ok(Some(freeze)) = self.prompt_freeze(source_id) {
-            let _ = self.save_prompt_freeze(&PromptFreeze {
-                conversation_id: forked.id.clone(),
-                ..freeze
-            });
+        if let Some(freeze) = self.prompt_freeze(source_id)? {
+            self.save_prompt_freeze(&PromptFreeze { conversation_id: forked.id.clone(), ..freeze })?;
         }
 
-        // session_events.run_id references runs(id) with ON DELETE SET NULL:
-        // only preserve lineage when the run row actually exists (e.g. real
-        // turns). Test/ad-hoc events with dangling run ids must not fail fork.
-        let run_exists = |run_id: &Option<String>| -> bool {
-            match run_id {
-                None => true,
-                Some(id) => self
-                    .connection
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1)",
-                        [id],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .unwrap_or(false),
-            }
+        let messages = self.messages(source_id)?;
+        let contents = self.model_contents(source_id)?;
+        let by_id: std::collections::HashMap<_, _> = messages.iter().map(|m| (m.id.as_str(), m)).collect();
+        let mut legacy_turn: Option<(Option<String>, &[Message])> = None;
+        let mut ids = std::collections::HashMap::new();
+        let mut runs = std::collections::HashMap::new();
+        let mut artifacts = ForkArtifacts {
+            store: self, source: source_id, target: &forked.id, ids: Default::default(),
         };
-        let count = filtered.len() as u64;
-        for ev in filtered {
-            let new_event = crate::sessions::SessionEvent {
-                id: uuid::Uuid::new_v4().to_string(),
-                conversation_id: forked.id.clone(),
-                run_id: if run_exists(&ev.run_id) {
-                    ev.run_id.clone()
-                } else {
-                    None
-                },
-                seq: ev.seq,
-                step_id: ev.step_id,
-                tool_call_id: ev.tool_call_id,
-                event_type: ev.event_type,
-                payload: ev.payload,
-                ignorable: ev.ignorable,
-                created_at: ev.created_at,
+        let mut todos = None;
+        let mut goal = None;
+        let mut legacy_todos = Vec::new();
+        let mut legacy_goal = None;
+        let mut recorded_goal = false;
+        let mut legacy_plan_calls = std::collections::HashMap::new();
+        let mut checkpoint = None;
+        let mut legacy_user = None;
+        let count = events.len() as u64;
+        for mut event in events {
+            if let Some(call_id) = &event.tool_call_id {
+                let key = (event.run_id.clone(), event.step_id.clone(), call_id.clone());
+                if event.event_type == "tool_call"
+                    && event.payload["name"].as_str().is_some_and(|name| matches!(name, "todo_write" | "todo_add" | "todo_update" | "goal_set" | "goal_clear"))
+                {
+                    legacy_plan_calls.insert(key, event.payload.clone());
+                } else if event.event_type == "tool_result" {
+                    if let Some(call) = legacy_plan_calls.remove(&key) {
+                        replay_legacy_plan_result(
+                            call["name"].as_str().unwrap_or_default(), &call["arguments"],
+                            event.payload.get("result").unwrap_or(&event.payload), event.created_at,
+                            todos.is_none().then_some(&mut legacy_todos),
+                            (!recorded_goal).then_some(&mut legacy_goal),
+                        );
+                    }
+                }
+            }
+            let role = match event.event_type.as_str() {
+                "user_msg" => Some("user"),
+                "turn_end" | "assistant_msg" => Some("assistant"),
+                "step_end" if event.payload["role"] == "assistant" => Some("assistant"),
+                "tool_result" => Some("tool"),
+                _ => None,
             };
-            self.append_session_event(&new_event)?;
+            if let Some(role) = role {
+                let mut source_message = event.payload["messageId"].as_str()
+                    .and_then(|id| by_id.get(id).copied().filter(|m| m.role == role));
+                if role == "user" {
+                    if let Some(recorded) = event.payload["content"].as_str() {
+                        source_message = source_message.filter(|message| message.content == recorded);
+                    }
+                    legacy_turn = None;
+                    if source_message.is_none() {
+                        if let Some(content) = event.payload["content"].as_str() {
+                            let mut matches = messages.iter().enumerate()
+                                .filter(|(_, m)| m.role == "user" && m.content == content);
+                            if let Some((start, user)) = matches.next().filter(|_| matches.next().is_none()) {
+                                let tail = &messages[start + 1..];
+                                let end = tail.iter().position(|m| m.role == "user").unwrap_or(tail.len());
+                                source_message = Some(user);
+                                legacy_turn = Some((event.run_id.clone(), &tail[..end]));
+                            }
+                        }
+                    }
+                } else if let Some((_, turn)) = legacy_turn.as_ref().filter(|(run, _)| *run == event.run_id) {
+                    if source_message.is_none() && role == "assistant" && event.event_type == "turn_end" {
+                        let mut candidates = turn.iter().filter(|m| m.role == "assistant"
+                            && event.payload["answerLength"].as_u64() == Some(m.content.len() as u64)
+                            && event.payload["status"].as_str() == Some(m.status.as_str()));
+                        source_message = candidates.next().filter(|_| candidates.next().is_none());
+                    }
+                    if source_message.is_none() && role == "tool" {
+                        if let Some(call) = event.tool_call_id.as_deref() {
+                            let mut candidates = turn.iter().filter(|m| {
+                                if m.role != "tool" || m.status != "complete" { return false; }
+                                let Ok(audit) = serde_json::from_str::<serde_json::Value>(&m.content) else { return false; };
+                                audit["request"]["callId"] == call
+                                    && audit["request"]["stepId"].as_str() == event.step_id.as_deref()
+                            });
+                            source_message = candidates.next().filter(|_| candidates.next().is_none());
+                        }
+                    }
+                }
+                if let Some(message) = source_message {
+                    if !ids.contains_key(&message.id) {
+                        let id = self.copy_fork_message(message, &forked.id, &mut artifacts, contents.get(&message.id))?;
+                        ids.insert(message.id.clone(), id);
+                    }
+                    event.payload["messageId"] = json!(ids[&message.id]);
+                } else if let Some(content) = event.payload["content"].as_str()
+                    .filter(|_| matches!(role, "user" | "assistant"))
+                {
+                    // Legacy journal rows carry the visible content but no
+                    // durable association. Replay that content directly.
+                    let content = artifacts.rewrite(content)?;
+                    let row = self.insert_message_row(&forked.id, role, &content, "complete", event.created_at)?;
+                    event.payload["messageId"] = json!(row.id);
+                    legacy_user = (role == "user").then_some(event.run_id.clone());
+                } else if role == "assistant" && legacy_user.as_ref() == Some(&event.run_id) {
+                    if let Some(answer) = event.payload["answer"].as_str() {
+                        let answer = artifacts.rewrite(answer)?;
+                        let row = self.insert_message_row(&forked.id, role, &answer, "complete", event.created_at)?;
+                        event.payload["messageId"] = json!(row.id);
+                    }
+                    legacy_user = None;
+                }
+            }
+            if event.event_type == "turn_end" {
+                if let Some(audit_ids) = event.payload["toolAuditIds"].as_array_mut() {
+                    for value in audit_ids.iter_mut() {
+                        if let Some(message) = value.as_str().and_then(|id| by_id.get(id))
+                            .filter(|m| m.role == "tool" && m.status == "complete")
+                        {
+                            if !ids.contains_key(&message.id) {
+                                let id = self.copy_fork_message(message, &forked.id, &mut artifacts, contents.get(&message.id))?;
+                                ids.insert(message.id.clone(), id);
+                            }
+                            *value = json!(ids[&message.id]);
+                        } else {
+                            *value = serde_json::Value::Null;
+                        }
+                    }
+                    audit_ids.retain(|value| !value.is_null());
+                }
+            }
+            if let Some(value) = event.payload.get("todos").filter(|_| event.event_type == "plan_state") {
+                todos = Some(serde_json::from_value::<Vec<crate::plans::Todo>>(value.clone()).map_err(|e| e.to_string())?);
+            }
+            if let Some(value) = event.payload.get("goal").filter(|_| event.event_type == "plan_state") {
+                goal = value.as_str().map(str::to_owned);
+                recorded_goal = true;
+            }
+            if event.event_type == "compaction" {
+                if let Some((id, cutoff)) = event.payload["artifact"].as_str().zip(event.payload["cutoff"].as_i64()) {
+                    checkpoint = Some((id.to_string(), cutoff, event.created_at));
+                }
+            }
+
+            if let Some(id) = event.payload["failedMessageId"].as_str() {
+                event.payload["failedMessageId"] = json!(ids.get(id));
+            }
+            if let Some(old_id) = event.run_id.take() {
+                if !runs.contains_key(&old_id) {
+                    if let Some(mut run) = self.run(&old_id)?.filter(|run| run.conversation_id == source_id) {
+                        run.id = format!("run-{}", uuid::Uuid::new_v4());
+                        run.conversation_id = forked.id.clone();
+                        run.status = crate::agent_run::RunState::Cancelled;
+                        run.checkpoint = None;
+                        run.error = None;
+                        run.updated_at = event.created_at;
+                        self.save_run(&run)?;
+                        runs.insert(old_id.clone(), run.id);
+                    }
+                }
+                event.run_id = runs.get(&old_id).cloned();
+                if let Some(new_id) = event.run_id.as_deref() {
+                    remap_fork_run(&mut event.payload, &old_id, new_id);
+                }
+                if event.event_type == "turn_end" {
+                    if let Some(run_id) = &event.run_id {
+                        use crate::agent_run::RunState;
+                        let status = match event.payload["status"].as_str() {
+                            Some("complete") => RunState::Completed,
+                            Some("error") => RunState::Failed,
+                            _ => RunState::Cancelled,
+                        };
+                        self.update_run_status(run_id, status, event.payload["error"].as_str(), None)?;
+                    }
+                }
+            }
+            event.id = uuid::Uuid::new_v4().to_string();
+            event.conversation_id = forked.id.clone();
+            artifacts.rewrite_value(&mut event.payload)?;
+            self.insert_session_event(&event, event.seq)?;
         }
-
-        let source_messages = self.messages(source_id)?;
-        // The fork point is a sequence number, not a wall clock: events and
-        // messages share no timestamp domain (fixtures use fixed created_at),
-        // so the number of source messages covered is derived from the forked
-        // event count proportionally. In production the two streams advance
-        // together, so copying min(forked_events, all messages) is exact for
-        // the common case and never drops history in tests.
-        let take = (count as usize).min(source_messages.len());
-
-        for msg in source_messages.into_iter().take(take) {
-            let id = uuid::Uuid::new_v4().to_string();
-            let _ = self.connection.execute(
-                "INSERT INTO messages(id, conversation_id, role, content, reasoning, status, created_at, error)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![id, forked.id, msg.role, msg.content, msg.reasoning, msg.status, msg.created_at, msg.error],
-            );
-            self.copy_model_content(&msg.id, &id)?;
-            if let Some(metrics) = &msg.metrics {
-                self.save_message_metrics(&id, metrics)?;
+        let todos = todos.unwrap_or(legacy_todos);
+        if !todos.is_empty() {
+            self.replace_todos(&forked.id, &todos)?;
+        }
+        if let Some(goal) = if recorded_goal { goal } else { legacy_goal } {
+            self.set_goal_row(&forked.id, &goal)?;
+        }
+        if let Some((id, cutoff, created_at)) = checkpoint {
+            let artifact_id = artifacts.rewrite(&id)?;
+            if artifact_id != id {
+                self.save_compaction(&crate::compaction::Checkpoint {
+                    conversation_id: forked.id.clone(), cutoff, artifact_id, created_at,
+                })?;
             }
         }
-
-        // Carry over conversation-scoped harness state so the fork keeps its
-        // preset, plan, goal, and tool choices (best-effort; never fails fork).
-        if let Ok(preset) = self.conversation_preset(source_id) {
-            let _ = self.save_conversation_preset(&forked.id, &preset);
-        }
-        if let Ok(todos) = self.todos(source_id) {
-            let _ = self.save_todos(&forked.id, &todos);
-        }
-        if let Ok(Some(goal)) = self.goal(source_id) {
-            let _ = self.save_goal(&forked.id, &goal);
-        }
-
+        crate::workspace_ui::inherit_task_meta(self, source_id, &forked.id)?;
         Ok((forked, count))
+    }
+
+    fn copy_fork_message(
+        &self,
+        message: &Message,
+        conversation_id: &str,
+        artifacts: &mut ForkArtifacts<'_>,
+        model_content: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let content = artifacts.rewrite(&message.content)?;
+        self.connection.execute(
+            "INSERT INTO messages(id, conversation_id, role, content, reasoning, status, created_at, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, conversation_id, message.role, content, message.reasoning, message.status, message.created_at, message.error],
+        ).map_err(db_error)?;
+        if let Some(content) = model_content {
+            let mut content = content.clone();
+            artifacts.rewrite_value(&mut content)?;
+            if message.role == "tool" {
+                self.save_native_tool_round(&id, &content)?;
+            } else {
+                self.save_model_content(&id, &content)?;
+            }
+        }
+        if let Some(metrics) = &message.metrics {
+            self.save_message_metrics(&id, metrics)?;
+        }
+        Ok(id)
     }
     pub fn artifact(&self, id: &str) -> Result<Option<crate::artifacts::ArtifactRecord>> {
         self.connection
@@ -2243,10 +2608,10 @@ impl Store {
         Ok(())
     }
     pub fn delete_conversation(&self, id: &str) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM conversations WHERE id=?1", [id])
-            .map_err(db_error)?;
-        Ok(())
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        self.connection.execute("DELETE FROM conversations WHERE id=?1", [id]).map_err(db_error)?;
+        self.connection.execute("DELETE FROM settings WHERE key=?1", [format!("failed_model_round:{id}")]).map_err(db_error)?;
+        tx.commit().map_err(db_error)
     }
     pub fn conversation_model(&self, id: &str) -> Result<(ModelSelection, bool)> {
         let row: Option<(Option<String>, Option<String>, i64)> = self
@@ -2528,6 +2893,24 @@ impl Store {
         self.connection.execute("INSERT INTO message_inference(message_id,metrics_json) VALUES(?1,?2) ON CONFLICT(message_id) DO UPDATE SET metrics_json=excluded.metrics_json", params![message_id, value]).map_err(db_error)?;
         Ok(())
     }
+    pub(crate) fn latest_turn_audit_ids(&self, conversation_id: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM messages WHERE conversation_id=?1 AND role='tool' AND status='complete'
+             AND rowid > (SELECT COALESCE(MAX(rowid),0) FROM messages WHERE conversation_id=?1 AND role='user')
+             ORDER BY rowid",
+        ).map_err(db_error)?;
+        let rows = statement.query_map([conversation_id], |row| row.get(0)).map_err(db_error)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(db_error)
+    }
+
+    pub(crate) fn next_message_time(&self, conversation_id: &str) -> Result<i64> {
+        let last = self.connection.query_row(
+            "SELECT MAX(created_at) FROM messages WHERE conversation_id=?1",
+            [conversation_id], |row| row.get::<_, Option<i64>>(0),
+        ).map_err(db_error)?;
+        Ok(last.map_or_else(now, |last| now().max(last.saturating_add(1))))
+    }
+
     pub fn append_message(
         &self,
         conversation_id: &str,
@@ -2535,8 +2918,23 @@ impl Store {
         content: &str,
         status: &str,
     ) -> Result<Message> {
-        if content.len() > 1_048_576 {
-            return Err("Message exceeds the 1 MiB limit.".into());
+        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        let message = self.insert_message_row(conversation_id, role, content, status, self.next_message_time(conversation_id)?)?;
+        tx.commit().map_err(db_error)?;
+        Ok(message)
+    }
+
+    pub(crate) fn insert_message_row(
+        &self,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+        status: &str,
+        created_at: i64,
+    ) -> Result<Message> {
+        let limit = if role == "tool" { crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES } else { 1_048_576 };
+        if content.len() > limit {
+            return Err(format!("Message exceeds the {limit}-byte storage limit."));
         }
         let message = Message {
             metrics: None,
@@ -2547,21 +2945,54 @@ impl Store {
             content: content.into(),
             reasoning: String::new(),
             status: status.into(),
-            created_at: now(),
+            created_at,
         };
-        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
-        transaction.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES (?1,?2,?3,?4,?5,?6)", params![message.id,conversation_id,role,content,status,message.created_at]).map_err(db_error)?;
-        transaction
+        self.connection.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES (?1,?2,?3,?4,?5,?6)", params![message.id,conversation_id,role,content,status,message.created_at]).map_err(db_error)?;
+        self.connection
             .execute(
                 "UPDATE conversations SET updated_at=?1 WHERE id=?2",
                 params![now(), conversation_id],
             )
             .map_err(db_error)?;
-        transaction.commit().map_err(db_error)?;
         Ok(message)
     }
     pub fn begin_turn(&self, conversation_id: &str, content: &str) -> Result<Message> {
-        self.begin_turn_inner(conversation_id, content, None)
+        self.begin_turn_inner(conversation_id, content, None, None)
+    }
+
+    pub fn pending_turn(&self, conversation_id: &str) -> Result<Option<PendingTurn>> {
+        self.connection.query_row(
+            "SELECT id, conversation_id, content, created_at FROM pending_turns WHERE conversation_id=?1",
+            [conversation_id],
+            |row| Ok(PendingTurn { id: row.get(0)?, conversation_id: row.get(1)?, content: row.get(2)?, created_at: row.get(3)? }),
+        ).optional().map_err(db_error)
+    }
+
+    pub fn pending_turn_conversations(&self) -> Result<Vec<String>> {
+        let mut stmt = self.connection.prepare("SELECT conversation_id FROM pending_turns ORDER BY created_at").map_err(db_error)?;
+        let rows = stmt.query_map([], |row| row.get(0)).map_err(db_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    /// Save a request before it can wait for an execution slot. A recovered
+    /// request must name the exact saved record and use its original content.
+    pub fn stage_pending_turn(&self, conversation_id: &str, content: &str, recovery_id: Option<&str>) -> Result<PendingTurn> {
+        let content = content.trim();
+        if content.is_empty() || content.len() > 1_048_576 { return Err("Enter a message no larger than 1 MiB.".into()); }
+        if let Some(saved) = self.pending_turn(conversation_id)? {
+            if recovery_id == Some(saved.id.as_str()) && saved.content == content { return Ok(saved); }
+            return Err("This conversation has a saved unsent request. Send it or discard its recovery copy first.".into());
+        }
+        if recovery_id.is_some() { return Err("The saved request no longer exists; it was not sent.".into()); }
+        let pending = PendingTurn { id: uuid::Uuid::new_v4().to_string(), conversation_id: conversation_id.into(), content: content.into(), created_at: now() };
+        self.connection.execute("INSERT INTO pending_turns(conversation_id,id,content,created_at) VALUES(?1,?2,?3,?4)", params![conversation_id, pending.id, pending.content, pending.created_at]).map_err(db_error)?;
+        Ok(pending)
+    }
+
+    pub fn discard_pending_turn(&self, conversation_id: &str, id: &str) -> Result<()> {
+        let removed = self.connection.execute("DELETE FROM pending_turns WHERE conversation_id=?1 AND id=?2", params![conversation_id, id]).map_err(db_error)?;
+        if removed != 1 { return Err("The saved request no longer exists or changed.".into()); }
+        Ok(())
     }
 
     /// Persist the rendered user content atomically with the UI turn. Replaying
@@ -2573,7 +3004,11 @@ impl Store {
         content: &str,
         model_content: &serde_json::Value,
     ) -> Result<Message> {
-        self.begin_turn_inner(conversation_id, content, Some(model_content))
+        self.begin_turn_inner(conversation_id, content, Some(model_content), None)
+    }
+
+    pub fn begin_pending_turn(&self, conversation_id: &str, content: &str, model_content: &serde_json::Value, pending_id: &str) -> Result<Message> {
+        self.begin_turn_inner(conversation_id, content, Some(model_content), Some(pending_id))
     }
 
     fn begin_turn_inner(
@@ -2581,11 +3016,13 @@ impl Store {
         conversation_id: &str,
         content: &str,
         model_content: Option<&serde_json::Value>,
+        pending_id: Option<&str>,
     ) -> Result<Message> {
         let content = content.trim();
         if content.is_empty() || content.len() > 1_048_576 {
             return Err("Enter a message no larger than 1 MiB.".into());
         }
+        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
         let assistant = Message {
             metrics: None,
             id: uuid::Uuid::new_v4().to_string(),
@@ -2594,10 +3031,13 @@ impl Store {
             content: String::new(),
             reasoning: String::new(),
             status: "streaming".into(),
-            created_at: now(),
+            created_at: self.next_message_time(conversation_id)?,
             error: None,
         };
-        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        if let Some(id) = pending_id {
+            let removed = transaction.execute("DELETE FROM pending_turns WHERE conversation_id=?1 AND id=?2 AND content=?3", params![conversation_id, id, content]).map_err(db_error)?;
+            if removed != 1 { return Err("The saved request changed or was discarded; it was not sent.".into()); }
+        }
         let existing: bool = transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id=?1)",
@@ -2605,6 +3045,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(db_error)?;
+        transaction.execute("DELETE FROM settings WHERE key=?1", [format!("failed_model_round:{conversation_id}")]).map_err(db_error)?;
         let user_id = uuid::Uuid::new_v4().to_string();
         transaction.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'user',?3,'complete',?4)", params![user_id, conversation_id, content, assistant.created_at]).map_err(db_error)?;
         if let Some(model_content) = model_content {
@@ -2639,6 +3080,15 @@ impl Store {
         Ok(assistant)
     }
 
+    pub(crate) fn turn_user_message_id(&self, assistant_id: &str) -> Result<String> {
+        self.connection.query_row(
+            "SELECT user.id FROM messages assistant JOIN messages user
+             ON user.rowid=assistant.rowid-1 AND user.conversation_id=assistant.conversation_id
+             WHERE assistant.id=?1 AND assistant.role='assistant' AND user.role='user'",
+            [assistant_id], |row| row.get(0),
+        ).map_err(db_error)
+    }
+
     pub fn save_model_content(&self, message_id: &str, content: &serde_json::Value) -> Result<()> {
         self.connection
             .execute(
@@ -2656,8 +3106,8 @@ impl Store {
         content: &serde_json::Value,
     ) -> Result<()> {
         let content = content.to_string();
-        if content.len() > 5 * 1024 * 1024 {
-            return Err("Native tool-round context exceeds5MiB.".into());
+        if content.len() > 2 * crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES {
+            return Err("Native tool-round context exceeds its storage limit.".into());
         }
         let changed = self
             .connection
@@ -2671,24 +3121,6 @@ impl Store {
         if changed != 1 {
             return Err("Native context requires an existing tool audit.".into());
         }
-        Ok(())
-    }
-
-    fn copy_model_content(&self, source_id: &str, target_id: &str) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO model_message_contents(message_id,content_json)
-             SELECT ?2,content_json FROM model_message_contents WHERE message_id=?1",
-                params![source_id, target_id],
-            )
-            .map_err(db_error)?;
-        self.connection
-            .execute(
-                "INSERT INTO native_tool_rounds(message_id,content_json)
-            SELECT ?2,content_json FROM native_tool_rounds WHERE message_id=?1",
-                params![source_id, target_id],
-            )
-            .map_err(db_error)?;
         Ok(())
     }
 
@@ -3169,6 +3601,67 @@ mod tests {
             store.message_status(&audit.id).unwrap().as_deref(),
             Some("interrupted")
         );
+    }
+    #[test]
+    fn orphan_recovery_rolls_back_the_run_if_message_update_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = super::Store::open(&temp.path().join("orphan.sqlite")).unwrap();
+        let chat = store.create_conversation().unwrap().id;
+        let assistant = store.append_message(&chat, "assistant", "partial", "streaming").unwrap();
+        store.append_message(&chat, "tool", "{}", "streaming").unwrap();
+        store.save_run(&crate::agent_run::RunRecord {
+            id: "orphan".into(), conversation_id: chat.clone(), status: crate::agent_run::RunState::Generating,
+            model_provider: None, model_id: None, checkpoint: None, error: None, created_at: 1, updated_at: 1,
+        }).unwrap();
+        store.connection.execute_batch("CREATE TRIGGER fail_orphan_update BEFORE UPDATE ON messages BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+        assert!(store.recover_orphaned_turn(&chat).is_err());
+        assert_eq!(store.run("orphan").unwrap().unwrap().status, crate::agent_run::RunState::Generating);
+        assert_eq!(store.message_status(&assistant.id).unwrap().as_deref(), Some("streaming"));
+        store.connection.execute_batch("DROP TRIGGER fail_orphan_update;").unwrap();
+        store.recover_orphaned_turn(&chat).unwrap();
+        assert_eq!(store.run("orphan").unwrap().unwrap().status, crate::agent_run::RunState::OutcomeUnknown);
+        assert_eq!(store.message_status(&assistant.id).unwrap().as_deref(), Some("interrupted"));
+    }
+    #[test]
+    fn pending_turn_survives_reopen_and_is_consumed_atomically_with_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pending.sqlite");
+        let store = super::Store::open(&path).unwrap();
+        let chat = store.create_conversation().unwrap().id;
+        let pending = store.stage_pending_turn(&chat, "queued request", None).unwrap();
+        assert!(store.stage_pending_turn(&chat, "another request", None).is_err());
+        assert!(store.stage_pending_turn(&chat, "changed content", Some(&pending.id)).is_err());
+        let reopened = super::Store::open(&path).unwrap();
+        reopened.recover_interrupted().unwrap();
+        assert_eq!(reopened.pending_turn(&chat).unwrap(), Some(pending.clone()));
+        assert!(reopened.discard_pending_turn(&chat, "wrong-id").is_err());
+        assert!(reopened.begin_pending_turn(&chat, "queued request", &serde_json::json!("rendered"), "wrong-id").is_err());
+        assert!(reopened.messages(&chat).unwrap().is_empty());
+        reopened.connection.execute_batch("CREATE TRIGGER fail_pending_assistant BEFORE INSERT ON messages WHEN NEW.role='assistant' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+        assert!(reopened.begin_pending_turn(&chat, "queued request", &serde_json::json!("rendered"), &pending.id).is_err());
+        assert_eq!(reopened.pending_turn(&chat).unwrap(), Some(pending.clone()));
+        assert!(reopened.messages(&chat).unwrap().is_empty());
+        reopened.connection.execute_batch("DROP TRIGGER fail_pending_assistant;").unwrap();
+        reopened.begin_pending_turn(&chat, "queued request", &serde_json::json!("rendered"), &pending.id).unwrap();
+        assert!(reopened.pending_turn(&chat).unwrap().is_none());
+        assert_eq!(reopened.messages(&chat).unwrap().len(), 2);
+        assert!(reopened.begin_pending_turn(&chat, "queued request", &serde_json::json!("rendered"), &pending.id).is_err());
+        assert_eq!(reopened.messages(&chat).unwrap().len(), 2);
+    }
+    #[test]
+    fn schema_one_adds_pending_turns_without_losing_conversations() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("old.sqlite");
+        let store = super::Store::open(&path).unwrap();
+        let chat = store.create_conversation().unwrap().id;
+        store.connection.execute_batch("DROP TABLE pending_turns; PRAGMA user_version=1;").unwrap();
+        drop(store);
+        let reopened = super::Store::open(&path).unwrap();
+        assert!(reopened.conversation_exists(&chat).unwrap());
+        let saved = reopened.stage_pending_turn(&chat, "queued", None).unwrap();
+        assert_eq!(reopened.pending_turn_conversations().unwrap(), vec![chat.clone()]);
+        reopened.delete_conversation(&chat).unwrap();
+        assert!(reopened.pending_turn(&saved.conversation_id).unwrap().is_none());
     }
     #[test]
     fn latest_run_recovers_legacy_pause_and_does_not_leak_it_into_new_turns() {
@@ -3983,6 +4476,42 @@ mod tests {
     }
 
     #[test]
+    fn chat_contexts_remain_independent_when_another_chat_compacts_or_is_deleted() {
+        let store = Store::open_memory().unwrap();
+        let first = store.create_conversation().unwrap();
+        let second = store.create_conversation().unwrap();
+        let fresh = store.create_conversation().unwrap();
+        let mut transcripts = Vec::new();
+        for (chat, secret) in [(&first, "first private context"), (&second, "second private context")] {
+            let reply = store.begin_turn(&chat.id, secret).unwrap();
+            store.finish_message(&reply.id, "Done", "", "complete", None).unwrap();
+            let transcript = vec![
+                serde_json::json!({"role":"user","content":secret}),
+                serde_json::json!({"role":"assistant","content":"Done"}),
+            ];
+            store.save_model_history(&chat.id, &reply.id, &transcript).unwrap();
+            transcripts.push(transcript);
+        }
+        assert_eq!(store.cached_model_history(&first.id).unwrap().unwrap(), transcripts[0]);
+        assert_eq!(store.cached_model_history(&second.id).unwrap().unwrap(), transcripts[1]);
+        assert!(store.messages(&fresh.id).unwrap().is_empty());
+        assert!(store.cached_model_history(&fresh.id).unwrap().is_none());
+        assert!(store.model_contents(&fresh.id).unwrap().is_empty());
+        store.save_compaction(&crate::compaction::Checkpoint {
+            conversation_id: first.id.clone(), cutoff: 0,
+            artifact_id: "first-only-checkpoint".into(), created_at: now(),
+        }).unwrap();
+        assert!(store.cached_model_history(&first.id).unwrap().is_none());
+        assert!(store.compaction(&second.id).unwrap().is_none());
+        assert_eq!(store.cached_model_history(&second.id).unwrap().unwrap(), transcripts[1]);
+        store.delete_conversation(&first.id).unwrap();
+        assert_eq!(store.cached_model_history(&second.id).unwrap().unwrap(), transcripts[1]);
+        let rows = store.messages(&second.id).unwrap();
+        assert!(rows.iter().all(|row| row.conversation_id == second.id));
+        assert_eq!(rows[0].content, "second private context");
+    }
+
+    #[test]
     fn explicit_compaction_invalidates_model_snapshot_and_deletion_cascades() {
         let store = Store::open_memory().unwrap();
         let conversation = store.create_conversation().unwrap();
@@ -4169,10 +4698,10 @@ mod tests {
     fn forked_conversation_keeps_message_history_and_run_lineage() {
         let store = Store::open_memory().unwrap();
         let conv = store.create_conversation().unwrap();
-        store
+        let user = store
             .append_message(&conv.id, "user", "Plan the release", "complete")
             .unwrap();
-        store
+        let assistant = store
             .append_message(&conv.id, "assistant", "Here is the plan", "complete")
             .unwrap();
         // Real run row so session_events.run_id FK lineage is preserved.
@@ -4200,7 +4729,7 @@ mod tests {
                     step_id: Some("step-0".into()),
                     tool_call_id: None,
                     event_type: event_type.into(),
-                    payload: serde_json::json!({}),
+                    payload: json!({"messageId": if seq == 1 { &user.id } else { &assistant.id }}),
                     ignorable: false,
                     created_at: 1000,
                 })
@@ -4213,7 +4742,10 @@ mod tests {
         let history = crate::history::model_history(&messages).unwrap();
         assert!(history.iter().any(|m| m["role"] == "user"));
         let events = store.session_events(&forked.id, None, None).unwrap();
-        assert!(events.iter().all(|e| e.run_id.as_deref() == Some("run-1")));
+        let new_run = events[0].run_id.as_deref().unwrap();
+        assert_ne!(new_run, "run-1");
+        assert!(events.iter().all(|e| e.run_id.as_deref() == Some(new_run)));
+        assert_eq!(store.run(new_run).unwrap().unwrap().conversation_id, forked.id);
     }
 
     #[test]
@@ -4249,4 +4781,62 @@ mod tests {
         let no_hits = store.search_sessions("nonexistent_needle_xyz", 10).unwrap();
         assert!(no_hits.is_empty());
     }
+
+    #[test]
+    fn journal_fork_pages_and_excludes_future_rows_while_copying_reachable_artifacts() {
+        use sha2::{Digest, Sha256};
+        let store = Store::open_memory().unwrap();
+        let source = store.create_conversation().unwrap().id;
+        let first = store.append_message(&source, "user", "original request", "complete").unwrap();
+        let second = store.append_message(&source, "user", "future instruction", "complete").unwrap();
+        let answer = store.append_message(&source, "assistant", "future answer", "complete").unwrap();
+        let image = crate::artifacts::ArtifactRecord {
+            id: "art_fixture_image".into(), conversation_id: source.clone(), run_id: None,
+            tool_name: "view_image".into(), mime_type: "image/png".into(), size_bytes: 4,
+            sha256: "image-checksum".into(), content: "data".into(), created_at: 1,
+        };
+        store.save_artifact(&image).unwrap();
+        let archived = json!({"messages":[{"imageArtifactId":image.id}]}).to_string();
+        let archive = crate::artifacts::ArtifactRecord {
+            id: "art_fixture_archive".into(), conversation_id: source.clone(), run_id: None,
+            tool_name: "compact_conversation".into(), mime_type: "application/json".into(),
+            size_bytes: archived.len(), sha256: format!("{:x}", Sha256::digest(archived.as_bytes())),
+            content: archived, created_at: 2,
+        };
+        store.save_artifact(&archive).unwrap();
+        let tx = store.connection.unchecked_transaction().unwrap();
+        for seq in 1..=5005 {
+            let (kind, payload) = match seq {
+                1 => ("user_msg", json!({"messageId":first.id})),
+                5001 => ("compaction", json!({"artifact":archive.id})),
+                5003 => ("user_msg", json!({"messageId":second.id})),
+                5005 => ("turn_end", json!({"messageId":answer.id, "status":"complete"})),
+                _ => ("step_start", json!({})),
+            };
+            let event = crate::sessions::SessionEvent {
+                id: format!("fixture-{seq}"), conversation_id: source.clone(), run_id: None, seq,
+                step_id: None, tool_call_id: None, event_type: kind.into(), payload, ignorable: false, created_at: seq as i64,
+            };
+            store.insert_session_event(&event, seq).unwrap();
+        }
+        tx.commit().unwrap();
+        store.save_goal(&source, "future goal").unwrap();
+        assert_eq!(store.session_event_prefix(&source, None).unwrap().len(), 5006);
+        let (fork, copied) = store.fork_session_events(&source, 5002).unwrap();
+        assert_eq!(copied, 5002);
+        let forked = store.messages(&fork.id).unwrap();
+        assert_eq!(forked.len(), 1);
+        assert_eq!(forked[0].content, "original request");
+        assert!(store.goal(&fork.id).unwrap().is_none());
+        let events = store.session_event_prefix(&fork.id, None).unwrap();
+        let fork_archive = store.artifact(events[5000].payload["artifact"].as_str().unwrap()).unwrap().unwrap();
+        assert_ne!(fork_archive.id, archive.id);
+        assert_eq!(fork_archive.conversation_id, fork.id);
+        let body: serde_json::Value = serde_json::from_str(&fork_archive.content).unwrap();
+        let copied_image = store.artifact(body["messages"][0]["imageArtifactId"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(copied_image.conversation_id, fork.id);
+        assert_eq!(copied_image.content, image.content);
+        assert_ne!(copied_image.id, image.id);
+    }
+
 }

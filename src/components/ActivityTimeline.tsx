@@ -3,8 +3,9 @@ import { ChevronRight } from 'lucide-react';
 import { api, nativeAvailable } from '../lib/api';
 import type { Message, SessionEvent } from '../lib/types';
 import { isPlanStateTool } from './PlanChecklist';
-import { MarkdownView } from './MarkdownView';
+import { ReasoningDisclosure } from './ReasoningDisclosure';
 import { TraceIcon, groupKindOf, toolKindOf } from './TraceIcon';
+import { reduceTurnItems, subscribeTurnItems, type TurnItem } from '../lib/turnItems';
 
 export function useSessionActivity(conversationId: string, generating: boolean) {
   const [events, setEvents] = useState<SessionEvent[]>([]);
@@ -40,6 +41,12 @@ export function useSessionActivity(conversationId: string, generating: boolean) 
       }
     }
     reload.current = () => void load();
+    const stopItems = subscribeTurnItems(conversationId, event => {
+      if (disposed) return;
+      setEvents(current => current.some(existing => existing.seq === event.seq) ? current : [...current, event].sort((a, b) => a.seq - b.seq));
+      const item = (event.payload as { item?: { kind?: unknown } } | null)?.item;
+      if (event.eventType === 'item.started' && item?.kind === 'approval') void load();
+    });
     let unlisten: (() => void) | undefined;
     // Subscribe before recovery loading. Both paths read the same committed
     // journal; polling also covers missed notifications and older backends.
@@ -47,7 +54,7 @@ export function useSessionActivity(conversationId: string, generating: boolean) 
       if (!disposed && seq >= cursor) void load();
     }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { /* Polling remains available. */ });
     void load();
-    return () => { disposed = true; unlisten?.(); clearTimeout(timer); reload.current = null; };
+    return () => { disposed = true; stopItems(); unlisten?.(); clearTimeout(timer); reload.current = null; };
   }, [conversationId]);
   useEffect(() => { reload.current?.(); }, [generating]);
   return events;
@@ -58,7 +65,7 @@ function toolCalls(events: SessionEvent[]) {
   const seen = new Set<string>();
   return [...events].sort((a, b) => a.seq - b.seq).filter(event => {
     if (event.eventType !== 'tool_call' || isPlanStateTool(String((event.payload as { name?: string }).name ?? ''))) return false;
-    const key = `${event.runId}:${event.toolCallId ?? event.id}`;
+    const key = JSON.stringify([event.runId, event.stepId, event.toolCallId ?? event.id]);
     if (seen.has(key)) return false;
     seen.add(key); return true;
   });
@@ -72,14 +79,19 @@ function toolRecord(message: Message): Record<string, any> {
   try { const value = JSON.parse(message.content); if (value && typeof value === 'object' && !Array.isArray(value)) record = value; } catch { /* Legacy tool text. */ }
   records.set(message, record); return record;
 }
-const replay = new WeakMap<SessionEvent, { result?: SessionEvent; ended: boolean; message: Message }>();
+const replay = new WeakMap<SessionEvent, { result?: SessionEvent; ended: boolean; awaiting: boolean; interruptedApproval: boolean; message: Message }>();
 
 /** Run identity and call intervals prevent reused provider IDs crossing runs.
  * Immutable event objects also let completed replay rows retain their identity. */
-export function activityTools(events: SessionEvent[], messages: Message[]): Message[] {
+export function activityTools(events: SessionEvent[], messages: Message[], items = reduceTurnItems(events), active = true): Message[] {
   const calls = toolCalls(events);
   if (!calls.length) return messages.filter(message => message.role === 'tool' && !isPlanMessage(message));
-  const results = new Map([...events].sort((a, b) => a.seq - b.seq).filter(event => event.eventType === 'tool_result').map(event => [JSON.stringify([event.runId, event.toolCallId]), event]));
+  const resultEvents = [...events].sort((a, b) => a.seq - b.seq).filter(event => event.eventType === 'tool_result');
+  const results = new Map(resultEvents.map(event => [JSON.stringify([event.runId, event.stepId ?? null, event.toolCallId]), event]));
+  const pending = new Set(items.filter(item => item.kind === 'approval' && item.status === 'awaiting' && typeof item.payload.callId === 'string')
+    .map(item => JSON.stringify([item.runId, item.payload.stepId ?? null, item.payload.callId])));
+  const interruptedApprovals = new Set(items.filter(item => item.kind === 'approval' && item.status === 'interrupted' && typeof item.payload.callId === 'string')
+    .map(item => JSON.stringify([item.runId, item.payload.stepId ?? null, item.payload.callId])));
   const ended = new Set(events.filter(event => event.eventType === 'turn_end').map(event => event.runId));
   const candidates = new Map<string, Message[]>();
   for (const message of messages) if (message.role === 'tool') {
@@ -98,19 +110,28 @@ export function activityTools(events: SessionEvent[], messages: Message[]): Mess
       if (runId) return runId === event.runId;
       return siblings.length === 1 || message.createdAt >= event.createdAt && (!next || message.createdAt < next.createdAt);
     });
-    const resultEvent = results.get(JSON.stringify([event.runId, event.toolCallId]));
-    if (persisted && (persisted.status !== 'streaming' || !resultEvent)) return persisted;
+    const resultEvent = results.get(JSON.stringify([event.runId, event.stepId ?? null, event.toolCallId]));
     const finished = ended.has(event.runId);
+    const approvalKey = JSON.stringify([event.runId, event.stepId ?? null, event.toolCallId]);
+    const hasPendingApproval = !resultEvent && pending.has(approvalKey);
+    const awaiting = !finished && active && hasPendingApproval;
+    const interruptedApproval = !resultEvent && (interruptedApprovals.has(approvalKey) || hasPendingApproval && (finished || !active));
+    if (persisted && (persisted.status !== 'streaming' || !resultEvent)) {
+      if ((!awaiting && !interruptedApproval) || persisted.status !== 'streaming') return persisted;
+      const record = toolRecord(persisted);
+      return { ...persisted, status: interruptedApproval ? 'interrupted' : persisted.status,
+        content: JSON.stringify({ ...record, request: { ...(record.request ?? {}), decision: awaiting ? 'pending' : undefined } }) };
+    }
     const cached = replay.get(event);
-    if (cached && cached.result === resultEvent && cached.ended === finished) return cached.message;
+    if (cached && cached.result === resultEvent && cached.ended === finished && cached.awaiting === awaiting && cached.interruptedApproval === interruptedApproval) return cached.message;
     const call = event.payload as Record<string, any>;
     const result = resultEvent?.payload as Record<string, any> | undefined;
     const message: Message = {
       id: event.id, conversationId: event.conversationId, role: 'tool', reasoning: '', createdAt: event.createdAt,
-      status: result ? 'complete' : finished ? 'interrupted' : 'streaming',
-      content: JSON.stringify({ request: { ...call, callId: event.toolCallId, runId: event.runId, name: result?.name ?? call.name, arguments: call.arguments, decision: result?.decision ?? (finished ? undefined : call.decision) }, result: result ? result.result ?? result : {} }),
+      status: result ? 'complete' : finished || interruptedApproval ? 'interrupted' : 'streaming',
+      content: JSON.stringify({ request: { ...call, callId: event.toolCallId, runId: event.runId, name: result?.name ?? call.name, arguments: call.arguments, decision: result?.decision ?? (awaiting ? 'pending' : finished ? undefined : call.decision) }, result: result ? result.result ?? result : {} }),
     };
-    replay.set(event, { result: resultEvent, ended: finished, message });
+    replay.set(event, { result: resultEvent, ended: finished, awaiting, interruptedApproval, message });
     return message;
   });
 }
@@ -186,45 +207,131 @@ export function activitySegments(events: SessionEvent[], content: string): { seq
   return segments;
 }
 
+
+function ToolDraftRow({ item, generating }: { item: TurnItem; generating: boolean }) {
+  const args = item.payload.arguments && typeof item.payload.arguments === 'object' && !Array.isArray(item.payload.arguments)
+    ? item.payload.arguments as Record<string, unknown> : {};
+  const name = typeof item.payload.name === 'string' ? item.payload.name : '';
+  const kind = toolKindOf(name, args);
+  const target = typeof args.path === 'string' ? args.path : typeof args.command === 'string' ? args.command : name;
+  const label = item.status === 'interrupted' ? 'Tool request incomplete · not run'
+    : !generating ? 'Tool request interrupted · check activity'
+    : kind === 'edit' ? 'Preparing edit request' : kind === 'command' ? 'Preparing command' : kind === 'read' ? 'Preparing read' : kind === 'search' ? 'Preparing search' : 'Preparing tool request';
+  return <div className="activity-draft" aria-live="off"><TraceIcon kind={kind} size={14} /><span>{label}</span>{target && <code title={target}>{target.length > 160 ? `${target.slice(0, 160)}…` : target}</code>}</div>;
+}
+
 export function ActivityTimeline({ events, messages, renderMessage, renderTool, generating = false }: {
   events: SessionEvent[]; messages: Message[];
-  renderMessage: (message: Message) => ReactNode; renderTool: (message: Message) => ReactNode;
+  renderMessage: (message: Message, variant?: 'commentary') => ReactNode; renderTool: (message: Message) => ReactNode;
   generating?: boolean;
 }) {
   const assistants = messages.filter(m => m.role === 'assistant');
   const assistant = assistants[assistants.length - 1];
-  const tools = useMemo(() => activityTools(events, messages), [events, messages]);
-  const reasoning = assistant?.reasoning || events.filter(e => e.eventType === 'reasoning').map(e => (e.payload as { text?: string }).text ?? '').join('\n\n');
+  const typedItems = useMemo(() => reduceTurnItems(events), [events]);
+  const tools = useMemo(() => activityTools(events, messages, typedItems, generating), [events, messages, typedItems, generating]);
+  // A turn can contain more than one assistant message (for example after a
+  // retry). Prefer the saved/live message text to the journal, which records
+  // the same reasoning by model round, and retain all messages in that turn.
+  const messageReasoning = assistants.map(message => message.reasoning).filter(Boolean).join('\n\n');
+  const reasoning = messageReasoning || events.filter(e => e.eventType === 'reasoning').map(e => (e.payload as { text?: string }).text ?? '').filter(Boolean).join('\n\n');
   const durations = events.filter(e => e.eventType === 'reasoning').map(e => (e.payload as { durationMs?: unknown }).durationMs);
   const measured = durations.length > 0 && durations.every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0);
   const reasoningMs = measured ? (durations as number[]).reduce((sum, value) => sum + value, 0) : undefined;
   const compactions = events.filter(e => e.eventType === 'compaction');
-  const [thoughtOpen, setThoughtOpen] = useState(false);
-  const thoughtContent = useRef<HTMLDivElement>(null);
   const hasAnswer = Boolean(assistant?.content?.trim());
   const live = generating && Boolean(reasoning);
   const thinking = live && !hasAnswer;
-  useEffect(() => { setThoughtOpen(live); }, [live]);
-  useEffect(() => {
-    if (live && thoughtContent.current) thoughtContent.current.scrollTop = thoughtContent.current.scrollHeight;
-  }, [reasoning, live]);
   const segments = assistant && assistants.length === 1 && assistant.presentation?.format !== 'openui' ? activitySegments(events, assistant.content) : [];
   let remaining = assistant?.content ?? '';
-  let lastSeq = -Infinity;
   const toolEvents = toolCalls(events);
-  const groups: ReactNode[] = [];
-  for (const segment of segments) {
-    const before = tools.filter((_, index) => toolEvents[index] && toolEvents[index].seq > lastSeq && toolEvents[index].seq < segment.seq);
-    if (before.length) groups.push(<ActivityGroup key={`tools-${segment.seq}`} tools={before} renderTool={renderTool} live={false} />);
-    groups.push(<Fragment key={`commentary-${segment.seq}`}>{renderMessage({ ...assistant!, id: `${assistant!.id}-round-${segment.seq}`, content: segment.content, reasoning: '', status: 'complete', presentation: undefined, metrics: null, error: null })}</Fragment>);
-    remaining = remaining.trimStart().slice(segment.content.length);
-    lastSeq = segment.seq;
+
+  // Only use per-round ordering when the journal is an exact prefix of the
+  // persisted/live text. Older or partial journals otherwise risk omitting or
+  // duplicating thought. Any unfinished current round remains a trailing card.
+  const typedThoughts = useMemo(() => typedItems.filter(item => item.kind === 'reasoning' && typeof item.payload.text === 'string' && item.payload.text.length > 0)
+    .map(item => ({ seq: item.seq, text: item.payload.text as string, durationMs: item.durationMs, status: item.status, thinking: item.status === 'running' && generating })), [typedItems, generating]);
+  const drafts = typedItems.filter(item => item.kind === 'tool' && (item.status === 'running' || item.status === 'interrupted'));
+  const legacyThoughts = [...new Map(events.filter(e => e.eventType === 'reasoning').map(e => [e.seq, e])).values()]
+    .sort((a, b) => a.seq - b.seq)
+    .flatMap(event => {
+      if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) return [];
+      const payload = event.payload as { text?: unknown; durationMs?: unknown };
+      if (typeof payload.text !== 'string' || !payload.text) return [];
+      const durationMs = typeof payload.durationMs === 'number' && Number.isFinite(payload.durationMs) && payload.durationMs >= 0 ? payload.durationMs : undefined;
+      return [{ seq: event.seq, text: payload.text, durationMs, thinking: false }];
+    });
+  // A journal write can fail after a typed item started. Once the turn ends,
+  // prefer a complete legacy round over an unterminated partial item.
+  const typedIncomplete = !generating && typedThoughts.some(item => item.status === 'running');
+  const usingTyped = typedThoughts.length > 0 && !(typedIncomplete && legacyThoughts.length);
+  const recordedThoughts = usingTyped ? typedThoughts : legacyThoughts;
+  const recordedText = recordedThoughts.map(thought => thought.text).join('');
+  const orderedThoughts = assistants.length === 1 && recordedText && (reasoning.startsWith(recordedText) || (usingTyped && recordedText.startsWith(reasoning))) ? recordedThoughts : [];
+  const feed: ReactNode[] = [];
+  if (orderedThoughts.length) {
+    const commentary = new Map(segments.map(segment => [segment.seq, segment]));
+    let pendingThought = reasoning.startsWith(recordedText) ? reasoning.slice(recordedText.length) : '';
+    const thoughtBySeq = new Map(orderedThoughts.map((thought, index) => {
+      const appendLive = index === orderedThoughts.length - 1 && thought.thinking ? pendingThought : '';
+      if (appendLive) pendingThought = '';
+      return [thought.seq, { ...thought, text: thought.text + appendLive, index }];
+    }));
+    const toolBySeq = new Map(toolEvents.map((event, index) => [event.seq, tools[index]]));
+    const draftBySeq = new Map(drafts.map(item => [item.seq, item]));
+    const orderedSeqs = [...new Set([...commentary.keys(), ...thoughtBySeq.keys(), ...toolBySeq.keys(), ...draftBySeq.keys()])].sort((a, b) => a - b);
+    let pendingTools: Message[] = [];
+    const flushTools = () => {
+      if (!pendingTools.length) return;
+      feed.push(<ActivityGroup key={`tools-${pendingTools[0].id}`} tools={pendingTools} renderTool={renderTool} live={generating} />);
+      pendingTools = [];
+    };
+    for (const seq of orderedSeqs) {
+      const tool = toolBySeq.get(seq);
+      if (tool) { pendingTools.push(tool); continue; }
+      flushTools();
+      const thought = thoughtBySeq.get(seq);
+      if (thought) feed.push(<ReasoningDisclosure key={`thought-${thought.index}`} text={thought.text} durationMs={thought.durationMs} active={thought.thinking} />);
+      const draft = draftBySeq.get(seq);
+      if (draft) feed.push(<ToolDraftRow key={draft.id} item={draft} generating={generating} />);
+      const segment = commentary.get(seq);
+      if (segment) {
+        feed.push(<Fragment key={`commentary-${seq}`}>{renderMessage({ ...assistant!, id: `${assistant!.id}-round-${seq}`, content: segment.content, reasoning: '', status: 'complete', presentation: undefined, metrics: null, error: null }, 'commentary')}</Fragment>);
+        remaining = remaining.trimStart().slice(segment.content.length);
+      }
+    }
+    flushTools();
+    // Message-only legacy tools have no sequence and remain visible.
+    if (!toolEvents.length && tools.length) feed.push(<ActivityGroup key="legacy-tools" tools={tools} renderTool={renderTool} live={generating} />);
+    if (pendingThought) feed.push(<ReasoningDisclosure key={`thought-${orderedThoughts.length}`} text={pendingThought} active={generating} />);
+  } else {
+    if (reasoning) feed.push(<ReasoningDisclosure key="thought-0" text={reasoning} durationMs={reasoningMs} active={thinking} />);
+    const commentary = new Map(segments.map(segment => [segment.seq, segment]));
+    const toolBySeq = new Map(toolEvents.map((event, index) => [event.seq, tools[index]]));
+    const draftBySeq = new Map(drafts.map(item => [item.seq, item]));
+    const orderedSeqs = [...new Set([...commentary.keys(), ...toolBySeq.keys(), ...draftBySeq.keys()])].sort((a, b) => a - b);
+    let pendingTools: Message[] = [];
+    const flushTools = () => {
+      if (!pendingTools.length) return;
+      feed.push(<ActivityGroup key={`tools-${pendingTools[0].id}`} tools={pendingTools} renderTool={renderTool} live={generating} />);
+      pendingTools = [];
+    };
+    for (const seq of orderedSeqs) {
+      const tool = toolBySeq.get(seq);
+      if (tool) { pendingTools.push(tool); continue; }
+      flushTools();
+      const draft = draftBySeq.get(seq);
+      if (draft) feed.push(<ToolDraftRow key={draft.id} item={draft} generating={generating} />);
+      const segment = commentary.get(seq);
+      if (segment) {
+        feed.push(<Fragment key={`commentary-${seq}`}>{renderMessage({ ...assistant!, id: `${assistant!.id}-round-${seq}`, content: segment.content, reasoning: '', status: 'complete', presentation: undefined, metrics: null, error: null }, 'commentary')}</Fragment>);
+        remaining = remaining.trimStart().slice(segment.content.length);
+      }
+    }
+    flushTools();
+    if (!toolEvents.length && tools.length) feed.push(<ActivityGroup key="legacy-tools" tools={tools} renderTool={renderTool} live={generating} />);
   }
-  const trailing = segments.length ? tools.filter((_, index) => !toolEvents[index] || toolEvents[index].seq > lastSeq) : tools;
   return <div className="activity-feed">
-    {reasoning && <details className="trace-thought-details" data-testid="turn-reasoning" open={thoughtOpen} onToggle={e => setThoughtOpen((e.currentTarget as HTMLDetailsElement).open)}><summary className="card-header trace-thought-pill"><TraceIcon kind="thought" size={14} /><span className={`trace-thought-label${thinking ? ' is-live' : ''}`}>{thinking ? 'Thinking…' : reasoningMs === undefined ? 'Reasoning' : `Reasoning · ${(reasoningMs / 1000).toFixed(1)}s`}</span><ChevronRight size={14} className="trace-chevron thought-chevron" aria-hidden="true" /></summary><div className="trace-thought-content" ref={thoughtContent}><MarkdownView content={reasoning} assistant streaming={thinking} /></div></details>}
-    {groups}
-    <ActivityGroup tools={trailing} renderTool={renderTool} live={generating} />
+    {feed}
     {assistants.map(message => <Fragment key={message.id}>{renderMessage(message === assistant && segments.length ? { ...message, content: remaining.trimStart() } : message)}</Fragment>)}
     {compactions.map(event => <details className="activity-compaction" key={event.id}><summary>Context compacted · continuing</summary><p>{typeof (event.payload as { artifact?: unknown }).artifact === 'string' ? (event.payload as { artifact: string }).artifact : 'Older activity was summarized to make room for the next steps.'}</p></details>)}
   </div>;

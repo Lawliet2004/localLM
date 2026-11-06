@@ -33,7 +33,7 @@ pub const GENUI_GUIDANCE: &str = include_str!("genui_prompt.txt");
 /// Injection kinds that ride on the current user draft. Anything pushed into
 /// `TurnPlan.injections` under a kind absent from this list is logged as a
 /// context_injection but silently never reaches the model.
-pub const VOLATILE_KINDS: [&str; 10] = [
+pub const VOLATILE_KINDS: [&str; 11] = [
     "model_capabilities",
     "project_documents",
     "unavailable_tools",
@@ -44,6 +44,7 @@ pub const VOLATILE_KINDS: [&str; 10] = [
     "arex_research",
     "system_time",
     "tool_discovery",
+    "development_task",
 ];
 
 /// Called after availability, offline policy and model compatibility filtering.

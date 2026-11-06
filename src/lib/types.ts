@@ -42,6 +42,7 @@ export interface Message {
   id: string; conversationId: string; role: 'user' | 'assistant' | 'tool';
   content: string; reasoning: string; status: 'complete' | 'streaming' | 'interrupted' | 'error' | 'paused'; createdAt: number;
 }
+export interface PendingTurn { id: string; conversationId: string; content: string; createdAt: number }
 export interface InferenceRound {
   phase?: string;
   usage: {
@@ -73,7 +74,7 @@ export interface Preferences {
   generativeUi?: boolean;
   systemPrompt: string;
 }
-export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null; gpuOffload?: { layers: number; totalLayers: number } | null; projector?: { path: string; offload: boolean; fileBytes: number } | null }
+export interface RuntimeStatus { phase: 'stopped' | 'loading' | 'ready' | 'error'; message: string; modelPath: string | null; loadedConfig?: RuntimeConfig | null; effectiveContextLength?: number | null; gpuOffload?: { layers: number; totalLayers: number } | null; projector?: { path: string; offload: boolean; fileBytes: number } | null }
 export type ToolSupport = 'unknown' | 'supported' | 'unsupported';
 export interface ModelControls {
   source: 'configured' | 'provider-reported';
@@ -95,6 +96,7 @@ export interface ProviderDraft {
 export interface ProviderTestResult { verified: boolean; modelListSupported: boolean; models: string[]; message: string }
 export interface ModelSelection { providerId: string | null; modelId: string }
 export interface Bootstrap {
+  pendingConversationIds?: string[];
   conversations: Conversation[]; config: RuntimeConfig; preferences: Preferences; runtime: RuntimeStatus;
   rememberedTools: RememberedTools; providers: ProviderConnection[]; preferredModel: ModelSelection;
 }
@@ -110,6 +112,15 @@ export interface McpInputField {
 }
 export interface McpInputForm { message: string; fields: McpInputField[] }
 export interface ToolApproval { purpose?: string | null; id: string; kind?: 'tool' | 'ask_user' | 'mcp_input' | 'plan_approval'; connector: string; localServerName?: string | null; name: string; arguments: Record<string, unknown>; form?: McpInputForm | null; closed?: boolean }
+export interface ActiveRunSnapshot {
+  conversationId: string;
+  instanceId: string;
+  phase: 'preparing' | 'queued' | 'running';
+  cancellationRequested: boolean;
+  state: string | null;
+  activity: string | null;
+  approvals: ToolApproval[];
+}
 export interface AskUserApproval extends ToolApproval { kind: 'ask_user'; }
 export interface ContextUsage {
   inputTokens: number; responseReserve: number; contextLength: number; estimated?: boolean;
@@ -213,6 +224,7 @@ export interface TodoItem {
 }
 
 export interface ChatEvent {
+  item?: SessionEvent;
   presentation?: PresentationRecord;
   notice?: string;
   messageId: string;
@@ -223,7 +235,7 @@ export interface ChatEvent {
   runId?: string;
   stepId?: string;
   seq?: number;
-  state?: RunState;
+  state?: RunState | 'queued';
   activity?: string;
   elapsedSecs?: number;
   roundIndex?: number;
@@ -284,6 +296,19 @@ export interface SessionEvent {
   payload: Record<string, unknown> | unknown;
   ignorable: boolean;
   createdAt: number;
+}
+export interface SubagentRun {
+  id: string;
+  conversationId: string;
+  parentRunId: string;
+  childRunId: string;
+  depth: number;
+  status: string;
+  label: string;
+  prompt: string;
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
 }
 export interface ForkSessionResult {
   newConversation: Conversation;

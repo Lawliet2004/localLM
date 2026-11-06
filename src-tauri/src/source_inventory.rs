@@ -32,7 +32,8 @@ pub fn relevant(path: &str) -> bool {
             | "AGENTS.md"
     ) || [
         "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "json", "toml", "yaml", "yml",
-        "css", "html", "sql",
+        "css", "html", "sql", "py", "pyi", "gd", "godot", "tscn", "tres", "shader",
+        "gdshader", "glsl", "vert", "frag", "wgsl", "go", "mod", "sum", "cs", "csproj",
     ]
     .contains(&path.rsplit('.').next().unwrap_or(""))
 }

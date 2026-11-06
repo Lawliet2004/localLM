@@ -26,6 +26,9 @@ interface Props {
   onSelect: (id: string) => void;
   onNew: (projectId?: string | null) => void;
   busy: boolean;
+  navigationBusy?: boolean;
+  sessionRuns?: Record<string, import('../hooks/useSessionRuns').SessionRun>;
+  pendingConversationIds?: readonly string[];
   search: string;
   onSearch: (search: string) => void;
   theme: string;
@@ -265,7 +268,7 @@ export function Sidebar(props: Props) {
         <button
           className="codex-chat-btn"
           aria-label={c.title}
-          disabled={props.busy}
+          disabled={props.navigationBusy ?? props.busy}
           onClick={() => props.onSelect(c.id)}
           title={c.title}
         >
@@ -275,7 +278,7 @@ export function Sidebar(props: Props) {
           </span>
         </button>
         <div className="codex-chat-trailing">
-          <span className="codex-chat-time">{time}</span>
+          <span className={`codex-chat-time ${props.sessionRuns?.[c.id]?.generating ? 'session-status' : ''}`}>{props.sessionRuns?.[c.id]?.approvals.length ? 'Input needed' : props.sessionRuns?.[c.id]?.generating && props.sessionRuns?.[c.id]?.activity?.state === 'queued' ? 'Waiting for a slot' : props.sessionRuns?.[c.id]?.generating ? 'Working' : props.pendingConversationIds?.includes(c.id) ? 'Unsent request' : props.sessionRuns?.[c.id]?.unread ? 'New response' : time}</span>
           <button
             className="icon-button codex-chat-more-btn"
             aria-label={`Options for ${c.title}`}
@@ -350,7 +353,7 @@ export function Sidebar(props: Props) {
             className="sidebar-brand-btn"
             aria-label="localLM home"
             title="Home"
-            disabled={props.busy}
+            disabled={props.navigationBusy ?? props.busy}
             onClick={() => props.onPage('chat')}
           >
             <div className="sidebar-brand-mark" aria-hidden="true">
@@ -395,7 +398,7 @@ export function Sidebar(props: Props) {
         className="sidebar-action-item new-chat"
         aria-label="New conversation"
         title={newChatTargetName ? `New chat in ${newChatTargetName}` : 'New chat — add a project folder first'}
-        disabled={props.busy}
+        disabled={props.navigationBusy ?? props.busy}
         onClick={handleNewChat}
       >
         <PenSquare size={15} className="new-chat-icon" />

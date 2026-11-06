@@ -356,6 +356,66 @@ pub(crate) fn managed_spawn(command: tokio::process::Command) -> std::io::Result
     command.spawn().map(ExecutionChild)
 }
 
+/// Execute a short-lived command with one deadline for input, exit and output.
+pub(crate) async fn capture_command(
+    command: tokio::process::Command,
+    input: Option<&[u8]>,
+    deadline: tokio::time::Instant,
+    output_limit: usize,
+) -> Result<(std::process::ExitStatus, String, String), CaptureError> {
+    let mut child = managed_spawn(command).map_err(CaptureError::Spawn)?;
+    let stdin = child.stdin().take();
+    let stdout = child.stdout().take();
+    let stderr = child.stderr().take();
+    let work = async {
+        tokio::try_join!(
+            async {
+                if let (Some(mut pipe), Some(input)) = (stdin, input) {
+                    match pipe.write_all(input).await {
+                        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => (),
+                        result => result?,
+                    }
+                }
+                Ok(())
+            },
+            child.wait(),
+            capture_pipe(stdout, output_limit),
+            capture_pipe(stderr, output_limit),
+        )
+    };
+    // Dropping the command owner kills the group, including on task
+    // cancellation. The pipe futures borrow no detached reader tasks.
+    match tokio::time::timeout_at(deadline, work).await {
+        Ok(Ok(((), status, out, err))) => Ok((status, out, err)),
+        Ok(Err(error)) => Err(CaptureError::Io(error)),
+        Err(_) => Err(CaptureError::Timeout),
+    }
+}
+
+pub(crate) enum CaptureError {
+    Spawn(std::io::Error),
+    Io(std::io::Error),
+    Timeout,
+}
+
+async fn capture_pipe(
+    pipe: Option<impl AsyncRead + Unpin>,
+    limit: usize,
+) -> std::io::Result<String> {
+    let mut kept = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let mut buffer = [0; 8192];
+        loop {
+            let count = pipe.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            kept.extend_from_slice(&buffer[..count.min(limit.saturating_sub(kept.len()))]);
+        }
+    }
+    Ok(String::from_utf8_lossy(&kept).into_owned())
+}
+
 /// Arm `PR_SET_PDEATHSIG` so the operating system kills the child when this
 /// process dies.
 ///

@@ -60,7 +60,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             mcp: true,
             system_time: true,
             skills: true,
-            harness: harness(&["verification_run", "verification_report", "verification_compare", "change_impact", "http_session_create", "http_session_close", "http_request", "http_compare", "openapi_inspect", "openapi_request", "database_schema", "database_query", "database_explain", "database_rehearse", "database_cleanup", "benchmark_run", "benchmark_compare", "profile_inspect", "profile_capture", "profile_compare", "debugger_start", "debugger_inspect", "debugger_control", "debugger_events", "debugger_stop", "process_start", "process_poll", "process_write", "process_stop", "shell_run", "workspace_open_preview", "check_run", "check_report", "git_status", "git_diff", "git_stage", "git_unstage", "git_commit", "git_branch", "git_history", "worktree_enter", "worktree_exit", "lsp_diagnostics", "lsp_symbols", "lsp_references", "lsp_prepare_rename", "lsp_rename", "lsp_definition", "lsp_hover", "lsp_implementations", "lsp_code_actions", "lsp_prepare_code_action", "lsp_apply_edit", "lsp_execute_command",  "ptc_run", "todo_write", "goal_set", "memory_teach", "memory_recall", "taste_recall", "taste_teach", "get_weather", "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch", "file_search", "format_paths", "skill_list", "skill_load", "session_rename", "session_move", "worktree_list", "models", "report_findings", "list_findings", "resolve_finding", "task_create", "task_update", "task_get", "task_list", "task_delete", "plan_submit", "ask_user", "artifact_read"]),
+            harness: harness(&["project_inspect", "development_guide", "verification_run", "verification_report", "verification_compare", "change_impact", "http_session_create", "http_session_close", "http_request", "http_compare", "openapi_inspect", "openapi_request", "database_schema", "database_query", "database_explain", "database_rehearse", "database_cleanup", "benchmark_run", "benchmark_compare", "profile_inspect", "profile_capture", "profile_compare", "debugger_start", "debugger_inspect", "debugger_control", "debugger_events", "debugger_stop", "process_start", "process_poll", "process_write", "process_stop", "shell_run", "workspace_open_preview", "check_run", "check_report", "git_status", "git_diff", "git_stage", "git_unstage", "git_commit", "git_branch", "git_history", "worktree_enter", "worktree_exit", "lsp_diagnostics", "lsp_symbols", "lsp_references", "lsp_prepare_rename", "lsp_rename", "lsp_definition", "lsp_hover", "lsp_implementations", "lsp_code_actions", "lsp_prepare_code_action", "lsp_apply_edit", "lsp_execute_command",  "ptc_run", "todo_write", "goal_set", "memory_teach", "memory_recall", "taste_recall", "taste_teach", "get_weather", "web_search", "web_open", "web_find", "web_fetch_url", "web_fetch", "file_search", "format_paths", "skill_list", "skill_load", "session_rename", "session_move", "worktree_list", "models", "report_findings", "list_findings", "resolve_finding", "task_create", "task_update", "task_get", "task_list", "task_delete", "plan_submit", "ask_user", "artifact_read"]),
         },
         MINIMAL => Preset {
             id: MINIMAL.into(),
@@ -84,7 +84,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             skills: true,
             harness: harness(&[
 
-                "verification_run", "verification_report", "verification_compare", "change_impact", "http_session_create", "http_session_close", "http_request", "http_compare", "openapi_inspect", "openapi_request", "database_schema", "database_query", "database_explain", "database_rehearse", "database_cleanup", "benchmark_run", "benchmark_compare", "profile_inspect", "profile_capture", "profile_compare", "debugger_start", "debugger_inspect", "debugger_control", "debugger_events", "debugger_stop", "process_start", "process_poll", "process_write", "process_stop", "shell_run", "workspace_open_preview", "check_run", "check_report", "git_status", "git_diff", "git_stage", "git_unstage", "git_commit", "git_branch", "git_history", "worktree_enter", "worktree_exit", "lsp_diagnostics", "lsp_symbols", "lsp_references", "lsp_prepare_rename", "lsp_rename", "lsp_definition", "lsp_hover", "lsp_implementations", "lsp_code_actions", "lsp_prepare_code_action", "lsp_apply_edit", "lsp_execute_command",
+                "project_inspect", "development_guide", "verification_run", "verification_report", "verification_compare", "change_impact", "http_session_create", "http_session_close", "http_request", "http_compare", "openapi_inspect", "openapi_request", "database_schema", "database_query", "database_explain", "database_rehearse", "database_cleanup", "benchmark_run", "benchmark_compare", "profile_inspect", "profile_capture", "profile_compare", "debugger_start", "debugger_inspect", "debugger_control", "debugger_events", "debugger_stop", "process_start", "process_poll", "process_write", "process_stop", "shell_run", "workspace_open_preview", "check_run", "check_report", "git_status", "git_diff", "git_stage", "git_unstage", "git_commit", "git_branch", "git_history", "worktree_enter", "worktree_exit", "lsp_diagnostics", "lsp_symbols", "lsp_references", "lsp_prepare_rename", "lsp_rename", "lsp_definition", "lsp_hover", "lsp_implementations", "lsp_code_actions", "lsp_prepare_code_action", "lsp_apply_edit", "lsp_execute_command",
                 "todo_write", "todo_add", "todo_update", "goal_set", "goal_clear", "subagent", "send_message",
                 "interrupt_agent", "list_agents", "list_subagent_models", "workflow_run", "ralph_run",
                 "terminal_create", "terminal_send", "terminal_close", "get_weather", "web_search", "web_read", "web_open", "web_find", "web_fetch_url", "web_fetch",
@@ -131,7 +131,7 @@ pub fn get(id: &str) -> Result<Preset, String> {
             system_time: true,
             skills: true,
             harness: harness(&[
-                "verification_run", "verification_report", "verification_compare", "change_impact", "http_session_create", "http_session_close", "http_request", "http_compare", "openapi_inspect", "openapi_request", "database_schema", "database_query", "database_explain", "database_rehearse", "database_cleanup", "benchmark_run", "benchmark_compare", "profile_inspect", "profile_capture", "profile_compare", "debugger_start", "debugger_inspect", "debugger_control", "debugger_events", "debugger_stop", "process_start", "process_poll", "process_write", "process_stop", "shell_run", "workspace_open_preview", "check_run", "check_report", "git_status", "git_diff", "git_stage", "git_unstage", "git_commit", "git_branch", "git_history", "worktree_enter", "worktree_exit", "lsp_diagnostics", "lsp_symbols", "lsp_references", "lsp_prepare_rename", "lsp_rename", "lsp_definition", "lsp_hover", "lsp_implementations", "lsp_code_actions", "lsp_prepare_code_action", "lsp_apply_edit", "lsp_execute_command",
+                "project_inspect", "development_guide", "verification_run", "verification_report", "verification_compare", "change_impact", "http_session_create", "http_session_close", "http_request", "http_compare", "openapi_inspect", "openapi_request", "database_schema", "database_query", "database_explain", "database_rehearse", "database_cleanup", "benchmark_run", "benchmark_compare", "profile_inspect", "profile_capture", "profile_compare", "debugger_start", "debugger_inspect", "debugger_control", "debugger_events", "debugger_stop", "process_start", "process_poll", "process_write", "process_stop", "shell_run", "workspace_open_preview", "check_run", "check_report", "git_status", "git_diff", "git_stage", "git_unstage", "git_commit", "git_branch", "git_history", "worktree_enter", "worktree_exit", "lsp_diagnostics", "lsp_symbols", "lsp_references", "lsp_prepare_rename", "lsp_rename", "lsp_definition", "lsp_hover", "lsp_implementations", "lsp_code_actions", "lsp_prepare_code_action", "lsp_apply_edit", "lsp_execute_command",
                 "todo_write", "todo_add", "todo_update", "goal_set", "goal_clear",
                 "subagent", "send_message", "interrupt_agent", "list_agents",
                 "terminal_create", "terminal_send", "terminal_close",
@@ -177,7 +177,7 @@ pub fn minimal_workspace_tools() -> [&'static str; 1] {
 /// The preset derives from it, so the two cannot drift apart — the drift
 /// that a hand-maintained duplicate invites.
 const ASSISTANT_CATALOG: &[&str] = &[
-        "verification_run",
+        "project_inspect", "development_guide", "verification_run",
         "verification_report",
         "verification_compare",
         "change_impact",
@@ -364,8 +364,9 @@ pub async fn set_preset(
 ) -> Result<Preset, String> {
     let _operation = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the active operation before changing the runtime preset.")?;
+    let _turn = state.turns.acquire(&conversation_id)?;
     validate(&preset)?;
     state
         .database()?

@@ -545,7 +545,9 @@ mod tests {
         messages.push(json!({"role":"tool","tool_call_id":"next","content":"new reading"}));
         messages.push(json!({"role":"assistant","tool_calls":[{"id":"last"}]}));
         messages.push(json!({"role":"tool","tool_call_id":"last","content":"last result"}));
-        crate::compaction::compact_model_messages(&store, &conversation, &mut messages, 10).unwrap();
+        if let Some(plan) = crate::compaction::plan_compaction(&messages, 0) {
+            crate::compaction::commit_plan(&store, &conversation, &mut messages, plan, 0, false).unwrap();
+        }
         assert!(messages.iter().any(|m| m["content"]
             .as_str()
             .is_some_and(|s| s.starts_with(CONTEXT_MARKER) && s.contains("https://example.org"))));

@@ -12,6 +12,15 @@ vi.mock('./HardwareStatus', () => ({ HardwareStatus: () => null }));
 vi.mock('./ModelDownload', () => ({ ModelDownload: () => null }));
 vi.mock('./RuntimeDownload', () => ({ RuntimeDownload: () => null }));
 
+it('explains why model controls are unavailable during other conversations', () => {
+  render(<Models config={defaultRuntimeConfig}
+    preferences={{ runtimePath: '', modelPath: '', temperature: 1, topP: 0.95, maxTokens: 2048, systemPrompt: '' }}
+    runtime={{ phase: 'stopped', message: 'No model loaded', modelPath: null }}
+    runningConversations={['Research', 'Implementation']} busy
+    onSaveConfig={vi.fn()} onSavePreferences={vi.fn()} onLoad={vi.fn()} onUnload={vi.fn()} />);
+  expect(screen.getByText(/Research, Implementation are working/)).toBeVisible();
+});
+
 it('saves a vision projector path with the model files', async () => {
   const onSavePreferences = vi.fn().mockResolvedValue(undefined);
   render(<Models config={defaultRuntimeConfig}

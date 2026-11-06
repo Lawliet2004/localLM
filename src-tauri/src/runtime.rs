@@ -16,6 +16,7 @@ pub struct RuntimeStatus {
     pub message: String,
     pub model_path: Option<String>,
     pub loaded_config: Option<RuntimeConfig>,
+    pub effective_context_length: Option<u32>,
     pub gpu_offload: Option<GpuOffload>,
     pub projector: Option<ProjectorStatus>,
 }
@@ -66,6 +67,7 @@ impl Default for RuntimeStatus {
             message: "No model loaded".into(),
             model_path: None,
             loaded_config: None,
+            effective_context_length: None,
             gpu_offload: None,
             projector: None,
         }
@@ -110,6 +112,7 @@ impl Runtime {
                         ),
                         model_path: None,
                         loaded_config: None,
+                        effective_context_length: None,
                         gpu_offload: None,
                         projector: None,
                     };
@@ -246,6 +249,7 @@ impl Runtime {
             // a false model mismatch after every successful load.
             model_path: Some(preferences.model_path.clone()),
             loaded_config: None,
+            effective_context_length: None,
             gpu_offload: None,
             projector: None,
         };
@@ -269,7 +273,23 @@ impl Runtime {
                     if let Ok(health) = client.get(format!("{}/health", self.endpoint)).send().await
                     {
                         if health.status().is_success() {
-                            self.context_length = config.context_length;
+                            let props = client.get(format!("{}/props", self.endpoint))
+                                .bearer_auth(&self.api_key).send().await;
+                            let effective = match props {
+                                Ok(response) if response.status().is_success() => {
+                                    response.json::<serde_json::Value>().await.ok()
+                                        .and_then(|props| effective_slot_context(&props, &config))
+                                }
+                                _ => None,
+                            };
+                            let Some(effective) = effective else {
+                                self.stop().await?;
+                                self.status.phase = "error".into();
+                                self.status.message = "The runtime did not report a usable per-slot context. Check the runtime version and configuration.".into();
+                                return Err(self.status.message.clone());
+                            };
+                            self.context_length = effective;
+                            self.status.effective_context_length = Some(effective);
                             self.supports_images = projector.is_some();
                             self.status.loaded_config = Some(config.clone());
                             self.status.gpu_offload = read_offload(&self.log_path);
@@ -300,6 +320,16 @@ impl Runtime {
         self.status.message = format!("Model startup timed out. See {}", self.log_path.display());
         Err(self.status.message.clone())
     }
+}
+
+fn effective_slot_context(props: &serde_json::Value, config: &RuntimeConfig) -> Option<u32> {
+    if props["total_slots"].as_u64()? != u64::from(config.inference_slots) {
+        return None;
+    }
+    let tokens = props.pointer("/default_generation_settings/n_ctx")?.as_u64()?;
+    // The runtime may round its allocation up or fit it down. The configured
+    // window remains the maximum requested by the user.
+    (tokens >= 128).then_some(tokens.min(u64::from(config.context_length)) as u32)
 }
 
 fn runtime_command(executable: &Path) -> Command {
@@ -705,7 +735,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type','application/json')
         self.end_headers()
-        self.wfile.write(b'{"data":[]}')
+        if self.path == '/props':
+            slots=int(sys.argv[sys.argv.index('--parallel')+1])
+            tokens=int(sys.argv[sys.argv.index('--ctx-size')+1])//slots
+            self.wfile.write(json.dumps({"total_slots":slots,"default_generation_settings":{"n_ctx":tokens}}).encode())
+        else:
+            self.wfile.write(b'{"data":[]}')
     def log_message(self,*args): pass
 http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
 "#).unwrap();
@@ -854,4 +889,17 @@ http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
             assert!(error.contains("symlink"), "{error}");
         }
     }
+
+    #[test]
+    fn effective_context_uses_reported_fit_and_slot_count() {
+        for slots in [1, 2] {
+            let config = RuntimeConfig { context_length: 32768, inference_slots: slots, ..Default::default() };
+            let args = config.arguments().unwrap();
+            assert_eq!(args[1], (32768 * u32::from(slots)).to_string());
+            let props = serde_json::json!({"total_slots":slots,"default_generation_settings":{"n_ctx":16384}});
+            assert_eq!(effective_slot_context(&props, &config), Some(16384));
+        }
+        assert_eq!(effective_slot_context(&serde_json::json!({}), &RuntimeConfig::default()), None);
+    }
+
 }

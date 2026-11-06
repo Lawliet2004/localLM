@@ -306,7 +306,10 @@ fn native_summary(
 ) -> Option<Value> {
     let enveloped = result.get("schemaVersion").and_then(Value::as_str)
         == Some(crate::tool_envelope::SCHEMA_VERSION);
-    if enveloped && result.pointer("/metadata/family").and_then(Value::as_str) != Some("harness") {
+    let family = result.pointer("/metadata/family").and_then(Value::as_str);
+    let workspace_read = matches!(artifact.tool_name.as_str(), "read_file" | "workspace_read_file")
+        && family == Some("workspace");
+    if enveloped && family != Some("harness") && !workspace_read {
         return None;
     }
     let mut out = if enveloped {
@@ -327,7 +330,7 @@ fn native_summary(
             data,
             Vec::new(),
             if error.is_null() { None } else { Some(error) },
-            json!({"family":"harness","truncated":true,"sideEffects":result.pointer("/metadata/sideEffects").and_then(Value::as_str).unwrap_or("unknown")}),
+            json!({"family":result["metadata"]["family"],"truncated":true,"sideEffects":result.pointer("/metadata/sideEffects").and_then(Value::as_str).unwrap_or("unknown")}),
         )
     } else {
         data
@@ -667,6 +670,162 @@ fn development_excerpt(
     Some(out)
 }
 
+/// A page already has a complete, conversation-owned artifact behind it.
+/// Fit its actual text and cursor together, including the normalized envelope
+/// overhead, instead of capturing the page into another unreadable artifact.
+fn artifact_page_excerpt(result: &Value, tool: &str, budget: usize) -> Option<Value> {
+    if tool != "artifact_read" || crate::tool_envelope::failed(result)
+        || result.get("error").is_some_and(|error| !error.is_null())
+    {
+        return None;
+    }
+    let enveloped = result.get("schemaVersion").and_then(Value::as_str)
+        == Some(crate::tool_envelope::SCHEMA_VERSION);
+    let source = if enveloped { &result["data"] } else { result };
+    let text = source["excerpt"].as_str()?;
+    source["id"].as_str()?;
+    let mut data = json!({"excerpt":"", "limit":0, "hasMore":true});
+    for key in ["id", "tool", "offset", "totalChars"] {
+        data[key] = source.get(key)?.clone();
+    }
+    let mut out = if enveloped {
+        let mut metadata = result["metadata"].clone();
+        metadata["truncated"] = json!(true);
+        crate::tool_envelope::make(
+            crate::tool_envelope::Status::Partial, data,
+            result["artifacts"].as_array()?.clone(), None, metadata,
+        )
+    } else {
+        data
+    };
+    let boundaries: Vec<usize> = text.char_indices().map(|(index, _)| index)
+        .chain(std::iter::once(text.len())).collect();
+    let chars = boundaries.len() - 1;
+    let set_page = |out: &mut Value, kept: usize| {
+        let page = if enveloped { &mut out["data"] } else { out };
+        page["excerpt"] = json!(&text[..boundaries[kept]]);
+        page["limit"] = json!(kept);
+        page["hasMore"] = json!(kept < chars || source["hasMore"] == true);
+    };
+    if serialized_len(&out) > budget {
+        return None;
+    }
+    // JSON escaping and UTF-8 can expand each character. Measure the whole
+    // result rather than subtracting an estimated number of text bytes.
+    let (mut low, mut high) = (0, chars);
+    while low < high {
+        let mid = low + (high - low + 1) / 2;
+        set_page(&mut out, mid);
+        if serialized_len(&out) <= budget { low = mid; } else { high = mid - 1; }
+    }
+    set_page(&mut out, low);
+    if low == 0 && !text.is_empty() { return None; }
+    Some(out)
+}
+
+/// A full-result pointer is published only after durable capture succeeds.
+pub(crate) fn capture_tool_result(
+    result: Value,
+    tool: &str,
+    owner: &str,
+    run: Option<&str>,
+    budget: usize,
+    save: impl FnOnce(&ArtifactRecord) -> Result<(), String>,
+) -> (Value, Option<String>) {
+    let original_status = result.get("status").cloned();
+    let (mut bounded, artifact) = bound_tool_result(result, tool, owner, run, budget);
+    let Some(artifact) = artifact else { return (bounded, None); };
+    if save(&artifact).is_ok() {
+        return (bounded, Some(artifact.id));
+    }
+
+    fn remove_pointer(value: &mut Value, id: &str) {
+        match value {
+            Value::Object(fields) => {
+                fields.retain(|key, item| {
+                    !(item.as_str() == Some(id) || key == "_notice" || key == "_sha256")
+                });
+                for field in fields.values_mut() {
+                    remove_pointer(field, id);
+                }
+            }
+            Value::Array(items) => {
+                items.retain(|item| item.as_str() != Some(id)
+                    && item["id"] != id && item["artifactId"] != id);
+                for item in items {
+                    remove_pointer(item, id);
+                }
+            }
+            Value::String(text) if text.contains(id) => {
+                *text = text.replace(id, "[unavailable artifact]");
+            }
+            _ => (),
+        }
+    }
+    remove_pointer(&mut bounded, &artifact.id);
+    let notice = "Full tool output could not be saved. The operation may already have taken effect.";
+    if crate::tool_envelope::is_envelope(&bounded) {
+        if let Some(status) = original_status {
+            bounded["metadata"]["operationStatus"] = status;
+        }
+        bounded["metadata"]["artifactCapture"] = json!("failed");
+        if bounded.pointer("/error/message").and_then(Value::as_str) == Some("See artifact.") {
+            bounded["error"]["message"] = json!("The tool reported an error and its full output could not be saved.");
+        }
+    }
+    bounded["_notice"] = json!(notice);
+    (bounded, None)
+}
+
+fn file_read_excerpt(result: &Value, tool: &str, artifact: &ArtifactRecord, budget: usize) -> Option<Value> {
+    if !matches!(tool, "read_file" | "workspace_read_file") {
+        return None;
+    }
+    let envelope = crate::tool_envelope::is_envelope(result);
+    if envelope && result.pointer("/metadata/family") != Some(&json!("workspace")) {
+        return None;
+    }
+    let source = if envelope { &result["data"] } else { result };
+    let sha = source["sha256"].as_str().filter(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))?;
+    let total = source["totalLines"].as_u64()?;
+    let path = source["path"].as_str()?;
+    let mut out = native_summary(result, json!({"sha256":sha,"totalLines":total}), artifact, budget)?;
+    if envelope {
+        let mut candidate = out.clone();
+        candidate["data"]["path"] = json!(path);
+        if serialized_len(&candidate) <= budget {
+            out = candidate;
+        }
+    }
+    for (key, value) in [("sha256", json!(sha)), ("totalLines", json!(total)), ("path", json!(path))] {
+        let mut candidate = out.clone();
+        candidate[key] = value;
+        if key == "sha256" {
+            for optional in ["_originalBytes", "_sha256"] {
+                if serialized_len(&candidate) > budget {
+                    candidate.as_object_mut()?.remove(optional);
+                }
+            }
+        }
+        if serialized_len(&candidate) <= budget {
+            out = candidate;
+        }
+    }
+    if let Some(text) = source["content"].as_str() {
+        let mut remaining = budget.saturating_sub(serialized_len(&out) + 25);
+        while remaining > 0 {
+            let mut candidate = out.clone();
+            candidate["content_excerpt"] = json!(truncate_utf8(text, remaining));
+            if serialized_len(&candidate) <= budget {
+                out = candidate;
+                break;
+            }
+            remaining /= 2;
+        }
+    }
+    Some(out)
+}
+
 /// Bound a tool output so huge outputs (e.g. web pages, dumps, large files) do not blow up model context.
 /// When serialized output exceeds `max_chars` bytes, full output is captured in an `ArtifactRecord`, and a structured excerpt
 /// with truncation indicators and artifact ID is returned to the model.
@@ -688,6 +847,10 @@ pub fn bound_tool_result(
     let budget = max_chars.max(MIN_RESULT_BUDGET);
     if size_bytes <= budget {
         return (result, None);
+    }
+
+    if let Some(page) = artifact_page_excerpt(&result, tool_name, budget) {
+        return (page, None);
     }
 
     let id = format!("art_{}", uuid::Uuid::new_v4().simple());
@@ -712,6 +875,7 @@ pub fn bound_tool_result(
     };
 
     if let Some(excerpt) = lifecycle_excerpt(&result, tool_name, &artifact, budget)
+        .or_else(|| file_read_excerpt(&result, tool_name, &artifact, budget))
         .or_else(|| git_diff_excerpt(&result, tool_name, &artifact, budget))
         .or_else(|| lsp_rename_excerpt(&result, tool_name, &artifact, budget))
         .or_else(|| development_excerpt(&result, tool_name, &artifact, budget))
@@ -1378,19 +1542,20 @@ mod tests {
             .await
             .unwrap();
         let mut complete = false;
+        let mut cursor = 0;
         for _ in 0..100 {
             let polled = registry
-                .poll("owner", root, json!({"id":id,"wait_ms":50}))
+                .poll("owner", root, json!({"id":id,"cursor":cursor,"wait_ms":50}))
                 .await
                 .unwrap();
             if polled["state"] == "exited" {
                 assert_eq!(polled["exitCode"], 0);
-                assert!(polled["output"]
-                    .to_string()
-                    .contains("bounded handle works"));
+                assert!(registry.retained_output("owner", root, id).unwrap()["output"]
+                    .to_string().contains("bounded handle works"));
                 complete = true;
                 break;
             }
+            cursor = polled["nextCursor"].as_u64().unwrap();
         }
         assert!(complete, "process did not settle");
         assert_eq!(
@@ -1554,6 +1719,55 @@ mod tests {
                 }
             }
             assert_eq!(recovered, record.content);
+        }
+    }
+
+    #[test]
+    fn normalized_artifact_pages_keep_content_and_original_cursor_without_recapture() {
+        let record = ArtifactRecord {
+            id: "art_0123456789abcdef0123456789abcdef".into(),
+            conversation_id: "c-1".into(),
+            run_id: None,
+            tool_name: "development_guide".into(),
+            mime_type: "application/json".into(),
+            content: "Guide: 77.9% 界\n\" ".repeat(400),
+            size_bytes: 0,
+            sha256: "x".into(),
+            created_at: 0,
+        };
+        for canonical_only in [false, true] {
+            for budget in [512, 2048, 8192] {
+                let mut recovered = String::new();
+                for _ in 0..record.content.chars().count() {
+                    let offset = recovered.chars().count();
+                    let mut page = crate::tool_envelope::normalize(
+                        read_window(&record, offset, 20_000),
+                        crate::tool_envelope::Family::Harness,
+                    );
+                    if canonical_only {
+                        page.as_object_mut().unwrap().retain(|key, _| {
+                            matches!(key.as_str(), "schemaVersion" | "status" | "data" | "error" | "metadata" | "artifacts")
+                        });
+                    }
+                    let (bounded, artifact) = bound_tool_result(page, "artifact_read", "c-1", None, budget);
+                    assert!(bounded.to_string().len() <= budget, "budget {budget}");
+                    assert!(crate::tool_envelope::validate_envelope(&bounded).is_ok());
+                    let data = &bounded["data"];
+                    assert_eq!(data["id"], record.id, "paging must retain the original artifact, budget {budget}");
+                    assert_eq!(data["offset"], offset);
+                    let excerpt = data["excerpt"].as_str().unwrap();
+                    assert!(!excerpt.is_empty(), "paging must make progress at budget {budget}");
+                    if data["hasMore"] == true {
+                        assert_eq!(data["limit"], excerpt.chars().count());
+                    }
+                    assert!(artifact.is_none(), "an existing artifact page must not create another artifact");
+                    recovered.push_str(excerpt);
+                    if data["hasMore"] == false {
+                        break;
+                    }
+                }
+                assert_eq!(recovered, record.content);
+            }
         }
     }
 
@@ -1879,4 +2093,28 @@ mod copy_tests {
         assert!(write_artifact_copy(&image, "invalid", "image/png").is_err());
         assert_eq!(std::fs::read(&image).unwrap(), b"hello");
     }
+
+    #[test]
+    fn bounded_workspace_identity_survives_a_failed_artifact_save() {
+        let sha = "a".repeat(64);
+        let input = crate::tool_envelope::normalize(
+            json!({"path":"src/main.rs","sha256":sha,"totalLines":100,"content":"data ".repeat(8000)}),
+            crate::tool_envelope::Family::Workspace,
+        );
+        let (bounded, artifact) = bound_tool_result(input.clone(), "read_file", "owner", None, 512);
+        assert_eq!(bounded["data"]["path"], "src/main.rs");
+        assert_eq!(bounded["data"]["sha256"], sha);
+        assert_eq!(bounded["sha256"], sha);
+        assert_ne!(bounded["_sha256"], bounded["sha256"]);
+        let (unavailable, id) = capture_tool_result(input, "read_file", "owner", None, 512, |_| Err("disk full".into()));
+        assert!(id.is_none());
+        assert!(!unavailable.to_string().contains(&artifact.unwrap().id));
+        assert!(unavailable.get("_artifactId").is_none());
+        assert_eq!(unavailable["metadata"]["artifactCapture"], "failed");
+        assert_eq!(unavailable["status"], "partial");
+        assert_eq!(unavailable["metadata"]["operationStatus"], "success");
+        assert_eq!(unavailable["data"]["sha256"], sha);
+        crate::tool_envelope::validate_envelope(&unavailable).unwrap();
+    }
+
 }

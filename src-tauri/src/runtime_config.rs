@@ -100,7 +100,11 @@ impl RuntimeConfig {
 
     pub fn arguments(&self) -> Result<Vec<String>, String> {
         self.validate()?;
-        let mut args = vec!["--ctx-size".into(), self.context_length.to_string()];
+        let mut args = vec![
+            "--ctx-size".into(),
+            self.total_context().to_string(),
+            "--no-kv-unified".into(),
+        ];
         // -1 means automatic: llama.cpp --fit chooses how many layers fill
         // VRAM and leaves the rest in RAM. Passing --n-gpu-layers disables that.
         if self.gpu_layers >= 0 {
@@ -130,6 +134,12 @@ impl RuntimeConfig {
         args.push("--parallel".into());
         args.push(self.inference_slots.to_string());
         Ok(args)
+    }
+
+    /// Settings express context per sequence. The split KV pool allocates
+    /// that capacity for each explicitly configured inference slot.
+    fn total_context(&self) -> u64 {
+        u64::from(self.context_length) * u64::from(self.inference_slots.max(1))
     }
 
     pub fn automatic_gpu(&self) -> bool {
@@ -188,14 +198,12 @@ fn kv_cache_bytes(model: &crate::gguf::ModelMetadata, config: &RuntimeConfig) ->
         .and_then(|(embed, heads)| (heads > 0).then_some(embed / heads));
     let key = u64::from(model.key_length.or(head).filter(|value| *value > 0)?);
     let value = u64::from(model.value_length.or(head).filter(|value| *value > 0)?);
-    let slots = u64::from(config.inference_slots.max(1));
     Some(
-        u64::from(config.context_length)
+        config.total_context()
             * blocks
             * heads_kv
             * (cache_elem_bytes(config.cache_type_k, key)
-                + cache_elem_bytes(config.cache_type_v, value))
-            * slots,
+                + cache_elem_bytes(config.cache_type_v, value)),
     )
 }
 

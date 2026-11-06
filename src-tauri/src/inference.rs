@@ -264,6 +264,12 @@ impl Backend {
             report["controlSource"] = json!("owned-runtime-protocol");
             report["structuredSchemaRequests"] = json!("supported-with-post-validation");
         }
+        if let Self::OpenAi { base_url, model_id, capabilities, .. } = self {
+            if capabilities.controls.as_ref().is_none_or(|controls| controls.reasoning_effort == crate::providers::ToolSupport::Supported)
+                && crate::provider_capabilities::documented_river_reasoning(base_url, model_id, "auto").is_some() {
+                report["documentedReasoning"] = json!({"source":"documented", "sourceUrl":"https://docs.river.ai/guides/inference-controls/", "required":true, "efforts":["low","high","max"]});
+            }
+        }
         report
     }
     fn protocol(&self) -> &str {
@@ -408,14 +414,38 @@ impl Backend {
     }
 
     pub fn stream_error(&self, value: &Value) -> String {
+        format!("Model error: {}", self.sanitize_error_detail(&value.to_string()))
+    }
+
+    /// Body errors can be reported as "decode" even when an HTTP connection
+    /// ended early. Keep the source chain and timeout classification instead
+    /// of showing the outer reqwest message as a tool/JSON validation error.
+    pub fn stream_read_error(&self, error: reqwest::Error) -> String {
+        use std::error::Error;
+        let error = error.without_url();
+        let summary = if error.is_timeout() {
+            "Model response timed out while reading the stream."
+        } else {
+            "Model response stream was interrupted while reading the HTTP response body."
+        };
+        let mut detail = error.to_string();
+        let mut source = error.source();
+        for _ in 0..8 {
+            let Some(cause) = source else { break; };
+            detail.push_str(": ");
+            detail.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        format!("{summary} The response did not finish; unfinished tool calls were not executed. Details: {}",
+            self.sanitize_error_detail(&detail))
+    }
+
+    fn sanitize_error_detail(&self, detail: &str) -> String {
         let key = match self {
             Self::Local { key, .. } | Self::OpenAi { key, .. } | Self::Claude { key, .. } => key,
             Self::Subscription { access_token, .. } => access_token,
         };
-        format!(
-            "Model error: {}",
-            crate::providers::sanitize_text(&value.to_string(), key)
-        )
+        crate::providers::sanitize_text(detail, key)
     }
 
     pub fn usage(&self) -> Option<crate::providers::ProviderUsage> {
@@ -439,8 +469,32 @@ impl InferenceProvider for Backend {
             payload.as_object_mut().unwrap().remove("max_tokens");
         }
         let capabilities = self.capabilities();
+        if let Self::OpenAi { base_url, model_id, responses, .. } = self {
+            if crate::provider_capabilities::documented_river_reasoning(base_url, model_id, "auto").is_some() {
+                let requested = if *responses { payload.get("reasoning").and_then(|value| value.get("effort")) }
+                    else { payload.get("reasoning_effort") };
+                if requested.is_some_and(|value| !matches!(value.as_str(), Some("low" | "high" | "max"))) {
+                    return Err("River GLM requires reasoning effort low, high, or max.".into());
+                }
+            }
+        }
+        let documented_effort = match self {
+            Self::OpenAi { base_url, model_id, .. }
+                if capabilities.controls.as_ref().is_none_or(|controls|
+                    controls.reasoning_effort == crate::providers::ToolSupport::Supported)
+                    && payload.get("reasoning_effort").is_none() && payload.get("reasoning").is_none() =>
+                payload.get("locallm_reasoning_mode").and_then(Value::as_str)
+                    .and_then(|mode| crate::provider_capabilities::documented_river_reasoning(base_url, model_id, mode)),
+            _ => None,
+        };
         if let Some(controls) = &capabilities.controls {
             crate::provider_capabilities::apply(&mut payload, controls, self.protocol())?;
+        }
+        if let Some(effort) = documented_effort {
+            if let Some(object) = payload.as_object_mut() {
+                if self.is_responses() { object.insert("reasoning".into(), json!({"effort": effort})); }
+                else { object.insert("reasoning_effort".into(), json!(effort)); }
+            }
         }
         if let Self::OpenAi {
             responses: true,
@@ -972,7 +1026,7 @@ mod tests {
             );
             let payload = backend.payload(&json!({"messages":messages,"max_tokens":64,"stream":true,"tools":[{"type":"function","function":{"name":"lookup","description":"Lookup","parameters":{"type":"object"}}}]})).unwrap();
             let mut stream = backend.stream(&payload).await.unwrap().bytes_stream();
-            let mut decoder = crate::sse::SseDecoder::default();
+            let mut decoder = crate::sse::SseDecoder::inference();
             let mut protocol = crate::sse::ModelStream::new(claude);
             let mut calls = crate::tool_calls::ToolCalls::default();
             let mut usage = InferenceUsage::default();
@@ -1623,6 +1677,33 @@ mod tests {
 #[cfg(test)]
 mod reasoning_payload_tests {
     use super::*;
+    #[test]
+    fn river_glm_effort_is_scoped_to_documented_endpoint_and_respects_overrides() {
+        let backend = |base: &str, responses: bool| Backend::OpenAi {
+            responses, client: reqwest::Client::new(), base_url: base.into(), key: String::new(),
+            model_id: "zai-org/GLM-5.3-Flash".into(), context_length: 8192,
+            max_output_tokens: None, capabilities: crate::provider_capabilities::ModelCapabilities::legacy(true),
+        };
+        for (mode, effort) in [("quick", "low"), ("auto", "high"), ("think", "max")] {
+            let input = json!({"messages":[], "locallm_reasoning_mode":mode});
+            assert_eq!(backend("https://api.river.ai/v1", false).payload(&input).unwrap()["reasoning_effort"], effort);
+            assert_eq!(backend("https://api.river.ai/v1", true).payload(&input).unwrap()["reasoning"]["effort"], effort);
+            for base in ["https://api.river.ai.evil.test/v1", "https://api.river.ai/other", "http://api.river.ai/v1", "https://api.river.ai:444/v1"] {
+                assert!(backend(base, false).payload(&input).unwrap().get("reasoning_effort").is_none(), "{base}");
+            }
+        }
+        assert_eq!(backend("https://api.river.ai/v1", false).capability_report()["documentedReasoning"]["source"], "documented");
+        assert!(backend("https://api.river.ai.evil.test/v1", false).capability_report().get("documentedReasoning").is_none());
+        let explicit = json!({"messages":[], "locallm_reasoning_mode":"quick", "reasoning_effort":"max"});
+        assert_eq!(backend("https://api.river.ai/v1", false).payload(&explicit).unwrap()["reasoning_effort"], "max");
+        assert!(backend("https://api.river.ai/v1", false).payload(&json!({"messages":[],"reasoning_effort":"none"})).is_err());
+        assert!(backend("https://api.river.ai/v1", true).payload(&json!({"messages":[],"reasoning":{"effort":"none"}})).is_err());
+        let mut disabled = backend("https://api.river.ai/v1", false);
+        if let Backend::OpenAi { capabilities, .. } = &mut disabled {
+            capabilities.controls = Some(crate::provider_capabilities::Controls { reasoning_effort: crate::providers::ToolSupport::Unsupported, ..Default::default() });
+        }
+        assert!(disabled.payload(&json!({"messages":[],"locallm_reasoning_mode":"quick"})).unwrap().get("reasoning_effort").is_none());
+    }
     #[test]
     fn remote_mapping_does_not_leak_local_extensions_or_guess_unknown_families() {
         let backend = |model: &str| Backend::OpenAi {

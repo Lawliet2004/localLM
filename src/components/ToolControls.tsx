@@ -398,7 +398,7 @@ type McpFieldValue = string | boolean | string[] | undefined;
 /// text; nothing here navigates, executes, or pre-submits a default — Send,
 /// Decline and Cancel are explicit user actions. Invalid answers surface the
 /// backend's rejection while the request stays pending.
-function McpInputDialog({ request, onResolve }: { request: ToolApproval; onResolve: (action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown>) => Promise<void> }) {
+function McpInputDialog({ request, sessionLabel, onResolve }: { request: ToolApproval; sessionLabel?: string; onResolve: (action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown>) => Promise<void> }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const form = request.form;
   const fields = form?.fields ?? [];
@@ -465,6 +465,7 @@ function McpInputDialog({ request, onResolve }: { request: ToolApproval; onResol
   const source = request.localServerName || request.connector;
   return <dialog ref={dialog} className="tool-approval" aria-labelledby="approval-title" onCancel={event => { event.preventDefault(); if (!busy) void decide('cancel'); }}>
     <h2 id="approval-title">{source} is asking for input</h2>
+    {sessionLabel && <p className="approval-session">Conversation: {sessionLabel}</p>}
     <p>The MCP server {request.localServerName ? <><code>{request.localServerName}</code> (id: <code>{request.connector}</code>)</> : <code>{request.connector}</code>} needs this information to continue <strong>{request.name}</strong>. Your answers are sent only to that server.</p>
     {form?.message && <p className="approval-purpose">{form.message}</p>}
     <form onSubmit={event => { event.preventDefault(); accept(); }}>
@@ -515,7 +516,7 @@ function McpInputDialog({ request, onResolve }: { request: ToolApproval; onResol
   </dialog>;
 }
 
-export function ApprovalDialog({ request, onResolve, onResolveAskUser, onResolveMcpInput }: { request: ToolApproval; onResolve: (allow: boolean) => Promise<void>; onResolveAskUser?: (choice: string | null) => Promise<void>; onResolveMcpInput?: (action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown>) => Promise<void> }) {
+export function ApprovalDialog({ request, sessionLabel, onResolve, onResolveAskUser, onResolveMcpInput }: { request: ToolApproval; sessionLabel?: string; onResolve: (allow: boolean) => Promise<void>; onResolveAskUser?: (choice: string | null) => Promise<void>; onResolveMcpInput?: (action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown>) => Promise<void> }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -533,7 +534,7 @@ export function ApprovalDialog({ request, onResolve, onResolveAskUser, onResolve
     catch (e) { setError(errorMessage(e)); setBusy(false); }
   }
   if (request.kind === 'mcp_input' && request.form && onResolveMcpInput) {
-    return <McpInputDialog request={request} onResolve={onResolveMcpInput} />;
+    return <McpInputDialog request={request} sessionLabel={sessionLabel} onResolve={onResolveMcpInput} />;
   }
   const isAskUser = request.kind === 'ask_user';
   const isPlanApproval = request.kind === 'plan_approval';
@@ -547,6 +548,7 @@ export function ApprovalDialog({ request, onResolve, onResolveAskUser, onResolve
     const summary = typeof request.arguments.summary === 'string' ? request.arguments.summary : '';
     return <dialog ref={dialog} className="tool-approval" aria-labelledby="approval-title" onCancel={event => { event.preventDefault(); if (!busy) void resolveChoice(null); }}>
       <h2 id="approval-title">Review the proposed plan</h2>
+      {sessionLabel && <p className="approval-session">Conversation: {sessionLabel}</p>}
       {summary && <p className="approval-purpose">{summary}</p>}
       <div className="approval-plan"><MarkdownView content={plan} /></div>
       <form onSubmit={event => { event.preventDefault(); const feedback = freeform.trim(); if (!feedback) { setError('Describe the changes you want, or approve the plan.'); return; } void resolveChoice(feedback); }}>
@@ -563,6 +565,7 @@ export function ApprovalDialog({ request, onResolve, onResolveAskUser, onResolve
   if (isAskUser) {
     return <dialog ref={dialog} className="tool-approval" aria-labelledby="approval-title" onCancel={event => { event.preventDefault(); if (!busy) void resolveChoice(null); }}>
       <h2 id="approval-title">{question || 'The assistant has a question'}</h2>
+      {sessionLabel && <p className="approval-session">Conversation: {sessionLabel}</p>}
       {options.length > 0 && <div className="connector-actions" role="group" aria-label="Answer options">
         {options.map(option => <button key={option} type="button" className="secondary" disabled={busy} onClick={() => void resolveChoice(option)}>{option}</button>)}
       </div>}
@@ -578,6 +581,7 @@ export function ApprovalDialog({ request, onResolve, onResolveAskUser, onResolve
   }
   return <dialog ref={dialog} className="tool-approval" aria-labelledby="approval-title" onCancel={event => { event.preventDefault(); if (!busy) void resolve(false); }}>
     <h2 id="approval-title">{request.localServerName ? `Allow local server ${request.localServerName} to run this tool?` : request.connector === 'Local execution' ? 'Run this code on your computer?' : `Allow ${request.connector} to run this tool?`}</h2>
+    {sessionLabel && <p className="approval-session">Conversation: {sessionLabel}</p>}
     {request.localServerName && <p>This local server runs with your account’s file and network permissions. Review the arguments before allowing this action. Server ID: <code>{request.connector}</code></p>}
     {request.purpose && <p className="approval-purpose">Current task: {request.purpose}</p>}
     <p><strong>{request.name}</strong></p><p>{request.connector === 'Local execution' ? 'This code runs unsandboxed with your account’s permissions. It can access files outside the workspace and the network. Review the complete code before allowing it.' : request.connector === 'Daytona' ? 'Cloud execution is unavailable. This call will not be sent. Historical cloud records stay readable.' : request.connector === 'Computer' ? 'This action can read your screen or control the focused desktop app. Coordinates use the primary monitor. Review the arguments before allowing it.' : request.connector === 'Browser' ? 'This action controls this conversation’s isolated browser. It may read pages, enter text, submit forms, or capture a screenshot.' : request.connector === 'Workspace' ? 'This action will access the workspace folder on your computer using the arguments below.' : request.connector === 'Skills' ? 'Read a verified file from an active skill’s local package. This does not execute scripts or contact a service.' : 'The arguments below will be sent to this service. The action may read or change external data.'}</p>

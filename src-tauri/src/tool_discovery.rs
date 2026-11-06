@@ -21,6 +21,8 @@ const CORE: &[&str] = &[
     "ptc_run",
 ];
 const EVERYDAY: &[&str] = &[
+    "project_inspect",
+    "development_guide",
     "workspace_list_files",
     "workspace_read_file",
     "workspace_search_content",

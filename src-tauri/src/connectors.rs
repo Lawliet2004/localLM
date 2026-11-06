@@ -309,6 +309,12 @@ enum ToolBackend {
     Workspace(Arc<crate::workspace::Workspace>),
 }
 impl AgentTool {
+    pub(crate) fn workspace_permission_roots(&self) -> Option<(&std::path::Path, &std::path::Path)> {
+        match &self.backend {
+            ToolBackend::Workspace(workspace) => Some(workspace.permission_roots()),
+            _ => None,
+        }
+    }
     pub fn automation(
         executor: Arc<crate::automation::Executor>,
         tool: ToolView,
@@ -497,6 +503,7 @@ impl AgentTool {
         } else {
             arguments
         };
+        crate::tool_spec::check_argument_bytes(&self.alias, arguments.to_string().len())?;
         crate::tool_validation::validate(&self.tool.input_schema, &arguments)?;
         if let ToolBackend::Execution(execution) = &self.backend {
             return execution.prepare_arguments(&self.tool.name, arguments);
@@ -534,11 +541,29 @@ impl AgentTool {
     /// elicitation + MRTR continuation). Callers without a UI channel pass
     /// `None`: the call still serializes on the session gate, but any server
     /// question fails explicitly instead of hanging.
+    pub(crate) fn call_deadline(&self, execution: Duration, interactive: bool) -> Duration {
+        if interactive && (self.is_mcp() || self.harness_name() == Some("ptc_run")) {
+            execution + crate::mcp_input::FORM_WAIT
+        } else {
+            execution
+        }
+    }
+
     pub async fn call_with_input(
         &self,
         arguments: Value,
         on_chunk: Option<crate::execution::ChunkCallback>,
         input: Option<crate::mcp_input::CallUi>,
+    ) -> Result<Value, String> {
+        self.call_with_execution_budget(arguments, on_chunk, input, self.timeout()).await
+    }
+
+    pub(crate) async fn call_with_execution_budget(
+        &self,
+        arguments: Value,
+        on_chunk: Option<crate::execution::ChunkCallback>,
+        input: Option<crate::mcp_input::CallUi>,
+        execution: Duration,
     ) -> Result<Value, String> {
         if matches!(&self.backend, ToolBackend::DetachedAutomation) {
             return Err("Automation belongs to the parent conversation. Ask the parent to perform this action.".into());
@@ -555,6 +580,7 @@ impl AgentTool {
                 fields.remove("approved_source");
             }
         }
+        crate::tool_spec::check_argument_bytes(&self.alias, public_arguments.to_string().len())?;
         crate::tool_validation::validate(&self.tool.input_schema, &public_arguments)?;
         match &self.backend {
             ToolBackend::Automation(executor) => return executor.call(&self.tool.name, arguments).await,
@@ -586,11 +612,36 @@ impl AgentTool {
                 // The scope serializes this call on the session input gate and
                 // registers it as the associated operation; it clears pending
                 // questions when it drops, however the call ends.
-                let scope = session.enter(input, &self.tool.name).await?;
-                match protocol {
-                    Some(operation) => crate::mcp_protocol::execute(peer, &self.connector, *operation, arguments, &scope).await,
-                    None => mcp_tool_call(peer, &self.tool.name, arguments, &scope).await,
+                let (input, budget) = match input {
+                    Some(input) => {
+                        let (input, budget) = input.with_budget(execution);
+                        (Some(input), Some(budget))
+                    }
+                    None => (None, None),
+                };
+                let call = async {
+                    let scope = session.enter(input, &self.tool.name).await?;
+                    match protocol {
+                        Some(operation) => crate::mcp_protocol::execute(peer, &self.connector, *operation, arguments, &scope).await,
+                        None => mcp_tool_call(peer, &self.tool.name, arguments, &scope).await,
+                    }
+                };
+                let expired = async {
+                    if let Some(budget) = budget {
+                        budget.execution_expired().await;
+                    } else {
+                        tokio::time::sleep(execution).await;
+                    }
+                };
+                tokio::select! {
+                    result = call => result,
+                    _ = expired => Ok(crate::tool_envelope::normalize_error(
+                        "Connector execution timed out. The operation may already have taken effect.",
+                        crate::tool_envelope::Cause { timeout: true, ..Default::default() },
+                        self.envelope_family(),
+                    )),
                 }
+
             }
             ToolBackend::DetachedMcp { .. } => {
                 Err("This connector tool was inherited without its live session. Ask the parent for what you need instead.".into())
@@ -598,7 +649,10 @@ impl AgentTool {
             ToolBackend::Workspace(workspace) => {
                 let workspace = workspace.clone();
                 let name = self.tool.name.clone();
-                tokio::task::spawn_blocking(move || workspace.call(&name, arguments))
+                // Closing the sender cancels any queued dispatch or running
+                // formatter when the outer tool future is dropped.
+                let (_cancel_on_drop, cancellation) = tokio::sync::watch::channel(());
+                tokio::task::spawn_blocking(move || workspace.call_with_cancellation(&name, arguments, Some(&cancellation)))
                     .await
                     .map_err(|_| "Workspace operation failed unexpectedly.")?
             }
@@ -1005,7 +1059,9 @@ impl McpHub {
                 .map_err(|error| format!("Connector endpoint rejected: {error}"))?;
             let mut builder = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(60))
+                // A POST or SSE stream may be idle while the user answers.
+                // Associated calls independently enforce execution time.
+                .read_timeout(Duration::from_secs(120) + crate::mcp_input::FORM_WAIT)
                 .redirect(reqwest::redirect::Policy::none())
                 .no_proxy();
             if let Some(domain) = &vetted.domain {

@@ -13,8 +13,7 @@
 //! the unresolved statement indices.
 
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
-use std::time::Instant;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::harness::{HarnessCtx, HarnessOutcome};
 
@@ -53,6 +52,8 @@ type Step<T> = Result<T, Abort>;
 enum MemberError {
     Cancelled,
     TimedOut,
+    Denied(String),
+    HookBlocked(String),
     Failed(String),
 }
 
@@ -115,7 +116,7 @@ struct Exec<'a> {
     /// Per-execution nonce — nested call audit IDs stay unique across
     /// `parallel` blocks and repeated `ptc_run` invocations in one turn.
     nonce: String,
-    deadline: Instant,
+    budget: Arc<crate::mcp_input::CallBudget>,
     cancel: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -131,8 +132,8 @@ impl<'a> Exec<'a> {
             top_attempted: 0,
             events: Vec::new(),
             nonce: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
-            deadline: Instant::now() + std::time::Duration::from_secs(MAX_PLAN_SECS),
-            cancel: ctx.state.cancel.subscribe(),
+            budget: Arc::new(crate::mcp_input::CallBudget::new(std::time::Duration::from_secs(MAX_PLAN_SECS))),
+            cancel: ctx.state.cancel_signal().subscribe(),
         }
     }
 
@@ -173,10 +174,9 @@ impl<'a> Exec<'a> {
             });
         }
         let mut cancel = self.cancel.clone();
-        let deadline = tokio::time::Instant::from_std(self.deadline);
         tokio::select! {
             _ = cancel.changed() => Err(Abort { status: "cancelled", message: "Plan cancelled.".into() }),
-            _ = tokio::time::sleep_until(deadline) => Err(error(format!("Plan exceeded its {MAX_PLAN_SECS}s time budget."))),
+            _ = self.budget.execution_expired() => Err(error(format!("Plan exceeded its {MAX_PLAN_SECS}s execution budget."))),
             output = future => Ok(output),
         }
     }
@@ -188,7 +188,7 @@ impl<'a> Exec<'a> {
                 message: "Plan cancelled.".into(),
             });
         }
-        if Instant::now() >= self.deadline {
+        if self.budget.expired() {
             return Err(Abort {
                 status: "error",
                 message: format!("Plan exceeded its {MAX_PLAN_SECS}s time budget."),
@@ -732,6 +732,9 @@ impl<'a> Exec<'a> {
             })?;
             (tool, tool_args)
         };
+        if matches!(tool.alias.as_str(), "ptc_run" | "finish" | "update_context") {
+            return Err(error(format!("Tool '{}' cannot run inside a plan.", tool.alias)));
+        }
         if let Some(reason) = crate::capabilities::tool_capability(tool).and_then(|capability| {
             crate::capabilities::ToolPolicy::guard(self.ctx.state.database()).denial(capability)
         }) {
@@ -786,13 +789,11 @@ impl<'a> Exec<'a> {
                 });
             }
         }
-        let automatic = !tool.requires_approval(&tool_args)
-            && self
-                .ctx
-                .access_mode
-                .automatic_reason(tool.trusted_read())
-                .is_some();
-        if automatic_only && !automatic {
+        let decision = crate::permission_rules::decide_nested_call(
+            self.ctx.state, self.ctx.access_mode, tool, &tool_args,
+        ).map_err(|message| Abort { status: "denied", message })?;
+        let automatic = matches!(decision, crate::permission_rules::Decision::Allow(_));
+        if automatic_only && matches!(decision, crate::permission_rules::Decision::Ask) {
             return Err(error(format!(
                 "Tool '{tool_name}' needs approval and cannot join a 'parallel' block."
             )));
@@ -803,7 +804,13 @@ impl<'a> Exec<'a> {
                 message: "Plan cancelled.".into(),
             });
         }
-        let allow = if automatic {
+        let mut denial_reason = match &decision {
+            crate::permission_rules::Decision::Deny(reason) => Some(reason.clone()),
+            _ => None,
+        };
+        let allow = if denial_reason.is_some() {
+            false
+        } else if automatic {
             true
         } else {
             let (approval_id, decision) = self
@@ -833,9 +840,37 @@ impl<'a> Exec<'a> {
             (self.ctx.emit)("Approval decision recorded".into(), Some(Value::Null));
             allow
         };
+        let allow = if allow {
+            match crate::permission_rules::recheck_nested_call(
+                self.ctx.state, self.ctx.access_mode, tool, &tool_args, !automatic,
+            ) {
+                Ok(()) => true,
+                Err(reason) => { denial_reason = Some(reason); false }
+            }
+        } else { false };
+        let mut hook_blocked = false;
+        let allow = if allow {
+            let verdict = self.await_bounded(crate::hooks::pre_use(
+                self.ctx.state, &self.ctx.conversation_id, &self.ctx.snapshot.workspace_path, &tool.alias, &tool_args,
+            )).await?;
+            for notice in verdict.notices { (self.ctx.emit)(notice, None); }
+            if let Some(reason) = verdict.blocked {
+                denial_reason = Some(reason);
+                hook_blocked = true;
+                false
+            } else { true }
+        } else { false };
+        let allow = if allow {
+            match crate::permission_rules::recheck_nested_call(
+                self.ctx.state, self.ctx.access_mode, tool, &tool_args, !automatic,
+            ) {
+                Ok(()) => true,
+                Err(reason) => { denial_reason = Some(reason); false }
+            }
+        } else { false };
         let audit = json!({"connector": tool.connector, "name": tool.tool.name, "arguments": tool_args,
             "decision": if allow { "allowed" } else { "denied" }, "accessMode": self.ctx.access_mode,
-            "authorization": if automatic { "auto-approved plan call" } else { "user approval decision" },
+            "authorization": if hook_blocked { "pre-use hook" } else if denial_reason.is_some() { "permission rule" } else if automatic { "auto-approved plan call" } else { "user approval decision" },
             "program": true, "callId": call_id, "stepId": self.ctx.step_id});
         let row = {
             let store = self
@@ -853,9 +888,10 @@ impl<'a> Exec<'a> {
                 .map_err(error)?
         };
         if !allow {
+            let message = denial_reason.as_deref().unwrap_or("The user denied this plan call. The plan aborted.");
             let denied = crate::tool_envelope::failure_notice(
-                "denied",
-                "The user denied this plan call. The plan aborted.",
+                if hook_blocked { "hook-blocked" } else { "denied" },
+                message,
                 false,
                 crate::tool_envelope::SIDE_NONE,
                 &json!({"denied": true}),
@@ -873,14 +909,14 @@ impl<'a> Exec<'a> {
             self.block_signature(&signature);
             return Err(Abort {
                 status: "denied",
-                message: "The user denied a plan call.".into(),
+                message: message.into(),
             });
         }
         // Shared turn budgets gate *before* dispatch: a denied approval above
         // already returned without spending, and a refused charge here must
         // settle the opened audit row instead of leaving it streaming.
         if let Err(message) =
-            crate::continuation::admit_tool(self.ctx.state, &self.ctx.run_id, tool_name, &tool_args)
+            crate::continuation::admit_tool(self.ctx.state, &self.ctx.run_id, &tool.alias, &tool_args)
         {
             let denied = crate::tool_envelope::failure_notice(
                 "tool-budget-blocked",
@@ -924,7 +960,7 @@ impl<'a> Exec<'a> {
                     tool.timeout(),
                     Box::pin(crate::harness::execute(
                         &nested,
-                        tool_name,
+                        &tool.alias,
                         tool_args.clone(),
                     )),
                 ))
@@ -966,11 +1002,11 @@ impl<'a> Exec<'a> {
                 crate::mcp_input::CallUi::new(
                     self.ctx.state.mcp_inputs.clone(),
                     self.ctx.emit.clone(),
-                )
+                ).share_budget(self.budget.clone())
             });
             match self
                 .await_bounded(tokio::time::timeout(
-                    tool.timeout(),
+                    tool.call_deadline(tool.timeout(), mcp_ui.is_some()),
                     tool.call_with_input(tool_args.clone(), None, mcp_ui),
                 ))
                 .await
@@ -1004,18 +1040,14 @@ impl<'a> Exec<'a> {
                 }
             }
         };
-        let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
+        let (bounded, _) = crate::artifacts::capture_tool_result(
             outcome,
             &tool.tool.name,
             &self.ctx.conversation_id,
             Some(&self.ctx.run_id),
             crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
+            |artifact| self.ctx.state.database()?.save_artifact(artifact),
         );
-        if let Some(artifact) = &maybe_artifact {
-            if let Ok(store) = self.ctx.state.database() {
-                let _ = store.save_artifact(artifact);
-            }
-        }
         {
             let store = self
                 .ctx
@@ -1142,6 +1174,7 @@ impl<'a> Exec<'a> {
                 let tool_name = member.tool_name.clone();
                 let args = member.args.clone();
                 let mut cancel = self.cancel.clone();
+                let budget = self.budget.clone();
                 async move {
                     // A cancel the executor already recorded never re-fires
                     // `changed()` — check the stored flag before dispatching.
@@ -1150,6 +1183,7 @@ impl<'a> Exec<'a> {
                     }
                     tokio::select! {
                         _ = cancel.changed() => Err(MemberError::Cancelled),
+                        _ = budget.execution_expired() => Err(MemberError::TimedOut),
                         result = async {
                             let tool_args = tool.prepare_arguments(args).map_err(MemberError::Failed)?;
                             // Capability kills deny at dispatch too — the same
@@ -1161,6 +1195,12 @@ impl<'a> Exec<'a> {
                             }) {
                                 return Err(MemberError::Failed(reason));
                             }
+                            match crate::permission_rules::decide_nested_call(ctx.state, ctx.access_mode, tool, &tool_args)
+                                .map_err(MemberError::Denied)? {
+                                crate::permission_rules::Decision::Allow(_) => {},
+                                crate::permission_rules::Decision::Deny(reason) => return Err(MemberError::Denied(reason)),
+                                crate::permission_rules::Decision::Ask => return Err(MemberError::Denied(format!("Tool '{tool_name}' needs approval and cannot join a 'parallel' block."))),
+                            }
                             crate::continuation::admit_tool(ctx.state,&ctx.run_id,&tool_name,&tool_args).map_err(MemberError::Failed)?;
                             // Turn-scoped replay protection, identical to the
                             // sequential gate — checked before any dispatch.
@@ -1170,11 +1210,11 @@ impl<'a> Exec<'a> {
                             if already_blocked {
                                 return Err(MemberError::Failed("Not repeated: an earlier attempt this turn had an uncertain outcome.".into()));
                             }
-                            let automatic = !tool.requires_approval(&tool_args)
-                                && ctx.access_mode.automatic_reason(tool.trusted_read()).is_some();
-                            if !automatic {
-                                return Err(MemberError::Failed(format!("Tool '{tool_name}' needs approval and cannot join a 'parallel' block.")));
-                            }
+                            let verdict = crate::hooks::pre_use(ctx.state, &ctx.conversation_id, &ctx.snapshot.workspace_path, &tool.alias, &tool_args).await;
+                            for notice in verdict.notices { (ctx.emit)(notice, None); }
+                            if let Some(reason) = verdict.blocked { return Err(MemberError::HookBlocked(reason)); }
+                            crate::permission_rules::recheck_nested_call(ctx.state, ctx.access_mode, tool, &tool_args, false)
+                                .map_err(MemberError::Denied)?;
                             if tool.is_harness() {
                                 let nested = HarnessCtx { depth: ctx.depth + 1, ..ctx.clone_for_nested() };
                                 tokio::time::timeout(tool.timeout(), crate::harness::execute(&nested, &tool_name, tool_args))
@@ -1184,9 +1224,9 @@ impl<'a> Exec<'a> {
                                     .map_err(MemberError::Failed)
                             } else {
                                 let mcp_ui = tool.is_mcp().then(|| {
-                                    crate::mcp_input::CallUi::new(ctx.state.mcp_inputs.clone(), ctx.emit.clone())
+                                    crate::mcp_input::CallUi::new(ctx.state.mcp_inputs.clone(), ctx.emit.clone()).share_budget(budget.clone())
                                 });
-                                tokio::time::timeout(tool.timeout(), tool.call_with_input(tool_args, None, mcp_ui))
+                                tokio::time::timeout(tool.call_deadline(tool.timeout(), mcp_ui.is_some()), tool.call_with_input(tool_args, None, mcp_ui))
                                     .await
                                     .map_err(|_| MemberError::TimedOut)?
                                     .map(|value| (value, Vec::new()))
@@ -1211,6 +1251,8 @@ impl<'a> Exec<'a> {
                 .iter()
                 .find(|tool| tool.alias == member.tool_name)
                 .expect("checked above");
+            let hook_blocked = matches!(&result, Err(MemberError::HookBlocked(_)));
+            let permission_denied = matches!(&result, Err(MemberError::Denied(_) | MemberError::HookBlocked(_)));
             let outcome = match result {
                 Ok((value, events)) => {
                     self.events.extend(events);
@@ -1232,27 +1274,29 @@ impl<'a> Exec<'a> {
                     },
                     tool.envelope_family(),
                 ),
+                Err(MemberError::Denied(message)) => crate::tool_envelope::failure_notice(
+                    "denied", &message, false, crate::tool_envelope::SIDE_NONE, &json!({"denied":true}),
+                ),
+                Err(MemberError::HookBlocked(message)) => crate::tool_envelope::failure_notice(
+                    "hook-blocked", &message, false, crate::tool_envelope::SIDE_NONE, &json!({"hookBlocked":true}),
+                ),
                 Err(MemberError::Failed(message)) => crate::tool_envelope::normalize_error(
                     &message,
                     crate::tool_envelope::Cause::default(),
                     tool.envelope_family(),
                 ),
             };
-            let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
+            let (bounded, _) = crate::artifacts::capture_tool_result(
                 outcome,
                 &tool.tool.name,
                 &self.ctx.conversation_id,
                 Some(&self.ctx.run_id),
                 crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
+                |artifact| self.ctx.state.database()?.save_artifact(artifact),
             );
-            if let Some(artifact) = &maybe_artifact {
-                if let Ok(store) = self.ctx.state.database() {
-                    let _ = store.save_artifact(artifact);
-                }
-            }
             let audit = json!({"connector": tool.connector, "name": tool.tool.name, "arguments": member.args,
-                "decision": "allowed", "accessMode": self.ctx.access_mode,
-                "authorization": "auto-approved plan parallel read",
+                "decision": if permission_denied { "denied" } else { "allowed" }, "accessMode": self.ctx.access_mode,
+                "authorization": if hook_blocked { "pre-use hook" } else if permission_denied { "permission rule" } else { "auto-approved plan parallel read" },
                 "program": true, "callId": call_id, "stepId": self.ctx.step_id});
             {
                 let store = self
@@ -1270,7 +1314,7 @@ impl<'a> Exec<'a> {
                     .map_err(error)?;
             }
             let failed = crate::tool_envelope::failed(&bounded);
-            if failed {
+            if failed && !permission_denied {
                 // Same non-retryable rule as sequential calls: an uncertain
                 // member outcome blocks its signature for the rest of the turn.
                 if let Ok(prepared) = tool.prepare_arguments(member.args.clone()) {
@@ -1279,7 +1323,7 @@ impl<'a> Exec<'a> {
             }
             let cancelled =
                 bounded.pointer("/error/code").and_then(Value::as_str) == Some("cancelled");
-            self.calls.push(json!({"tool": member.tool_name, "status": if cancelled { "cancelled" } else if failed { "error" } else { "ok" }, "result": bounded, "callId": call_id}));
+            self.calls.push(json!({"tool": member.tool_name, "status": if cancelled { "cancelled" } else if permission_denied { "denied" } else if failed { "error" } else { "ok" }, "result": bounded, "callId": call_id}));
             if let Some(name) = &member.bind {
                 self.bind(name, bounded.clone())?;
             }
@@ -1289,6 +1333,8 @@ impl<'a> Exec<'a> {
                         status: "cancelled",
                         message: "Plan cancelled.".into(),
                     }
+                } else if permission_denied {
+                    Abort { status: "denied", message: format!("Tool '{}' was denied by permission settings.", member.tool_name) }
                 } else {
                     error(format!(
                         "Tool '{}' failed; the plan aborted.",
@@ -1547,6 +1593,231 @@ mod tests {
             .await
             .map(|outcome| outcome.value)
             .unwrap_or_else(|error| json!({"status": "rejected", "error": error}))
+    }
+
+    #[tokio::test]
+    async fn nested_plans_apply_saved_rules_and_audit_parallel_denials() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("public.txt"), "public-readable").unwrap();
+        std::fs::write(workspace.join("secret.txt"), "protected-secret-value").unwrap();
+        let tools = workspace_tools(&state, &workspace);
+        for action in [Action::Path, Action::Tool] {
+            let resource = if action == Action::Path { "secret.txt" } else { "workspace_read_file" };
+            crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+                action, resource: resource.into(), effect: Effect::Deny,
+            }] }).unwrap();
+            let ctx = fixture(&state, &workspace, "rules", &tools, crate::permissions::AccessMode::FullAccess, Arc::new(|_, _| {}));
+            let result = run_plan(&ctx, json!({"body":[{"call":{"tool":"workspace_read_file","args":{"path":"secret.txt"}}}]})).await;
+            assert_eq!(result["error"]["code"], "denied", "{result}");
+            assert!(!result.to_string().contains("protected-secret-value"));
+            let rows = state.database().unwrap().messages(&ctx.conversation_id).unwrap();
+            let audit: Value = serde_json::from_str(&rows.iter().find(|row| row.role == "tool").unwrap().content).unwrap();
+            assert_eq!(audit["request"]["decision"], "denied");
+        }
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+            action: Action::Path, resource: "secret.txt".into(), effect: Effect::Deny,
+        }] }).unwrap();
+        let ctx = fixture(&state, &workspace, "parallel", &tools, crate::permissions::AccessMode::FullAccess, Arc::new(|_, _| {}));
+        let result = run_plan(&ctx, json!({"body":[{"parallel":{"body":[
+            {"call":{"tool":"workspace_read_file","args":{"path":"public.txt"}}},
+            {"call":{"tool":"workspace_read_file","args":{"path":"secret.txt"}}}
+        ]}}]})).await;
+        assert_eq!(result["error"]["code"], "denied", "{result}");
+        assert!(result.to_string().contains("public-readable"), "successful sibling outcome was lost: {result}");
+        assert!(!result.to_string().contains("protected-secret-value"));
+        let rows = state.database().unwrap().messages(&ctx.conversation_id).unwrap();
+        let records: Vec<Value> = rows.iter().filter(|row| row.role == "tool").map(|row| serde_json::from_str(&row.content).unwrap()).collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["request"]["decision"], "allowed");
+        assert_eq!(records[1]["request"]["decision"], "denied");
+        assert_eq!(records[1]["result"]["error"]["sideEffects"], "none");
+
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+            action: Action::Path, resource: "secret.txt".into(), effect: Effect::Ask,
+        }] }).unwrap();
+        let ctx = fixture(&state, &workspace, "parallel-ask", &tools, crate::permissions::AccessMode::FullAccess, Arc::new(|_, approval| assert!(approval.is_none(), "parallel call must not open approval dialogs")));
+        let result = run_plan(&ctx, json!({"body":[{"parallel":{"body":[{"call":{"tool":"workspace_read_file","args":{"path":"secret.txt"}}}]}}]})).await;
+        assert_eq!(result["error"]["code"], "denied", "{result}");
+        assert!(!result.to_string().contains("protected-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn multi_path_program_calls_refuse_before_any_file_changes() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("source.txt"), "original").unwrap();
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+            action: Action::Path, resource: "protected.txt".into(), effect: Effect::Deny,
+        }] }).unwrap();
+        let tools = workspace_tools(&state, &workspace);
+        let ctx = fixture(&state, &workspace, "paths", &tools, crate::permissions::AccessMode::FullAccess, Arc::new(|_, _| {}));
+        let patch = run_plan(&ctx, json!({"body":[{"call":{"tool":"workspace_apply_patch","args":{"changes":[
+            {"kind":"create","path":"public.txt","content":"public"},
+            {"kind":"create","path":"protected.txt","content":"protected"}
+        ]}}}]})).await;
+        assert_eq!(patch["error"]["code"], "denied", "{patch}");
+        assert!(!workspace.join("public.txt").exists() && !workspace.join("protected.txt").exists());
+        let info = crate::workspace::Workspace::open(workspace.to_str().unwrap()).unwrap().call("file_info", json!({"path":"source.txt"})).unwrap();
+        let ctx = fixture(&state, &workspace, "destination", &tools, crate::permissions::AccessMode::FullAccess, Arc::new(|_, _| {}));
+        let copy = run_plan(&ctx, json!({"body":[{"call":{"tool":"workspace_copy_file","args":{
+            "path":"source.txt","destination":"protected.txt","expected_sha256":info["sha256"]
+        }}}]})).await;
+        assert_eq!(copy["error"]["code"], "denied", "{copy}");
+        assert!(!workspace.join("protected.txt").exists());
+        assert_eq!(std::fs::read_to_string(workspace.join("source.txt")).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_calls_apply_absolute_rules_to_selected_and_canonical_roots() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        let actual = dir.path().join("actual");
+        let selected = dir.path().join("selected");
+        std::fs::create_dir(&actual).unwrap();
+        symlink(&actual, &selected).unwrap();
+        std::fs::write(actual.join("secret.txt"), "absolute-protected").unwrap();
+        let tools = workspace_tools(&state, &selected);
+        for root in [&actual, &selected] {
+            crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+                action: Action::Path, resource: root.join("secret.txt").to_string_lossy().into_owned(), effect: Effect::Deny,
+            }] }).unwrap();
+            let ctx = fixture(&state, &selected, "absolute", &tools, crate::permissions::AccessMode::FullAccess, Arc::new(|_, _| {}));
+            let result = run_plan(&ctx, json!({"body":[{"call":{"tool":"workspace_read_file","args":{"path":"secret.txt"}}}]})).await;
+            assert_eq!(result["error"]["code"], "denied", "{result}");
+            assert!(!result.to_string().contains("absolute-protected"));
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_plan_ask_requires_approval_and_new_deny_overrides_it() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        for (approve, change_to_deny) in [(false, false), (true, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(crate::test_support::app_state(dir.path()));
+            let workspace = dir.path().join("ws");
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(workspace.join("secret.txt"), "approval-secret-value").unwrap();
+            state.database().unwrap().save_workspace_path(workspace.to_str().unwrap()).unwrap();
+            state.database().unwrap().save_setting(crate::hooks::HOOKS_KEY, &vec![crate::hooks::Hook {
+                id: "marker".into(), event: crate::hooks::EVENT_PRE_TOOL.into(), matcher: "workspace_read_file".into(),
+                command: "printf x > hook-started".into(), timeout_secs: 5, enabled: true,
+            }]).unwrap();
+            let rules = |effect| RuleSet { rules: vec![Rule { action: Action::Path, resource: "secret.txt".into(), effect }] };
+            crate::permission_rules::save(&state.database().unwrap(), &rules(Effect::Ask)).unwrap();
+            let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let emit: Arc<dyn Fn(String, Option<Value>) + Send + Sync> = {
+                let state = state.clone();
+                let seen = seen.clone();
+                Arc::new(move |_, payload| {
+                    if let Some(id) = payload.as_ref().and_then(|value| value["id"].as_str()) {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if change_to_deny { crate::permission_rules::save(&state.database().unwrap(), &rules(Effect::Deny)).unwrap(); }
+                        state.approvals.resolve(id, approve).unwrap();
+                    }
+                })
+            };
+            let tools = workspace_tools(&state, &workspace);
+            let ctx = fixture(&state, &workspace, "ask", &tools, crate::permissions::AccessMode::FullAccess, emit);
+            let result = run_plan(&ctx, json!({"body":[{"call":{"tool":"workspace_read_file","args":{"path":"secret.txt"},"as":"value"}}],"return":{"$":"value"}})).await;
+            assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(result.to_string().contains("approval-secret-value"), approve && !change_to_deny, "{result}");
+            assert_eq!(workspace.join("hook-started").exists(), approve && !change_to_deny, "hook ran without authorization");
+            assert_eq!(result["error"]["code"] == "denied", !approve || change_to_deny, "{result}");
+        }
+    }
+
+    #[tokio::test]
+    async fn discovered_targets_and_always_ask_keep_their_own_permissions() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::test_support::app_state(dir.path()));
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("secret.txt"), "wrapped-secret").unwrap();
+        let mut tools = workspace_tools(&state, &workspace);
+        tools.push(crate::connectors::AgentTool::harness(crate::tool_discovery::INVOKE).unwrap());
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+            action: Action::Tool, resource: "workspace_read_file".into(), effect: Effect::Deny,
+        }] }).unwrap();
+        let ctx = fixture(&state, &workspace, "wrapper", &tools, crate::permissions::AccessMode::FullAccess, Arc::new(|_, _| {}));
+        let result = run_plan(&ctx, json!({"body":[{"call":{"tool":"tool_invoke","args":{"name":"workspace_read_file","arguments":{"path":"secret.txt"}}}}]})).await;
+        assert_eq!(result["error"]["code"], "denied", "{result}");
+        assert!(!result.to_string().contains("wrapped-secret"));
+
+        tools.push(crate::connectors::AgentTool::harness("todo_add").unwrap());
+        let ctx = fixture(&state, &workspace, "wrapper-harness", &tools, crate::permissions::AccessMode::FullAccess, Arc::new(|_, _| {}));
+        let result = run_plan(&ctx, json!({"body":[{"call":{"tool":"tool_invoke","args":{"name":"todo_add","arguments":{"text":"Review the change"}}}}]})).await;
+        assert_eq!(result["status"], "success", "{result}");
+        assert_eq!(state.database().unwrap().todos(&ctx.conversation_id).unwrap().len(), 1);
+
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+            action: Action::Tool, resource: "workspace_read_file".into(), effect: Effect::Allow,
+        }] }).unwrap();
+        tools.iter_mut().find(|tool| tool.alias == "workspace_read_file").unwrap().tool.input_schema["x-locallm-always-ask"] = json!(true);
+        let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let emit: Arc<dyn Fn(String, Option<Value>) + Send + Sync> = {
+            let state = state.clone(); let approvals = approvals.clone();
+            Arc::new(move |_, payload| {
+                if let Some(id) = payload.as_ref().and_then(|v| v["id"].as_str()) {
+                    approvals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    state.approvals.resolve(id, false).unwrap();
+                }
+            })
+        };
+        let ctx = fixture(&state, &workspace, "always-ask", &tools, crate::permissions::AccessMode::FullAccess, emit);
+        let result = run_plan(&ctx, json!({"body":[{"call":{"tool":"workspace_read_file","args":{"path":"secret.txt"}}}]})).await;
+        assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(result["error"]["code"], "denied", "{result}");
+        assert!(!result.to_string().contains("wrapped-secret"));
+    }
+
+    #[tokio::test]
+    async fn program_hooks_block_or_recheck_changed_rules_before_dispatch() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        for (parallel, block_hook) in [(false, true), (true, true), (false, false), (true, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = crate::test_support::app_state(dir.path());
+            let workspace = dir.path().join("ws");
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(workspace.join("secret.txt"), "hook-secret-value").unwrap();
+            state.database().unwrap().save_workspace_path(workspace.to_str().unwrap()).unwrap();
+            let hook = crate::hooks::Hook { id: "guard".into(), event: crate::hooks::EVENT_PRE_TOOL.into(), matcher: "workspace_read_file".into(),
+                command: if block_hook { "exit 2" } else { "printf x > started; sleep 1" }.into(), timeout_secs: 5, enabled: true };
+            state.database().unwrap().save_setting(crate::hooks::HOOKS_KEY, &vec![hook]).unwrap();
+            let tools = workspace_tools(&state, &workspace);
+            let ctx = fixture(&state, &workspace, "hooks", &tools, crate::permissions::AccessMode::FullAccess, Arc::new(|_, _| {}));
+            let call = json!({"call":{"tool":"workspace_read_file","args":{"path":"secret.txt"}}});
+            let statement = if parallel { json!({"parallel":{"body":[call]}}) } else { call };
+            let task = run_plan(&ctx, json!({"body":[statement]}));
+            let update = async {
+                if !block_hook {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while !workspace.join("started").exists() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+                    }).await.expect("pre-use hook did not start");
+                    crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+                        action: Action::Path, resource: "secret.txt".into(), effect: Effect::Deny,
+                    }] }).unwrap();
+                }
+            };
+            let (result, ()) = tokio::join!(task, update);
+            assert_eq!(result["error"]["code"], "denied", "parallel={parallel}: {result}");
+            assert!(!result.to_string().contains("hook-secret-value"));
+            let rows = state.database().unwrap().messages(&ctx.conversation_id).unwrap();
+            let audit: Value = serde_json::from_str(&rows.iter().find(|row| row.role == "tool").unwrap().content).unwrap();
+            assert_eq!(audit["request"]["decision"], "denied");
+            assert_eq!(audit["result"]["error"]["sideEffects"], "none");
+            assert_eq!(audit["request"]["authorization"], if block_hook { "pre-use hook" } else { "permission rule" });
+        }
     }
 
     #[tokio::test]
@@ -2088,7 +2359,7 @@ mod tests {
         );
         // Time cap: force an expired deadline and the first guard fails.
         let mut exec = Exec::new(&ctx);
-        exec.deadline = Instant::now() - std::time::Duration::from_secs(1);
+        exec.budget = Arc::new(crate::mcp_input::CallBudget::new(std::time::Duration::ZERO));
         let abort = exec
             .run_statements(&[json!({"let": {"name": "v", "value": 1}})], 0, true)
             .await

@@ -30,6 +30,7 @@ pub(crate) fn app_state(root: &Path) -> crate::AppState {
         turns: crate::TurnLocks::default(),
         cancel: tokio::sync::watch::channel(false).0,
         run_control: Mutex::new(crate::agent_run::RunControl::default()),
+        session_runs: crate::session_runs::Registry::default(),
         connectors: tokio::sync::Mutex::new(crate::connectors::McpHub::new(vault)),
         oauth_operation: tokio::sync::Mutex::new(()),
         oauth_cancel: tokio::sync::watch::channel(false).0,

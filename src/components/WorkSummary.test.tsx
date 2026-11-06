@@ -10,6 +10,7 @@ const run: RunRecord = { id:'run', conversationId:'chat', status:'completed', cr
 it('shows recorded duration and an expandable edit card with actual diff counts', async () => {
   render(<WorkSummary messages={[edit]} run={run}><p>Updated the styles.</p></WorkSummary>);
   expect(screen.getByText('Worked for 3m 51s')).toBeVisible();
+  expect(screen.getByLabelText('Recorded work summary')).toHaveTextContent('1 action · 1 file changed +2 −1');
   expect(screen.getByText('Edited 1 file')).toBeVisible();
   expect(screen.getAllByText('+2')[0]).toBeVisible();
   expect(screen.getAllByText('−1')[0]).toBeVisible();
@@ -30,7 +31,7 @@ it('does not call a cancelled run completed', () => {
 it('groups repeated edits by path and supports viewing and collapsing files', async () => {
   render(<WorkSummary messages={[edit, { ...edit, id: 'second-edit' }]}><p>Done.</p></WorkSummary>);
   expect(screen.getByText('Edited 1 file')).toBeVisible();
-  expect(screen.getAllByText('+4')).toHaveLength(2);
+  expect(screen.getAllByText('+4')).toHaveLength(3);
   await userEvent.click(screen.getByRole('button', { name: 'View changes' }));
   expect(screen.getAllByText(/--- a\/src\/styles.css/)).toHaveLength(2);
   expect(screen.getAllByText(/--- a\/src\/styles.css/)[0]).toBeVisible();

@@ -342,7 +342,9 @@ impl Stream {
             state.call_id = call_id.into();
             state.name = name.into();
             self.calls += 1;
-            delta["tool_calls"].as_array_mut().unwrap().push(json!({"index":state.slot,"type":"function","id":call_id,"function":{"name":name,"arguments":""}}));
+            delta.get_mut("tool_calls").and_then(Value::as_array_mut)
+                .ok_or("Invalid normalized Responses tool delta.")?
+                .push(json!({"index":state.slot,"type":"function","id":call_id,"function":{"name":name,"arguments":""}}));
         }
         self.items.insert(index, state);
         Ok(())
@@ -368,14 +370,12 @@ impl Stream {
         } else {
             text
         };
-        if state.arguments.len() + fragment.len() > 65536 {
-            return Err("Responses function arguments exceed64KiB.".into());
-        }
+        crate::tool_spec::check_argument_bytes(&state.name, state.arguments.len().saturating_add(fragment.len()))?;
         if !fragment.is_empty() {
             state.arguments.push_str(fragment);
-            delta["tool_calls"]
-                .as_array_mut()
-                .unwrap()
+            delta.get_mut("tool_calls")
+                .and_then(Value::as_array_mut)
+                .ok_or("Invalid normalized Responses tool delta.")?
                 .push(json!({"index":state.slot,"function":{"arguments":fragment}}));
         }
         Ok(())
@@ -420,7 +420,7 @@ impl Stream {
         if !self.items.contains_key(&index) {
             self.start(index, item, delta)?;
         }
-        let state = &self.items[&index];
+        let state = self.items.get(&index).ok_or("Responses output item was not initialized.")?;
         if state.id != string(item, "id")? || state.kind != string(item, "type")? {
             return Err("Conflicting final Responses output identity.".into());
         }
@@ -439,7 +439,7 @@ impl Stream {
                 self.argument(index, None, string(item, "arguments")?, true, delta)?;
             }
             Some("message") => {
-                for (part, value) in item["content"].as_array().unwrap().iter().enumerate() {
+                for (part, value) in item["content"].as_array().ok_or("Responses message content must be an array.")?.iter().enumerate() {
                     let text = if value["type"] == "refusal" {
                         string(value, "refusal")?
                     } else {
@@ -466,9 +466,9 @@ impl Stream {
                     }
                 }
             }
-            _ => unreachable!(),
+            _ => return Err("Unsupported Responses output item.".into()),
         }
-        self.items.get_mut(&index).unwrap().done = true;
+        self.items.get_mut(&index).ok_or("Responses output item was not initialized.")?.done = true;
         self.output.insert(index, item.clone());
         Ok(())
     }
@@ -600,10 +600,10 @@ impl Stream {
             | "response.output_text.annotation.added" => {}
             _ => return Err(format!("Unsupported Responses stream event '{kind}'.")),
         }
-        if delta["tool_calls"].as_array().unwrap().is_empty() {
-            delta.as_object_mut().unwrap().remove("tool_calls");
+        if delta.get("tool_calls").and_then(Value::as_array).ok_or("Invalid normalized Responses tool delta.")?.is_empty() {
+            delta.as_object_mut().ok_or("Invalid normalized Responses delta.")?.remove("tool_calls");
         }
-        if delta.as_object().unwrap().is_empty() && finish.is_none() && usage.is_null() {
+        if delta.as_object().ok_or("Invalid normalized Responses delta.")?.is_empty() && finish.is_none() && usage.is_null() {
             return Ok(None);
         }
         let mut out = json!({"choices":[{"delta":delta}]});
@@ -627,6 +627,15 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_response_items_and_internal_delta_shapes_fail_closed() {
+        let mut stream = Stream::default();
+        let function = json!({"type":"function_call","id":"item","call_id":"call","name":"read","arguments":"{}"});
+        assert!(stream.start(0, &function, &mut json!({"tool_calls":{}})).is_err());
+        assert!(Stream::default().push(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":{}}})).is_err());
+        assert!(Stream::default().push(&json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"missing","delta":"{"})).is_err());
+    }
     fn function() -> Value {
         json!({"type":"function","function":{"name":"echo","description":"Echo","parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}}})
     }

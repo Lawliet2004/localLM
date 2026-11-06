@@ -342,117 +342,101 @@ pub fn get_subscription_status(
     }
 }
 
-pub async fn refresh_subscription_token(
-    vault: &Vault,
-    provider: &str,
-    mut session: SubscriptionSession,
-) -> Result<SubscriptionSession, String> {
-    let refresh_token = match &session.refresh_token {
-        Some(t) if !t.is_empty() => t.clone(),
-        _ => return Ok(session),
+fn token_expiration(access: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let payload = access.split('.').nth(1)?;
+    if payload.len() > 64 * 1024 { return None; }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims["exp"].as_i64()
+}
+
+async fn request_refresh(id: &'static str, refresh_token: String) -> Result<serde_json::Value, String> {
+    let (endpoint, client_id) = match id {
+        VAULT_CHATGPT_SUB => ("https://auth.openai.com/oauth/token", OPENAI_CODEX_CLIENT_ID),
+        _ => ("https://auth.x.ai/oauth/token", GROK_BUILD_CLIENT_ID),
     };
-
-    let client = crate::providers::client()?;
-    let now_sec = crate::store::now() / 1000;
-
-    match provider {
-        PROVIDER_CHATGPT | "chatgpt-subscription" => {
-            let body = format!(
-                "grant_type=refresh_token&client_id={}&refresh_token={}",
-                OPENAI_CODEX_CLIENT_ID,
-                urlencoding::encode(&refresh_token)
-            );
-            let response = client
-                .post("https://auth.openai.com/oauth/token")
-                .header(
-                    reqwest::header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
-                )
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to reach OpenAI refresh endpoint: {e}"))?;
-
-            if response.status().is_success() {
-                let json: serde_json::Value = response
-                    .json()
-                    .await
-                    .map_err(|e| format!("Invalid refresh response: {e}"))?;
-
-                if let Some(new_access) = json.get("access_token").and_then(|v| v.as_str()) {
-                    session.access_token = new_access.to_string();
-                }
-                if let Some(new_refresh) = json.get("refresh_token").and_then(|v| v.as_str()) {
-                    session.refresh_token = Some(new_refresh.to_string());
-                }
-                if let Some(expires_in) = json.get("expires_in").and_then(|v| v.as_i64()) {
-                    session.expires_at = Some(now_sec + expires_in);
-                }
-                session.updated_at = crate::store::now();
-                let _ = save_session(vault, &session);
-            }
-        }
-        PROVIDER_GROK | "grok-subscription" => {
-            let body = format!(
-                "grant_type=refresh_token&client_id={}&refresh_token={}",
-                GROK_BUILD_CLIENT_ID,
-                urlencoding::encode(&refresh_token)
-            );
-            let response = client
-                .post("https://auth.x.ai/oauth/token")
-                .header(
-                    reqwest::header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
-                )
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to reach Grok refresh endpoint: {e}"))?;
-
-            if response.status().is_success() {
-                let json: serde_json::Value = response
-                    .json()
-                    .await
-                    .map_err(|e| format!("Invalid refresh response: {e}"))?;
-
-                if let Some(new_access) = json.get("access_token").and_then(|v| v.as_str()) {
-                    session.access_token = new_access.to_string();
-                }
-                if let Some(new_refresh) = json.get("refresh_token").and_then(|v| v.as_str()) {
-                    session.refresh_token = Some(new_refresh.to_string());
-                }
-                if let Some(expires_in) = json.get("expires_in").and_then(|v| v.as_i64()) {
-                    session.expires_at = Some(now_sec + expires_in);
-                }
-                session.updated_at = crate::store::now();
-                let _ = save_session(vault, &session);
-            }
-        }
-        _ => {}
+    let mut response = crate::providers::client()?
+        .post(endpoint)
+        .timeout(std::time::Duration::from_secs(30))
+        .form(&[("grant_type", "refresh_token"), ("client_id", client_id), ("refresh_token", refresh_token.as_str())])
+        .send().await.map_err(|_| "Could not reach the subscription authentication service.")?;
+    if !response.status().is_success() {
+        return Err(format!("Subscription refresh was rejected (HTTP {}). Sign in or sync from CLI again.", response.status().as_u16()));
     }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "Could not read the subscription refresh response.")? {
+        if body.len() + chunk.len() > 128 * 1024 {
+            return Err("The subscription refresh response exceeds its size limit.".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| "Subscription authentication returned an invalid refresh response.".into())
+}
 
+async fn valid_session_with<F, Fut>(
+    vault: std::sync::Arc<Vault>,
+    id: &'static str,
+    refresh: F,
+) -> Result<SubscriptionSession, String>
+where
+    F: FnOnce(&'static str, String) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    // There is one credential record per subscription provider. Re-read
+    // inside that account's gate so simultaneous calls reuse a rotation.
+    static CHATGPT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static GROK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let gate = if id == VAULT_CHATGPT_SUB { &CHATGPT } else { &GROK };
+    let _refresh = gate.lock().await;
+    let saved = vault.load_blocking(id).await
+        .map_err(|_| "Could not read the saved subscription credentials.")?
+        .ok_or("No active subscription session. Sign in or sync from CLI first.")?;
+    let mut session: SubscriptionSession = serde_json::from_slice(&saved)
+        .map_err(|_| "The saved subscription credentials are invalid.")?;
+    session.expires_at = session.expires_at.or_else(|| token_expiration(&session.access_token));
+    let now = crate::store::now() / 1000;
+    let expiring = session.expires_at.is_some_and(|expires| expires <= now.saturating_add(180));
+    if expiring {
+        if let Some(token) = session.refresh_token.as_ref().filter(|token| !token.trim().is_empty()) {
+            let response = refresh(id, token.clone()).await?;
+            let access = response["access_token"].as_str().filter(|token| !token.trim().is_empty())
+                .ok_or("Subscription refresh returned no usable access token.")?;
+            session.access_token = access.to_string();
+            if let Some(token) = response["refresh_token"].as_str().filter(|token| !token.trim().is_empty()) {
+                session.refresh_token = Some(token.to_string());
+            }
+            session.expires_at = if let Some(ttl) = response.get("expires_in") {
+                Some(ttl.as_i64().filter(|ttl| *ttl > 0).and_then(|ttl| now.checked_add(ttl))
+                    .ok_or("Subscription refresh returned an invalid token expiry.")?)
+            } else {
+                token_expiration(access)
+            };
+            if session.expires_at.is_some_and(|expires| expires <= now) {
+                return Err("Subscription refresh returned an expired access token.".into());
+            }
+            session.updated_at = crate::store::now();
+            let bytes = serde_json::to_vec(&session).map_err(|_| "Could not prepare refreshed subscription credentials.")?;
+            vault.replace_blocking(id, saved, bytes).await
+                .map_err(|_| "Could not save refreshed subscription credentials. Sign in or sync from CLI again.")?;
+        }
+    }
+    if session.access_token.trim().is_empty() || session.expires_at.is_some_and(|expires| expires <= now) {
+        return Err("Subscription access expired. Sign in or sync from CLI again.".into());
+    }
     Ok(session)
 }
 
-pub async fn get_valid_access_token(vault: &Vault, provider: &str) -> Result<String, String> {
-    let session = load_session(vault, provider)?.ok_or_else(|| {
-        format!(
-            "No active subscription session found for {provider}. Sign in or sync from CLI first."
-        )
-    })?;
+pub async fn get_valid_session(vault: &std::sync::Arc<Vault>, provider: &str) -> Result<SubscriptionSession, String> {
+    let id = vault_id_for_provider(provider)?;
+    // A cancelled inference may stop awaiting the result, but an already
+    // rotating credential still needs to reach the vault.
+    tokio::spawn(valid_session_with(vault.clone(), id, request_refresh)).await
+        .map_err(|_| "Subscription authentication was interrupted.".to_string())?
+}
 
-    let now_sec = crate::store::now() / 1000;
-    let needs_refresh = session
-        .expires_at
-        .map(|exp| now_sec >= exp - 180)
-        .unwrap_or(false);
-
-    if needs_refresh && session.refresh_token.is_some() {
-        let refreshed = refresh_subscription_token(vault, provider, session).await?;
-        Ok(refreshed.access_token)
-    } else {
-        Ok(session.access_token)
-    }
+pub async fn get_valid_access_token(vault: &std::sync::Arc<Vault>, provider: &str) -> Result<String, String> {
+    Ok(get_valid_session(vault, provider).await?.access_token)
 }
 
 pub fn base64url_encode(data: &[u8]) -> String {
@@ -827,4 +811,39 @@ mod tests {
         );
         assert_eq!(extract_query_param(target, "unknown"), None);
     }
+
+    #[tokio::test]
+    async fn refresh_requires_valid_durable_credentials_and_reuses_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = std::sync::Arc::new(Vault::new(dir.path().into()));
+        let mut expired = save_manual_token(&vault, PROVIDER_CHATGPT, "expired", Some("old-refresh"), None).unwrap();
+        expired.expires_at = Some(1);
+        save_session(&vault, &expired).unwrap();
+        let failed = valid_session_with(vault.clone(), VAULT_CHATGPT_SUB, |_, _| async { Err("redacted HTTP error".into()) }).await;
+        assert!(failed.is_err());
+        let missing = valid_session_with(vault.clone(), VAULT_CHATGPT_SUB, |_, _| async { Ok(serde_json::json!({"expires_in":3600})) }).await;
+        assert!(missing.is_err());
+        let target = dir.path().join(format!("{VAULT_CHATGPT_SUB}.sealed"));
+        let backup = dir.path().join("saved");
+        let failed_save = valid_session_with(vault.clone(), VAULT_CHATGPT_SUB, |_, _| async {
+            std::fs::rename(&target, &backup).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            Ok(serde_json::json!({"access_token":"unsaved","expires_in":3600}))
+        }).await;
+        assert!(failed_save.unwrap_err().contains("Could not save"));
+        std::fs::remove_dir(&target).unwrap();
+        std::fs::rename(&backup, &target).unwrap();
+        let rotate = |_, refresh: String| async move {
+            assert_eq!(refresh, "old-refresh");
+            Ok(serde_json::json!({"access_token":"new-access","refresh_token":"rotated","expires_in":3600}))
+        };
+        let (a, b) = tokio::join!(
+            valid_session_with(vault.clone(), VAULT_CHATGPT_SUB, rotate),
+            valid_session_with(vault.clone(), VAULT_CHATGPT_SUB, rotate),
+        );
+        assert_eq!(a.unwrap().access_token, "new-access");
+        assert_eq!(b.unwrap().access_token, "new-access");
+        assert_eq!(load_session(&vault, PROVIDER_CHATGPT).unwrap().unwrap().refresh_token.as_deref(), Some("rotated"));
+    }
+
 }

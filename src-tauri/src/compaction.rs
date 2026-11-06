@@ -157,21 +157,13 @@ pub struct CompactionPlan {
 /// window is cut on a user boundary, so an assistant message and its tool
 /// results are never split apart.
 ///
-/// The current draft (the last user message) is always kept. When the buffer
-/// carries an assistant exchange *after* the last user message, that exchange
-/// is kept too: it is the newest complete exchange.
+/// The current user turn and its entire tool exchange are always kept.
 pub fn plan_compaction(messages: &[Value], keep: usize) -> Option<CompactionPlan> {
-    let user = messages.iter().rposition(|m| m["role"] == "user")?;
-    // The newest complete exchange: an assistant message that follows the
-    // last user message. In the model-visible turn buffer the draft is last,
-    // so this is normally empty.
-    let tail = messages
-        .iter()
-        .enumerate()
-        .skip(user + 1)
-        .rfind(|(_, m)| m["role"] == "assistant")
-        .map(|(i, _)| i)
-        .unwrap_or(messages.len());
+    let is_user = |m: &Value| {
+        m["role"] == "user" && m["_continuation"] != true
+            && !m["content"].as_str().is_some_and(|text| text.starts_with("Context checkpoint: the first "))
+    };
+    let user = messages.iter().rposition(is_user)?;
     let leading = messages
         .iter()
         .take_while(|m| m["role"] == "system")
@@ -187,20 +179,16 @@ pub fn plan_compaction(messages: &[Value], keep: usize) -> Option<CompactionPlan
         .iter()
         .enumerate()
         .take(user)
-        .filter(|(_, m)| m["role"] == "user")
+        .filter(|(_, m)| is_user(m))
         .map(|(i, _)| i)
         .collect();
-    // Where the retained window begins. `None` means the whole history fits
-    // inside the window and nothing needs to be dropped.
-    let retention_start = if history_turn_starts.is_empty() {
-        None
-    } else if keep == 0 {
-        // Keep no history turn at all: only the draft survives.
-        Some(messages.len())
-    } else if history_turn_starts.len() > keep {
-        Some(history_turn_starts[history_turn_starts.len() - keep])
+    if history_turn_starts.len() <= keep {
+        return None;
+    }
+    let retention_start = if keep == 0 {
+        user
     } else {
-        None
+        history_turn_starts[history_turn_starts.len() - keep]
     };
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
@@ -214,9 +202,7 @@ pub fn plan_compaction(messages: &[Value], keep: usize) -> Option<CompactionPlan
         if i < leading
             || volatile == Some(i)
             || research_checkpoint == Some(i)
-            || i == user
-            || i >= tail
-            || (i < user && retention_start.is_some_and(|start| i >= start))
+            || i >= retention_start
         {
             kept.push(message.clone());
         } else {
@@ -264,28 +250,17 @@ pub fn plan_compaction(messages: &[Value], keep: usize) -> Option<CompactionPlan
     Some(CompactionPlan { id, kept, dropped })
 }
 
-/// Number of leading system messages (the frozen instructions).
-/// Reduce only completed exchanges, never an assistant call without its result.
-/// Keep instructions, the latest user request, and the last `keep` complete
-/// exchanges. The bounded extract is a navigation aid, not a fabricated model
-/// summary.
-pub fn compact_model_messages(
+/// Publish exactly the plan that was counted and accepted.
+pub fn commit_plan(
     store: &crate::store::Store,
     conversation_id: &str,
     messages: &mut Vec<Value>,
+    plan: CompactionPlan,
     keep: usize,
-) -> Result<Option<String>, String> {
-    let Some(plan) = plan_compaction(messages, keep) else {
-        return Ok(None);
-    };
+    draft_saved: bool,
+) -> Result<String, String> {
     let CompactionPlan { id, kept, dropped } = plan;
-    if serde_json::to_vec(&kept).map_err(|e| e.to_string())?.len()
-        >= serde_json::to_vec(messages)
-            .map_err(|e| e.to_string())?
-            .len()
-    {
-        return Ok(None);
-    }
+    let transaction = store.connection.unchecked_transaction().map_err(|e| e.to_string())?;
     let content = json!({"kind":"auto-compaction", "messages":dropped}).to_string();
     use sha2::{Digest, Sha256};
     store.save_artifact(&crate::artifacts::ArtifactRecord {
@@ -299,9 +274,10 @@ pub fn compact_model_messages(
         content,
         created_at: crate::store::now(),
     })?;
-    persist_live_cutoff(store, conversation_id, &id, keep)?;
+    persist_live_cutoff(store, conversation_id, &id, keep, draft_saved)?;
+    transaction.commit().map_err(|e| e.to_string())?;
     *messages = kept;
-    Ok(Some(id))
+    Ok(id)
 }
 
 /// Persist a user-boundary cutoff so the next turn replays the compacted prefix
@@ -314,19 +290,26 @@ fn persist_live_cutoff(
     conversation_id: &str,
     artifact_id: &str,
     keep: usize,
+    draft_saved: bool,
 ) -> Result<(), String> {
     if conversation_id.is_empty() {
         return Ok(());
     }
-    let stored = match store.messages(conversation_id) {
-        Ok(messages) => messages,
-        Err(_) => return Ok(()),
+    let stored = store.messages(conversation_id)?;
+    let retained = keep + usize::from(draft_saved);
+    let boundary = if retained == 0 {
+        stored.len()
+    } else {
+        let Some(boundary) = kept_boundary(&stored, retained) else {
+            return Ok(());
+        };
+        boundary
     };
-    let Some(boundary) = kept_boundary(&stored, keep) else {
+    let Some(last_archived) = boundary.checked_sub(1).and_then(|i| stored.get(i)) else {
         return Ok(());
     };
-    let cutoff = stored[boundary - 1].created_at;
-    if stored[boundary].created_at <= cutoff {
+    let cutoff = last_archived.created_at;
+    if stored.get(boundary).is_some_and(|m| m.created_at <= cutoff) {
         let mut next_ts = cutoff + 1;
         for msg in &stored[boundary..] {
             if msg.created_at < next_ts {
@@ -392,6 +375,7 @@ pub fn compact_now(
     conversation_id: &str,
     keep: usize,
 ) -> Result<Checkpoint, String> {
+    let tx = store.connection.unchecked_transaction().map_err(|e| e.to_string())?;
     let keep = keep.clamp(1, 200);
     let messages = store.messages(conversation_id)?;
     let boundary = kept_boundary(&messages, keep).ok_or_else(|| {
@@ -429,6 +413,7 @@ pub fn compact_now(
     checkpoint.artifact_id = artifact.id.clone();
     store.save_artifact(&artifact)?;
     store.save_compaction(&checkpoint)?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(checkpoint)
 }
 
@@ -511,18 +496,16 @@ pub async fn compact_conversation_cmd(
         return Err("Context compaction is disabled in Tools settings. Re-enable the compaction capability before creating a checkpoint.".into());
     }
     let outcome = outcome(&store, &conversation_id, keep)?;
-    if let Ok(store) = state.database() {
-        crate::chat::emit_session_event(
-            &store,
-            &conversation_id,
-            None,
-            None,
-            None,
-            "compaction",
-            json!({"artifact": outcome.checkpoint.artifact_id, "cutoff": outcome.checkpoint.cutoff, "auto": false}),
-            false,
-        );
-    }
+    crate::chat::emit_session_event(
+        &store,
+        &conversation_id,
+        None,
+        None,
+        None,
+        "compaction",
+        json!({"artifact": outcome.checkpoint.artifact_id, "cutoff": outcome.checkpoint.cutoff, "auto": false}),
+        false,
+    );
     Ok(outcome)
 }
 
@@ -613,38 +596,34 @@ mod tests {
     }
 
     #[test]
-    fn live_compaction_archives_old_exchanges_without_repeating_or_splitting_tools() {
-        let store = crate::store::Store::open_memory().unwrap();
-        let id = store.create_conversation().unwrap().id;
-        let mut messages = vec![
+    fn compaction_preserves_the_retained_window_and_complete_active_exchange() {
+        let messages = vec![
             json!({"role":"system","content":"Keep instructions"}),
-            json!({"role":"user","content":"Implement the feature"}),
-            json!({"role":"assistant","tool_calls":[{"id":"old"}],"content":"Reading"}),
+            json!({"role":"user","content":"Historical requirement"}),
+            json!({"role":"assistant","tool_calls":[{"id":"old"}]}),
             json!({"role":"tool","tool_call_id":"old","content":"x".repeat(12000)}),
-            json!({"role":"assistant","tool_calls":[{"id":"latest"}],"content":"Testing"}),
+            json!({"role":"user","content":"Current request"}),
+            json!({"role":"assistant","tool_calls":[{"id":"latest"}]}),
             json!({"role":"tool","tool_call_id":"latest","content":"tests passed"}),
+            json!({"role":"user","content":"Continue","_continuation":true}),
         ];
-        let artifact = compact_model_messages(&store, &id, &mut messages, 10)
-            .unwrap()
-            .unwrap();
-        assert_eq!(messages[0]["content"], "Keep instructions");
-        assert!(messages
-            .iter()
-            .any(|m| m["content"] == "Implement the feature"));
-        assert_eq!(
-            messages[messages.len() - 2]["tool_calls"][0]["id"],
-            "latest"
-        );
-        assert_eq!(messages.last().unwrap()["tool_call_id"], "latest");
-        assert!(store
-            .artifact(&artifact)
-            .unwrap()
-            .unwrap()
-            .content
-            .contains("old"));
-        assert!(compact_model_messages(&store, &id, &mut messages, 10)
-            .unwrap()
-            .is_none());
+        assert!(plan_compaction(&messages, 10).is_none());
+        assert!(plan_compaction(&messages, 1).is_none());
+        assert!(plan_compaction(&messages[4..], 0).is_none());
+        let plan = plan_compaction(&messages, 0).unwrap();
+        assert_eq!(&plan.dropped, &messages[1..4]);
+        assert_eq!(&plan.kept[2..], &messages[4..]);
+    }
+
+    fn compact_model_messages(
+        store: &crate::store::Store,
+        id: &str,
+        messages: &mut Vec<Value>,
+        keep: usize,
+    ) -> Result<Option<String>, String> {
+        plan_compaction(messages, keep)
+            .map(|plan| commit_plan(store, id, messages, plan, keep, false))
+            .transpose()
     }
 
     #[test]
@@ -658,7 +637,7 @@ mod tests {
             json!({"role":"system","content":"[injected plan]\nopen todos: x"}),
             json!({"role":"user","content":"draft"}),
         ];
-        compact_model_messages(&store, &id, &mut messages, 10)
+        compact_model_messages(&store, &id, &mut messages, 0)
             .unwrap()
             .unwrap();
         assert_eq!(messages[0]["content"], "frozen");
@@ -680,7 +659,7 @@ mod tests {
             json!({"role":"assistant","content":"x".repeat(4000)}),
             json!({"role":"user","content":"[injected plan]\nopen todos: x\n\ndraft"}),
         ];
-        compact_model_messages(&store, &id, &mut messages, 10)
+        compact_model_messages(&store, &id, &mut messages, 0)
             .unwrap()
             .unwrap();
         assert_eq!(messages[0]["content"], "frozen");
@@ -983,4 +962,36 @@ mod tests {
         assert_eq!(big.source_refs.len(), 50);
         assert_eq!(big.pending_work.len(), 20);
     }
+
+    #[test]
+    fn accepted_plan_is_the_archive_loaded_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("archive.sqlite");
+        let store = crate::store::Store::open(&db).unwrap();
+        let owner = store.create_conversation().unwrap().id;
+        store.begin_turn(&owner, "earlier request").unwrap();
+        let text = format!("{}unique tail", "a".repeat(4000));
+        let mut messages = vec![
+            json!({"role":"system","content":"instructions"}),
+            json!({"role":"user","content":"earlier request"}),
+            json!({"role":"assistant","content":text}),
+            json!({"role":"user","content":"current request"}),
+        ];
+        let plan = plan_compaction(&messages, 0).unwrap();
+        let exact_payload = plan.kept.clone();
+        let id = plan.id.clone();
+        assert_eq!(commit_plan(&store, &owner, &mut messages, plan, 0, false).unwrap(), id);
+        assert_eq!(messages, exact_payload);
+        store.begin_turn(&owner, "current request").unwrap();
+        drop(store);
+        let store = crate::store::Store::open(&db).unwrap();
+        let checkpoint = store.compaction(&owner).unwrap().unwrap();
+        assert_eq!(checkpoint.artifact_id, id);
+        let archived = store.artifact(&id).unwrap().unwrap();
+        assert_eq!(archived.conversation_id, owner);
+        assert!(archived.content.contains("unique tail"));
+        let replay = crate::history::model_history_with_cutoff(&store.messages(&owner).unwrap(), Some((checkpoint.cutoff, &id))).unwrap();
+        assert!(replay.iter().any(|m| m["content"] == "current request"));
+    }
+
 }

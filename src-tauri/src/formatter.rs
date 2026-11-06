@@ -15,8 +15,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::time::Duration;
+use crate::execution::{capture_command, CaptureError};
 
 /// Files larger than this are left alone. Reformatting a huge generated file
 /// costs more than it is worth and can stall a tool call.
@@ -255,7 +256,7 @@ impl FormatFailure {
 }
 
 /// Format one workspace-relative file, reporting whether a formatter ran.
-pub fn format_file_detailed(
+async fn format_file_async(
     root: &std::path::Path,
     relative: &str,
     timeout_seconds: u64,
@@ -285,8 +286,7 @@ pub fn format_file_detailed(
         &root,
         &target,
         Duration::from_secs(timeout_seconds.max(1)),
-    );
-    let after = file_sha256(&root, relative)?;
+    ).await;
     match outcome {
         RunOutcome::NotInstalled => Ok(Some(DetailedOutcome {
             outcome: FormatOutcome {
@@ -309,9 +309,13 @@ pub fn format_file_detailed(
         }),
         RunOutcome::Failed { detail } => Err(FormatFailure::FormatterFailed {
             formatter: formatter.name.to_string(),
-            detail,
+            detail: format!("{detail} The file may already have changed."),
         }),
         RunOutcome::Finished { detail } => {
+            let after = file_sha256(&root, relative).map_err(|error| FormatFailure::FormatterFailed {
+                formatter: formatter.name.to_string(),
+                detail: format!("{} finished, but its file changes could not be verified: {}", formatter.name, error.message()),
+            })?;
             let changed = before != after;
             Ok(Some(DetailedOutcome {
                 outcome: FormatOutcome {
@@ -331,6 +335,40 @@ pub fn format_file_detailed(
                 applied: true,
             }))
         }
+    }
+}
+
+/// Synchronous entry point for workspace writes, which already run on a
+/// blocking worker and hold the workspace transaction guard.
+pub fn format_file_detailed(
+    root: &Path,
+    relative: &str,
+    timeout_seconds: u64,
+    cancel: Option<&tokio::sync::watch::Receiver<()>>,
+) -> Result<Option<DetailedOutcome>, FormatFailure> {
+    let run = || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .map_err(|error| FormatFailure::InvalidTarget(format!("Formatter runtime unavailable: {error}")))?;
+        runtime.block_on(async {
+            if let Some(cancel) = cancel {
+                let mut cancel = cancel.clone();
+                tokio::select! {
+                    biased;
+                    _ = cancel.changed() => Err(FormatFailure::InvalidTarget(
+                        "Formatting interrupted; the file may already have changed.".into()
+                    )),
+                    outcome = format_file_async(root, relative, timeout_seconds) => outcome,
+                }
+            } else {
+                format_file_async(root, relative, timeout_seconds).await
+            }
+        })
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| scope.spawn(run).join())
+            .map_err(|_| FormatFailure::InvalidTarget("Formatter worker stopped unexpectedly.".into()))?
+    } else {
+        run()
     }
 }
 
@@ -426,68 +464,24 @@ enum RunOutcome {
 }
 
 /// Run one formatter over one file, with a hard timeout.
-fn run_formatter(formatter: &Formatter, root: &Path, target: &Path, timeout: Duration) -> RunOutcome {
-    let mut command = Command::new(formatter.command);
-    command
-        .args(formatter.args)
-        .arg(target)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: a formatter must never flash a console window.
-        command.creation_flags(0x08000000);
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return RunOutcome::NotInstalled
+async fn run_formatter(formatter: &Formatter, root: &Path, target: &Path, timeout: Duration) -> RunOutcome {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut command = tokio::process::Command::new(formatter.command);
+    command.args(formatter.args).arg(target).current_dir(root)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let (status, stdout, stderr) = match capture_command(command, None, deadline, MAX_CAPTURE_BYTES).await {
+        Ok(output) => output,
+        Err(CaptureError::Spawn(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RunOutcome::NotInstalled;
         }
-        Err(error) => {
-            return RunOutcome::Failed {
-                detail: format!("The formatter could not be started: {error}"),
-            }
-        }
+        Err(CaptureError::Spawn(error)) => return RunOutcome::Failed {
+            detail: format!("The formatter could not be started: {error}"),
+        },
+        Err(CaptureError::Io(error)) => return RunOutcome::Failed {
+            detail: format!("Could not collect the formatter result: {error}"),
+        },
+        Err(CaptureError::Timeout) => return RunOutcome::TimedOut,
     };
-    // The pipes are drained on their own threads so a chatty formatter can
-    // never block on a full pipe while the parent waits for the exit.
-    let stdout = child
-        .stdout
-        .take()
-        .map(|pipe| std::thread::spawn(move || read_bounded(pipe)));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|pipe| std::thread::spawn(move || read_bounded(pipe)));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return RunOutcome::Failed {
-                    detail: format!("The formatter could not be waited for: {error}"),
-                };
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return RunOutcome::TimedOut;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = stdout
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let stderr = stderr
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
     if status.success() {
         let detail = if stderr.trim().is_empty() {
             stdout.trim().to_string()
@@ -513,24 +507,6 @@ fn run_formatter(formatter: &Formatter, root: &Path, target: &Path, timeout: Dur
         };
         RunOutcome::Failed { detail }
     }
-}
-
-/// Read a pipe to the end, keeping only the first bounded slice.
-fn read_bounded<R: Read>(mut reader: R) -> String {
-    let mut kept: Vec<u8> = Vec::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(count) => {
-                let room = MAX_CAPTURE_BYTES.saturating_sub(kept.len());
-                if room > 0 {
-                    kept.extend_from_slice(&buffer[..count.min(room)]);
-                }
-            }
-        }
-    }
-    String::from_utf8_lossy(&kept).into_owned()
 }
 
 /// Whether a path is a file that can be executed.
@@ -616,13 +592,22 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     });
     let output = json!({
         "type":"object",
-        "required":["formatted","skipped","failed"],
+        "required":["schemaVersion","status","data","error","metadata"],
         "properties":{
-            "formatted":{"type":"array","items":{"$ref":"#/$defs/outcome"}},
-            "skipped":{"type":"array","items":{"$ref":"#/$defs/outcome"}},
-            "failed":{"type":"array","items":{"$ref":"#/$defs/outcome"}}
+            "schemaVersion":{"const":crate::tool_envelope::SCHEMA_VERSION},
+            "status":{"enum":["success","partial","failure"]},
+            "error":{"type":["object","null"]},
+            "metadata":{"type":"object","required":["sideEffects"]},
+            "data":{
+                "type":"object","required":["formatted","skipped","failed"],
+                "properties":{
+                    "formatted":{"type":"array","items":{"$ref":"#/$defs/outcome"}},
+                    "skipped":{"type":"array","items":{"$ref":"#/$defs/outcome"}},
+                    "failed":{"type":"array","items":{"$ref":"#/$defs/outcome"}}
+                },
+                "additionalProperties":false
+            }
         },
-        "additionalProperties":false,
         "$defs":{
             "outcome":{
                 "type":"object",
@@ -689,13 +674,7 @@ pub async fn execute(
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
     for path in targets {
-        let outcome = tokio::task::spawn_blocking({
-            let root = root.clone();
-            let path = path.clone();
-            move || format_file_detailed(&root, &path, TOOL_TIMEOUT_SECONDS)
-        })
-        .await
-        .map_err(|_| "The formatter run did not finish.".to_string())?;
+        let outcome = format_file_async(&root, &path, TOOL_TIMEOUT_SECONDS).await;
         match outcome {
             Ok(None) => skipped.push(outcome_json(&path, None, false, "No formatter applies to this file.")),
             Ok(Some(detailed)) if detailed.applied => {
@@ -712,7 +691,9 @@ pub async fn execute(
                 false,
                 &detailed.outcome.detail,
             )),
-            Err(FormatFailure::InvalidTarget(message)) => return Err(message),
+            Err(FormatFailure::InvalidTarget(message)) => {
+                failed.push(outcome_json(&path, None, false, &message));
+            }
             Err(FormatFailure::MissingFile(message)) => {
                 skipped.push(outcome_json(&path, None, false, &message))
             }
@@ -724,7 +705,27 @@ pub async fn execute(
             )),
         }
     }
-    Ok(json!({"formatted":formatted,"skipped":skipped,"failed":failed}))
+    Ok(format_result(formatted, skipped, failed))
+}
+
+fn format_result(formatted: Vec<Value>, skipped: Vec<Value>, failed: Vec<Value>) -> Value {
+    use crate::tool_envelope::{error_object, make, merge_compat, Status, SIDE_APPLIED, SIDE_NONE, SIDE_UNKNOWN};
+    let (status, side_effects) = if failed.is_empty() {
+        (Status::Success, if formatted.iter().any(|file| file["changed"] == true) { SIDE_APPLIED } else { SIDE_NONE })
+    } else if formatted.is_empty() {
+        (Status::Failure, SIDE_UNKNOWN)
+    } else {
+        (Status::Partial, SIDE_UNKNOWN)
+    };
+    let message = "Some paths could not be formatted. Inspect the per-file outcomes before retrying.";
+    let error = (status == Status::Failure).then(|| error_object("format-failed", message, false, side_effects));
+    let data = json!({"formatted":formatted,"skipped":skipped,"failed":failed});
+    let mut result = make(status, data.clone(), Vec::new(), error, json!({"sideEffects":side_effects}));
+    merge_compat(&mut result, &data);
+    if status == Status::Failure {
+        result["isError"] = json!(true);
+    }
+    result
 }
 
 /// One per-file outcome in the tool result.
@@ -864,7 +865,7 @@ mod tests {
     fn a_file_without_a_formatter_is_not_an_error() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("notes.txt"), "hello\n").unwrap();
-        let outcome = format_file_detailed(root.path(), "notes.txt", 10).unwrap();
+        let outcome = format_file_detailed(root.path(), "notes.txt", 10, None).unwrap();
         assert!(outcome.is_none());
     }
 
@@ -879,7 +880,7 @@ mod tests {
             "sub/../../escape.rs",
         ] {
             assert!(
-                format_file_detailed(root.path(), path, 10).is_err(),
+                format_file_detailed(root.path(), path, 10, None).is_err(),
                 "{path} was not refused"
             );
         }
@@ -894,7 +895,7 @@ mod tests {
         let target = outside.path().join("secret.rs");
         std::fs::write(&target, "fn main() {}\n").unwrap();
         symlink(&target, root.path().join("link.rs")).unwrap();
-        let error = format_file_detailed(root.path(), "link.rs", 10).unwrap_err();
+        let error = format_file_detailed(root.path(), "link.rs", 10, None).unwrap_err();
         let message = error.message();
         assert!(message.contains("link") || message.contains("symbolic"), "{message}");
         // The file outside the workspace is untouched.
@@ -914,11 +915,11 @@ mod tests {
         assert!(crate::tool_validation::validate(&spec.input, &json!({})).is_err());
         assert!(crate::tool_validation::validate(&spec.input, &json!({"paths":"a.rs"})).is_err());
         assert!(crate::tool_validation::validate(&spec.input, &json!({"paths":[""],"x":1})).is_err());
-        let result = json!({
-            "formatted":[{"path":"a.rs","formatter":"rustfmt","changed":true,"detail":"rewrote"}],
-            "skipped":[{"path":"b.txt","formatter":null,"changed":false,"detail":"no formatter"}],
-            "failed":[]
-        });
+        let result = format_result(
+            vec![outcome_json("a.rs", Some("rustfmt"), true, "rewrote")],
+            vec![outcome_json("b.txt", None, false, "no formatter")],
+            vec![],
+        );
         assert!(spec.validate_output(&result).is_ok());
         assert!(spec
             .validate_output(&json!({"formatted":[],"skipped":[]}))
@@ -974,4 +975,30 @@ mod tests {
         assert!(execute(&ctx, json!({"paths":["../escape.rs"]})).await.is_err());
         assert!(execute(&ctx, json!({"paths":[]})).await.is_err());
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_formatter_pipes_obey_the_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("fixture.rs");
+        let formatter = Formatter { name: "fixture", extensions: &["rs"], command: "sh", args: &["-c", "(sleep 2) & exit 0"] };
+        let start = std::time::Instant::now();
+        let outcome = run_formatter(&formatter, root.path(), &target, Duration::from_millis(100)).await;
+        assert!(matches!(outcome, RunOutcome::TimedOut));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn failed_and_partial_formatter_outcomes_stay_typed_after_normalization() {
+        let failed = outcome_json("a.rs", Some("rustfmt"), false, "formatter failed");
+        let formatted = outcome_json("b.rs", Some("rustfmt"), true, "formatted");
+        for (files, expected) in [(vec![], "failure"), (vec![formatted], "partial")] {
+            let value = format_result(files, vec![], vec![failed.clone()]);
+            let normalized = crate::tool_envelope::normalize(value, crate::tool_envelope::Family::Harness);
+            assert_eq!(normalized["status"], expected);
+            assert_eq!(normalized["metadata"]["sideEffects"], "unknown");
+            assert_eq!(normalized["data"]["failed"][0]["path"], "a.rs");
+        }
+    }
+
 }

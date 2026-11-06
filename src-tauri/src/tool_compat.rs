@@ -93,7 +93,7 @@ pub async fn retest_tool_calling(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut cancellation = state.cancel.subscribe();
+    let mut cancellation = state.cancel_signal().subscribe();
     let operation = async {
         let response = client.post(format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))).bearer_auth(&key).json(&json!({
             "messages":[{"role":"user","content":"Call locallm_probe with value 42. Do not answer in prose."}],

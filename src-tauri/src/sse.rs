@@ -3,10 +3,15 @@ pub struct SseDecoder {
     pending: Vec<u8>,
     data: Vec<String>,
     event_size: usize,
+    event_limit: Option<usize>,
     skip_lf: bool,
     started: bool,
 }
 impl SseDecoder {
+    pub(crate) fn inference() -> Self {
+        Self { event_limit: Some(2 * crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES), ..Self::default() }
+    }
+
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, String> {
         let mut events = Vec::new();
         for byte in bytes {
@@ -17,8 +22,8 @@ impl SseDecoder {
                 }
             }
             self.event_size += 1;
-            if self.event_size > 1_048_576 {
-                return Err("Stream event exceeds 1 MiB.".into());
+            if self.event_size > self.event_limit.unwrap_or(1_048_576) {
+                return Err("Stream event exceeds its byte limit.".into());
             }
             if *byte != b'\n' && *byte != b'\r' {
                 self.pending.push(*byte);

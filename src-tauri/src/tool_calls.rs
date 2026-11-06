@@ -63,9 +63,60 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
 }
+
+/// Display-only fragments. They are never accepted as executable arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallDraft {
+    pub index: u64,
+    pub id: String,
+    pub name: String,
+    pub path: Option<String>,
+    pub command: Option<String>,
+}
+
+/// Read a complete top-level string value from an otherwise incomplete JSON
+/// object. The normal `validated` path remains the only execution authority.
+fn partial_preview(input: &str) -> Option<(&'static str, String)> {
+    let mut offset = 0;
+    let bytes = input.as_bytes();
+    while bytes.get(offset).is_some_and(u8::is_ascii_whitespace) { offset += 1; }
+    if bytes.get(offset) != Some(&b'{') { return None; }
+    offset += 1;
+    loop {
+        while bytes.get(offset).is_some_and(u8::is_ascii_whitespace) { offset += 1; }
+        if bytes.get(offset) != Some(&b'"') { return None; }
+        let mut key = serde_json::Deserializer::from_str(&input[offset..]).into_iter::<Value>();
+        let key_value = key.next()?.ok()?;
+        let name = key_value.as_str()?;
+        offset += key.byte_offset();
+        while bytes.get(offset).is_some_and(u8::is_ascii_whitespace) { offset += 1; }
+        if bytes.get(offset) != Some(&b':') { return None; }
+        offset += 1;
+        while bytes.get(offset).is_some_and(u8::is_ascii_whitespace) { offset += 1; }
+        let mut value = serde_json::Deserializer::from_str(&input[offset..]).into_iter::<Value>();
+        let decoded = value.next()?.ok()?;
+        offset += value.byte_offset();
+        while bytes.get(offset).is_some_and(u8::is_ascii_whitespace) { offset += 1; }
+        if matches!(name, "path" | "command") {
+            if bytes.get(offset).is_some_and(|&byte| !matches!(byte, b',' | b'}')) { return None; }
+            return decoded.as_str().map(|value| (if name == "path" { "path" } else { "command" }, value.to_owned()));
+        }
+        if bytes.get(offset) != Some(&b',') { return None; }
+        offset += 1;
+    }
+}
+
 impl ToolCalls {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+    pub fn drafts(&self) -> Vec<ToolCallDraft> {
+        self.0.iter().filter(|(_, call)| !call.name.is_empty()).map(|(&index, call)| {
+            let preview = partial_preview(&call.arguments);
+            ToolCallDraft { index, id: call.id.clone(), name: call.name.clone(),
+                path: preview.as_ref().filter(|(key, _)| *key == "path").map(|(_, value)| value.clone()),
+                command: preview.as_ref().filter(|(key, _)| *key == "command").map(|(_, value)| value.clone()) }
+        }).collect()
     }
     /// Assemble one OpenAI-compatible streaming delta. Some local runtimes
     /// (AREX-family templates) interleave `content` reasoning prose with tool
@@ -95,13 +146,18 @@ impl ToolCalls {
             // and "read"+"read" — a call that can no longer be resolved.
             merge_identity(&mut entry.id, call["id"].as_str())?;
             merge_identity(&mut entry.name, call["function"]["name"].as_str())?;
+            if entry.id.len() > 128 || entry.name.len() > 128 {
+                return Err("Tool call exceeds its identifier size limit.".into());
+            }
             if let Some(text) = call["function"]["arguments"].as_str() {
+                crate::tool_spec::check_argument_bytes(&entry.name, entry.arguments.len().saturating_add(text.len()))?;
                 entry.arguments.push_str(text);
             } else if !call["function"]["arguments"].is_null() {
                 return Err("Malformed tool call fragment.".into());
             }
-            if entry.id.len() > 128 || entry.name.len() > 128 || entry.arguments.len() > 65_536 {
-                return Err("Tool call exceeds its size limit.".into());
+            crate::tool_spec::check_argument_bytes(&entry.name, entry.arguments.len())?;
+            if self.0.values().map(|call| call.arguments.len()).sum::<usize>() > crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES {
+                return Err("Model tool arguments exceed the per-round byte limit.".into());
             }
         }
         Ok(())
@@ -115,6 +171,9 @@ impl ToolCalls {
         if self.0.len() > 8 {
             return Err("The model requested more than eight tools in one round.".into());
         }
+        if self.0.values().map(|call| call.arguments.len()).sum::<usize>() > crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES {
+            return Err("Model tool arguments exceed the per-round byte limit.".into());
+        }
         let mut ids = std::collections::HashSet::new();
         let calls: Vec<ToolCall> = self
             .0
@@ -124,9 +183,10 @@ impl ToolCalls {
                 if call.id.is_empty() || call.name.is_empty() || !ids.insert(call.id.clone()) {
                     return Err("Tool call has missing or duplicate identifiers.".into());
                 }
-                if call.id.len() > 128 || call.name.len() > 128 || call.arguments.len() > 65_536 {
+                if call.id.len() > 128 || call.name.len() > 128 {
                     return Err("Tool call exceeds its size limit.".into());
                 }
+                crate::tool_spec::check_argument_bytes(&call.name, call.arguments.len())?;
                 // Truncated generations arrive as partial JSON; detect them
                 // here so the chat loop rejects unfinished arguments instead
                 // of executing a guessed call.
@@ -257,7 +317,7 @@ impl ToolCalls {
 /// the normal permissioned dispatch instead of leaking into the answer.
 /// Returns None when any block is malformed — a partial parse is never executed.
 pub fn parse_text_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
-    if text.len() > 1_048_576 {
+    if text.len() > crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES {
         return None;
     }
     let visible = without_presentation_fences(text);
@@ -306,6 +366,8 @@ pub fn parse_text_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         } else {
             break;
         }
+        let latest = calls.last()?;
+        crate::tool_spec::check_argument_bytes(&latest.name, latest.arguments.to_string().len()).ok()?;
         if calls.len() > 8 {
             return None;
         }
@@ -476,6 +538,20 @@ impl ToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_fields_are_complete_top_level_strings_and_never_authorize_partial_calls() {
+        let mut calls = ToolCalls::default();
+        calls.push(&json!({"tool_calls":[{"index":0,"id":"call","function":{"name":"workspace_edit_file","arguments":"{\"nested\":{\"path\":\"wrong\"},\"path\":\"src/"}}]})).unwrap();
+        assert_eq!(calls.drafts()[0].path, None);
+        assert!(calls.validated().is_err());
+        calls.push(&json!({"tool_calls":[{"index":0,"function":{"arguments":"app\\\".tsx\",\"content\":\"unfinished"}}]})).unwrap();
+        assert_eq!(calls.drafts()[0].path.as_deref(), Some("src/app\".tsx"));
+        assert!(calls.validated().is_err());
+        assert_eq!(partial_preview("{\"command\":\"echo \\u263a\",\"next\":"), Some(("command", "echo ☺".into())));
+        assert_eq!(partial_preview("{\"path\":99,\"other\":"), None);
+        assert_eq!(partial_preview("{\"path\":\"x\\\",\"other\":"), None);
+    }
     /// Several OpenAI-compatible servers repeat the call id and the tool name
     /// in every delta. Appending them corrupts both, and the call can no
     /// longer be resolved.
@@ -713,4 +789,19 @@ mod tests {
         assert!(!braces_balanced("{\"q\":\"abc\""));
         assert!(!braces_balanced("{\"q\":"));
     }
+
+    #[test]
+    fn advertised_workspace_writes_fit_the_model_assembler() {
+        let content = "\u{0}".repeat(1024 * 1024);
+        let call = json!({"tool_calls":[{"id":"write-1","type":"function","function":{
+            "name":"workspace_write_file","arguments":json!({"path":"page.html","content":content}).to_string()
+        }}]});
+        let calls = ToolCalls::from_openai_message(&call).unwrap();
+        assert_eq!(calls[0].arguments["content"].as_str().unwrap().len(), 1024 * 1024);
+        let invalid = json!({"tool_calls":[{"id":"bad","function":{
+            "name":"workspace_write_file","arguments":"{\"path\":"
+        }}]});
+        assert!(ToolCalls::from_openai_message(&invalid).is_err());
+    }
+
 }

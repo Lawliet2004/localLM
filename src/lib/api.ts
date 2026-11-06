@@ -213,6 +213,12 @@ export const api = {
   },
   getRun: (id: string) => invoke<RunRecord | null>('get_run', { id }),
   getConversationRun: (conversationId: string) => invoke<RunRecord | null>('get_conversation_run', { conversationId }),
+  listActiveRuns: () => invoke<import('./types').ActiveRunSnapshot[]>('list_active_runs'),
+  getPendingTurn: (conversationId: string) => invoke<import('./types').PendingTurn | null>('get_pending_turn', { conversationId }),
+  discardPendingTurn: (conversationId: string, id: string) => invoke<void>('discard_pending_turn', { conversationId, id }),
+  conversationWorktree: (conversationId: string) => invoke<{ original: string; path: string; branch: string; state?: 'creating' | 'active' | 'detached' } | null>('conversation_worktree', { conversationId }),
+  enterConversationWorktree: (conversationId: string, name: string) => invoke<unknown>('enter_conversation_worktree', { conversationId, name }),
+  exitConversationWorktree: (conversationId: string, action: 'keep' | 'remove') => invoke<unknown>('exit_conversation_worktree', { conversationId, action }),
   getRunEvents: (runId: string) => invoke<RunEvent[]>('get_run_events', { runId }),
   listCapabilities: (conversationId?: string | null) => invoke<Capability[]>('list_capabilities', { conversationId }),
   setCapabilityEnabled: (id: string, enabled: boolean) => invoke<Capability[]>('set_capability_enabled', { id, enabled }),
@@ -239,13 +245,13 @@ export const api = {
   localReasoningCapability: () => invoke<string | null>('local_reasoning_capability'),
   runtimeStatus: () => invoke<RuntimeStatus>('runtime_status'),
   retestToolCalling: () => invoke<{ supported: boolean; message: string }>('retest_tool_calling'),
-  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = [], connectorTools: ToolSelection[] = [], planMode = false, reasoningMode?: Preferences['reasoningMode'], presentationMode?: import('./types').PresentationMode) => {
+  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = [], connectorTools: ToolSelection[] = [], planMode = false, reasoningMode?: Preferences['reasoningMode'], presentationMode?: import('./types').PresentationMode, recoveryId?: string, resumeFailedMessageId?: string) => {
     const channel = new Channel<ChatEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools, planMode, reasoningMode, presentationMode });
+    return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools, planMode, reasoningMode, presentationMode, recoveryId, resumeFailedMessageId });
   },
-  cancelGeneration: () => invoke<void>('cancel_generation'),
-  pauseGeneration: () => invoke<void>('pause_generation'),
+  cancelGeneration: (conversationId?: string) => invoke<void>('cancel_generation', { conversationId }),
+  pauseGeneration: (conversationId?: string) => invoke<void>('pause_generation', { conversationId }),
   resumeGeneration: (conversationId: string) => invoke<{ generation: number; question: string; pending: string[]; completed: string[]; checkpoint: string }>('resume_generation', { conversationId }),
   restartGeneration: () => invoke<{ replayedWriteIds: string[]; unconditionalSuccess: boolean }>('restart_generation'),
   resolveToolApproval: (id: string, allow: boolean) => invoke<void>('resolve_tool_approval', { id, allow }),
@@ -254,6 +260,8 @@ export const api = {
   getTodos: (conversationId: string) => invoke<TodoItem[]>('get_todos', { conversationId }),
   getGoal: (conversationId: string) => invoke<string | null>('get_goal', { conversationId }),
   clearTodos: (conversationId: string) => invoke<void>('clear_todos', { conversationId }),
+  listSubagentRuns: (conversationId: string) => invoke<import('./types').SubagentRun[]>('list_subagent_runs', { conversationId }),
+  interruptSubagent: (childRunId: string) => invoke<boolean>('interrupt_subagent', { childRunId }),
   onSessionActivity: (conversationId: string, onActivity: (seq: number) => void) =>
     listen<{ conversationId: string; seq: number }>('locallm://session-activity', event => {
       if (event.payload.conversationId === conversationId && Number.isSafeInteger(event.payload.seq)) onActivity(event.payload.seq);

@@ -235,16 +235,17 @@ export function CommandRunCard({
   const kind = isWeb ? 'Web' : isEdit ? 'Edit' : isSearch ? 'Explore' : isRead ? 'Read' : isCommand ? 'Terminal' : 'Tool';
 
   let displayVerb = kind;
+  const unsettled = status === 'awaiting_approval' || status === 'failed' || status === 'interrupted';
   if (isWeb) {
-    displayVerb = toolName === 'web_open' ? 'Opened' : toolName === 'web_fetch_url' || toolName === 'web_fetch' ? 'Fetched' : toolName === 'web_find' ? 'Found' : 'Searched the web';
-  } else if (isEdit) displayVerb = 'Edited';
-  else if (isRead) displayVerb = 'Read';
-  else if (isSearch) displayVerb = 'Searched';
+    displayVerb = unsettled ? 'Browse' : status === 'running' ? 'Browsing' : toolName === 'web_open' ? 'Opened' : toolName === 'web_fetch_url' || toolName === 'web_fetch' ? 'Fetched' : toolName === 'web_find' ? 'Found' : 'Searched the web';
+  } else if (isEdit) displayVerb = unsettled ? 'Edit' : status === 'running' ? 'Editing' : 'Edited';
+  else if (isRead) displayVerb = unsettled ? 'Read' : status === 'running' ? 'Reading' : 'Read';
+  else if (isSearch) displayVerb = unsettled ? 'Search' : status === 'running' ? 'Searching' : 'Searched';
   else if (isTask) {
     const action = typeof args?.Action === 'string' ? args.Action : '';
     displayVerb = action === 'status' || action === 'check' || !action ? 'Checked task' : 'Task';
   } else if (isCommand) {
-    displayVerb = status === 'running' ? 'Running' : status === 'awaiting_approval' ? 'Run' : 'Ran';
+    displayVerb = status === 'running' ? 'Running' : unsettled ? 'Run' : 'Ran';
   }
 
   const firstLine = command ? command.split(/\r?\n/)[0].trim() : '';

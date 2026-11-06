@@ -91,6 +91,8 @@
 .activity-feed { gap: 12px; font-size: var(--chat-font-size, 16px); }
 .activity-feed > * { animation: none; }
 .activity-feed .message-assistant { padding-block: 8px 16px; }
+.activity-draft { display: flex; align-items: baseline; gap: 8px; min-width: 0; color: var(--secondary); font-size: .94em; }
+.activity-draft code { color: var(--text); overflow-wrap: anywhere; white-space: pre-wrap; }
 .activity-feed :is(details.activity-summary, details.trace-thought-details) {
   border: 0;
   border-radius: 0;
@@ -112,9 +114,9 @@
 }
 .activity-feed :is(details.activity-summary, details.trace-thought-details) > summary .trace-chevron {
   margin-left: 0;
-  transform: rotate(90deg);
+  transform: rotate(0deg);
 }
-.activity-feed :is(details.activity-summary, details.trace-thought-details)[open] > summary .trace-chevron { transform: rotate(-90deg); }
+.activity-feed :is(details.activity-summary, details.trace-thought-details)[open] > summary .trace-chevron { transform: rotate(90deg); }
 .activity-feed .trace-icon {
   width: 18px;
   height: 20px;
@@ -127,7 +129,10 @@
 .activity-feed details.trace-thought-details .trace-thought-content {
   background: transparent;
   border: 0;
-  padding: 8px 0 12px 26px;
+  border-inline-start: 1px solid var(--border);
+  margin: 6px 0 12px 9px;
+  padding: 2px 0 2px 16px;
+  color: var(--secondary);
 }
 .desktop-app .assistant-work > .work-summary { margin: 8px 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); font-size: 14px; }
 .desktop-app .assistant-work > .work-summary > summary { padding: 3px 0; flex-direction: row-reverse; color: var(--secondary); }
@@ -274,3 +279,58 @@
 @media (prefers-reduced-motion: reduce) {
   .markdown.is-streaming > .markdown-block:last-child > *:last-child::after { animation: none; }
 }
+
+/* A stable disclosure label and a single small motion signal during work. */
+.activity-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 21px;
+  height: 20px;
+  flex: 0 0 21px;
+  color: var(--secondary);
+}
+.activity-indicator > span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.activity-indicator[data-active=true] > span { animation: activity-breathe 1.5s ease-in-out infinite; }
+.activity-indicator[data-active=true] > span:nth-child(2) { animation-delay: .16s; }
+.activity-indicator[data-active=true] > span:nth-child(3) { animation-delay: .32s; }
+@keyframes activity-breathe {
+  0%, 70%, 100% { opacity: .4; transform: scale(.8); }
+  35% { opacity: 1; transform: scale(1); }
+}
+.activity-feed details.trace-thought-details > summary.trace-thought-pill {
+  width: fit-content;
+  max-width: 100%;
+  min-height: 36px;
+  padding-inline: 6px;
+  margin-inline-start: -6px;
+  border-radius: var(--radius-sm);
+}
+.activity-feed details.trace-thought-details .trace-thought-label { font-size: 13px; }
+.activity-feed details.trace-thought-details > summary:hover .trace-thought-label { color: var(--text); }
+.activity-live { min-height: 36px; animation: none; }
+.activity-live .activity-live-text { animation: none; opacity: 1; overflow-wrap: anywhere; }
+.desktop-app .message-assistant .copy-message {
+  width: auto;
+  height: 32px;
+  min-width: 32px;
+  padding: 0 8px;
+  gap: 6px;
+  margin: 8px 0 0 -8px;
+  opacity: 1;
+  color: var(--secondary);
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+}
+.desktop-app .message-assistant .copy-message:hover { color: var(--text); background: var(--hover); }
+.desktop-app .message-assistant .copy-message:focus-visible { outline: 2px solid var(--focus-border); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .activity-indicator[data-active=true] > span { animation: none; }
+}
+:root[data-motion=reduced] .activity-indicator[data-active=true] > span { animation: none; }

@@ -862,7 +862,7 @@ mod tests {
         let registry = Arc::new(crate::mcp_input::Registry::default());
         let inner = registry.clone();
         let emit = Arc::new(move |_message: String, payload: Option<Value>| {
-            let Some(approval) = payload.and_then(|value| value.get("approval").cloned()) else {
+            let Some(approval) = payload else {
                 return;
             };
             if approval["closed"].as_bool() == Some(true) {

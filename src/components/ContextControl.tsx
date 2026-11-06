@@ -29,10 +29,17 @@ function ContextRing({ percent, size, stroke }: { percent: number | null; size: 
   );
 }
 
-export function ContextControl({ conversationId, usage, busy, onCompact, compacting }: {
+type ContextControlProps = {
   conversationId: string; usage?: ContextUsage; busy: boolean;
   onCompact?: () => void; compacting?: boolean;
-}) {
+};
+
+// Remount session-owned controls so late async writes cannot update another chat.
+export function ContextControl(props: ContextControlProps) {
+  return <SessionContextControl key={props.conversationId} {...props} />;
+}
+
+function SessionContextControl({ conversationId, usage, busy, onCompact, compacting }: ContextControlProps) {
   const [auto, setAuto] = useState(true);
   const [saving, setSaving] = useState(false);
   const [pinned, setPinned] = useState(false);
@@ -45,7 +52,7 @@ export function ContextControl({ conversationId, usage, busy, onCompact, compact
     }
     return () => { disposed = true; };
   }, [conversationId]);
-  const percent = usage && usage.contextLength > 0 ? Math.min(100, Math.round((usage.inputTokens + usage.responseReserve) / usage.contextLength * 100)) : null;
+  const percent = usage && usage.contextLength > 0 ? Math.min(100, Math.round(usage.inputTokens / usage.contextLength * 100)) : null;
   const level = percent === null ? 'idle' : percent >= 80 ? 'high' : percent >= 55 ? 'mid' : 'low';
   return (
     <div className={`context-control context-${level} ${pinned ? 'is-open' : ''}`}>
@@ -66,7 +73,7 @@ export function ContextControl({ conversationId, usage, busy, onCompact, compact
             <strong>Context window</strong>
             <small>
               {usage
-                ? `${(usage.inputTokens + usage.responseReserve).toLocaleString()} / ${usage.contextLength.toLocaleString()} tokens`
+                ? `${usage.inputTokens.toLocaleString()} / ${usage.contextLength.toLocaleString()} tokens`
                 : 'No usage measured yet'}
             </small>
           </div>
@@ -75,6 +82,9 @@ export function ContextControl({ conversationId, usage, busy, onCompact, compact
           <p className="context-detail">
             {usage.estimated ? 'Estimated: ' : ''}{usage.inputTokens.toLocaleString()} input + {usage.responseReserve.toLocaleString()} reserved / {usage.contextLength.toLocaleString()} tokens
           </p>
+        )}
+        {usage && (
+          <p className="context-detail">The response reserve is an output allowance, not stored conversation history. Auto-compaction checks input plus this allowance.</p>
         )}
         {usage?.cachedTokens != null && (
           <p className="context-detail" aria-label="Prompt cache usage">

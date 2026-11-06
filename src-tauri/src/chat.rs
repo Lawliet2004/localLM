@@ -369,7 +369,7 @@ fn begin_plan_implementation(messages: &mut Vec<Value>, plan_text: &str) -> Resu
         replace_in_content(draft, PLAN_MODE_INSTRUCTION, PLAN_MODE_ACTIVE);
     }
     messages.push(json!({"role": "assistant", "content": plan_text}));
-    messages.push(json!({"role": "user", "content": PLAN_IMPLEMENT_INSTRUCTION}));
+    messages.push(json!({"role": "user", "_continuation": true, "content": PLAN_IMPLEMENT_INSTRUCTION}));
     Ok(())
 }
 
@@ -755,7 +755,7 @@ async fn run_finish_call(
             Some(step_id),
             Some(&call.id),
             "tool_result",
-            json!({"callId": call.id, "name": "finish", "decision": "allowed", "result": result, "artifactId": null}),
+            json!({"callId": call.id, "name": "finish", "decision": "allowed", "result": result, "artifactId": null,"messageId":row.id}),
             false,
         );
     }
@@ -818,6 +818,8 @@ pub struct ChatEvent {
     pub round_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_stream: Option<ToolStreamEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<crate::sessions::SessionEvent>,
 }
 
 impl ChatEvent {
@@ -845,6 +847,7 @@ impl ChatEvent {
             round_index: None,
             presentation: None,
             tool_stream: None,
+            item: None,
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -875,6 +878,7 @@ impl ChatEvent {
             round_index: None,
             presentation: None,
             tool_stream: None,
+            item: None,
         }
     }
 }
@@ -931,7 +935,8 @@ pub struct TurnPlan {
     pub selection: crate::providers::ModelSelection,
     pub access_mode: crate::permissions::AccessMode,
     pub context_length: u32,
-    /// llama.cpp slot for this conversation (parent = 0). None for remote.
+    /// Prefer parent slot 0 for cache reuse. Competing sessions let llama.cpp
+    /// select an available slot; remote providers do not use a slot hint.
     pub id_slot: Option<i64>,
     /// The AREX research contract was applied to this turn's tool set — the
     /// model answers through its `finish` tool, which must stay reachable on
@@ -999,6 +1004,7 @@ fn append_workspace_tools(
     tools: &mut Vec<crate::connectors::AgentTool>,
     path: &str,
     minimal: bool,
+    database: &std::path::Path,
 ) -> Option<String> {
     let workspace = match crate::workspace::Workspace::open(path) {
         Ok(workspace) => workspace,
@@ -1009,7 +1015,7 @@ fn append_workspace_tools(
             "Workspace Files was skipped because its folder is unavailable: {error}. Choose another project or folder in Tools to use workspace files."
         )),
     };
-    let mut workspace_tools = std::sync::Arc::new(workspace).tools();
+    let mut workspace_tools = std::sync::Arc::new(workspace.with_permission_store(database)).tools();
     if minimal {
         workspace_tools.retain(|tool| {
             crate::presets::minimal_workspace_tools().contains(&tool.tool.name.as_str())
@@ -1105,6 +1111,7 @@ pub(crate) async fn assemble_turn(
             &mut tools,
             &workspace_path,
             preset.id == crate::presets::MINIMAL,
+            &state.db_path,
         ) {
             add_tool_notice(&mut tool_notice, notice);
         }
@@ -1429,11 +1436,8 @@ pub(crate) async fn assemble_turn(
             } else {
                 "grok"
             };
-            let token =
-                crate::subscription_auth::get_valid_access_token(&state.daytona_vault, kind)
-                    .await?;
-            let account_id = crate::subscription_auth::load_session(&state.daytona_vault, kind)?
-                .and_then(|s| s.account_id);
+            let session = crate::subscription_auth::get_valid_session(&state.daytona_vault, kind).await?;
+            let (token, account_id) = (session.access_token, session.account_id);
             Backend::subscription(&provider.name, &provider.base_url, token, account_id, model)?
         } else if provider.api_format == crate::providers::OPENAI_CHAT_COMPLETIONS
             || provider.api_format == crate::providers::OPENAI_RESPONSES
@@ -1444,7 +1448,7 @@ pub(crate) async fn assemble_turn(
                 &provider,
                 state
                     .daytona_vault
-                    .load(&crate::providers::credential_id(&provider_id))?,
+                    .load_blocking(&crate::providers::credential_id(&provider_id)).await?,
             )?;
             Backend::openai(&provider, key, model)?
         } else {
@@ -1671,6 +1675,9 @@ pub(crate) async fn assemble_turn(
             crate::arex::RESEARCH_GUIDANCE.into(),
         ));
     }
+    if let Some(guidance) = crate::authoring::task_hint(content, &tools.iter().map(|t| t.alias.as_str()).collect::<Vec<_>>()) {
+        injections.push(("development_task".into(), guidance));
+    }
     if crate::tool_discovery::attach(&mut tools)? {
         injections.push(("tool_discovery".into(),"Some authorized tool schemas are deferred to keep the request bounded. Use tool_search to find names and exact input schemas, then tool_invoke to call a discovered tool. Its original validation, approvals and audit still apply. Discovery does not change the advertised schema set or broaden selected sources.".into()));
     }
@@ -1720,7 +1727,7 @@ pub(crate) async fn assemble_turn(
         &mut tools,
     )?;
     let id_slot = match &backend {
-        Backend::Local { .. } => Some(0),
+        Backend::Local { .. } if state.session_runs.running_count() <= 1 => Some(0),
         _ => None,
     };
     Ok(TurnPlan {
@@ -1848,6 +1855,10 @@ struct TurnRounds<'a> {
     content: &'a str,
     snapshot: &'a mut crate::subagents::BackendSnapshot,
     response_started: Instant,
+    recovery_only: bool,
+    failed_model_round: bool,
+    outcome: Option<Value>,
+    partial_work: bool,
 }
 
 impl<'a> TurnRounds<'a> {
@@ -1901,11 +1912,13 @@ impl<'a> TurnRounds<'a> {
     let mut corrections_used = 0u32;
     // Plan mode: mutating tools refuse until plan_submit is approved.
     let mut plan_approved = false;
-    // Verify-before-finish: a successful workspace write sets this and a
-    // dispatched check_run clears it; at most one nudge per run.
-    let mut verify_dirty = false;
+    // Verify actual terminal outcomes after the latest observed mutation.
+    // The reminder remains bounded to one corrective round per parent turn.
+    let mut verification = crate::verification_progress::Progress::default();
+    let result = async {
+    let development_task = plan.injections.iter().any(|(kind, _)| kind == "development_task");
     let mut check_nudged = false;
-    let check_run_offered = plan.tools.iter().any(|tool| tool.alias == "check_run");
+    let check_run_offered = plan.tools.iter().any(|tool| matches!(tool.alias.as_str(), "check_run" | "verification_run"));
     let mut repairs_used = 0u32;
     let mut output_recoveries = 0u32;
     let mut round_preferences = plan.preferences.clone();
@@ -1921,12 +1934,13 @@ impl<'a> TurnRounds<'a> {
     if let Some(task) = ledger.as_ref() {
         save_ledger(state, task);
     }
-    for round in 0..budgets.lock().map(|b| b.max_rounds).unwrap_or(64) as usize {
+    let max_rounds = if self.recovery_only { 1 } else { budgets.lock().map(|b| b.max_rounds).unwrap_or(64) as usize };
+    for round in 0..max_rounds {
         // Only the last executed round may provide the saved model content;
         // an earlier round's value must not survive into a finishing exit.
         self.replay_answer = None;
         if cancel_applies(state, run_generation) { return Ok(false); }
-        if state.run_control.lock().map(|control| control.pause).unwrap_or(false) {
+        if state.with_run_control(|control| control.pause).unwrap_or(false) {
             if let Some(task) = ledger.as_mut() {
                 if task.status == crate::research_tasks::TaskStatus::Running {
                     task.pending_work.push("Continue the interrupted request from the saved checkpoint.".into());
@@ -1964,10 +1978,11 @@ impl<'a> TurnRounds<'a> {
                 refresh_plan_focus(messages, &todos);
             }
         }
-        let finalizing = self.research_fallback.is_some() || self.finalization_retried || budgets.lock().map(|b| b.reserve_final_response()).unwrap_or(true);
+        let finalizing = self.recovery_only || self.research_fallback.is_some() || self.finalization_retried || budgets.lock().map(|b| b.reserve_final_response()).unwrap_or(true);
         if budgets.lock().map(|b| b.reserve_final_response()).unwrap_or(true) && self.research_fallback.is_none() {
+            self.partial_work = true;
             self.research_fallback = Some("Partial result. The model round budget is exhausted. State the completed work and name unresolved steps without claiming completion.".into());
-            messages.push(json!({"role":"user","content":self.research_fallback.as_deref().unwrap_or_default()}));
+            messages.push(json!({"role":"user","_continuation":true,"content":self.research_fallback.as_deref().unwrap_or_default()}));
         }
         if let Ok(mut b) = budgets.lock() { b.note_round(); }
         let _ = run.transition_to(crate::agent_run::RunState::Generating);
@@ -1998,13 +2013,13 @@ impl<'a> TurnRounds<'a> {
         if round > 0 {
             let (tokens, compacted) = tokio::select! {
                 _ = cancellation.changed() => return Ok(false),
-                result = prepare_context(state, plan, &round_preferences, &conversation_id, messages, tool_use_denied, finalizing) => result?,
+                result = prepare_context(state, plan, &round_preferences, &conversation_id, messages, tool_use_denied, finalizing, true) => result?,
             };
             self.input_tokens = tokens;
             if let Some(artifact) = compacted {
                 let store = state.database()?;
                 emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), None,
-                    "compaction", json!({"artifact":artifact,"auto":true,"thresholdPercent":80,"inputTokens":tokens}), false);
+                    "compaction", json!({"artifact":artifact,"cutoff":store.compaction(&conversation_id)?.map(|c| c.cutoff),"auto":true,"thresholdPercent":80,"inputTokens":tokens}), false);
                 let mut event = ChatEvent::progress(&run.id, &step_id, &assistant.id, "Context compacted · continuing…", None);
                 event.notice = Some("Context reached 80%. Older activity was archived; continuing this response.".into());
                 channel.send(event).map_err(|e| e.to_string())?;
@@ -2035,18 +2050,21 @@ impl<'a> TurnRounds<'a> {
         *active_measurement = Some((round_start_time, crate::inference::InferenceRound {
             phase: None, usage: Default::default(), first_token_ms: None, first_visible_answer_ms: None, reasoning_ms: None, duration_ms: 0.0, complete: false,
         }));
+        self.failed_model_round = true;
         let response = tokio::select! {
             _ = cancellation.changed() => return Ok(false),
             result = tokio::time::timeout(Duration::from_secs(600), plan.backend.stream(&payload)) => result.map_err(|_| "Model did not respond within ten minutes.")??,
         };
         let mut stream = response.bytes_stream();
-        let mut decoder = SseDecoder::default();
+        let mut decoder = SseDecoder::inference();
         let mut protocol = crate::sse::ModelStream::for_backend(&plan.backend);
         let mut usage = crate::inference::InferenceUsage::default();
         let mut checkpoint = Instant::now();
         let mut calls = crate::tool_calls::ToolCalls::default();
         let mut round_answer = String::new();
         let mut round_reasoning = String::new();
+        let mut reasoning_item = crate::turn_items::ReasoningItem::new(state, channel, &conversation_id, &run.id, &step_id, &assistant.id, round);
+        let mut tool_drafts = crate::turn_items::ToolDraftItems::new(state, channel, &conversation_id, &run.id, &step_id, &assistant.id, round);
         let mut reasoning_started: Option<Instant> = None;
         let mut reasoning_last: Option<Instant> = None;
         let mut finish_reason = String::new();
@@ -2064,12 +2082,18 @@ impl<'a> TurnRounds<'a> {
         let mut next_rep_check = 1_200usize;
         let mut repetition_stopped = false;
         'stream: loop {
+            let flush_deadline = [reasoning_item.flush_deadline(), tool_drafts.flush_deadline()].into_iter().flatten().min();
             let next = tokio::select! {
                 _ = cancellation.changed() => return Ok(false),
+                _ = tokio::time::sleep_until(flush_deadline.unwrap_or_else(tokio::time::Instant::now)), if flush_deadline.is_some() => {
+                    reasoning_item.flush_pending();
+                    tool_drafts.flush_pending();
+                    continue;
+                },
                 next = tokio::time::timeout(Duration::from_secs(300), stream.next()) => next.map_err(|_| "Model stopped responding.")?,
             };
             let Some(bytes) = next else { decoder.finish()?; return Err("Model stream ended without a completion marker.".into()); };
-            for event in decoder.push(&bytes.map_err(|error| error.to_string())?)? {
+            for event in decoder.push(&bytes.map_err(|error| plan.backend.stream_read_error(error))?)? {
                 let value = protocol.push(&event)?;
                 let Some(value) = value else {if protocol.done{break 'stream;}continue;};
                 if let Some(error) = value.get("error") { return Err(plan.backend.stream_error(error)); }
@@ -2109,6 +2133,8 @@ impl<'a> TurnRounds<'a> {
                 answer.push_str(&ans_chunk); round_answer.push_str(&ans_chunk);
                 reasoning.push_str(&thought_chunk); round_reasoning.push_str(&thought_chunk);
                 if answer.len() + reasoning.len() > 4_194_304 { return Err("Model output exceeded 4 MiB.".into()); }
+                reasoning_item.push(&thought_chunk);
+                if delta.get("tool_calls").is_some_and(|calls| !calls.is_null()) { tool_drafts.observe(&calls); }
                 if round_answer.len() >= next_rep_check {
                     next_rep_check = round_answer.len() + 1024;
                     // A loop may have re-emitted the block more than once;
@@ -2152,6 +2178,7 @@ impl<'a> TurnRounds<'a> {
                 if protocol.done{break 'stream;}
             }
         }
+        self.failed_model_round = false;
         if repetition_stopped {
             if !calls.is_empty() {
                 return Err("Model output repeated before its tool calls completed. Unfinished tool calls were not executed.".into());
@@ -2185,6 +2212,7 @@ impl<'a> TurnRounds<'a> {
             }
             answer.push_str(&flush_ans); round_answer.push_str(&flush_ans);
             reasoning.push_str(&flush_th); round_reasoning.push_str(&flush_th);
+            reasoning_item.push(&flush_th);
             self.seq += 1;
             let mut evt = ChatEvent::new(
                 run,
@@ -2201,6 +2229,10 @@ impl<'a> TurnRounds<'a> {
             evt.round_index = Some(round);
             let _ = channel.send(evt);
         }
+        reasoning_item.finish();
+        drop(reasoning_item);
+        tool_drafts.finish(finish_reason != "length" && calls.validated().is_ok());
+        drop(tool_drafts);
         if planning {
             // No tools were offered in this round, so its answer is the
             // plan. Park it in the transcript, then let the ordinary tool
@@ -2289,7 +2321,7 @@ impl<'a> TurnRounds<'a> {
                     json!({"role":"assistant","content":round_answer})
                 });
             }
-            messages.push(json!({"role":"user","content":if unfinished_call || round_answer.trim().is_empty() {
+            messages.push(json!({"role":"user","_continuation":true,"content":if unfinished_call || round_answer.trim().is_empty() {
                 RETRY_TRUNCATED_CALL
             } else {
                 crate::prompt::CONTINUE_INSTRUCTION
@@ -2343,7 +2375,7 @@ impl<'a> TurnRounds<'a> {
                     if crate::history::saved_native_message(&repaired).is_some() {
                         messages.push(repaired);
                     }
-                    messages.push(json!({"role":"user","content":format!("The previous tool call was malformed and was not executed. Validation error: {error}. Reply with one valid tool call or a final answer.")}));
+                    messages.push(json!({"role":"user","_continuation":true,"content":format!("The previous tool call was malformed and was not executed. Validation error: {error}. Reply with one valid tool call or a final answer.")}));
                     let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
                     state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id))?;
                     continue;
@@ -2372,7 +2404,7 @@ impl<'a> TurnRounds<'a> {
             } else {
                 messages.push(json!({"role":"assistant","content":round_answer}));
             }
-            messages.push(json!({"role":"user","content":crate::continuation::WEB_LOOKUP_RETRY}));
+            messages.push(json!({"role":"user","_continuation":true,"content":crate::continuation::WEB_LOOKUP_RETRY}));
             if let Ok(store) = state.database() {
                 emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), None,
                     "web_lookup_retry", json!({"round":round,"reason":"claimed_no_live_access_without_lookup"}), false);
@@ -2385,7 +2417,7 @@ impl<'a> TurnRounds<'a> {
         // A final answer while a workspace write is unverified gets one
         // corrective round, mirroring the missing-lookup retry above.
         if !finalizing && !tool_use_denied && calls.is_empty() && finish_reason == "stop"
-            && verify_dirty && check_run_offered && !check_nudged
+            && verification.needs_verification() && check_run_offered && !check_nudged
         {
             check_nudged = true;
             answer.truncate(answer_len_before_round);
@@ -2395,7 +2427,7 @@ impl<'a> TurnRounds<'a> {
             } else {
                 messages.push(json!({"role":"assistant","content":round_answer}));
             }
-            messages.push(json!({"role":"user","content":crate::continuation::VERIFY_BEFORE_FINISH}));
+            messages.push(json!({"role":"user","_continuation":true,"content":verification.reminder()}));
             if let Ok(store) = state.database() {
                 emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), None,
                     "verify_before_finish", json!({"round":round}), false);
@@ -2521,7 +2553,7 @@ impl<'a> TurnRounds<'a> {
                             messages.push(json!({"role":"assistant","content":round_answer}));
                         }
                     }
-                    messages.push(json!({"role":"user","content":if research_progress.stopped() { RESEARCH_STALLED } else { FINAL_ANSWER_INSTRUCTION }}));
+                    messages.push(json!({"role":"user","_continuation":true,"content":if research_progress.stopped() { RESEARCH_STALLED } else { FINAL_ANSWER_INSTRUCTION }}));
                     if let Ok(store) = state.database() {
                         emit_session_event(
                             &store,
@@ -2654,7 +2686,6 @@ impl<'a> TurnRounds<'a> {
             }
             let _ = run.transition_to(crate::agent_run::RunState::Completed);
             let _ = state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id));
-            crate::hooks::run_finished(state, conversation_id.clone(), json!({"status":"completed"}));
             if let Ok(store) = state.database() {
                 emit_session_event(
                     &store,
@@ -2717,6 +2748,7 @@ impl<'a> TurnRounds<'a> {
                     let result=crate::tool_envelope::failure_notice("unavailable-tool",&error,false,crate::tool_envelope::SIDE_NONE,&json!({}));
                     let store=state.database()?;let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":"Unavailable","name":call.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"unavailable"},"result":result}).to_string(),"complete")?;
                     crate::history::remember_native_round(&store,&row,&round_model_message,&mut round_model_saved)?;
+                    emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":row.id,"result":result}), false);
                     messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));call_index+=1;continue;
                 },
             };
@@ -2740,7 +2772,9 @@ impl<'a> TurnRounds<'a> {
                 prefetch_read_group(state,plan,snapshot,&conversation_id,run,&step_id,&assistant.id,round,channel,&cancellation,&mut ledger,&calls[call_index..end],&mut prefetched).await;
                 if let Some(entry)=prefetched.get_mut(&call.id){entry.audit_row=reserved;}
             }
+            let hook_workspace = snapshot.workspace_path.clone();
             let was_prefetched = prefetched.contains_key(&call.id);
+            let prefetched_dispatched = prefetched.get(&call.id).is_some_and(|entry| entry.dispatched);
             call_index += 1;
 
             // Capability kills are re-checked at dispatch: a frozen catalog
@@ -2755,7 +2789,7 @@ impl<'a> TurnRounds<'a> {
                 let store = state.database()?;
                 let recorded=store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"capability disabled"},"result":result}).to_string(), "complete")?;
                 crate::history::remember_native_round(&store,&recorded,&round_model_message,&mut round_model_saved)?;
-                emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", result.clone(), false);
+                emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":recorded.id,"result":result}), false);
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
                 continue;
             }
@@ -2767,19 +2801,19 @@ impl<'a> TurnRounds<'a> {
                 let store = state.database()?;
                 let recorded = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"plan approval pending"},"result":result}).to_string(), "complete")?;
                 crate::history::remember_native_round(&store,&recorded,&round_model_message,&mut round_model_saved)?;
-                emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", result.clone(), false);
+                emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":recorded.id,"result":result}), false);
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
                 continue;
             }
             // A finish attempt while a workspace write is unverified gets
             // one refusal carrying the nudge; the retry is accepted.
-            if call.name == "finish" && verify_dirty && check_run_offered && !check_nudged {
+            if call.name == "finish" && verification.needs_verification() && check_run_offered && !check_nudged {
                 check_nudged = true;
-                let result = crate::tool_envelope::failure_notice("verify-before-finish", crate::continuation::VERIFY_BEFORE_FINISH, true, crate::tool_envelope::SIDE_NONE, &json!({}));
+                let result = crate::tool_envelope::failure_notice("verify-before-finish", &verification.reminder(), true, crate::tool_envelope::SIDE_NONE, &json!({}));
                 let store = state.database()?;
                 let recorded = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"verify before finish nudge"},"result":result}).to_string(), "complete")?;
                 crate::history::remember_native_round(&store,&recorded,&round_model_message,&mut round_model_saved)?;
-                emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", result.clone(), false);
+                emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":recorded.id,"result":result}), false);
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
                 continue;
             }
@@ -2787,7 +2821,7 @@ impl<'a> TurnRounds<'a> {
                 settle_unconsumed_reads(state, plan, &conversation_id, run, &step_id, &mut ledger, &calls, &mut prefetched, messages, &mut self.seq);
                 return Ok(false);
             }
-            if state.run_control.lock().map(|control| crate::agent_run::pause_blocks_new_tool(control.pause)).unwrap_or(false) {
+            if state.with_run_control(|control| crate::agent_run::pause_blocks_new_tool(control.pause)).unwrap_or(false) {
                 let notice = crate::agent_run::pause_notice(false);
                 if let Some(task) = ledger.as_mut() {
                     let _ = task.pause_before_new_tool(&call.id, &call.name);
@@ -2799,17 +2833,25 @@ impl<'a> TurnRounds<'a> {
                 settle_unconsumed_reads(state, plan, &conversation_id, run, &step_id, &mut ledger, &calls, &mut prefetched, messages, &mut self.seq);
                 break;
             }
-            match tool.prepare_arguments(call.arguments.clone()) {
+            if was_prefetched {
+                // Use the exact prepared arguments that the group used.
+                // Re-validating after dispatch can erase a real outcome.
+                if let Some(arguments) = prefetched.get(&call.id).and_then(|entry| entry.prepared_arguments.clone()) {
+                    call.arguments = arguments;
+                }
+            } else {
+              match tool.prepare_arguments(call.arguments.clone()) {
                 Ok(arguments) => call.arguments = arguments,
                 Err(error) => {
                     let result = crate::tool_envelope::failure_notice("invalid-arguments", &error, false, crate::tool_envelope::SIDE_NONE, &json!({}));
                     let store = state.database()?;
                     let recorded=store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"invalid"},"result":result}).to_string(), "complete")?;
                 crate::history::remember_native_round(&store,&recorded,&round_model_message,&mut round_model_saved)?;
-                    emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", result.clone(), false);
+                    emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":recorded.id,"result":result}), false);
                     messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
                     continue;
                 }
+              }
             }
             let signature = crate::continuation::tool_signature(tool, &call.arguments);
             // A prefetched member is never "re-dispatched": its outcome is
@@ -2818,6 +2860,7 @@ impl<'a> TurnRounds<'a> {
                 let skipped = crate::tool_envelope::failure_notice("uncertain-outcome-not-repeated", "Not repeated: the previous attempt had an uncertain outcome.", false, crate::tool_envelope::SIDE_UNKNOWN, &json!({}));
                 let store=state.database()?;let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"turn replay protection"},"result":skipped}).to_string(),"complete")?;
                 crate::history::remember_native_round(&store,&row,&round_model_message,&mut round_model_saved)?;
+                emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":row.id,"result":skipped}), false);
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":skipped.to_string()}));
                 continue;
             }
@@ -2825,17 +2868,16 @@ impl<'a> TurnRounds<'a> {
             // user's explicit rule is authoritative, and the access mode
             // only decides the calls no rule matched. Rules come from
             // persisted settings only — never from model output.
-            let rule_set = crate::permission_rules::load(&*state.database()?);
-            let (rule_action, rule_resource) =
-                crate::permission_rules::classify(&call.name, &call.arguments);
-            let rule_decision = crate::permission_rules::decide_for_tool(
-                &rule_set,
-                plan.access_mode,
-                rule_action,
-                &rule_resource,
-                tool.trusted_read(),
-                tool.requires_approval(&call.arguments),
-            );
+            let rule_decision = if was_prefetched {
+                // The group passed permission checks before dispatch. A rule
+                // changed afterward cannot retroactively erase its outcome.
+                crate::permission_rules::Decision::Allow("auto-approved read group")
+            } else {
+                match crate::permission_rules::load_checked(&*state.database()?) {
+                    Ok(rule_set) => crate::permission_rules::decide_for_agent_tool(&rule_set, plan.access_mode, tool, &call.arguments),
+                    Err(_) => crate::permission_rules::Decision::Deny("Permission settings are unavailable or invalid.".into()),
+                }
+            };
             let automatic_reason = match rule_decision {
                 crate::permission_rules::Decision::Allow(reason) => Some(reason),
                 crate::permission_rules::Decision::Ask => None,
@@ -2850,6 +2892,7 @@ impl<'a> TurnRounds<'a> {
                     let store = state.database()?;
                     let row = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"permission rule"},"result":skipped}).to_string(), "complete")?;
                     crate::history::remember_native_round(&store, &row, &round_model_message, &mut round_model_saved)?;
+                    emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"callId":call.id,"name":tool.tool.name,"decision":"denied","result":skipped,"messageId":row.id}), false);
                     messages.push(json!({"role":"tool","tool_call_id":call.id,"content":skipped.to_string()}));
                     tool_use_denied = true;
                     continue;
@@ -2863,6 +2906,8 @@ impl<'a> TurnRounds<'a> {
                     .find(|todo| todo.status == crate::plans::IN_PROGRESS).map(|todo| todo.text);
                 let (approval_id, decision) = state.approvals.request()?;
                 let _pending = state.approvals.guard(&approval_id);
+                let mut approval_item = crate::turn_items::ApprovalItem::new(state, channel, &conversation_id,
+                    &run.id, &step_id, &assistant.id, round, &call.id, &call.name);
                 self.seq += 1;
                 let sent = channel.send(ChatEvent::new(
                     run,
@@ -2877,12 +2922,18 @@ impl<'a> TurnRounds<'a> {
                 ));
                 if sent.is_err() { state.approvals.remove(&approval_id); return Err("The approval interface disconnected.".into()); }
                 let approval_started = Instant::now();
-                let allow = tokio::select! {
+                let decision = tokio::select! {
                     _ = cancellation.changed() => None,
-                    result = tokio::time::timeout(Duration::from_secs(600),decision) => Some(result.ok().and_then(Result::ok).unwrap_or(false)),
+                    result = tokio::time::timeout(Duration::from_secs(600),decision) => Some(match result {
+                        Ok(Ok(true)) => (true, "approved"),
+                        Ok(Ok(false)) => (false, "denied"),
+                        Ok(Err(_)) => (false, "withdrawn"),
+                        Err(_) => (false, "expired"),
+                    }),
                 };
                 response_metrics.approval_ms = Some(response_metrics.approval_ms.unwrap_or(0.0) + approval_started.elapsed().as_secs_f64() * 1000.0);
                 state.approvals.remove(&approval_id);
+                if let Some((_, outcome)) = decision { approval_item.finish(outcome); }
                 self.seq += 1;
                 channel.send(ChatEvent::new(
                     run,
@@ -2895,21 +2946,80 @@ impl<'a> TurnRounds<'a> {
                     None,
                     Some(Value::Null),
                 )).map_err(|error| error.to_string())?;
-                let Some(allow) = allow else {
+                let Some((allow, _)) = decision else {
                     settle_unconsumed_reads(state, plan, &conversation_id, run, &step_id, &mut ledger, &calls, &mut prefetched, messages, &mut self.seq);
                     return Ok(false);
                 };
                 allow
             };
+            let approval_was_granted = allow;
+            let mut gate_failure: Option<(&str, String, &str)> = None;
+            if allow && !was_prefetched {
+                if let Err(reason) = crate::permission_rules::recheck_nested_call(
+                    state, plan.access_mode, tool, &call.arguments, automatic_reason.is_none(),
+                ) {
+                    gate_failure = Some(("authorization-changed", reason, "permission rule"));
+                } else if let Some(reason) = crate::capabilities::tool_capability(tool).and_then(|capability| {
+                    crate::capabilities::ToolPolicy::guard(state.database()).denial(capability)
+                }) {
+                    gate_failure = Some(("capability-disabled", reason, "capability disabled"));
+                }
+            }
+            let budget_error=if allow&&!was_prefetched&&gate_failure.is_none() {crate::continuation::admit_tool(state,&run.id,&call.name,&call.arguments).err()}else{None};
+            if allow && budget_error.is_none() && !was_prefetched && gate_failure.is_none() {
+                // Approval and hooks can take time. Do not announce execution
+                // or dispatch until current permissions and capabilities have
+                // been checked again after the hook finishes.
+                let verdict = tokio::select! {
+                    _ = cancellation.changed() => {
+                        settle_unconsumed_reads(state, plan, &conversation_id, run, &step_id, &mut ledger, &calls, &mut prefetched, messages, &mut self.seq);
+                        return Ok(false);
+                    }
+                    verdict = crate::hooks::pre_use(state, &conversation_id, &snapshot.workspace_path, &call.name, &call.arguments) => verdict,
+                };
+                for notice in verdict.notices {
+                    let _ = channel.send(ChatEvent::progress(&run.id, &step_id, &assistant.id, &notice, None));
+                }
+                if *cancellation.borrow() && cancel_applies(state, run_generation) {
+                    settle_unconsumed_reads(state, plan, &conversation_id, run, &step_id, &mut ledger, &calls, &mut prefetched, messages, &mut self.seq);
+                    return Ok(false);
+                }
+                if state.with_run_control(|control| crate::agent_run::pause_blocks_new_tool(control.pause)).unwrap_or(true) {
+                    let notice = crate::agent_run::pause_notice(false);
+                    if let Some(task) = ledger.as_mut() {
+                        let _ = task.pause_before_new_tool(&call.id, &call.name);
+                        save_ledger(state, task);
+                    }
+                    let paused = crate::tool_envelope::failure_notice("paused", notice, false, crate::tool_envelope::SIDE_NONE, &json!({"paused":true}));
+                    messages.push(json!({"role":"tool","tool_call_id":call.id,"content":paused.to_string()}));
+                    paused_exit = true;
+                    settle_unconsumed_reads(state, plan, &conversation_id, run, &step_id, &mut ledger, &calls, &mut prefetched, messages, &mut self.seq);
+                    break;
+                }
+                if let Some(reason) = verdict.blocked {
+                    gate_failure = Some(("hook-blocked", reason, "pre-use hook"));
+                } else if let Err(reason) = crate::permission_rules::recheck_nested_call(
+                    state, plan.access_mode, tool, &call.arguments, automatic_reason.is_none(),
+                ) {
+                    gate_failure = Some(("authorization-changed", reason, "permission rule"));
+                } else if let Some(reason) = crate::capabilities::tool_capability(tool).and_then(|capability| {
+                    crate::capabilities::ToolPolicy::guard(state.database()).denial(capability)
+                }) {
+                    gate_failure = Some(("capability-disabled", reason, "capability disabled"));
+                }
+            }
+            let allow = allow && gate_failure.is_none();
             if !allow { tool_use_denied = true; }
-            let budget_error=if allow&&!was_prefetched {crate::continuation::admit_tool(state,&run.id,&call.name,&call.arguments).err()}else{None};
-            let authorization = if budget_error.is_some() {"turn tool-budget admission denied"} else if blocked_by_denial { "blocked by an earlier denial in this turn" } else { automatic_reason.unwrap_or("user approval decision") };
-            let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":if allow&&budget_error.is_none() { "allowed" } else { "denied" },"accessMode":plan.access_mode,"authorization":authorization,"callId":call.id,"stepId":step_id,"assistantContent":round_answer});
+            let dispatched_or_ready = allow && budget_error.is_none() && (!was_prefetched || prefetched_dispatched);
+            let authorization = if let Some((_, _, reason)) = &gate_failure { *reason } else if was_prefetched && !prefetched_dispatched { "group stopped before dispatch" } else if budget_error.is_some() {"turn tool-budget admission denied"} else if blocked_by_denial { "blocked by an earlier denial in this turn" } else { automatic_reason.unwrap_or("user approval decision") };
+            let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":if dispatched_or_ready { "allowed" } else { "denied" },"accessMode":plan.access_mode,"authorization":authorization,"callId":call.id,"stepId":step_id,"assistantContent":round_answer});
             let row = if let Some(row)=prefetched.get_mut(&call.id).and_then(|entry|entry.audit_row.take()) {
                 state.database()?.update_message(&row.id,&audit.to_string(),"","streaming")?;
                 row
             } else {
-                state.database()?.append_message(&conversation_id,"tool",&audit.to_string(),if allow&&budget_error.is_none() { "streaming" } else { "complete" })?
+                // Keep the native-context anchor streaming until its final
+                // result replaces this audit payload, including denials.
+                state.database()?.append_message(&conversation_id,"tool",&audit.to_string(),"streaming")?
             };
             self.last_model_message_id = row.id.clone();
             crate::history::remember_native_round(&*state.database()?,&row,&round_model_message,&mut round_model_saved)?;
@@ -2921,7 +3031,7 @@ impl<'a> TurnRounds<'a> {
                 run,
                 Some(&step_id),
                 self.seq,
-                &format!("{} {}", if budget_error.is_some(){"Blocked"}else{"Executing"}, tool.tool.name),
+                &format!("{} {}", if dispatched_or_ready {"Executing"} else {"Blocked"}, tool.tool.name),
                 &assistant.id,
                 "",
                 "",
@@ -2930,7 +3040,7 @@ impl<'a> TurnRounds<'a> {
             )).map_err(|error| error.to_string())?;
 
             let tool_exec_start = Instant::now();
-            if allow&&budget_error.is_none() {
+            if dispatched_or_ready {
                 let cmd_arg = if tool.tool.name == "execute_command" {
                     call.arguments.get("command").and_then(|v| v.as_str()).map(String::from)
                 } else {
@@ -2954,6 +3064,7 @@ impl<'a> TurnRounds<'a> {
                     elapsed_secs: Some(0.0),
                     round_index: Some(round),
                     presentation: None,
+                    item: None,
                     tool_stream: Some(ToolStreamEvent::Started {
                         tool_call_id: call.id.clone(),
                         tool_name: tool.tool.name.clone(),
@@ -2964,18 +3075,10 @@ impl<'a> TurnRounds<'a> {
                 });
             }
 
-            let mut result = if let Some(error)=budget_error {crate::tool_envelope::failure_notice("tool-budget-blocked",&error,false,crate::tool_envelope::SIDE_NONE,&json!({"budget":true}))} else if !allow { crate::tool_envelope::failure_notice("denied", "The user denied this tool request. Do not repeat it without a new instruction.", false, crate::tool_envelope::SIDE_NONE, &json!({"denied":true})) } else {
+            let mut result = if let Some((code, reason, _)) = &gate_failure { crate::tool_envelope::failure_notice(code, reason, false, crate::tool_envelope::SIDE_NONE, &json!({"denied":true})) } else if let Some(error)=budget_error {crate::tool_envelope::failure_notice("tool-budget-blocked",&error,false,crate::tool_envelope::SIDE_NONE,&json!({"budget":true}))} else if !allow { crate::tool_envelope::failure_notice("denied", "The user denied this tool request. Do not repeat it without a new instruction.", false, crate::tool_envelope::SIDE_NONE, &json!({"denied":true})) } else {
                 let args_text = call.arguments.to_string();
-                // User pre_tool_use hooks may veto before dispatch; a block
-                // is a failure envelope, other failures are notices.
-                let hook_verdict = crate::hooks::pre_use(state, &conversation_id, &call.name, &call.arguments).await;
-                for notice in &hook_verdict.notices {
-                    let _ = channel.send(ChatEvent::progress(&run.id, &step_id, &assistant.id, notice, None));
-                }
-                if let Some(blocked) = hook_verdict.blocked {
-                    crate::tool_envelope::failure_notice("hook-blocked", &blocked, false, crate::tool_envelope::SIDE_NONE, &json!({"hookBlocked":true}))
                 // Guard: three identical calls in a row end loudly, not in a loop.
-                } else if let Some(note) = crate::sandbox::check_repetition(&recent_calls, &call.name, &args_text) {
+                if let Some(note) = (!was_prefetched).then(|| crate::sandbox::check_repetition(&recent_calls, &call.name, &args_text)).flatten() {
                     recent_calls.push((call.name.clone(), args_text));
                     json!({"isError":true,"message":note})
                 } else {
@@ -3009,6 +3112,7 @@ impl<'a> TurnRounds<'a> {
                             elapsed_secs: Some(tool_exec_start.elapsed().as_secs_f64()),
                             round_index: Some(round),
                             presentation: None,
+                            item: None,
                             tool_stream: Some(ToolStreamEvent::OutputChunk {
                                 tool_call_id: emit_tool_call_id.clone(),
                                 stream: stream_name.to_string(),
@@ -3017,7 +3121,7 @@ impl<'a> TurnRounds<'a> {
                         });
                     });
                     let catalog_name = matches!(call.name.as_str(), "run_code" | "file_write" | "file_read");
-                    if allow && catalog_name {
+                    if !was_prefetched && dispatched_or_ready && catalog_name {
                         if let Some(task) = ledger.as_mut() {
                             if let Ok(store) = state.database() {
                                 begin_catalog_op(&store, task, &call.id, &call.name);
@@ -3050,7 +3154,7 @@ impl<'a> TurnRounds<'a> {
                     } else {
                     tokio::select! {
                         _ = cancellation.changed() => None,
-                        result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+                        result = tokio::time::timeout(tool.call_deadline(Duration::from_secs(timeout_secs), true), async {
                             if tool.is_harness() {
                                 let emit_run = run.id.clone();
                                 let emit_step = step_id.clone();
@@ -3108,7 +3212,7 @@ impl<'a> TurnRounds<'a> {
                                         progress_emit(channel, &run.id, &step_id, &assistant.id),
                                     )
                                 });
-                                tool.call_with_input(call.arguments.clone(), Some(tool_chunk_cb), mcp_ui).await
+                                tool.call_with_execution_budget(call.arguments.clone(), Some(tool_chunk_cb), mcp_ui, Duration::from_secs(timeout_secs)).await
                             }
                         }) => Some(result),
                     }
@@ -3126,19 +3230,20 @@ impl<'a> TurnRounds<'a> {
                         });
                     }
                     let duration_ms = tool_exec_start.elapsed().as_millis();
-                    response_metrics.tools_ms = Some(response_metrics.tools_ms.unwrap_or(0.0) + tool_exec_start.elapsed().as_secs_f64() * 1000.0);
-                    let exit_code = match &outcome {
-                        Some(Ok(Ok(val))) => val.get("exitCode").and_then(|v| v.as_i64()).map(|c| c as i32),
-                        _ => None,
-                    };
-                    let error_info = match &outcome {
-                        Some(Ok(Ok(val))) => tool_execution_error(val),
-                        Some(Ok(Err(err))) => Some(err.clone()),
-                        Some(Err(_)) => Some("Tool request timed out.".into()),
-                        None => Some("Cancelled".into()),
-                    };
-                    self.seq += 1;
-                    let _ = channel.send(ChatEvent {
+                    if dispatched_or_ready {
+                        response_metrics.tools_ms = Some(response_metrics.tools_ms.unwrap_or(0.0) + tool_exec_start.elapsed().as_secs_f64() * 1000.0);
+                        let exit_code = match &outcome {
+                            Some(Ok(Ok(val))) => val.get("exitCode").and_then(|v| v.as_i64()).map(|c| c as i32),
+                            _ => None,
+                        };
+                        let error_info = match &outcome {
+                            Some(Ok(Ok(val))) => tool_execution_error(val),
+                            Some(Ok(Err(err))) => Some(err.clone()),
+                            Some(Err(_)) => Some("Tool request timed out.".into()),
+                            None => Some("Cancelled".into()),
+                        };
+                        self.seq += 1;
+                        let _ = channel.send(ChatEvent {
                         run_id: Some(run.id.clone()),
                         step_id: Some(step_id.clone()),
                         seq: Some(self.seq),
@@ -3153,13 +3258,15 @@ impl<'a> TurnRounds<'a> {
                         elapsed_secs: Some(tool_exec_start.elapsed().as_secs_f64()),
                         round_index: Some(round),
                         presentation: None,
+                        item: None,
                         tool_stream: Some(ToolStreamEvent::Finished {
                             tool_call_id: call.id.clone(),
                             exit_code,
                             duration_ms,
                             error: error_info,
                         }),
-                    });
+                        });
+                    }
                     match outcome {
                         None => {
                             let _ = run.transition_to(crate::agent_run::RunState::Cancelled);
@@ -3185,8 +3292,8 @@ impl<'a> TurnRounds<'a> {
             // from calls the access mode approved on their own. An
             // auto-approved call carries no signal about the user's
             // taste, so it is deliberately not recorded.
-            if !matches!(rule_decision, crate::permission_rules::Decision::Allow(_)) {
-                let decision = if allow {
+            if !blocked_by_denial && !was_prefetched && automatic_reason.is_none() {
+                let decision = if approval_was_granted {
                     crate::taste::Decision::Accepted
                 } else {
                     crate::taste::Decision::Rejected
@@ -3219,11 +3326,7 @@ impl<'a> TurnRounds<'a> {
                     if let Ok(todos) = store.todos(&conversation_id) { refresh_plan_focus(messages, &todos); }
                 }
             }
-            if call.name.strip_prefix("workspace_").is_some_and(crate::workspace::is_write_call)
-                && !crate::tool_envelope::failed(&result)
-            {
-                verify_dirty = true;
-            }
+            verification.observe(&call.name, &call.arguments, &result, development_task);
             if matches!(call.name.as_str(), "worktree_enter" | "worktree_exit")
                 && !crate::tool_envelope::failed(&result)
             {
@@ -3232,11 +3335,6 @@ impl<'a> TurnRounds<'a> {
                         snapshot.workspace_path = path;
                     }
                 }
-            }
-            if call.name == "check_run"
-                && !matches!(result.pointer("/error/code").and_then(Value::as_str), Some("denied" | "unavailable-tool" | "plan-approval-required"))
-            {
-                verify_dirty = false;
             }
             let control = if tool.connector == "Harness" && matches!(call.name.as_str(), "update_context" | "finish") { Some(result.clone()) } else { None };
             let deliverable_missing = matches!(call.name.as_str(), "file_write" | "create_file" | "run_code")
@@ -3285,26 +3383,35 @@ impl<'a> TurnRounds<'a> {
 
             // Excerpt size follows the tokens still free after the counted
             // input and response reserve; full results stay in artifacts.
-            let catalog_recorded = matches!(call.name.as_str(), "run_code" | "file_write" | "file_read") && allow;
+            let catalog_recorded = matches!(call.name.as_str(), "run_code" | "file_write" | "file_read") && dispatched_or_ready;
             let excerpt_chars = crate::artifacts::excerpt_budget(
                 plan.context_length,
                 self.input_tokens,
                 round_preferences.max_tokens,
             );
-            let (bounded_val, maybe_artifact) = crate::artifacts::bound_tool_result(
+            let (bounded_val, artifact_id) = crate::artifacts::capture_tool_result(
                 result,
                 &tool.tool.name,
                 &conversation_id,
                 Some(&run.id),
                 excerpt_chars,
+                |artifact| state.database()?.save_artifact(artifact),
             );
-            if let Some(artifact) = &maybe_artifact {
-                let _ = state.database()?.save_artifact(artifact);
-            }
             let mut bounded_val = bounded_val;
-            if let Some(note) = crate::hooks::post_use(state, &conversation_id, &call.name, &call.arguments, &bounded_val, "approved").await {
-                // Survives artifact bounding: applied after it, separate field.
-                bounded_val["hookNote"] = json!(note);
+            if dispatched_or_ready {
+                let note = if *cancellation.borrow() {
+                    None
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.changed() => Some("Post-tool hook interrupted; its side effects may already have occurred.".into()),
+                        note = crate::hooks::post_use(state, &conversation_id, &hook_workspace, &call.name, &call.arguments, &bounded_val, "approved") => note,
+                    }
+                };
+                if let Some(note) = note {
+                    // Survives artifact bounding: applied after it, separate field.
+                    bounded_val["hookNote"] = json!(note);
+                }
             }
             state.database()?.update_message(&row.id,&json!({"request":audit,"result":bounded_val}).to_string(),"","complete")?;
             messages.push(json!({"role":"tool","tool_call_id":call.id,"content":bounded_val.to_string()}));
@@ -3315,7 +3422,7 @@ impl<'a> TurnRounds<'a> {
                 }
             }
             if let Some(follow_up) = follow_up {
-                messages.push(json!({"role":"user","content":follow_up}));
+                messages.push(json!({"role":"user","_continuation":true,"content":follow_up}));
             }
             if let Some(control) = control {
                 explicit_finish = crate::arex::apply_control(&call.name, &control, &*state.database()?, &conversation_id, &run.id, messages)?;
@@ -3334,9 +3441,10 @@ impl<'a> TurnRounds<'a> {
                     json!({
                         "callId": call.id,
                         "name": tool.tool.name,
-                        "decision": if allow { "allowed" } else { "denied" },
+                        "decision": if dispatched_or_ready { "allowed" } else { "denied" },
                         "result": bounded_val,
-                        "artifactId": maybe_artifact.as_ref().map(|a| a.id.clone()),
+                        "artifactId": artifact_id,
+                        "messageId":row.id,
                     }),
                     false,
                 );
@@ -3354,12 +3462,12 @@ impl<'a> TurnRounds<'a> {
         if !tool_use_denied && research_progress.stopped() {
             let unresolved = "Unresolved: the research budget is exhausted before every source was read.";
             self.research_fallback = Some(format!("{RESEARCH_STALLED_FALLBACK}\n\n{unresolved}"));
-            messages.push(json!({"role":"user","content":format!("{RESEARCH_STALLED}\n\n{unresolved}")}));
+            messages.push(json!({"role":"user","_continuation":true,"content":format!("{RESEARCH_STALLED}\n\n{unresolved}")}));
             let mut event = ChatEvent::progress(&run.id, &step_id, &assistant.id, "Research stopped · preparing answer…", None);
             event.notice = Some("Research is no longer making progress or has reached its budget. Preparing an answer from the collected results.".into());
             channel.send(event).map_err(|e| e.to_string())?;
         } else if !tool_use_denied && research_progress.calls > research_calls_before && research_progress.stagnant == 2 {
-            messages.push(json!({"role":"user","content":"The last web calls added no new evidence. Do not rephrase the same search. Read an unvisited source, change the source or research approach, or answer from existing evidence and explain the gap."}));
+            messages.push(json!({"role":"user","_continuation":true,"content":"The last web calls added no new evidence. Do not rephrase the same search. Read an unvisited source, change the source or research approach, or answer from existing evidence and explain the gap."}));
         }
         let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
         let _ = state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id));
@@ -3377,23 +3485,34 @@ impl<'a> TurnRounds<'a> {
         }
     }
     Err("Tool round limit reached.".into())
+    }.await;
+    self.outcome = Some(verification.outcome());
+    result
     }
 }
 
 
 #[tauri::command]
-pub fn cancel_generation(state: State<'_, AppState>) {
-    if let Ok(mut control) = state.run_control.lock() {
-        crate::agent_run::request_cancel(&mut control);
+pub fn cancel_generation(state: State<'_, AppState>, conversation_id: Option<String>) -> Result<(), String> {
+    if let Some(signals) = state.session_runs.target(conversation_id.as_deref())? {
+        signals.request_cancel()?;
+    } else {
+        state.with_run_control(|control| {
+            crate::agent_run::request_cancel(control);
+            state.cancel_signal().send_replace(true);
+        })?;
     }
-    state.cancel.send_replace(true);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn pause_generation(state: State<'_, AppState>) {
-    if let Ok(mut control) = state.run_control.lock() {
-        crate::agent_run::apply_pause(&mut control);
+pub fn pause_generation(state: State<'_, AppState>, conversation_id: Option<String>) -> Result<(), String> {
+    if let Some(signals) = state.session_runs.target(conversation_id.as_deref())? {
+        crate::agent_run::apply_pause(&mut *signals.control.lock().map_err(|_| "Run control is unavailable.")?);
+    } else {
+        state.with_run_control(crate::agent_run::apply_pause)?;
     }
+    Ok(())
 }
 
 fn save_ledger(state: &AppState, task: &crate::research_tasks::ResearchTask) {
@@ -3572,6 +3691,8 @@ const MAX_READ_GROUP: usize = 4;
 /// persistence) processes prefetched results identically.
 struct Prefetched {
     outcome: Option<Result<Result<Value, String>, tokio::time::error::Elapsed>>,
+    dispatched: bool,
+    prepared_arguments: Option<Value>,
     events: Vec<crate::harness::PendingEvent>,
     catalog: bool,
     // Native protocol context is durably anchored before group dispatch. The
@@ -3596,9 +3717,7 @@ fn concurrent_read_ok(
         return false;
     }
     if state
-        .run_control
-        .lock()
-        .map(|control| crate::agent_run::pause_blocks_new_tool(control.pause))
+        .with_run_control(|control| crate::agent_run::pause_blocks_new_tool(control.pause))
         .unwrap_or(true)
     {
         return false;
@@ -3626,9 +3745,10 @@ fn concurrent_read_ok(
     if tool.requires_approval(&arguments) {
         return false;
     }
-    plan.access_mode
-        .automatic_reason(tool.trusted_read())
-        .is_some()
+    if plan.access_mode.automatic_reason(tool.trusted_read()).is_none() { return false; }
+    let Ok(store) = state.database() else { return false; };
+    let Ok(rules) = crate::permission_rules::load_checked(&store) else { return false; };
+    matches!(crate::permission_rules::decide_for_agent_tool(&rules, plan.access_mode, tool, &arguments), crate::permission_rules::Decision::Allow(_))
 }
 
 /// End index of the read group starting at `start`: consecutive members that
@@ -3724,6 +3844,7 @@ fn tool_chunk_callback(
             elapsed_secs: Some(started.elapsed().as_secs_f64()),
             round_index: Some(round),
             presentation: None,
+            item: None,
             tool_stream: Some(ToolStreamEvent::OutputChunk {
                 tool_call_id: call_id.clone(),
                 stream: stream_name.to_string(),
@@ -3783,7 +3904,8 @@ async fn prefetch_read_group(
                 }
             }
             let tool = tool.expect("grouped calls passed concurrent_read_ok");
-            let arguments = tool.prepare_arguments(call.arguments.clone()).unwrap_or_else(|_| call.arguments.clone());
+            let arguments = tool.prepare_arguments(call.arguments.clone());
+            let prepared_arguments = arguments.as_ref().ok().cloned();
             let timeout = timeout_secs(tool);
             let mut cancellation = cancellation.clone();
             let catalog_db = catalog_db.clone();
@@ -3795,13 +3917,24 @@ async fn prefetch_read_group(
                 // `changed()` only fires on a NEW send — a cancel the loop
                 // already observed still blocks this member's dispatch.
                 if *cancellation.borrow() {
-                    return Prefetched { outcome: None, events, catalog, audit_row: None };
+                    return Prefetched { outcome: None, dispatched: false, prepared_arguments, events, catalog, audit_row: None };
                 }
+                let mut dispatched = false;
                 let outcome = tokio::select! {
                     _ = cancellation.changed() => None,
                     result = tokio::time::timeout(std::time::Duration::from_secs(timeout), async {
+                        let arguments = arguments?;
                         if let Err(error)=crate::continuation::admit_tool(state,&run.id,&call.name,&call.arguments){return Ok(crate::tool_envelope::failure_notice("tool-budget-blocked",&error,false,crate::tool_envelope::SIDE_NONE,&json!({"budget":true})));}
-                        if let Some(blocked)=crate::hooks::pre_use(state,conversation_id,&call.name,&call.arguments).await.blocked{return Ok(crate::tool_envelope::failure_notice("hook-blocked",&blocked,false,crate::tool_envelope::SIDE_NONE,&json!({"hookBlocked":true})));}
+                        let verdict = crate::hooks::pre_use(state,conversation_id,&workspace_path,&call.name,&call.arguments).await;
+                        for notice in verdict.notices { let _ = channel.send(ChatEvent::progress(&run.id, step_id, assistant_id, &notice, None)); }
+                        if let Some(blocked)=verdict.blocked{return Ok(crate::tool_envelope::failure_notice("hook-blocked",&blocked,false,crate::tool_envelope::SIDE_NONE,&json!({"hookBlocked":true})));}
+                        // Rules, pause or capability settings can change while
+                        // a pre-hook runs. Recheck immediately before dispatch;
+                        // an Ask now requires a fresh user-authorized attempt.
+                        if !concurrent_read_ok(&call, plan, state, &std::collections::HashSet::new(), false) {
+                            return Ok(crate::tool_envelope::failure_notice("authorization-changed", "The grouped read was not dispatched because its permissions or availability changed. Retry to apply the current settings.", true, crate::tool_envelope::SIDE_NONE, &json!({})));
+                        }
+                        dispatched = true;
                         if tool.is_harness() {
                             if catalog {
                                 let Some(config) = config.clone() else {
@@ -3848,7 +3981,7 @@ async fn prefetch_read_group(
                         }
                     }) => Some(result),
                 };
-                Prefetched { outcome, events, catalog, audit_row: None }
+                Prefetched { outcome, dispatched, prepared_arguments, events, catalog, audit_row: None }
             }
         })
         .collect();
@@ -3922,26 +4055,22 @@ fn settle_unconsumed_reads(
             Some(Err(_)) => crate::tool_envelope::normalize_error("Tool request timed out. Its remote outcome may be unknown; do not automatically retry.", crate::tool_envelope::Cause { timeout: true, ..Default::default() }, tool.envelope_family()),
             None => crate::tool_envelope::normalize_error("The read group was interrupted before this call produced a result.", crate::tool_envelope::Cause { cancelled: true, ..Default::default() }, tool.envelope_family()),
         };
-        let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
+        let (bounded, _) = crate::artifacts::capture_tool_result(
             result,
             &tool.tool.name,
             conversation_id,
             Some(&run.id),
             crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
+            |artifact| state.database()?.save_artifact(artifact),
         );
-        if let Some(artifact) = &maybe_artifact {
-            if let Ok(store) = state.database() {
-                let _ = store.save_artifact(artifact);
-            }
-        }
         let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":"allowed","accessMode":plan.access_mode,"authorization":"auto-approved read group (settled at turn interrupt)","callId":call.id,"stepId":step_id});
         if let Ok(store) = state.database() {
             let content = json!({"request":audit,"result":bounded}).to_string();
-            if let Some(row) = &pre.audit_row {
-                let _ = store.update_message(&row.id, &content, "", "complete");
+            let message_id = if let Some(row) = &pre.audit_row {
+                store.update_message(&row.id, &content, "", "complete").ok().map(|_| row.id.clone())
             } else {
-                let _ = store.append_message(conversation_id, "tool", &content, "complete");
-            }
+                store.append_message(conversation_id, "tool", &content, "complete").ok().map(|row| row.id)
+            };
             emit_session_event(
                 &store,
                 conversation_id,
@@ -3949,7 +4078,7 @@ fn settle_unconsumed_reads(
                 Some(step_id),
                 Some(&call.id),
                 "tool_result",
-                bounded.clone(),
+                json!({"messageId":message_id,"result":bounded}),
                 false,
             );
         }
@@ -4044,8 +4173,9 @@ pub fn resume_generation(
 ) -> Result<Value, String> {
     let _operation = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the active operation before resuming.")?;
+    let _turn = state.turns.acquire(&conversation_id)?;
     let store = state.database()?;
     let staged = stage_paused_resume(&store, &conversation_id)?;
     drop(store);
@@ -4056,7 +4186,7 @@ pub fn resume_generation(
             .map_err(|_| "Run control is unavailable.")?;
         crate::agent_run::resume_run(&mut control)
     };
-    state.cancel.send_replace(false);
+    state.cancel_signal().send_replace(false);
     Ok(json!({
         "generation": generation,
         "question": staged.question,
@@ -4075,11 +4205,8 @@ pub fn restart_generation(
 }
 
 fn cancel_applies(state: &AppState, generation: u64) -> bool {
-    let Ok(control) = state.run_control.lock() else {
-        return true;
-    };
-    *state.cancel.borrow()
-        && crate::agent_run::cancel_matches(control.cancel_generation, generation)
+    *state.cancel_signal().borrow() && state.with_run_control(|control|
+        crate::agent_run::cancel_matches(control.cancel_generation, generation)).unwrap_or(true)
 }
 
 /// Count before every generation round. Compaction never runs inside a tool call.
@@ -4091,6 +4218,7 @@ async fn prepare_context(
     messages: &mut Vec<Value>,
     denied: bool,
     finalizing: bool,
+    draft_saved: bool,
 ) -> Result<(u64, Option<String>), String> {
     let payload = plan.backend.payload(&request_payload(
         messages,
@@ -4127,7 +4255,7 @@ async fn prepare_context(
         //
         // Windows are planned without side effects; only the accepted window
         // archives its dropped messages and moves the durable cutoff.
-        let original = messages.clone();
+        let mut accepted = None;
         let mut windows = vec![keep];
         for smaller in [4usize, 2, 1, 0] {
             if smaller < keep {
@@ -4135,7 +4263,7 @@ async fn prepare_context(
             }
         }
         for window in windows {
-            let Some(compaction) = crate::compaction::plan_compaction(&original, window)
+            let Some(compaction) = crate::compaction::plan_compaction(messages, window)
             else {
                 continue;
             };
@@ -4154,14 +4282,7 @@ async fn prepare_context(
                 // This window did not help; try a smaller one.
                 continue;
             }
-            let mut accepted = compaction.kept;
-            artifact = crate::compaction::compact_model_messages(
-                &*state.database()?,
-                conversation_id,
-                &mut accepted,
-                window,
-            )?;
-            *messages = accepted;
+            accepted = Some((compaction, window));
             tokens = candidate_tokens;
             if !crate::compaction::should_compact(
                 tokens,
@@ -4171,9 +4292,33 @@ async fn prepare_context(
                 break;
             }
         }
+        crate::context::validate_budget(tokens, preferences.max_tokens, plan.context_length)?;
+        if let Some((compaction, window)) = accepted {
+            artifact = Some(crate::compaction::commit_plan(
+                &*state.database()?,
+                conversation_id,
+                messages,
+                compaction,
+                window,
+                draft_saved,
+            )?);
+        }
     }
     crate::context::validate_budget(tokens, preferences.max_tokens, plan.context_length)?;
     Ok((tokens, artifact))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FailedModelRound {
+    assistant_id: String,
+    request: String,
+    selection: crate::providers::ModelSelection,
+    history: Vec<Value>,
+    verification: Value,
+}
+
+fn failed_round_key(conversation_id: &str) -> String {
+    format!("failed_model_round:{conversation_id}")
 }
 
 #[tauri::command]
@@ -4186,12 +4331,94 @@ pub async fn send_message(
     connector_tools: Option<Vec<crate::connectors::ToolSelection>>,
     plan_mode: Option<bool>,
     reasoning_mode: Option<crate::store::ReasoningMode>,
-    channel: Channel<ChatEvent>,
+    channel: Channel<Value>,
     presentation_mode: Option<crate::presentation::Mode>,
+    recovery_id: Option<String>,
+    resume_failed_message_id: Option<String>,
 ) -> Result<(), String> {
     if let Some(mode) = presentation_mode { state.database()?.set_presentation_mode(Some(&conversation_id), Some(mode))?; }
-    send_message_inner(
-        &state,
+    send_registered_turn(&state, conversation_id, content, connector_ids, connector_tools, plan_mode, reasoning_mode, channel, recovery_id, resume_failed_message_id).await
+}
+
+fn recoverable_chat_channel(signals: std::sync::Arc<crate::session_runs::Signals>, channel: Channel<Value>) -> Channel<ChatEvent> {
+    // A missing old webview must not decide a pending approval or abort a turn.
+    // Approval authority stays with the existing explicit resolution commands.
+    Channel::new(move |body| {
+        if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+            let value: Value = serde_json::from_str(&json)?;
+            signals.observe(&value);
+            let _ = channel.send(value);
+        }
+        Ok(())
+    })
+}
+
+/// Shared by IPC and loopback integration tests so queue ownership and the
+/// model turn are exercised together.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_registered_message(
+    state: &AppState,
+    conversation_id: String,
+    content: String,
+    connector_ids: Option<Vec<String>>,
+    connector_tools: Option<Vec<crate::connectors::ToolSelection>>,
+    plan_mode: Option<bool>,
+    reasoning_mode: Option<crate::store::ReasoningMode>,
+    channel: Channel<Value>,
+    recovery_id: Option<String>,
+) -> Result<(), String> {
+    send_registered_turn(state, conversation_id, content, connector_ids, connector_tools, plan_mode, reasoning_mode, channel, recovery_id, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_registered_turn(
+    state: &AppState,
+    conversation_id: String,
+    content: String,
+    connector_ids: Option<Vec<String>>,
+    connector_tools: Option<Vec<crate::connectors::ToolSelection>>,
+    plan_mode: Option<bool>,
+    reasoning_mode: Option<crate::store::ReasoningMode>,
+    channel: Channel<Value>,
+    recovery_id: Option<String>,
+    resume_failed_message_id: Option<String>,
+) -> Result<(), String> {
+    let registration = state.session_runs.register(&conversation_id)?;
+    let channel = recoverable_chat_channel(registration.signals.clone(), channel);
+    // Queueing owns the conversation too: deleting or moving it before the
+    // slot is granted must not orphan or retarget its saved request.
+    let _turn = state.turns.acquire(&conversation_id)?;
+    let (pending, resume) = {
+        let store = state.database()?;
+        if let Some(message_id) = resume_failed_message_id.as_deref() {
+            if recovery_id.is_some() || store.pending_turn(&conversation_id)?.is_some() {
+                return Err("Resolve the saved unsent request before continuing this response.".into());
+            }
+            let saved = store.setting::<Option<FailedModelRound>>(&failed_round_key(&conversation_id))?
+                .filter(|saved| saved.assistant_id == message_id)
+                .ok_or("This response has no remaining model-round retry.")?;
+            let history = store.messages(&conversation_id)?;
+            let latest = history.iter().rev().find(|m| m.role == "assistant");
+            let request = history.iter().rev().find(|m| m.role == "user");
+            if !latest.is_some_and(|m| m.id == message_id && m.status == "error")
+                || !request.is_some_and(|m| m.content == saved.request.trim())
+            {
+                return Err("The failed response is no longer the latest turn.".into());
+            }
+            (None, Some(saved))
+        } else {
+            (Some(store.stage_pending_turn(&conversation_id, &content, recovery_id.as_deref())?.id), None)
+        }
+    };
+    let _slot = registration.wait_for_slot(|| {
+        let mut event = ChatEvent::progress("", "", "", "Waiting for a response slot…", None);
+        event.state = Some("queued".into());
+        let _ = channel.send(event);
+    }).await?;
+    let _ = channel.send(ChatEvent::progress("", "", "", "Preparing request…", None));
+    crate::session_runs::scope(registration.signals.clone(), send_message_with_pending(
+        state,
         conversation_id,
         content,
         connector_ids,
@@ -4199,12 +4426,15 @@ pub async fn send_message(
         plan_mode,
         reasoning_mode,
         channel,
-    )
+        pending,
+        resume,
+    ))
     .await
 }
 
 /// The real parent turn, callable with a plain `&AppState` so tests can drive
 /// the same orchestration the IPC command exposes.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_message_inner(
     state: &AppState,
@@ -4216,6 +4446,24 @@ pub(crate) async fn send_message_inner(
     reasoning_mode: Option<crate::store::ReasoningMode>,
     channel: Channel<ChatEvent>,
 ) -> Result<(), String> {
+    send_message_with_pending(state, conversation_id, content, connector_ids, connector_tools, plan_mode, reasoning_mode, channel, None, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_message_with_pending(
+    state: &AppState,
+    conversation_id: String,
+    content: String,
+    connector_ids: Option<Vec<String>>,
+    connector_tools: Option<Vec<crate::connectors::ToolSelection>>,
+    plan_mode: Option<bool>,
+    reasoning_mode: Option<crate::store::ReasoningMode>,
+    channel: Channel<ChatEvent>,
+    pending_id: Option<String>,
+    resume: Option<FailedModelRound>,
+) -> Result<(), String> {
+    let recovery_only = resume.is_some();
+    let content = resume.as_ref().map_or(content, |saved| saved.request.clone());
     let response_started = Instant::now();
     // A model turn holds the **shared** lease of the operation gate: several
     // conversations can run at once, and an exclusive operation (a provider
@@ -4226,18 +4474,19 @@ pub(crate) async fn send_message_inner(
         .operation
         .try_shared()
         .map_err(|_| "Another operation is in progress. Try again when it finishes.")?;
-    let _turn = state
-        .turns
-        .acquire(&conversation_id)?;
+    // Registered turns already hold this lock while queued. Direct test
+    // callers still acquire it here, as before.
+    let _turn = if pending_id.is_none() && !recovery_only { Some(state.turns.acquire(&conversation_id)?) } else { None };
     // Establish the run and its interrupt subscription before any preparation
     // awaits. A Stop/Pause during assembly belongs to this generation.
-    let (run_generation, mut cancellation) = {
-        let mut control = state
-            .run_control
-            .lock()
-            .map_err(|_| "Run control is unavailable.")?;
-        crate::agent_run::begin_generation(&mut control, &state.cancel)
-    };
+    let (run_generation, mut cancellation) = state.with_run_control(|control| {
+        let cancel = state.cancel_signal();
+        if crate::session_runs::in_session_scope() {
+            crate::session_runs::begin_pending_generation(control, &cancel)
+        } else {
+            Ok(crate::agent_run::begin_generation(control, &cancel))
+        }
+    })??;
     if content.trim().is_empty() || content.len() > 1_048_576 {
         return Err("Enter a message no larger than 1 MiB.".into());
     }
@@ -4245,7 +4494,6 @@ pub(crate) async fn send_message_inner(
         let store = state.database()?;
         if let Some(path) = crate::workspace_ui::task_workspace(&store, &conversation_id)? {
             crate::workspace::Workspace::open(&path)?;
-            store.save_workspace_path(&path)?;
         }
     }
     let mut plan = tokio::select! {
@@ -4262,7 +4510,14 @@ pub(crate) async fn send_message_inner(
         ) => result?,
     };
     let presentation_mode = state.database()?.presentation_mode(Some(&conversation_id))?.effective_mode;
-    let plan_mode = plan_mode.unwrap_or(false);
+    let plan_mode = !recovery_only && plan_mode.unwrap_or(false);
+    if let Some(saved) = &resume {
+        if saved.selection != plan.selection {
+            return Err("Select the model used by the failed response before continuing it.".into());
+        }
+        plan.tools.clear();
+        plan.tool_definitions.clear();
+    }
     // Rides on the draft as a volatile injection so the prompt-cache prefix
     // and the logged injections stay identical to every other turn.
     inject_plan_mode(&mut plan, plan_mode);
@@ -4272,19 +4527,33 @@ pub(crate) async fn send_message_inner(
         let _ = channel.send(event);
     }
     let mut messages = build_turn_messages(&plan);
-    if let Ok(store) = state.database() {
+    if let Some(saved) = &resume {
+        messages = saved.history.clone();
+        messages.push(json!({
+            "role":"user", "_continuation":true,
+            "content":"Finish the original request using the recorded tool outcomes. Report unresolved or uncertain work explicitly. This recovery round has no tools."
+        }));
+    } else if let Ok(store) = state.database() {
         take_staged_checkpoint(&store, &conversation_id, &mut messages);
     }
     let (input_tokens, compacted_once) = tokio::select! {
         biased;
         _ = cancellation.changed() => return Err("Message cancelled before generation; it was not saved.".into()),
-        result = prepare_context(state, &plan, &plan.preferences, &conversation_id, &mut messages, false, false) => result?,
+        result = prepare_context(state, &plan, &plan.preferences, &conversation_id, &mut messages, false, recovery_only, recovery_only) => result?,
     };
-    let assistant = state.database()?.begin_turn_with_model_content(
-        &conversation_id,
-        &content,
-        &messages.last().ok_or("Missing current user message.")?["content"],
-    )?;
+    let model_content = &messages.last().ok_or("Missing current user message.")?["content"];
+    let assistant = if recovery_only {
+        let store = state.database()?;
+        let tx = store.connection.unchecked_transaction().map_err(|e| e.to_string())?;
+        store.save_setting(&failed_round_key(&conversation_id), &Option::<FailedModelRound>::None)?;
+        let assistant = store.insert_message_row(&conversation_id, "assistant", "", "streaming", store.next_message_time(&conversation_id)?)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        assistant
+    } else if let Some(id) = pending_id.as_deref() {
+        state.database()?.begin_pending_turn(&conversation_id, &content, model_content, id)?
+    } else {
+        state.database()?.begin_turn_with_model_content(&conversation_id, &content, model_content)?
+    };
     let run_id = format!("run-{}", uuid::Uuid::new_v4());
     let now = crate::store::now();
     let mut run = crate::agent_run::RunRecord {
@@ -4300,16 +4569,21 @@ pub(crate) async fn send_message_inner(
     };
     state.database()?.save_run(&run)?;
     if let Ok(store) = state.database() {
-        emit_session_event(
-            &store,
-            &conversation_id,
-            Some(&run.id),
-            Some("turn_start"),
-            None,
-            "user_msg",
-            json!({"role": "user", "content": content.trim()}),
-            false,
-        );
+        if let Some(saved) = &resume {
+            emit_session_event(&store, &conversation_id, Some(&run.id), Some("turn_start"), None,
+                "model_round_resumed", json!({"failedMessageId":saved.assistant_id}), false);
+        } else {
+            emit_session_event(
+                &store,
+                &conversation_id,
+                Some(&run.id),
+                Some("turn_start"),
+                None,
+                "user_msg",
+                json!({"role": "user", "content": content.trim(), "messageId":store.turn_user_message_id(&assistant.id)?}),
+                false,
+            );
+        }
         emit_session_event(
             &store,
             &conversation_id,
@@ -4340,7 +4614,7 @@ pub(crate) async fn send_message_inner(
                 Some("turn_start"),
                 None,
                 "compaction",
-                json!({"artifact": checkpoint, "thresholdPercent": 80, "auto": true}),
+                json!({"artifact": checkpoint, "cutoff":store.compaction(&conversation_id)?.map(|c| c.cutoff), "thresholdPercent": 80, "auto": true}),
                 false,
             );
         }
@@ -4446,12 +4720,20 @@ pub(crate) async fn send_message_inner(
         content: &content,
         snapshot: &mut snapshot,
         response_started,
+        recovery_only,
+        failed_model_round: false,
+        outcome: None,
+        partial_work: false,
     };
     let result: Result<bool,String> = rounds.run().await;
     // The round loop owns these while it runs; take them back for the
     // post-turn bookkeeping.
     replay_answer = rounds.replay_answer;
     last_model_message_id = rounds.last_model_message_id;
+    let failed_model_round = rounds.failed_model_round;
+    let partial_work = rounds.partial_work;
+    let verification_outcome = resume.as_ref().map(|saved| saved.verification.clone())
+        .or(rounds.outcome).unwrap_or_else(|| json!({"status":"unverified"}));
     if let Some((start, mut measurement)) = active_measurement.take() {
         measurement.duration_ms = start.elapsed().as_secs_f64() * 1000.0;
         response_metrics.rounds.push(measurement);
@@ -4465,9 +4747,7 @@ pub(crate) async fn send_message_inner(
     let final_run_state = crate::agent_run::settled_state(
         result.as_ref().ok().copied(),
         state
-            .run_control
-            .lock()
-            .map(|control| control.pause)
+            .with_run_control(|control| control.pause)
             .unwrap_or(false),
         cancel_applies(state, run_generation),
     );
@@ -4481,39 +4761,6 @@ pub(crate) async fn send_message_inner(
             Err(_) => "error",
         }
     };
-    // A delivered answer means nothing is still in progress. Models routinely
-    // finish without todo bookkeeping, so close out open items here — the
-    // checklist must not sit on a stale "Now" badge after the turn ends.
-    if matches!(result, Ok(true)) {
-        if let Ok(store) = state.database() {
-            if let Ok(mut todos) = store.todos(&conversation_id) {
-                if todos
-                    .iter()
-                    .any(|todo| todo.status != crate::plans::COMPLETED)
-                {
-                    let now = crate::store::now();
-                    for todo in &mut todos {
-                        if todo.status != crate::plans::COMPLETED {
-                            todo.status = crate::plans::COMPLETED.into();
-                            todo.updated_at = now;
-                        }
-                    }
-                    if store.save_todos(&conversation_id, &todos).is_ok() {
-                        emit_session_event(
-                            &store,
-                            &conversation_id,
-                            Some(&run.id),
-                            None,
-                            None,
-                            "plan",
-                            json!({"kind": "todos", "count": todos.len(), "closed": true}),
-                            false,
-                        );
-                    }
-                }
-            }
-        }
-    }
     state.database()?.finish_message(
         &assistant.id,
         &answer,
@@ -4521,6 +4768,17 @@ pub(crate) async fn send_message_inner(
         status,
         result.as_ref().err().map(String::as_str),
     )?;
+    let mut recovery_available = false;
+    if status == "error" && failed_model_round && !recovery_only {
+        let saved = FailedModelRound {
+            assistant_id: assistant.id.clone(), request: content.clone(),
+            selection: plan.selection.clone(), history: messages.clone(),
+            verification: verification_outcome.clone(),
+        };
+        if serde_json::to_vec(&saved).is_ok_and(|value| value.len() <= 2 * crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES) {
+            recovery_available = state.database()?.save_setting(&failed_round_key(&conversation_id), &Some(saved)).is_ok();
+        }
+    }
     if status == "complete" {
         if let Some(content) = &replay_answer {
             state
@@ -4540,7 +4798,7 @@ pub(crate) async fn send_message_inner(
             &messages[1..],
         )?;
     }
-    if status == "complete" {
+    if status == "complete" && !recovery_only {
         match crate::presentation::generate(state, &plan, crate::presentation::FinalAnswer{conversation:&conversation_id,message:&assistant.id,question:&content,answer:&answer,mode:presentation_mode,run_id:&run.id}, &channel, &mut cancellation).await {
             Ok(Some(measurement)) => response_metrics.rounds.push(measurement),
             Ok(None) => {},
@@ -4565,6 +4823,10 @@ pub(crate) async fn send_message_inner(
         None,
     );
     if let Ok(store) = state.database() {
+        let unfinished = store.todos(&conversation_id).unwrap_or_default().into_iter()
+            .filter(|todo| todo.status != crate::plans::COMPLETED).collect::<Vec<_>>();
+        let partial = partial_work || !unfinished.is_empty() || verification_outcome["status"] == "unverified";
+        let audit_ids = store.latest_turn_audit_ids(&conversation_id)?;
         emit_session_event(
             &store,
             &conversation_id,
@@ -4575,11 +4837,21 @@ pub(crate) async fn send_message_inner(
             json!({
                 "status": status,
                 "error": result.as_ref().err().map(String::as_str),
+                "messageId": assistant.id,
+                "delivered":status == "complete",
+                "recoveryAvailable":recovery_available,
+                "toolAuditIds":audit_ids,
+                "partial":partial || status != "complete",
+                "unfinishedTodos":unfinished,
+                "verification":verification_outcome,
                 "answerLength": answer.len(),
                 "reasoningLength": reasoning.len(),
             }),
             false,
         );
+    }
+    if status == "complete" && !recovery_only {
+        crate::hooks::run_finished(state, &conversation_id, &snapshot.workspace_path, json!({"status":"completed"}));
     }
     result.map(|_| ())
 }
@@ -4904,6 +5176,11 @@ fn request_payload(
     arex: bool,
 ) -> Value {
     let mut payload = json!({"messages":messages,"temperature":preferences.temperature,"top_p":preferences.top_p,"max_tokens":preferences.max_tokens,"stream":true,"cache_prompt":true,"stream_options":{"include_usage":true}});
+    for message in payload["messages"].as_array_mut().into_iter().flatten() {
+        if let Some(message) = message.as_object_mut() {
+            message.remove("_continuation");
+        }
+    }
     // Keep the tools array identical on every round — including finalizing and
     // planning rounds. Strict templates (AREX) render <tools> at the very top of
     // the prompt, so omitting it shifts the token stream at position ~3 and
@@ -5895,7 +6172,7 @@ mod finish_tests {
     #[test]
     fn missing_workspace_skips_workspace_tools_without_failing_the_turn() {
         let mut tools = Vec::new();
-        let notice = super::append_workspace_tools(&mut tools, "", false);
+        let notice = super::append_workspace_tools(&mut tools, "", false, std::path::Path::new("unused"));
 
         assert!(tools.is_empty());
         assert_eq!(
@@ -6543,6 +6820,31 @@ mod read_group_tests {
     }
 
     #[tokio::test]
+    async fn read_group_respects_explicit_ask_and_deny_rules() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), "sensitive fixture").unwrap();
+        let (_, plan) = read_group_plan(&state, &workspace).await;
+        let first = call("a", "workspace_list_files", json!({"path":"."}));
+        let second = call("b", "workspace_read_file", json!({"path":"a.txt"}));
+        let calls = vec![first.clone(), second.clone()];
+        let blocked = std::collections::HashSet::new();
+        assert_eq!(super::read_group_end(&calls, 0, &plan, &state, &blocked, false, &[]), 2);
+        for (action, resource) in [(Action::Tool, "workspace_read_file"), (Action::Path, "a.txt")] {
+            for effect in [Effect::Ask, Effect::Deny] {
+                let rules = RuleSet { rules: vec![Rule { action, resource: resource.into(), effect }] };
+                crate::permission_rules::save(&state.database().unwrap(), &rules).unwrap();
+                assert!(super::concurrent_read_ok(&first, &plan, &state, &blocked, false));
+                assert!(!super::concurrent_read_ok(&second, &plan, &state, &blocked, false));
+                assert_eq!(super::read_group_end(&calls, 0, &plan, &state, &blocked, false, &[]), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn prefetched_reads_actually_overlap_and_keep_call_order() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::test_support::app_state(dir.path());
@@ -7163,6 +7465,25 @@ mod output_recovery_tests {
     use super::*;
 
     #[test]
+    fn disconnected_view_does_not_lose_pending_approval_or_decide_it() {
+        let registry = crate::session_runs::Registry::default();
+        let run = registry.register("chat").unwrap();
+        let disconnected = Channel::<Value>::new(|_| {
+            serde_json::from_str::<Value>("invalid json").map(|_| ()).map_err(Into::into)
+        });
+        let channel = recoverable_chat_channel(run.signals.clone(), disconnected);
+        channel.send(ChatEvent::progress("run", "step", "message", "Waiting", Some(json!({
+            "id":"approval-1", "connector":"Local", "name":"write", "arguments":{"path":"test"}
+        })))).unwrap();
+        let snapshot = serde_json::to_value(registry.snapshots().unwrap()).unwrap();
+        assert_eq!(snapshot[0]["approvals"][0]["id"], "approval-1");
+        assert_eq!(snapshot[0]["approvals"][0]["arguments"]["path"], "test");
+        assert!(!*run.signals.cancel.borrow());
+        channel.send(ChatEvent::progress("run", "step", "message", "Closed", Some(Value::Null))).unwrap();
+        assert!(serde_json::to_value(registry.snapshots().unwrap()).unwrap()[0]["approvals"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn recovery_budget_grows_within_model_and_context_capacity_without_changing_preferences() {
         assert_eq!(recovery_response_budget(2048, 14000, 32768, Some(8192)), 8192);
         assert_eq!(recovery_response_budget(8192, 14000, 65536, Some(16384)), 16384);
@@ -7228,6 +7549,582 @@ mod output_recovery_tests {
 
     #[tokio::test]
     #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn glm_reasoning_items_match_live_delivery_and_journal_replay() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let chunks = [
+            json!({"choices":[{"delta":{"reasoning_content":"Inspect "},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"reasoning_content":"the history."},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"content":"Answer."},"finish_reason":"stop"}]}),
+        ];
+        let wire = format!("{}data: [DONE]\r\n\r\n", chunks.iter().map(|chunk| format!("data: {chunk}\r\n\r\n")).collect::<String>());
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![wire]).await;
+        let id = conversation(&state, base).await;
+        let live: Arc<Mutex<Vec<crate::sessions::SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let received = live.clone();
+        let channel = Channel::<Value>::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                let event: Value = serde_json::from_str(&text)?;
+                if let Some(item) = event.get("item") { received.lock().unwrap().push(serde_json::from_value(item.clone())?); }
+            }
+            Ok(())
+        });
+        send_registered_message(&state, id.clone(), "Answer briefly".into(), Some(vec![]), Some(vec![]), None, None, channel, None).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let replay: Vec<_> = state.database().unwrap().session_events(&id, None, None).unwrap().into_iter()
+            .filter(|event| event.event_type.starts_with("item.")).collect();
+        assert_eq!(*live.lock().unwrap(), replay);
+        assert_eq!(replay.first().unwrap().event_type, "item.started");
+        assert_eq!(replay.last().unwrap().payload["status"], "completed");
+        let thought: String = replay.iter().filter(|event| event.event_type == "item.delta")
+            .filter_map(|event| event.payload["delta"]["text"].as_str()).collect();
+        assert_eq!(thought, "Inspect the history.");
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn grouped_reads_run_pre_hooks_once_and_preserve_both_results() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha fixture").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bravo fixture").unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let hook = crate::hooks::Hook { id: "count".into(), event: crate::hooks::EVENT_PRE_TOOL.into(), matcher: "workspace_read_file".into(),
+            command: "printf 'hook\\n' >> pre-hooks.log".into(), timeout_secs: 10, enabled: true };
+        state.database().unwrap().save_setting(crate::hooks::HOOKS_KEY, &vec![hook]).unwrap();
+        let delta = json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"first","type":"function","function":{"name":"workspace_read_file","arguments":"{\"path\":\"a.txt\"}"}},
+            {"index":1,"id":"second","type":"function","function":{"name":"workspace_read_file","arguments":"{\"path\":\"b.txt\"}"}}
+        ]},"finish_reason":"tool_calls"}]});
+        let wire = format!("data: {delta}\r\n\r\ndata: [DONE]\r\n\r\n");
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![wire, text_wire("Finished.", "stop")]).await;
+        let id = conversation(&state, base).await;
+        send_registered_message(&state, id.clone(), "Read both files".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, Channel::new(|_| Ok(())), None).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("pre-hooks.log")).unwrap().lines().count(), 2);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let replay = requests[1].body["messages"].as_array().unwrap();
+        let output: Vec<_> = replay.iter().filter(|message| message["role"] == "tool").collect();
+        assert_eq!(output.len(), 2);
+        assert!(output[0]["content"].as_str().unwrap().contains("alpha fixture"));
+        assert!(output[1]["content"].as_str().unwrap().contains("bravo fixture"));
+        assert_eq!(state.database().unwrap().messages(&id).unwrap().iter().filter(|message| message.role == "tool").count(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn explicit_ask_rule_prevents_grouped_read_before_user_decision() {
+        use std::sync::Arc;
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "private fixture content").unwrap();
+        let state = Arc::new(crate::test_support::app_state(dir.path()));
+        crate::test_support::select_fixture_model(&state, dir.path());
+        {
+            let store = state.database().unwrap();
+            crate::permission_rules::save(&store, &RuleSet { rules: vec![Rule { action: Action::Path, resource: "secret.txt".into(), effect: Effect::Ask }] }).unwrap();
+            let hook = crate::hooks::Hook { id: "read-marker".into(), event: crate::hooks::EVENT_PRE_TOOL.into(), matcher: "workspace_read_file".into(),
+                command: "printf 'called\\n' >> read-marker.log".into(), timeout_secs: 10, enabled: true };
+            store.save_setting(crate::hooks::HOOKS_KEY, &vec![hook]).unwrap();
+        }
+        let delta = json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"list","type":"function","function":{"name":"workspace_list_files","arguments":"{\"path\":\".\"}"}},
+            {"index":1,"id":"read","type":"function","function":{"name":"workspace_read_file","arguments":"{\"path\":\"secret.txt\"}"}}
+        ]},"finish_reason":"tool_calls"}]});
+        let wire = format!("data: {delta}\r\n\r\ndata: [DONE]\r\n\r\n");
+        let (base, _requests, server) = crate::test_support::scripted_sse(vec![wire, text_wire("Finished.", "stop")]).await;
+        let id = conversation(&state, base).await;
+        let task_state = state.clone(); let task_id = id.clone();
+        let turn = tokio::spawn(async move {
+            send_registered_message(&task_state, task_id, "Inspect the folder".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, Channel::new(|_| Ok(())), None).await
+        });
+        let approval = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let snapshots = serde_json::to_value(state.session_runs.snapshots().unwrap()).unwrap();
+                if let Some(value) = snapshots[0]["approvals"].as_array().and_then(|values| values.first()) { break value.clone(); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("explicit ask did not reach the user");
+        assert!(!dir.path().join("read-marker.log").exists(), "the read's hook ran before approval");
+        assert!(!state.database().unwrap().messages(&id).unwrap().iter().any(|message| message.role == "tool" && message.content.contains("private fixture content")));
+        state.approvals.resolve(approval["id"].as_str().unwrap(), false).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(20), turn).await.unwrap().unwrap();
+        assert!(!dir.path().join("read-marker.log").exists(), "the denied read ran");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn sequential_read_authorization_rechecks_before_dispatch_and_reports_truthfully() {
+        use std::sync::{Arc, Mutex};
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        for scenario in ["hook-change", "approval-change", "bad-rules", "hook-veto"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("secret.txt"), "sequential-protected-content").unwrap();
+            let state = Arc::new(crate::test_support::app_state(dir.path()));
+            crate::test_support::select_fixture_model(&state, dir.path());
+            let rules = |effect| RuleSet { rules: vec![Rule { action: Action::Path, resource: "secret.txt".into(), effect }] };
+            if scenario == "approval-change" { crate::permission_rules::save(&state.database().unwrap(), &rules(Effect::Ask)).unwrap(); }
+            let hook = crate::hooks::Hook { id: "read-guard".into(), event: crate::hooks::EVENT_PRE_TOOL.into(), matcher: "workspace_read_file".into(),
+                command: match scenario { "hook-change" => "printf x > hook-started; sleep 1", "hook-veto" => "exit 2", _ => "printf x > hook-started" }.into(), timeout_secs: 5, enabled: true };
+            state.database().unwrap().save_setting(crate::hooks::HOOKS_KEY, &vec![hook]).unwrap();
+            let delta = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"read","type":"function","function":{"name":"workspace_read_file","arguments":"{\"path\":\"secret.txt\"}"}}]},"finish_reason":"tool_calls"}]});
+            let wire = format!("data: {delta}\r\n\r\ndata: [DONE]\r\n\r\n");
+            let (base, requests, server) = crate::test_support::scripted_sse(vec![wire, text_wire("Finished.", "stop")]).await;
+            let id = conversation(&state, base).await;
+            if scenario == "bad-rules" {
+                state.database().unwrap().connection.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)", rusqlite::params![crate::permission_rules::RULES_KEY, "invalid-json"]).unwrap();
+            }
+            let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let sink = events.clone(); let task_state = state.clone(); let task_id = id.clone();
+            let turn = tokio::spawn(async move {
+                let channel = Channel::<Value>::new(move |body| {
+                    if let tauri::ipc::InvokeResponseBody::Json(text) = body { sink.lock().unwrap().push(serde_json::from_str(&text)?); }
+                    Ok(())
+                });
+                send_registered_message(&task_state, task_id, "Inspect the file".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, channel, None).await
+            });
+            if scenario == "hook-change" {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !dir.path().join("hook-started").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+                }).await.expect("pre-use hook did not start");
+                crate::permission_rules::save(&state.database().unwrap(), &rules(Effect::Deny)).unwrap();
+            } else if scenario == "approval-change" {
+                let approval = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let snapshots = serde_json::to_value(state.session_runs.snapshots().unwrap()).unwrap();
+                        if let Some(value) = snapshots[0]["approvals"].as_array().and_then(|values| values.first()) { break value.clone(); }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("approval did not appear");
+                crate::permission_rules::save(&state.database().unwrap(), &rules(Effect::Deny)).unwrap();
+                state.approvals.resolve(approval["id"].as_str().unwrap(), true).unwrap();
+            }
+            let outcome = tokio::time::timeout(Duration::from_secs(20), turn).await.unwrap().unwrap();
+            assert!(outcome.is_ok(), "{scenario}: {outcome:?}");
+            server.abort(); let _ = server.await;
+            let rows = state.database().unwrap().messages(&id).unwrap();
+            let row = rows.iter().find(|row| row.role == "tool").expect("denied call must be audited");
+            let audit: Value = serde_json::from_str(&row.content).unwrap();
+            assert_eq!(audit["request"]["decision"], "denied", "{scenario}: {audit}");
+            let code = match scenario { "bad-rules" => "permission-denied", "hook-veto" => "hook-blocked", _ => "authorization-changed" };
+            assert_eq!(audit["result"]["error"]["code"], code, "{scenario}: {audit}");
+            assert_eq!(audit["result"]["error"]["sideEffects"], "none");
+            assert!(!rows.iter().any(|row| row.content.contains("sequential-protected-content")));
+            assert!(!requests.lock().unwrap().iter().any(|request| request.body.to_string().contains("sequential-protected-content")));
+            assert!(!events.lock().unwrap().iter().any(|event| event["toolStream"]["type"] == "started"), "{scenario}");
+            if matches!(scenario, "approval-change" | "bad-rules") { assert!(!dir.path().join("hook-started").exists(), "{scenario}: hook ran without authorization"); }
+            let journal = state.database().unwrap().session_events(&id, None, None).unwrap();
+            assert!(journal.iter().any(|event| event.event_type == "tool_result" && event.payload["decision"] == "denied"), "{scenario}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn model_multi_path_edits_respect_rule_on_later_target() {
+        use std::sync::{Arc, Mutex};
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        for name in ["workspace_apply_patch", "workspace_copy_file"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("source.txt"), "original").unwrap();
+            let state = crate::test_support::app_state(dir.path());
+            crate::test_support::select_fixture_model(&state, dir.path());
+            crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+                action: Action::Path, resource: "protected.txt".into(), effect: Effect::Deny,
+            }] }).unwrap();
+            let info = crate::workspace::Workspace::open(dir.path().to_str().unwrap()).unwrap().call("file_info", json!({"path":"source.txt"})).unwrap();
+            let args = if name == "workspace_apply_patch" { json!({"changes":[
+                {"kind":"create","path":"public.txt","content":"public"},
+                {"kind":"create","path":"protected.txt","content":"protected"}
+            ]}) } else { json!({"path":"source.txt","destination":"protected.txt","expected_sha256":info["sha256"]}) };
+            let delta = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"edit","type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
+            let wire = format!("data: {delta}\r\n\r\ndata: [DONE]\r\n\r\n");
+            let (base, _requests, server) = crate::test_support::scripted_sse(vec![wire, text_wire("Finished.", "stop")]).await;
+            let id = conversation(&state, base).await;
+            let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let channel = Channel::<Value>::new(move |body| {
+                if let tauri::ipc::InvokeResponseBody::Json(text) = body { sink.lock().unwrap().push(serde_json::from_str(&text)?); }
+                Ok(())
+            });
+            send_registered_message(&state, id.clone(), "Make the change".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, channel, None).await.unwrap();
+            server.abort(); let _ = server.await;
+            assert!(!dir.path().join("public.txt").exists() && !dir.path().join("protected.txt").exists(), "{name}");
+            assert_eq!(std::fs::read_to_string(dir.path().join("source.txt")).unwrap(), "original");
+            let rows = state.database().unwrap().messages(&id).unwrap();
+            let audit: Value = serde_json::from_str(&rows.iter().find(|row| row.role == "tool").unwrap().content).unwrap();
+            assert_eq!(audit["request"]["decision"], "denied", "{name}: {audit}");
+            assert_eq!(audit["result"]["error"]["code"], "permission-denied");
+            assert!(!events.lock().unwrap().iter().any(|event| event["toolStream"]["type"] == "started"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn permission_change_during_group_hooks_blocks_dispatch_and_preserves_audit() {
+        use std::sync::{Arc, Mutex};
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha private fixture").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bravo private fixture").unwrap();
+        let state = Arc::new(crate::test_support::app_state(dir.path()));
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let hook = crate::hooks::Hook { id: "slow".into(), event: crate::hooks::EVENT_PRE_TOOL.into(), matcher: "workspace_read_file".into(),
+            command: "printf 'hook\\n' >> pre-hooks.log; sleep 1".into(), timeout_secs: 10, enabled: true };
+        state.database().unwrap().save_setting(crate::hooks::HOOKS_KEY, &vec![hook]).unwrap();
+        let delta = json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"first","type":"function","function":{"name":"workspace_read_file","arguments":"{\"path\":\"a.txt\"}"}},
+            {"index":1,"id":"second","type":"function","function":{"name":"workspace_read_file","arguments":"{\"path\":\"b.txt\"}"}}
+        ]},"finish_reason":"tool_calls"}]});
+        let wire = format!("data: {delta}\r\n\r\ndata: [DONE]\r\n\r\n");
+        let (base, _requests, server) = crate::test_support::scripted_sse(vec![wire, text_wire("Finished.", "stop")]).await;
+        let id = conversation(&state, base).await;
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone(); let task_state = state.clone(); let task_id = id.clone();
+        let turn = tokio::spawn(async move {
+            let channel = Channel::<Value>::new(move |body| {
+                if let tauri::ipc::InvokeResponseBody::Json(text) = body { sink.lock().unwrap().push(serde_json::from_str(&text)?); }
+                Ok(())
+            });
+            send_registered_message(&task_state, task_id, "Read both files".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, channel, None).await
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if std::fs::read_to_string(dir.path().join("pre-hooks.log")).unwrap_or_default().lines().count() == 2 { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("both group hooks did not start");
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule { action: Action::Tool, resource: "workspace_read_file".into(), effect: Effect::Deny }] }).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(20), turn).await.unwrap().unwrap();
+        server.abort(); let _ = server.await;
+        let rows: Vec<_> = state.database().unwrap().messages(&id).unwrap().into_iter().filter(|row| row.role == "tool").collect();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let audit: Value = serde_json::from_str(&row.content).unwrap();
+            assert_eq!(audit["request"]["decision"], "denied");
+            assert_eq!(audit["result"]["error"]["code"], "authorization-changed");
+            assert!(!row.content.contains("private fixture"));
+        }
+        assert!(!events.lock().unwrap().iter().any(|event| event["toolStream"]["type"] == "started"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("pre-hooks.log")).unwrap().lines().count(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn permission_change_after_group_dispatch_preserves_both_real_results() {
+        use std::sync::Arc;
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::test_support::app_state(dir.path()));
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let hook = crate::hooks::Hook { id: "post".into(), event: crate::hooks::EVENT_POST_TOOL.into(), matcher: "process_poll".into(),
+            command: "printf 'post\\n' >> post-hooks.log; sleep 1".into(), timeout_secs: 10, enabled: true };
+        state.database().unwrap().save_setting(crate::hooks::HOOKS_KEY, &vec![hook]).unwrap();
+        let (base, listener) = {
+            // The fixture server waits for its first request while process IDs
+            // are obtained below, then returns the two real poll calls.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}/v1", listener.local_addr().unwrap());
+            (base, listener)
+        };
+        let id = conversation(&state, base).await;
+        let config = state.database().unwrap().execution_config().unwrap();
+        let mut process_ids = Vec::new();
+        for _ in 0..2 {
+            let started = state.processes.execute(&id, dir.path().to_str().unwrap(), config.clone(), "process_start",
+                json!({"command":"sleep 5","yield_ms":0})).await.unwrap();
+            process_ids.push(started["id"].as_str().unwrap().to_string());
+        }
+        let delta = json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"first","type":"function","function":{"name":"process_poll","arguments":json!({"id":process_ids[0],"wait_ms":900,"max_bytes":8192}).to_string()}},
+            {"index":1,"id":"second","type":"function","function":{"name":"process_poll","arguments":json!({"id":process_ids[1],"wait_ms":900,"max_bytes":8192}).to_string()}}
+        ]},"finish_reason":"tool_calls"}]});
+        let wire = format!("data: {delta}\r\n\r\ndata: [DONE]\r\n\r\n");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = tokio::spawn(async move {
+            for body in [wire, text_wire("Finished.", "stop")] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 8192];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    if n == 0 { return; }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                        let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                        if bytes.len() >= end + 4 + length { break; }
+                    }
+                }
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let task_state = state.clone(); let task_id = id.clone();
+        let turn = tokio::spawn(async move {
+            send_registered_message(&task_state, task_id, "Inspect both processes".into(), Some(vec!["__workspace".into(), "__execution".into()]), Some(vec![]), None, None, Channel::new(|_| Ok(())), None).await
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !dir.path().join("post-hooks.log").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("first completed group result was not processed");
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule { action: Action::Tool, resource: "process_poll".into(), effect: Effect::Deny }] }).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), turn).await.unwrap().unwrap();
+        state.processes.stop_owned(&id);
+        outcome.unwrap();
+        server.await.unwrap();
+        let rows: Vec<_> = state.database().unwrap().messages(&id).unwrap().into_iter().filter(|row| row.role == "tool").collect();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let audit: Value = serde_json::from_str(&row.content).unwrap();
+            assert_eq!(audit["request"]["decision"], "allowed");
+            assert_eq!(audit["request"]["authorization"], "auto-approved read group");
+            assert_ne!(audit["result"]["isError"], true);
+            assert!(!row.content.contains("permission-denied"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn buffered_reasoning_flushes_while_the_provider_is_silent() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let frame = |text| format!("data: {}\r\n\r\n", json!({"choices":[{"delta":{"reasoning_content":text},"finish_reason":null}]}));
+        let prefix = format!("{}{}", frame("First "), frame("second"));
+        let suffix = text_wire("Done.", "stop");
+        let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", prefix.len() + suffix.len());
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(prefix.as_bytes()).await.unwrap();
+            let _ = wait_for_release.await;
+            let _ = stream.write_all(suffix.as_bytes()).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::test_support::app_state(dir.path()));
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let id = conversation(&state, base).await;
+        let received = Arc::new(Mutex::new(String::new()));
+        let output = received.clone();
+        let task_state = state.clone();
+        let turn = tokio::spawn(async move {
+            let channel = Channel::<Value>::new(move |body| {
+                if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                    let value: Value = serde_json::from_str(&text)?;
+                    if value["item"]["eventType"] == "item.delta" {
+                        if let Some(text) = value["item"]["payload"]["delta"]["text"].as_str() { output.lock().unwrap().push_str(text); }
+                    }
+                }
+                Ok(())
+            });
+            send_registered_message(&task_state, id, "Answer briefly".into(), Some(vec![]), Some(vec![]), None, None, channel, None).await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while *received.lock().unwrap() != "First second" { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("coalesced reasoning did not flush while the provider was silent");
+        assert!(!turn.is_finished(), "the provider has not finished the response");
+        let _ = release.send(());
+        tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn partial_tool_request_is_visible_before_completion_and_stop_never_dispatches_it() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let first = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"draft","type":"function","function":{"name":"workspace_create_file","arguments":"{\"path\":\"draft"}}]},"finish_reason":null}]});
+        let second = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":".txt\",\"content\":\"unfinished"}}]},"finish_reason":null}]});
+        let prefix = format!("data: {first}\r\n\r\ndata: {second}\r\n\r\n");
+        let suffix = "data: [DONE]\r\n\r\n";
+        let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", prefix.len() + suffix.len());
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(prefix.as_bytes()).await.unwrap();
+            let _ = wait_for_release.await;
+            let _ = stream.write_all(suffix.as_bytes()).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::test_support::app_state(dir.path()));
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let id = conversation(&state, base).await;
+        let events: Arc<Mutex<Vec<crate::sessions::SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let task_state = state.clone();
+        let task_id = id.clone();
+        let turn = tokio::spawn(async move {
+            let channel = Channel::<Value>::new(move |body| {
+                if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                    let value: Value = serde_json::from_str(&text)?;
+                    if let Some(item) = value.get("item") { output.lock().unwrap().push(serde_json::from_value(item.clone())?); }
+                }
+                Ok(())
+            });
+            send_registered_message(&task_state, task_id, "Create a file".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, channel, None).await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !events.lock().unwrap().iter().any(|event| event.event_type == "item.updated" && event.payload["payload"]["arguments"]["path"] == "draft.txt") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("partial path was not visible while the provider was waiting");
+        assert!(!turn.is_finished());
+        assert!(!dir.path().join("draft.txt").exists());
+        state.session_runs.target(Some(&id)).unwrap().unwrap().request_cancel().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap().unwrap();
+        let _ = release.send(());
+        server.await.unwrap();
+        assert!(!dir.path().join("draft.txt").exists());
+        let saved: Vec<_> = state.database().unwrap().session_events(&id, None, None).unwrap().into_iter().filter(|event| event.event_type.starts_with("item.")).collect();
+        assert_eq!(*events.lock().unwrap(), saved);
+        assert!(saved.iter().any(|event| event.event_type == "item.completed" && event.payload["status"] == "interrupted"));
+        assert!(!state.database().unwrap().session_events(&id, None, None).unwrap().iter().any(|event| event.event_type == "tool_call"));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn disconnected_view_can_recover_and_resolve_a_real_pending_approval() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::test_support::app_state(dir.path()));
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![
+            call_wire("write-1", &json!({"path":"recovered.txt","content":"approved"}).to_string(), "tool_calls"),
+            text_wire("Saved.", "stop"),
+        ]).await;
+        let id = conversation(&state, base).await;
+        state.database().unwrap().save_conversation_tools(&id, &crate::store::ConversationTools {
+            access_mode: crate::permissions::AccessMode::Ask,
+            sources: vec!["__workspace".into()], tools: vec![],
+        }).unwrap();
+        let task_state = state.clone();
+        let task_id = id.clone();
+        let turn = tokio::spawn(async move {
+            let disconnected = Channel::<Value>::new(|_| serde_json::from_str::<Value>("invalid json").map(|_| ()).map_err(Into::into));
+            send_registered_message(&task_state, task_id, "Create recovered.txt".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, disconnected, None).await
+        });
+        let approval = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let snapshot = serde_json::to_value(state.session_runs.snapshots().unwrap()).unwrap();
+                if let Some(value) = snapshot[0]["approvals"].as_array().and_then(|items| items.first()) { break value.clone(); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("pending approval was not recoverable");
+        assert_eq!(approval["name"], "create_file");
+        assert!(!dir.path().join("recovered.txt").exists());
+        state.approvals.resolve(approval["id"].as_str().unwrap(), true).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), turn).await.unwrap().unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("recovered.txt")).unwrap(), "approved");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert!(state.session_runs.snapshots().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn approval_items_match_live_and_replay_for_allow_deny_and_stop() {
+        use std::sync::{Arc, Mutex};
+        for choice in ["allow", "deny", "stop"] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(crate::test_support::app_state(dir.path()));
+            crate::test_support::select_fixture_model(&state, dir.path());
+            let (base, _requests, server) = crate::test_support::scripted_sse(vec![
+                call_wire("write-1", &json!({"path":"review.txt","content":"approved content"}).to_string(), "tool_calls"),
+                text_wire("Finished.", "stop"),
+            ]).await;
+            let id = conversation(&state, base).await;
+            state.database().unwrap().save_conversation_tools(&id, &crate::store::ConversationTools {
+                access_mode: crate::permissions::AccessMode::Ask,
+                sources: vec!["__workspace".into()], tools: vec![],
+            }).unwrap();
+            let live: Arc<Mutex<Vec<crate::sessions::SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let sink = live.clone(); let task_state = state.clone(); let task_id = id.clone();
+            let turn = tokio::spawn(async move {
+                let channel = Channel::<Value>::new(move |body| {
+                    if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                        let event: Value = serde_json::from_str(&text)?;
+                        if let Some(item) = event.get("item") { sink.lock().unwrap().push(serde_json::from_value(item.clone())?); }
+                    }
+                    Ok(())
+                });
+                send_registered_message(&task_state, task_id, "Create review.txt".into(), Some(vec!["__workspace".into()]), Some(vec![]), None, None, channel, None).await
+            });
+            let approval = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let snapshot = serde_json::to_value(state.session_runs.snapshots().unwrap()).unwrap();
+                    if let Some(value) = snapshot[0]["approvals"].as_array().and_then(|values| values.first()) { break value.clone(); }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("approval did not appear");
+            let started = live.lock().unwrap().iter().find(|event| event.event_type == "item.started" && event.payload["item"]["kind"] == "approval").unwrap().clone();
+            assert_eq!(started.payload["item"]["status"], "awaiting");
+            assert_eq!(started.payload["item"]["payload"]["callId"], "write-1");
+            assert!(!started.payload.to_string().contains("approved content"));
+            assert!(!dir.path().join("review.txt").exists());
+            if choice == "stop" { state.session_runs.target(Some(&id)).unwrap().unwrap().request_cancel().unwrap(); }
+            else { state.approvals.resolve(approval["id"].as_str().unwrap(), choice == "allow").unwrap(); }
+            tokio::time::timeout(Duration::from_secs(20), turn).await.unwrap().unwrap().unwrap();
+            server.abort(); let _ = server.await;
+            assert_eq!(dir.path().join("review.txt").exists(), choice == "allow");
+            let saved: Vec<_> = state.database().unwrap().session_events(&id, None, None).unwrap().into_iter().filter(|event| event.event_type.starts_with("item.")).collect();
+            assert_eq!(*live.lock().unwrap(), saved, "{choice}");
+            let item_id = started.payload["item"]["id"].as_str().unwrap();
+            let completed = saved.iter().find(|event| event.event_type == "item.completed" && event.payload["itemId"] == item_id).unwrap();
+            assert_eq!(completed.payload["status"], if choice == "stop" { "interrupted" } else { "completed" });
+            let update = saved.iter().find(|event| event.event_type == "item.updated" && event.payload["itemId"] == item_id);
+            if choice == "stop" { assert!(update.is_none()); }
+            else { assert_eq!(update.unwrap().payload["payload"]["decision"], if choice == "allow" { "approved" } else { "denied" }); }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn failed_model_round_resumes_from_durable_tools_without_redispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![
+            call_wire("settled", r#"{"path":"saved.txt","content":"created"}"#, "tool_calls"),
+            "data: {\"error\":{\"code\":\"inference_timeout\"}}\r\n\r\n".into(),
+            text_wire("Saved saved.txt.", "stop"),
+        ]).await;
+        let id = conversation(&state, base).await;
+        let prompt = "Create saved.txt";
+        assert!(send_registered_message(&state, id.clone(), prompt.into(),
+            Some(vec!["__workspace".into()]), Some(vec![]), None, None,
+            Channel::new(|_| Ok(())), None).await.is_err());
+        let saved = state.database().unwrap().setting::<Option<FailedModelRound>>(&failed_round_key(&id)).unwrap().unwrap();
+        send_registered_turn(&state, id.clone(), String::new(), None, None, None, None,
+            Channel::new(|_| Ok(())), None, Some(saved.assistant_id.clone())).await.unwrap();
+        server.await.unwrap();
+        let rows = state.database().unwrap().messages(&id).unwrap();
+        assert_eq!(rows.iter().filter(|m| m.role == "user").count(), 1);
+        assert_eq!(rows.iter().filter(|m| m.role == "tool").count(), 1);
+        assert_eq!(std::fs::read_to_string(dir.path().join("saved.txt")).unwrap(), "created");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].body.get("tools").is_none());
+        assert!(requests[2].body["messages"].as_array().unwrap().iter()
+            .any(|m| m["tool_call_id"] == "settled"));
+        assert!(state.database().unwrap().setting::<Option<FailedModelRound>>(&failed_round_key(&id)).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
     async fn real_turn_recovers_empty_or_truncated_tool_output_and_actually_saves_the_file() {
         for first in [text_wire("", "length"), call_wire("unfinished", "{\"path\":\"tetris.html\",\"content\":\"partial", "length")] {
             let dir = tempfile::tempdir().unwrap();
@@ -7244,7 +8141,9 @@ mod output_recovery_tests {
             assert_eq!(std::fs::read_to_string(dir.path().join("tetris.html")).unwrap(),"<!doctype html><title>Tetris</title>");
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(),3);
-            assert_eq!(requests[0].body["max_tokens"],2048);
+            // Remote inference uses the configured model maximum on both
+            // attempts; only local inference grows a smaller retry budget.
+            assert_eq!(requests[0].body["max_tokens"],8192);
             assert_eq!(requests[1].body["max_tokens"],8192);
             assert_ne!(requests[1].body["tool_choice"],"none");
             assert!(!requests[1].body["messages"].as_array().unwrap().iter().any(|m| m["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|call| call["id"] == "unfinished"))),"partial tool items must not enter replay");
@@ -7271,5 +8170,164 @@ mod output_recovery_tests {
         assert!(rows.iter().any(|m|m.role=="assistant" && m.status=="error"));
         let status:String=state.database().unwrap().connection.query_row("SELECT status FROM runs WHERE conversation_id=?1",[id],|row|row.get(0)).unwrap();
         assert_eq!(status,"failed");
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn dropped_registered_turn_is_reconciled_after_its_lock_is_released() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (received, wait_for_request) = tokio::sync::oneshot::channel();
+        let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            assert!(stream.read(&mut buffer).await.unwrap() > 0);
+            let _ = received.send(());
+            let _ = wait_for_release.await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::test_support::app_state(dir.path()));
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let id = conversation(&state, base).await;
+        let task_state = state.clone();
+        let task_id = id.clone();
+        let turn = tokio::spawn(async move {
+            send_registered_message(&task_state, task_id, "Answer briefly".into(), Some(vec![]), Some(vec![]), None, None, Channel::new(|_| Ok(())), None).await
+        });
+        tokio::time::timeout(Duration::from_secs(20), wait_for_request).await.unwrap().unwrap();
+        crate::commands::reconcile_orphaned_turn(&state, &id).unwrap();
+        assert_eq!(state.database().unwrap().latest_run(&id).unwrap().unwrap().status, crate::agent_run::RunState::Generating);
+        turn.abort();
+        assert!(turn.await.unwrap_err().is_cancelled());
+        assert!(!state.session_runs.is_active(&id).unwrap());
+        crate::commands::reconcile_orphaned_turn(&state, &id).unwrap();
+        {
+            let store = state.database().unwrap();
+            assert_eq!(store.latest_run(&id).unwrap().unwrap().status, crate::agent_run::RunState::Cancelled);
+            assert!(store.messages(&id).unwrap().iter().any(|message| message.role == "assistant" && message.status == "interrupted"));
+        }
+        let _ = release.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn registered_turns_queue_and_cancel_independently_against_scripted_provider() {
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let received = Arc::new(AtomicUsize::new(0));
+        let (release, _) = tokio::sync::watch::channel(false);
+        let server_received = received.clone();
+        let server_release = release.clone();
+        let server = tokio::spawn(async move {
+            let mut handlers = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let received = server_received.clone();
+                let mut release = server_release.subscribe();
+                handlers.push(tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 8192];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&chunk[..n]);
+                        assert!(bytes.len() < 4 * 1024 * 1024);
+                        if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                            let len: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                            if bytes.len() >= end + 4 + len { break; }
+                        }
+                    }
+                    received.fetch_add(1, Ordering::SeqCst);
+                    let released = *release.borrow();
+                    if !released { let _ = release.changed().await; }
+                    let body = text_wire("Fixture response.", "stop");
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }));
+            }
+            for handler in handlers { handler.await.unwrap(); }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::test_support::app_state(dir.path()));
+        crate::test_support::select_fixture_model(&state, dir.path());
+        let mut ids = Vec::new();
+        for _ in 0..5 { ids.push(conversation(&state, base.clone()).await); }
+        let mut handles = Vec::new();
+        for id in ids.iter().take(4) {
+            let state = state.clone(); let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                send_registered_message(&state, id, "Answer briefly".into(), Some(vec![]), Some(vec![]), None, None, Channel::new(|_| Ok(())), None).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while received.load(Ordering::SeqCst) < 4 { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("four turns did not reach the provider");
+        let queued = Arc::new(AtomicBool::new(false));
+        let queued_event = queued.clone();
+        let queued_state = state.clone();
+        let queued_id = ids[4].clone();
+        let fifth = tokio::spawn(async move {
+            let channel = Channel::new(move |body| {
+                let is_queued = match body {
+                    tauri::ipc::InvokeResponseBody::Json(json) => serde_json::from_str::<Value>(&json).ok().is_some_and(|value| value["state"] == "queued"),
+                    _ => false,
+                };
+                if is_queued {
+                    queued_event.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            send_registered_message(&queued_state, queued_id, "Queued request".into(), Some(vec![]), Some(vec![]), None, None, channel, None).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !queued.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("fifth turn did not report its queue state");
+        assert_eq!(state.session_runs.running_count(), 4);
+        assert_eq!(received.load(Ordering::SeqCst), 4);
+        assert!(state.database().unwrap().messages(&ids[4]).unwrap().is_empty());
+        let saved = state.database().unwrap().pending_turn(&ids[4]).unwrap().unwrap();
+        assert_eq!(saved.content, "Queued request");
+        assert!(state.turns.acquire(&ids[4]).is_err(), "a queued request must protect its conversation");
+        state.session_runs.target(Some(&ids[4])).unwrap().unwrap().request_cancel().unwrap();
+        assert!(fifth.await.unwrap().unwrap_err().contains("cancelled before generation"));
+        assert_eq!(state.database().unwrap().pending_turn(&ids[4]).unwrap(), Some(saved.clone()));
+        state.session_runs.target(Some(&ids[0])).unwrap().unwrap().request_cancel().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut handles[0]).await.unwrap().unwrap().unwrap();
+        assert_eq!(state.database().unwrap().latest_run(&ids[0]).unwrap().unwrap().status, crate::agent_run::RunState::Cancelled);
+        release.send_replace(true);
+        for handle in handles.into_iter().skip(1) { tokio::time::timeout(Duration::from_secs(10), handle).await.unwrap().unwrap().unwrap(); }
+        server.await.unwrap();
+        for id in &ids[1..4] {
+            assert_eq!(state.database().unwrap().latest_run(id).unwrap().unwrap().status, crate::agent_run::RunState::Completed);
+        }
+        // Reopen the database as a new application instance. Recovery must not
+        // automatically replay the queued request or duplicate its user row.
+        drop(state);
+        let restarted = crate::test_support::app_state(dir.path());
+        restarted.database().unwrap().recover_interrupted().unwrap();
+        assert_eq!(restarted.database().unwrap().pending_turn(&ids[4]).unwrap(), Some(saved.clone()));
+        assert!(restarted.database().unwrap().messages(&ids[4]).unwrap().is_empty());
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![text_wire("Recovered.", "stop")]).await;
+        {
+            let store = restarted.database().unwrap();
+            let mut provider = store.provider("fixture-loopback").unwrap().unwrap();
+            provider.base_url = base;
+            store.save_provider(&provider).unwrap();
+        }
+        send_registered_message(&restarted, ids[4].clone(), saved.content.clone(), Some(vec![]), Some(vec![]), None, None, Channel::new(|_| Ok(())), Some(saved.id.clone())).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let duplicate = send_registered_message(&restarted, ids[4].clone(), saved.content.clone(), Some(vec![]), Some(vec![]), None, None, Channel::new(|_| Ok(())), Some(saved.id)).await;
+        assert!(duplicate.unwrap_err().contains("no longer exists"));
+        let store = restarted.database().unwrap();
+        assert!(store.pending_turn(&ids[4]).unwrap().is_none());
+        assert_eq!(store.messages(&ids[4]).unwrap().iter().filter(|message| message.role == "user").count(), 1);
     }
 }

@@ -700,6 +700,20 @@ struct ScanBounds {
     bytes: usize,
 }
 
+struct TreePermissions<'a> {
+    policy: &'a crate::permission_rules::SearchPermissions,
+    source: &'a str,
+    destination: Option<&'a str>,
+}
+
+impl TreePermissions<'_> {
+    fn allows(&self, path: &str) -> bool {
+        self.policy.allows(path) && self.destination.is_none_or(|destination| {
+            self.policy.allows(&format!("{destination}/{}", subtree_relative(path, self.source)))
+        })
+    }
+}
+
 /// Stream one file's SHA-256 without a per-file size cap; callers bound the
 /// tree totals, and mutations re-verify every byte through the journal.
 fn hash_file(
@@ -749,6 +763,7 @@ fn scan_tree(
     bounds: &ScanBounds,
     hashed: &mut usize,
     out: &mut Vec<TreeEntry>,
+    permissions: Option<&TreePermissions<'_>>,
 ) -> Result<(), String> {
     for entry in dir.entries().map_err(io)? {
         if out.len() >= bounds.entries {
@@ -774,6 +789,9 @@ fn scan_tree(
         // are never enumerated, hashed, moved or deleted.
         if crate::sandbox::check_fs_path("", &path, false).is_err() {
             continue;
+        }
+        if permissions.is_some_and(|permissions| !permissions.allows(&path)) {
+            return Err("Directory operation includes paths restricted by permission rules; no tree pin or change was produced.".into());
         }
         if kind.is_symlink() {
             out.push(TreeEntry {
@@ -810,6 +828,7 @@ fn scan_tree(
                 bounds,
                 hashed,
                 out,
+                permissions,
             )?;
             continue;
         }
@@ -1073,7 +1092,7 @@ impl Workspace {
     /// Scan a directory subtree until the expected hash from list_tree matches
     /// under either generated-directory policy, then refuse anything the
     /// journal cannot safely reproduce or restore.
-    fn pinned_tree(&self, path: &str, expected: &str) -> Result<Vec<TreeEntry>, String> {
+    fn pinned_tree(&self, path: &str, expected: &str, permissions: Option<&TreePermissions<'_>>) -> Result<Vec<TreeEntry>, String> {
         parse_hash(expected)?;
         let bounds = ScanBounds {
             entries: TREE_MUTATE_ENTRIES,
@@ -1092,6 +1111,7 @@ impl Workspace {
                 &bounds,
                 &mut hashed,
                 &mut entries,
+                permissions,
             )?;
             if tree_sha256(&entries).eq_ignore_ascii_case(expected) {
                 if entries
@@ -1167,6 +1187,8 @@ impl Workspace {
         };
         let mut hashed = 0usize;
         let mut entries = Vec::new();
+        let policy = self.search_permissions("list_tree")?;
+        let permissions = policy.as_ref().map(|policy| TreePermissions { policy, source: &request.path, destination: None });
         scan_tree(
             &dir,
             &prefix,
@@ -1176,6 +1198,7 @@ impl Workspace {
             &bounds,
             &mut hashed,
             &mut entries,
+            permissions.as_ref(),
         )?;
         let total = entries.len();
         let mut shown: Vec<&TreeEntry> = entries
@@ -1218,7 +1241,9 @@ impl Workspace {
         let expected = request
             .expected_tree_sha256
             .ok_or("Recursive delete requires expected_tree_sha256 from list_tree.")?;
-        let entries = self.pinned_tree(&request.path, &expected)?;
+        let policy = self.search_permissions("delete_directory")?;
+        let permissions = policy.as_ref().map(|policy| TreePermissions { policy, source: &request.path, destination: None });
+        let entries = self.pinned_tree(&request.path, &expected, permissions.as_ref())?;
         let desired: Vec<Desired> = entries
             .iter()
             .filter(|entry| entry.kind == TreeKind::File)
@@ -1274,7 +1299,9 @@ impl Workspace {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             _ => return Err("Destination already exists; it was preserved.".into()),
         }
-        let entries = self.pinned_tree(&request.path, &request.expected_tree_sha256)?;
+        let policy = self.search_permissions(tool)?;
+        let permissions = policy.as_ref().map(|policy| TreePermissions { policy, source: &request.path, destination: Some(&request.destination) });
+        let entries = self.pinned_tree(&request.path, &request.expected_tree_sha256, permissions.as_ref())?;
         // Directories are created first so journaled file creates land in a
         // finished tree; on any failure they are removed empty, bottom-up.
         let mut dir_paths: Vec<String> = entries
@@ -1754,7 +1781,13 @@ impl Workspace {
             return Err("Invalid transaction manifest version, ID, state or entry count.".into());
         }
         unique_paths(manifest.entries.iter().map(|e| e.path.clone()))?;
+        let permissions = self.search_permissions("recover_patch")?;
         for entry in &manifest.entries {
+            if permissions.as_ref().is_some_and(|policy| {
+                !policy.allows(&entry.path) || entry.rename_to.as_deref().is_some_and(|path| !policy.allows(path))
+            }) {
+                return Err("Recovery includes paths restricted by permission rules; the transaction and backups were preserved.".into());
+            }
             if let Some(destination) = &entry.rename_to {
                 valid_path(destination, false)?;
                 if destination == &entry.path
@@ -1796,16 +1829,16 @@ pub(super) fn definitions() -> Vec<(&'static str, &'static str, Value, Vec<&'sta
     let create = json!({"type":"object","properties":{"kind":{"const":"create"},"path":path,"content":{"type":"string","maxLength":1048576}},"required":["kind","path","content"],"additionalProperties":false});
     let delete = json!({"type":"object","properties":{"kind":{"const":"delete"},"path":path,"expected_sha256":hash},"required":["kind","path","expected_sha256"],"additionalProperties":false});
     vec![
-        ("apply_patch", "Apply 1–16 hash-pinned file edits/creates/deletes after all-file preflight. Edits use unique, nonoverlapping replacements against original text; smart quotes, dash variants, exotic spaces, trailing whitespace and CRLF are tolerated when matching and the line endings of every replaced region are preserved. Atomic per-file replacement with durable rollback journal; external applications do not share cross-file isolation. Returns diffs and explicit committed/rolled_back/unknown status. Parents must exist; 1 MiB/file, 8 MiB total. Recover an interrupted transaction with recover_patch.", json!({"changes":{"type":"array","minItems":1,"maxItems":16,"items":{"oneOf":[edit,create,delete]}}}), vec!["changes"]),
+        ("apply_patch", "Apply 1–16 hash-pinned file edits/creates/deletes after all-file preflight. Edits use unique, nonoverlapping replacements against original text; smart quotes, dash variants, exotic spaces, trailing whitespace and CRLF are tolerated when matching and the line endings of every replaced region are preserved. Atomic per-file replacement with durable rollback journal; external applications do not share cross-file isolation. Returns diffs and explicit committed/rolled_back/unknown status. Parents must exist; 1 MiB/file, 8 MiB total. Serialized arguments are limited to 8 MiB. For large batches, split the changes across calls. Recover an interrupted transaction with recover_patch.", json!({"changes":{"type":"array","minItems":1,"maxItems":16,"items":{"oneOf":[edit,create,delete]}}}), vec!["changes"]),
         ("copy_file", "Copy a regular workspace file to a new destination without overwriting. Requires source SHA-256 from file_info/read_file. Parents must exist. Maximum 1 MiB; returns journaled transaction status.", json!({"path":path,"destination":path,"expected_sha256":hash}), vec!["path","destination","expected_sha256"]),
         ("move_file", "Move a hash-pinned regular workspace file to a new destination using a recoverable copy/delete transaction. Never overwrites a destination. Parents must exist. Maximum 1 MiB.", json!({"path":path,"destination":path,"expected_sha256":hash}), vec!["path","destination","expected_sha256"]),
         ("delete_file", "Delete one regular workspace file after verifying expected_sha256. Uses durable rollback backup until commit. Does not delete directories. Maximum 1 MiB.", json!({"path":path,"expected_sha256":hash}), vec!["path","expected_sha256"]),
         ("recover_patch", "Inspect or recover pending workspace patch transactions. Omit transaction_id to list. Supply the ID to roll back a prepared transaction or clean a committed one. Divergent external edits are preserved and unresolved recovery is reported. This is a write operation subject to normal approval.", json!({"transaction_id":{"type":"string","pattern":"^[a-f0-9]{32}$"}}), vec![]),
         ("file_info", "Read bounded metadata and SHA-256 for a regular workspace text or binary file up to 1 MiB. Use the hash for copy/move/delete or patches. Does not return file contents.", json!({"path":path}), vec!["path"]),
-        ("write_file", "Create or overwrite one whole UTF-8 workspace file up to 1 MiB. Overwriting requires expected_sha256 from a fresh read_file/file_info; creating requires omitting it and never overwrites. Journaled transaction returning status and a diff when overwriting.", json!({"path":path,"content":{"type":"string","maxLength":1048576},"expected_sha256":hash}), vec!["path","content"]),
+        ("write_file", "Create or overwrite one whole UTF-8 workspace file up to 1 MiB. For incremental text writes, create the file and use append_file with the updated hash after each append. Overwriting requires expected_sha256 from a fresh read_file/file_info; creating requires omitting it and never overwrites. Journaled transaction returning status and a diff when overwriting.", json!({"path":path,"content":{"type":"string","maxLength":1048576},"expected_sha256":hash}), vec!["path","content"]),
         ("write_file_base64", "Create or overwrite one workspace file with base64-decoded binary content, up to 1 MiB decoded. Same existence and expected_sha256 rules as write_file. Journaled transaction returning status.", json!({"path":path,"content_base64":{"type":"string","maxLength":1400000},"expected_sha256":hash}), vec!["path","content_base64"]),
         ("append_file", "Append UTF-8 text to an existing workspace file after verifying expected_sha256. The resulting file must stay under 1 MiB. Journaled transaction returning status and a diff.", json!({"path":path,"content":{"type":"string","maxLength":1048576},"expected_sha256":hash}), vec!["path","content","expected_sha256"]),
-        ("multi_edit", "Apply 1–32 unique nonoverlapping text replacements to one existing UTF-8 workspace file pinned by expected_sha256. Each old_text must occur exactly once in the original file. Smart quotes, dash variants, exotic spaces, trailing whitespace and CRLF are tolerated when matching, and the line endings of every replaced region are preserved. Journaled transaction returning status and a diff.", json!({"path":path,"expected_sha256":hash,"edits":{"type":"array","minItems":1,"maxItems":32,"items":replacement}}), vec!["path","expected_sha256","edits"]),
+        ("multi_edit", "Apply 1–32 unique nonoverlapping text replacements to one existing UTF-8 workspace file pinned by expected_sha256. Each old_text must occur exactly once in the original file. Serialized arguments are limited to 8 MiB. Smart quotes, dash variants, exotic spaces, trailing whitespace and CRLF are tolerated when matching, and the line endings of every replaced region are preserved. Journaled transaction returning status and a diff.", json!({"path":path,"expected_sha256":hash,"edits":{"type":"array","minItems":1,"maxItems":32,"items":replacement}}), vec!["path","expected_sha256","edits"]),
         ("edit_lines", "Replace an inclusive 1-based line range in an existing UTF-8 workspace file pinned by expected_sha256. Use end_line = start_line - 1 to insert before start_line; start_line may be totalLines + 1 to append. The file's line ending style is preserved. Maximum file size 1 MiB.", json!({"path":path,"expected_sha256":hash,"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":0},"new_text":{"type":"string","maxLength":1048576}}), vec!["path","expected_sha256","start_line","end_line","new_text"]),
         ("list_tree", "List a workspace directory recursively down to max_depth (1–10, default 3), skipping generated directories unless include_generated. Returns up to 2000 entries with path, kind, size and file SHA-256 plus treeSha256 over the full tree, the pin delete/move/copy_directory require.", json!({"path":path,"max_depth":{"type":"integer","minimum":1,"maximum":10,"default":3},"include_generated":{"type":"boolean","default":false}}), vec!["path"]),
         ("delete_directory", "Delete a workspace directory. Non-recursive removes only an empty directory. Recursive requires expected_tree_sha256 from list_tree for that path, refuses linked or special entries, and is capped at 2000 entries / 8 MiB. File contents are journaled for rollback before emptied directories are removed bottom-up.", json!({"path":path,"recursive":{"type":"boolean"},"expected_tree_sha256":hash}), vec!["path","recursive"]),
@@ -1817,6 +1850,66 @@ pub(super) fn definitions() -> Vec<(&'static str, &'static str, Value, Vec<&'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_tree_operations_refuse_restricted_descendants_before_changes() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(state_dir.path());
+        std::fs::create_dir(root.path().join("source")).unwrap();
+        std::fs::write(root.path().join("source/public.txt"), "public").unwrap();
+        std::fs::write(root.path().join("source/private.txt"), "protected").unwrap();
+        let raw = workspace(root.path());
+        let pin = raw.call("list_tree", json!({"path":"source"})).unwrap()["treeSha256"].clone();
+        let model = Workspace::open(root.path().to_str().unwrap()).unwrap().with_permission_store(&state.db_path);
+        for effect in [Effect::Deny, Effect::Ask] {
+            let rules = RuleSet { rules: vec![Rule { action: Action::Path, resource: "source/private.txt".into(), effect }] };
+            crate::permission_rules::save(&state.database().unwrap(), &rules).unwrap();
+            let listing = model.call("list_files", json!({"path":"source"})).unwrap();
+            assert!(listing.to_string().contains("public.txt") && !listing.to_string().contains("private.txt"), "{listing}");
+            assert_eq!(listing["incomplete"], true);
+            let err = model.call("list_tree", json!({"path":"source"})).unwrap_err();
+            assert!(err.contains("restricted by permission rules"), "{err}");
+            let err = model.call("delete_directory", json!({"path":"source","recursive":true,"expected_tree_sha256":pin})).unwrap_err();
+            assert!(err.contains("restricted by permission rules"), "{err}");
+            assert_eq!(std::fs::read_to_string(root.path().join("source/private.txt")).unwrap(), "protected");
+        }
+        let rules = RuleSet { rules: vec![Rule { action: Action::Path, resource: "destination/private.txt".into(), effect: Effect::Deny }] };
+        crate::permission_rules::save(&state.database().unwrap(), &rules).unwrap();
+        for tool in ["copy_directory", "move_directory"] {
+            let err = model.call(tool, json!({"path":"source","destination":"destination","expected_tree_sha256":pin})).unwrap_err();
+            assert!(err.contains("restricted by permission rules"), "{tool}: {err}");
+            assert!(!root.path().join("destination").exists(), "{tool} created a partial destination");
+            assert_eq!(std::fs::read_to_string(root.path().join("source/private.txt")).unwrap(), "protected");
+        }
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet::default()).unwrap();
+        let result = model.call("copy_directory", json!({"path":"source","destination":"destination","expected_tree_sha256":pin})).unwrap();
+        assert_eq!(result["status"], "committed", "{result}");
+        assert_eq!(std::fs::read_to_string(root.path().join("destination/private.txt")).unwrap(), "protected");
+    }
+
+    #[test]
+    fn model_recovery_preserves_all_files_when_any_manifest_path_is_restricted() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(state_dir.path());
+        let id = interrupted(root.path(), "prepared");
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+            action: Action::Path, resource: "b.txt".into(), effect: Effect::Deny,
+        }] }).unwrap();
+        let model = Workspace::open(root.path().to_str().unwrap()).unwrap().with_permission_store(&state.db_path);
+        let error = model.call("recover_patch", json!({"transaction_id":id})).unwrap_err();
+        assert!(error.contains("restricted by permission rules"), "{error}");
+        assert_eq!(std::fs::read_to_string(root.path().join("a.txt")).unwrap(), "after a");
+        assert_eq!(std::fs::read_to_string(root.path().join("b.txt")).unwrap(), "before b");
+        assert!(root.path().join(JOURNAL).join(format!("{id}.json")).exists());
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet::default()).unwrap();
+        assert_eq!(model.call("recover_patch", json!({"transaction_id":id})).unwrap()["status"], "rolled_back");
+        assert_eq!(std::fs::read_to_string(root.path().join("a.txt")).unwrap(), "before a");
+        assert_eq!(std::fs::read_to_string(root.path().join("b.txt")).unwrap(), "before b");
+    }
 
     fn workspace(root: &Path) -> Workspace {
         Workspace::open(root.to_str().unwrap()).unwrap()

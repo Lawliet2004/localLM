@@ -62,13 +62,70 @@ impl ChildPolicy {
     }
 }
 
+// ChildPolicy already pins reads-only children to trusted reads. Use the
+// equivalent automatic-read mode here, then apply that pin independently so
+// an explicit Allow rule cannot grant a child extra authority.
+fn child_rule_decision(
+    store: &crate::store::Store,
+    policy: ChildPolicy,
+    tool: &crate::connectors::AgentTool,
+    call: &crate::tool_calls::ToolCall,
+) -> crate::permission_rules::Decision {
+    let mode = match policy {
+        ChildPolicy::ReadsOnly => crate::permissions::AccessMode::AutoApprove,
+        ChildPolicy::Full => crate::permissions::AccessMode::FullAccess,
+    };
+    let rules = match crate::permission_rules::load_checked(store) {
+        Ok(rules) => rules,
+        Err(_) => return crate::permission_rules::Decision::Deny("Permission settings are unavailable or invalid.".into()),
+    };
+    crate::permission_rules::decide_for_agent_tool(&rules, mode, tool, &call.arguments)
+}
+
+fn child_permission_failure(reason: &str) -> serde_json::Value {
+    crate::tool_envelope::failure_notice(
+        "permission-denied",
+        reason,
+        false,
+        crate::tool_envelope::SIDE_NONE,
+        &serde_json::json!({"denied":true}),
+    )
+}
+
+// Recheck after hooks and approval waits: settings can change while either is
+// running. An approval covers Ask for this call, never a later Deny.
+fn child_dispatch_permission(
+    state: &crate::AppState,
+    request: &ChildRequest,
+    tool: &crate::connectors::AgentTool,
+    call: &crate::tool_calls::ToolCall,
+    approved: bool,
+) -> Option<serde_json::Value> {
+    let decision = match state.database() {
+        Ok(store) => child_rule_decision(&store, request.policy, tool, call),
+        Err(_) => {
+            return Some(child_permission_failure(
+                "Permission settings are unreachable.",
+            ))
+        }
+    };
+    match decision {
+        crate::permission_rules::Decision::Deny(reason) => Some(child_permission_failure(&reason)),
+        crate::permission_rules::Decision::Ask if !approved => Some(child_permission_failure(
+            "This child call now requires approval; ask the parent to retry it.",
+        )),
+        _ => None,
+    }
+}
+
 /// Harness tools the detached background driver can serve without &AppState.
 /// Store-only / stateless tools run against a fresh SQLite connection;
 /// `file_*` run through the same workspace-bounded handler as the foreground
 /// catalog. Everything else needs the foreground dispatcher (approval,
 /// terminals, schedulers, orchestration) and fails loud instead of hanging.
 pub fn harness_detached_supported(alias: &str) -> bool {
-    crate::git_tools::owns(alias)
+    crate::authoring::owns(alias)
+        || crate::git_tools::owns(alias)
         || (crate::lsp_tools::owns(alias) && alias != "lsp_execute_command")
         || matches!(
             alias,
@@ -112,6 +169,11 @@ pub async fn harness_detached(
     }
     let workspace_path = snapshot.workspace_path.clone();
     match alias {
+        name if crate::authoring::owns(name) => {
+            let name = name.to_string();
+            tokio::task::spawn_blocking(move || crate::authoring::execute(&workspace_path, &name, args))
+                .await.map_err(|_| "Authoring reader failed.".to_string())?
+        }
         name if crate::lsp_tools::owns(name) => {
             // A detached child owns a short-lived manager. It never borrows
             // the parent's live sessions or its pending approval authority.
@@ -250,7 +312,8 @@ pub async fn harness_detached(
             if workspace_path.is_empty() {
                 return Err("Choose a workspace folder before file_search.".into());
             }
-            let hits = crate::sandbox::file_search(std::path::Path::new(&workspace_path), &query)?;
+            let rules = crate::permission_rules::load_checked(&store)?;
+            let hits = crate::sandbox::file_search_with_rules(std::path::Path::new(&workspace_path), &query, &rules)?;
             Ok(serde_json::json!({"hits": hits}))
         }
         "list_agents" => {
@@ -497,11 +560,8 @@ pub async fn snapshot_for_conversation(
             } else {
                 "grok"
             };
-            let token =
-                crate::subscription_auth::get_valid_access_token(&state.daytona_vault, kind)
-                    .await?;
-            let account_id = crate::subscription_auth::load_session(&state.daytona_vault, kind)?
-                .and_then(|s| s.account_id);
+            let session = crate::subscription_auth::get_valid_session(&state.daytona_vault, kind).await?;
+            let (token, account_id) = (session.access_token, session.account_id);
             snapshot.kind = "subscription".into();
             snapshot.key = token;
             snapshot.account_id = account_id;
@@ -522,7 +582,7 @@ pub async fn snapshot_for_conversation(
                 &provider,
                 state
                     .daytona_vault
-                    .load(&crate::providers::credential_id(&provider_id))?,
+                    .load_blocking(&crate::providers::credential_id(&provider_id)).await?,
             )?;
             snapshot.kind = "remote".into();
             snapshot.key = key;
@@ -983,7 +1043,7 @@ pub fn local_tools(
     if !snapshot.workspace_path.is_empty() {
         if policy.denial("workspace_files").is_none() {
             if let Ok(workspace) = crate::workspace::Workspace::open(&snapshot.workspace_path) {
-                tools.extend(std::sync::Arc::new(workspace).tools());
+                tools.extend(std::sync::Arc::new(workspace.with_permission_store(&snapshot.db_path)).tools());
             }
         }
         if policy.denial("local_execution").is_none() {
@@ -1246,9 +1306,15 @@ pub async fn drive_child(
                     continue;
                 }
             }
+            let rule_decision = match state.database() {
+                Ok(store) => child_rule_decision(&store, request.policy, tool, &call),
+                Err(_) => crate::permission_rules::Decision::Deny("Permission settings are unreachable.".into()),
+            };
             let allowed = request.policy.allows(tool.trusted_read())
-                && !tool.requires_approval(&call.arguments);
-            let result = if !allowed && emit.is_some() {
+                && matches!(rule_decision, crate::permission_rules::Decision::Allow(_));
+            let result = if let crate::permission_rules::Decision::Deny(reason) = rule_decision {
+                child_permission_failure(&reason)
+            } else if !allowed && emit.is_some() {
                 // Dropping the approval future releases the pending entry via
                 // its guard; nothing is left awaiting a decision.
                 let decision = tokio::select! {
@@ -1261,7 +1327,7 @@ pub async fn drive_child(
                 match decision {
                     Some(true) => tokio::select! {
                         _ = cancel.cancelled() => return Err(cancelled_tool_call(state, child_run_id, round, &call, &mut event_seq)),
-                        result = call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call, emit.as_ref()) => result,
+                        result = call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call, emit.as_ref(), true) => result,
                     },
                     _ => crate::tool_envelope::failure_notice("denied", "Denied by the subagent approval pin (reads-only). Ask the parent for what you need instead.", false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({"denied":true})),
                 }
@@ -1272,7 +1338,7 @@ pub async fn drive_child(
                 // child processes die with the execution wrapper on drop.
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(cancelled_tool_call(state, child_run_id, round, &call, &mut event_seq)),
-                    result = call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call, emit.as_ref()) => result,
+                    result = call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call, emit.as_ref(), false) => result,
                 }
             };
             let control = if tool.harness_name().is_some()
@@ -1282,18 +1348,14 @@ pub async fn drive_child(
             } else {
                 None
             };
-            let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
+            let (bounded, _) = crate::artifacts::capture_tool_result(
                 result,
                 &tool.tool.name,
                 &request.conversation_id,
                 Some(child_run_id),
                 crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
+                |artifact| state.database()?.save_artifact(artifact),
             );
-            if let Some(artifact) = &maybe_artifact {
-                if let Ok(store) = state.database() {
-                    let _ = store.save_artifact(artifact);
-                }
-            }
             if let Ok(store) = state.database() {
                 event_seq += 1;
                 let _ = store.append_run_event(&crate::agent_run::RunEvent {
@@ -1393,8 +1455,13 @@ async fn call_child_tool(
     tool: &crate::connectors::AgentTool,
     call: &crate::tool_calls::ToolCall,
     emit: Option<&ChildEmit>,
+    approved: bool,
 ) -> serde_json::Value {
+    if let Some(failure) = child_dispatch_permission(state, request, tool, call, approved) {
+        return failure;
+    }
     if tool.harness_name() == Some(crate::tool_discovery::SEARCH) {
+        if let Some(failure) = child_pre_use(state, &snapshot.workspace_path, request, tool, call, emit, approved).await { return failure; }
         let policy = crate::capabilities::ToolPolicy::guard(state.database());
         return match crate::tool_discovery::search(tools.iter().copied(), &call.arguments, &policy)
         {
@@ -1446,6 +1513,7 @@ async fn call_child_tool(
                 );
             }
         }
+        if let Some(failure) = child_pre_use(state, &snapshot.workspace_path, request, tool, call, emit, approved).await { return failure; }
         // Foreground children keep the real progress channel so nested MCP
         // input forms reach the chat; detached paths fall back to a no-op.
         let emit: ChildEmit = match emit {
@@ -1468,19 +1536,6 @@ async fn call_child_tool(
             inherit_tools: &owned,
             emit,
         };
-        if let Some(blocked) =
-            crate::hooks::pre_use(state, &request.conversation_id, alias, &call.arguments)
-                .await
-                .blocked
-        {
-            return crate::tool_envelope::failure_notice(
-                "hook-blocked",
-                &blocked,
-                false,
-                crate::tool_envelope::SIDE_NONE,
-                &serde_json::json!({"hookBlocked":true}),
-            );
-        }
         match tokio::time::timeout(tool.timeout(), Box::pin(crate::harness::execute(&ctx, alias, call.arguments.clone()))).await {
             Ok(Ok(outcome)) => {
                 if let Ok(store) = state.database() {
@@ -1542,6 +1597,7 @@ async fn call_child_tool(
                 );
             }
         }
+        if let Some(failure) = child_pre_use(state, &snapshot.workspace_path, request, tool, call, emit, approved).await { return failure; }
         let mcp_ui = match (tool.is_mcp(), emit) {
             (true, Some(emit)) => Some(crate::mcp_input::CallUi::new(
                 state.mcp_inputs.clone(),
@@ -1549,12 +1605,34 @@ async fn call_child_tool(
             )),
             _ => None,
         };
-        match tokio::time::timeout(tool.timeout(), tool.call_with_input(call.arguments.clone(), None, mcp_ui)).await {
+        match tokio::time::timeout(tool.call_deadline(tool.timeout(), mcp_ui.is_some()), tool.call_with_input(call.arguments.clone(), None, mcp_ui)).await {
             Ok(Ok(value)) => crate::tool_envelope::normalize(value, tool.envelope_family()),
             Ok(Err(error)) => crate::tool_envelope::normalize_error(&error, crate::tool_envelope::Cause::default(), tool.envelope_family()),
             Err(_) => crate::tool_envelope::normalize_error("Subagent tool call timed out. Its outcome may be unknown; do not automatically retry.", crate::tool_envelope::Cause { timeout: true, ..Default::default() }, tool.envelope_family()),
         }
     }
+}
+
+async fn child_pre_use(
+    state: &crate::AppState,
+    workspace: &str,
+    request: &ChildRequest,
+    tool: &crate::connectors::AgentTool,
+    call: &crate::tool_calls::ToolCall,
+    emit: Option<&ChildEmit>,
+    approved: bool,
+) -> Option<serde_json::Value> {
+    let verdict = crate::hooks::pre_use(state, &request.conversation_id, workspace, &tool.alias, &call.arguments).await;
+    if let Some(emit) = emit {
+        for notice in &verdict.notices { emit(notice.clone(), None); }
+    }
+    if let Some(blocked) = verdict.blocked {
+        return Some(crate::tool_envelope::failure_notice("hook-blocked", &blocked, false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({"hookBlocked":true})));
+    }
+    if let Some(failure) = child_dispatch_permission(state, request, tool, call, approved) { return Some(failure); }
+    crate::capabilities::ToolPolicy::guard(state.database()).denial_for_tool(tool).map(|reason| {
+        crate::tool_envelope::failure_notice("capability-disabled", &reason, false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({}))
+    })
 }
 
 /// Forward a foreground child's write request to the user's approval modal.
@@ -1727,7 +1805,7 @@ pub async fn run_child_inline(
     let cancel = ChildCancel::new(
         interrupt,
         state.subagents.cancellation(&child_run_id),
-        Some(state.cancel.subscribe()),
+        Some(state.cancel_signal().subscribe()),
     );
     let answer = drive_child(
         state,
@@ -2123,12 +2201,18 @@ pub async fn drive_detached(
                     continue;
                 }
             }
-            let result = if !request.policy.allows(tool.trusted_read())
-                || tool.requires_approval(&call.arguments)
+            let rule_decision = match store.lock() {
+                Ok(store) => child_rule_decision(&store, request.policy, tool, &call),
+                Err(_) => crate::permission_rules::Decision::Deny("Permission settings are unreachable.".into()),
+            };
+            let result = if let crate::permission_rules::Decision::Deny(reason) = rule_decision {
+                child_permission_failure(&reason)
+            } else if !request.policy.allows(tool.trusted_read())
+                || !matches!(rule_decision, crate::permission_rules::Decision::Allow(_))
             {
                 crate::tool_envelope::failure_notice(
                     "denied",
-                    "Denied by the subagent approval pin (reads-only).",
+                    "This background subagent cannot request approval. Ask the parent for what you need instead.",
                     false,
                     crate::tool_envelope::SIDE_NONE,
                     &serde_json::json!({"denied":true}),
@@ -2180,18 +2264,14 @@ pub async fn drive_detached(
             } else {
                 None
             };
-            let (bounded, maybe_artifact) = crate::artifacts::bound_tool_result(
+            let (bounded, _) = crate::artifacts::capture_tool_result(
                 result,
                 &tool.tool.name,
                 &request.conversation_id,
                 Some(child_run_id),
                 crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
+                |artifact| store.lock().map_err(|_| "Artifact store is unavailable.".to_string())?.save_artifact(artifact),
             );
-            if let Some(artifact) = &maybe_artifact {
-                if let Ok(s) = store.lock() {
-                    let _ = s.save_artifact(artifact);
-                }
-            }
             event_seq += 1;
             if let Ok(s) = store.lock() {
                 let _ = s.append_run_event(&crate::agent_run::RunEvent {
@@ -2241,7 +2321,7 @@ async fn collect_stream(
     cancel: &mut ChildCancel,
 ) -> Result<StreamOutcome, String> {
     let mut stream = response.bytes_stream();
-    let mut decoder = crate::sse::SseDecoder::default();
+    let mut decoder = crate::sse::SseDecoder::inference();
     let mut protocol = crate::sse::ModelStream::for_backend(backend);
     let mut calls = crate::tool_calls::ToolCalls::default();
     let mut text = String::new();
@@ -2258,7 +2338,7 @@ async fn collect_stream(
             decoder.finish()?;
             return Err("Subagent stream ended without a completion marker.".into());
         };
-        for event in decoder.push(&bytes.map_err(|error| error.to_string())?)? {
+        for event in decoder.push(&bytes.map_err(|error| backend.stream_read_error(error))?)? {
             let value = protocol.push(&event)?;
             let Some(value) = value else {
                 if protocol.done {
@@ -2412,7 +2492,7 @@ pub async fn run_workflow(
         ids.push(spawn_background(snapshot.clone(), request)?);
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
-    let mut global_cancel = state.cancel.subscribe();
+    let mut global_cancel = state.cancel_signal().subscribe();
     loop {
         if state.cancel_requested() {
             for id in &ids {
@@ -3162,6 +3242,278 @@ mod tests {
             policy,
             parent_run_id: "parent".into(),
             conversation_id: conversation_id.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_workspace_child_runs_hook_and_rechecks_permissions() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        for scenario in ["allowed", "veto", "changed"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let state = crate::test_support::app_state(state_dir.path());
+            std::fs::write(workspace.path().join("secret.txt"), "child-hook-secret").unwrap();
+            let conversation = state.database().unwrap().create_conversation().unwrap();
+            state.database().unwrap().save_workspace_path(workspace.path().to_str().unwrap()).unwrap();
+            let hook = crate::hooks::Hook { id: "guard".into(), event: crate::hooks::EVENT_PRE_TOOL.into(), matcher: "workspace_read_file".into(),
+                command: match scenario { "veto" => "exit 2", "changed" => "printf x > started; sleep 1", _ => "printf x > started" }.into(), timeout_secs: 5, enabled: true };
+            state.database().unwrap().save_setting(crate::hooks::HOOKS_KEY, &vec![hook]).unwrap();
+            let snapshot = crate::test_support::snapshot(&state, workspace.path(), &["workspace_read_file"]);
+            let policy = crate::capabilities::ToolPolicy::guard(state.database());
+            let owned = local_tools(&snapshot, &policy);
+            let tools: Vec<_> = owned.iter().collect();
+            let tool = tools.iter().find(|tool| tool.alias == "workspace_read_file").unwrap();
+            let request = fixture_request(ChildPolicy::Full, &conversation.id);
+            let call = crate::tool_calls::ToolCall { id: "call".into(), name: tool.alias.clone(), arguments: serde_json::json!({"path":"secret.txt"}) };
+            let task = call_child_tool(&state, &snapshot, &request, &tools, "child", 0, tool, &call, None, false);
+            let update = async {
+                if scenario == "changed" {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while !workspace.path().join("started").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+                    }).await.expect("child hook did not start");
+                    crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+                        action: Action::Path, resource: "secret.txt".into(), effect: Effect::Deny,
+                    }] }).unwrap();
+                }
+            };
+            let (result, ()) = tokio::join!(task, update);
+            assert_eq!(result.to_string().contains("child-hook-secret"), scenario == "allowed", "{scenario}: {result}");
+            if scenario != "allowed" {
+                assert_eq!(result["error"]["sideEffects"], "none", "{result}");
+                assert_eq!(result["error"]["code"], if scenario == "veto" { "hook-blocked" } else { "permission-denied" });
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_harness_search_respects_path_rules() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        let workspace = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(state_dir.path());
+        std::fs::create_dir(workspace.path().join("private")).unwrap();
+        std::fs::write(workspace.path().join("public.txt"), "needle public").unwrap();
+        std::fs::write(workspace.path().join("private/secret.txt"), "needle protected").unwrap();
+        let conversation = state.database().unwrap().create_conversation().unwrap();
+        crate::permission_rules::save(&state.database().unwrap(), &RuleSet { rules: vec![Rule {
+            action: Action::Path, resource: "private/**".into(), effect: Effect::Deny,
+        }] }).unwrap();
+        let snapshot = crate::test_support::snapshot(&state, workspace.path(), &["file_search"]);
+        let request = fixture_request(ChildPolicy::ReadsOnly, &conversation.id);
+        let result = harness_detached(&snapshot, &request, "file_search", serde_json::json!({"query":"needle"})).await.unwrap().to_string();
+        assert!(result.contains("public.txt") && result.contains("permission rules"), "{result}");
+        assert!(!result.contains("protected") && !result.contains("secret.txt"), "{result}");
+
+        let mut catalog_snapshot = snapshot.clone();
+        catalog_snapshot.allowed_tool_aliases.push("workspace_search_content".into());
+        let policy = crate::capabilities::ToolPolicy::guard(state.database());
+        let tools = local_tools(&catalog_snapshot, &policy);
+        let search = tools.iter().find(|tool| tool.alias == "workspace_search_content").unwrap();
+        let result = search.call(serde_json::json!({"query":"needle"})).await.unwrap().to_string();
+        assert!(result.contains("public.txt") && result.contains("permission rules"), "{result}");
+        assert!(!result.contains("protected") && !result.contains("secret.txt"), "{result}");
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn child_permission_rules_block_or_allow_actual_workspace_reads() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        use serde_json::json;
+
+        for detached in [false, true] {
+            for effect in [Some(Effect::Deny), Some(Effect::Ask), Some(Effect::Allow), None] {
+                let workspace = tempfile::tempdir().unwrap();
+                let state_dir = tempfile::tempdir().unwrap();
+                std::fs::write(workspace.path().join("secret.txt"), "unique-child-secret").unwrap();
+                let state = crate::test_support::app_state(state_dir.path());
+                let conversation = state.database().unwrap().create_conversation().unwrap();
+                crate::permission_rules::save(
+                    &state.database().unwrap(),
+                    &RuleSet {
+                        rules: vec![Rule {
+                            action: Action::Path,
+                            resource: "secret.txt".into(),
+                            effect: effect.unwrap_or(Effect::Deny),
+                        }],
+                    },
+                )
+                .unwrap();
+                if effect.is_none() {
+                    state.database().unwrap().connection.execute("UPDATE settings SET value=?1 WHERE key=?2", rusqlite::params!["invalid-json", crate::permission_rules::RULES_KEY]).unwrap();
+                }
+                let request = fixture_request(ChildPolicy::ReadsOnly, &conversation.id);
+                let child_id = format!("child-{}", uuid::Uuid::new_v4());
+                fixture_run(&state.database().unwrap(), &child_id, &conversation.id);
+                let args = json!({"path":"secret.txt"}).to_string();
+                let call = format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"workspace_read_file","arguments":args}}]}}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})
+                );
+                let done = format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"delta":{"content":"Done"}}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+                );
+                let (base, requests, server) =
+                    crate::test_support::scripted_sse(vec![call, done]).await;
+                let snapshot = crate::test_support::snapshot(
+                    &state,
+                    workspace.path(),
+                    &["workspace_read_file"],
+                );
+                let backend = crate::inference::Backend::OpenAi {
+                    responses: false,
+                    client: reqwest::Client::builder().no_proxy().build().unwrap(),
+                    base_url: base,
+                    key: "fixture".into(),
+                    model_id: "fixture".into(),
+                    context_length: 8192,
+                    max_output_tokens: Some(512),
+                    capabilities: crate::provider_capabilities::ModelCapabilities::legacy(true),
+                };
+                let policy = crate::capabilities::ToolPolicy::guard(state.database());
+                let owned = local_tools(&snapshot, &policy);
+                assert!(owned.iter().any(|tool| tool.alias == "workspace_read_file"));
+                if detached {
+                    let store = Arc::new(Mutex::new(
+                        crate::store::Store::open(&snapshot.db_path).unwrap(),
+                    ));
+                    drive_detached(
+                        &snapshot,
+                        &request,
+                        owned.iter().collect(),
+                        &backend,
+                        ChildCancel::none(),
+                        None,
+                        &child_id,
+                        store,
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    let tools = merge_child_tools(owned, &[], &None, &policy);
+                    drive_child(
+                        &state,
+                        &snapshot,
+                        &request,
+                        tools,
+                        &backend,
+                        ChildCancel::none(),
+                        None,
+                        &child_id,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                server.await.unwrap();
+                let requests = requests.lock().unwrap();
+                let replay = requests[1].body.to_string();
+                assert_eq!(
+                    replay.contains("unique-child-secret"),
+                    effect == Some(Effect::Allow),
+                    "detached={detached}, effect={effect:?}: {replay}"
+                );
+                if effect != Some(Effect::Allow) {
+                    assert!(replay.contains("denied"), "{replay}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires a permitted host with loopback TCP; no browser is launched"]
+    async fn foreground_child_approval_does_not_override_a_new_deny_rule() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        use serde_json::json;
+        for change_to_deny in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            std::fs::write(workspace.path().join("secret.txt"), "approved-child-secret").unwrap();
+            let state = Arc::new(crate::test_support::app_state(state_dir.path()));
+            let conversation = state.database().unwrap().create_conversation().unwrap();
+            let rule = |effect| RuleSet {
+                rules: vec![Rule {
+                    action: Action::Path,
+                    resource: "secret.txt".into(),
+                    effect,
+                }],
+            };
+            crate::permission_rules::save(&state.database().unwrap(), &rule(Effect::Ask)).unwrap();
+            let request = fixture_request(ChildPolicy::ReadsOnly, &conversation.id);
+            let child_id = format!("child-{}", uuid::Uuid::new_v4());
+            fixture_run(&state.database().unwrap(), &child_id, &conversation.id);
+            let args = json!({"path":"secret.txt"}).to_string();
+            let call = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"workspace_read_file","arguments":args}}]}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})
+            );
+            let done = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"content":"Done"}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+            );
+            let (base, requests, server) =
+                crate::test_support::scripted_sse(vec![call, done]).await;
+            let snapshot =
+                crate::test_support::snapshot(&state, workspace.path(), &["workspace_read_file"]);
+            let backend = crate::inference::Backend::OpenAi {
+                responses: false,
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+                base_url: base,
+                key: "fixture".into(),
+                model_id: "fixture".into(),
+                context_length: 8192,
+                max_output_tokens: Some(512),
+                capabilities: crate::provider_capabilities::ModelCapabilities::legacy(true),
+            };
+            let policy = crate::capabilities::ToolPolicy::guard(state.database());
+            let tools = merge_child_tools(local_tools(&snapshot, &policy), &[], &None, &policy);
+            let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let emit: ChildEmit = {
+                let state = state.clone();
+                let approvals = approvals.clone();
+                Arc::new(move |_, payload| {
+                    if let Some(id) = payload.as_ref().and_then(|value| value["id"].as_str()) {
+                        approvals.fetch_add(1, Ordering::SeqCst);
+                        if change_to_deny {
+                            crate::permission_rules::save(
+                                &state.database().unwrap(),
+                                &rule(Effect::Deny),
+                            )
+                            .unwrap();
+                        }
+                        state.approvals.resolve(id, true).unwrap();
+                    }
+                })
+            };
+            drive_child(
+                &state,
+                &snapshot,
+                &request,
+                tools,
+                &backend,
+                ChildCancel::none(),
+                None,
+                &child_id,
+                Some(emit),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(approvals.load(Ordering::SeqCst), 1);
+            let requests = requests.lock().unwrap();
+            let replay = requests[1].body.to_string();
+            assert_eq!(
+                replay.contains("approved-child-secret"),
+                !change_to_deny,
+                "{replay}"
+            );
+            if change_to_deny {
+                assert!(replay.contains("permission-denied"), "{replay}");
+            }
         }
     }
 

@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
+use crate::execution::{capture_command, CaptureError};
+use std::time::Duration;
 
 pub const HOOKS_KEY: &str = "hooks_v1";
 pub const EVENT_PRE_TOOL: &str = "pre_tool_use";
@@ -104,6 +105,10 @@ async fn run_hook(
     stdin_json: &Value,
     timeout_secs: u32,
 ) -> Result<(i32, String, String), String> {
+    if !workspace_available(workspace) {
+        return Err("The execution workspace is unavailable.".into());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs.into());
     let mut process = tokio::process::Command::new(&config.bash_path);
     let stem = std::path::Path::new(&config.bash_path)
         .file_stem()
@@ -138,42 +143,32 @@ async fn run_hook(
             process.env(name, value);
         }
     }
-    let mut child = process
-        .spawn()
-        .map_err(|error| format!("Hook command failed to start: {error}"))?;
     let payload = stdin_json.to_string();
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(payload.as_bytes()).await;
-        let _ = stdin.shutdown().await;
-    }
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs as u64),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| format!("Hook timed out after {timeout_secs}s."))?
-    .map_err(|error| format!("Hook failed: {error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok((output.status.code().unwrap_or(-1), stdout, stderr))
+    let (status, stdout, stderr) = capture_command(process, Some(payload.as_bytes()), deadline, 16 * 1024)
+        .await
+        .map_err(|error| match error {
+            CaptureError::Spawn(error) => format!("Hook command failed to start: {error}"),
+            CaptureError::Io(error) => format!("Hook failed: {error}. Hook side effects may already have occurred."),
+            CaptureError::Timeout => format!("Hook timed out after {timeout_secs}s. Hook side effects may already have occurred."),
+        })?;
+    Ok((status.code().unwrap_or(-1), stdout, stderr))
 }
 
-/// The store + execution config + workspace needed to spawn hook processes.
-/// Returns None (hooks silently skip) when the run has no workspace or shell.
 fn hook_context(
     state: &crate::AppState,
-) -> Result<(Vec<Hook>, crate::execution::ExecutionConfig, String), String> {
+) -> Result<(Vec<Hook>, crate::execution::ExecutionConfig), String> {
     let store = state.database()?;
-    let hooks = hooks(&store);
-    if hooks.is_empty() {
-        return Ok((Vec::new(), store.execution_config()?, String::new()));
-    }
     let config = store.execution_config()?;
-    if !config.bash.enabled {
-        return Ok((Vec::new(), config, String::new()));
-    }
-    let workspace = store.workspace_path().unwrap_or_default();
-    Ok((hooks, config, workspace))
+    let hooks = if config.bash.enabled { hooks(&store) } else { Vec::new() };
+    Ok((hooks, config))
+}
+
+/// The execution snapshot already names the tool's workspace. A removed
+/// worktree or a replaced path cannot redirect a hook to another project.
+fn workspace_available(workspace: &str) -> bool {
+    let path = std::path::Path::new(workspace);
+    path.is_absolute()
+        && std::fs::canonicalize(path).is_ok_and(|canonical| crate::workspace::same_canonical_path(&canonical, path) && canonical.is_dir())
 }
 
 pub struct PreUse {
@@ -188,6 +183,7 @@ pub struct PreUse {
 pub async fn pre_use(
     state: &crate::AppState,
     conversation_id: &str,
+    workspace: &str,
     alias: &str,
     arguments: &Value,
 ) -> PreUse {
@@ -195,16 +191,19 @@ pub async fn pre_use(
         blocked: None,
         notices: Vec::new(),
     };
-    let Ok((hooks, config, workspace)) = hook_context(state) else {
+    let Ok((hooks, config)) = hook_context(state) else {
         return verdict;
     };
-    if workspace.is_empty() {
+    if !workspace_available(workspace) {
+        if matching(&hooks, EVENT_PRE_TOOL, alias).next().is_some() {
+            verdict.notices.push("Pre-tool hooks skipped because the execution workspace is unavailable.".into());
+        }
         return verdict;
     }
-    let stdin = json!({"event": EVENT_PRE_TOOL, "conversationId": conversation_id, "tool": alias, "arguments": arguments});
+    let stdin = json!({"event": EVENT_PRE_TOOL, "conversationId": conversation_id, "workspace": workspace, "tool": alias, "arguments": arguments});
     for hook in matching(&hooks, EVENT_PRE_TOOL, alias) {
         match run_hook(
-            &workspace,
+            workspace,
             &config,
             &hook.command,
             &stdin,
@@ -242,65 +241,57 @@ pub async fn pre_use(
 pub async fn post_use(
     state: &crate::AppState,
     conversation_id: &str,
+    workspace: &str,
     alias: &str,
     arguments: &Value,
     result: &Value,
     decision: &str,
 ) -> Option<String> {
-    let Ok((hooks, config, workspace)) = hook_context(state) else {
+    let Ok((hooks, config)) = hook_context(state) else {
         return None;
     };
-    if workspace.is_empty() {
-        return None;
+    if !workspace_available(workspace) {
+        return matching(&hooks, EVENT_POST_TOOL, alias).next()
+            .map(|_| "Post-tool hooks skipped because the execution workspace is unavailable.".into());
     }
-    let stdin = json!({"event": EVENT_POST_TOOL, "conversationId": conversation_id, "tool": alias,
+    let stdin = json!({"event": EVENT_POST_TOOL, "conversationId": conversation_id, "workspace": workspace, "tool": alias,
         "arguments": arguments, "result": result, "decision": decision});
     let mut note = String::new();
     for hook in matching(&hooks, EVENT_POST_TOOL, alias) {
-        if let Ok((0, stdout, _)) = run_hook(
-            &workspace,
-            &config,
-            &hook.command,
-            &stdin,
-            hook.timeout_secs,
-        )
-        .await
-        {
-            let trimmed = stdout.trim();
-            if !trimmed.is_empty() && note.chars().count() < 4096 {
-                if !note.is_empty() {
-                    note.push('\n');
-                }
-                note.push_str(
-                    &trimmed
-                        .chars()
-                        .take(4096 - note.chars().count())
-                        .collect::<String>(),
-                );
+        let detail = match run_hook(workspace, &config, &hook.command, &stdin, hook.timeout_secs).await {
+            Ok((0, stdout, _)) => stdout,
+            Ok((code, _, stderr)) => format!("Hook '{}' exited {code}: {}", hook.id, stderr.trim()),
+            Err(error) => format!("Hook '{}' failed: {error}", hook.id),
+        };
+        if !detail.trim().is_empty() && note.chars().count() < 4096 {
+            if !note.is_empty() {
+                note.push('\n');
             }
+            note.extend(detail.trim().chars().take(4096 - note.chars().count()));
         }
     }
     (!note.is_empty()).then_some(note)
 }
 
 /// Fire-and-forget run_finished hooks. Call once per run completion.
-pub fn run_finished(state: &crate::AppState, conversation_id: String, detail: Value) {
-    let Ok((hooks, config, workspace)) = hook_context(state) else {
+pub fn run_finished(state: &crate::AppState, conversation_id: &str, workspace: &str, detail: Value) {
+    let Ok((hooks, config)) = hook_context(state) else {
         return;
     };
-    if workspace.is_empty() {
+    if !workspace_available(workspace) {
         return;
     }
     let stdin =
-        json!({"event": EVENT_RUN_FINISHED, "conversationId": conversation_id, "result": detail});
+        json!({"event": EVENT_RUN_FINISHED, "conversationId": conversation_id, "workspace": workspace, "result": detail});
     for hook in hooks
         .iter()
         .filter(|hook| hook.enabled && hook.event == EVENT_RUN_FINISHED)
         .cloned()
         .collect::<Vec<_>>()
     {
-        let (config, workspace, stdin) = (config.clone(), workspace.clone(), stdin.clone());
+        let (config, workspace, stdin) = (config.clone(), workspace.to_string(), stdin.clone());
         tokio::spawn(async move {
+            if !workspace_available(&workspace) { return; }
             let _ = run_hook(
                 &workspace,
                 &config,
@@ -349,7 +340,7 @@ mod tests {
     // `await_holding_lock` does not model an explicit `drop`.
     #[allow(clippy::await_holding_lock)]
     async fn pre_hook_exit_2_blocks_with_stderr_and_matcher_globs() {
-        let (_dir, state) = fixture();
+        let (dir, state) = fixture();
         let store = state.database().unwrap();
         save(
             &store,
@@ -374,7 +365,7 @@ mod tests {
         )
         .unwrap();
         drop(store);
-        let verdict = pre_use(&state, "conv", "workspace_edit_file", &json!({})).await;
+        let verdict = pre_use(&state, "conv", dir.path().to_str().unwrap(), "workspace_edit_file", &json!({})).await;
         assert_eq!(
             verdict.blocked.as_deref(),
             Some("no"),
@@ -382,13 +373,13 @@ mod tests {
             verdict.notices
         );
         // Non-matching aliases are untouched.
-        let verdict = pre_use(&state, "conv", "check_report", &json!({})).await;
+        let verdict = pre_use(&state, "conv", dir.path().to_str().unwrap(), "check_report", &json!({})).await;
         assert!(verdict.blocked.is_none());
     }
 
     #[tokio::test]
     async fn post_hook_stdout_becomes_a_bounded_note() {
-        let (_dir, state) = fixture();
+        let (dir, state) = fixture();
         state
             .database()
             .unwrap()
@@ -407,6 +398,7 @@ mod tests {
         let note = post_use(
             &state,
             "conv",
+            dir.path().to_str().unwrap(),
             "check_run",
             &json!({}),
             &json!({"ok": true}),
@@ -418,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_hook_nonzero_and_timeout_are_notices_not_blocks() {
-        let (_dir, state) = fixture();
+        let (dir, state) = fixture();
         state
             .database()
             .unwrap()
@@ -444,7 +436,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        let verdict = pre_use(&state, "conv", "check_run", &json!({})).await;
+        let verdict = pre_use(&state, "conv", dir.path().to_str().unwrap(), "check_run", &json!({})).await;
         assert!(verdict.blocked.is_none());
         assert_eq!(verdict.notices.len(), 2, "{:?}", verdict.notices);
     }
@@ -473,4 +465,24 @@ mod tests {
         hook.command.clear();
         assert!(validate(&[hook]).is_err());
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_covers_stdin_and_stops_descendants_in_the_selected_workspace() {
+        let (global, state) = fixture();
+        let selected = tempfile::tempdir().unwrap();
+        state.database().unwrap().save_setting(HOOKS_KEY, &vec![Hook {
+            id: "workspace".into(), event: EVENT_PRE_TOOL.into(), matcher: "*".into(),
+            command: "pwd > cwd; (sleep 1.4; touch late) & wait".into(),
+            timeout_secs: 1, enabled: true,
+        }]).unwrap();
+        let workspace = selected.path().to_str().unwrap();
+        let verdict = pre_use(&state, "conv", workspace, "write", &json!({"content":"x".repeat(512 * 1024)})).await;
+        assert!(verdict.notices.iter().any(|note| note.contains("timed out")));
+        assert!(selected.path().join("cwd").exists());
+        assert!(!global.path().join("cwd").exists());
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(!selected.path().join("late").exists());
+    }
+
 }

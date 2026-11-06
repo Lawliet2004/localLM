@@ -2,6 +2,7 @@ import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { SessionEvent } from '../lib/types';
 import { useSessionActivity } from './ActivityTimeline';
+import { publishTurnItem } from '../lib/turnItems';
 
 const mocks = vi.hoisted(() => ({ load: vi.fn(), subscribe: vi.fn() }));
 vi.mock('../lib/api', () => ({ nativeAvailable: true, api: { getSessionEvents: mocks.load, onSessionActivity: mocks.subscribe } }));
@@ -32,6 +33,20 @@ it('retains polling recovery when pushed-event subscription fails', async () => 
   mocks.load.mockResolvedValueOnce([event]);
   await act(async () => { await vi.advanceTimersByTimeAsync(750); });
   expect(view.result.current).toEqual([event]); view.unmount();
+});
+it('shows typed live events immediately and merges the committed journal without duplicates', async () => {
+  const view = renderHook(() => useSessionActivity('one', true));
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  const item: SessionEvent = { ...event, id: 'item', seq: 42, eventType: 'item.started', payload: { item: { id: 'thought' } } };
+  const preceding: SessionEvent = { ...event, id: 'earlier', seq: 41 };
+  await act(async () => { publishTurnItem(item); });
+  expect(view.result.current).toEqual([item]);
+  mocks.load.mockResolvedValueOnce([preceding, item]);
+  await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+  expect(view.result.current).toEqual([preceding, item]);
+  await act(async () => { publishTurnItem(item); });
+  expect(view.result.current).toHaveLength(2);
+  view.unmount();
 });
 it('releases a listener that resolves after the conversation has changed', async () => {
   let resolve!: (stop: () => void) => void;

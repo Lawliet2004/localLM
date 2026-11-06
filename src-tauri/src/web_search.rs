@@ -283,7 +283,7 @@ async fn run_worker_with_settings(
         .ok_or("Research stdout unavailable")?
         .take(2 * 1024 * 1024);
     let stderr = child.stderr().take().ok_or("Research stderr unavailable")?;
-    let mut cancel = state.cancel.subscribe();
+    let mut cancel = state.cancel_signal().subscribe();
     let operation = async {
         let mut out = Vec::new();
         // stderr doubles as the progress channel: lines prefixed with \x1e are

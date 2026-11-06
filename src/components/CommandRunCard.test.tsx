@@ -48,6 +48,20 @@ it('renders running state with pulse indicator and running badge', () => {
   expect(screen.getByText('Compiling test...')).toBeInTheDocument();
 });
 
+it('uses honest verbs for pending, running, denied, and completed file edits', () => {
+  const view = render(<CommandRunCard toolName="workspace_edit_file" status="awaiting_approval" arguments={{ path: 'app.ts' }} />);
+  expect(screen.getByTestId('status-awaiting')).toBeInTheDocument();
+  expect(screen.getByText('Edit')).toBeInTheDocument();
+  expect(screen.queryByText('Edited')).not.toBeInTheDocument();
+  view.rerender(<CommandRunCard toolName="workspace_edit_file" status="running" arguments={{ path: 'app.ts' }} />);
+  expect(screen.getByText('Editing')).toBeInTheDocument();
+  view.rerender(<CommandRunCard toolName="workspace_edit_file" status="failed" decision="denied" arguments={{ path: 'app.ts' }} />);
+  expect(screen.getByText('Edit')).toBeInTheDocument();
+  expect(screen.getByTestId('status-denied')).toBeInTheDocument();
+  view.rerender(<CommandRunCard toolName="workspace_edit_file" status="completed" arguments={{ path: 'app.ts' }} />);
+  expect(screen.getByText('Edited')).toBeInTheDocument();
+});
+
 it('renders exit 0 badge on successful command execution', () => {
   render(
     <CommandRunCard

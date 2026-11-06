@@ -403,6 +403,8 @@ fn reject_private_server(url: &str) -> Result<(), String> {
         .unwrap_or(host);
     if let Ok(ip) = literal.parse::<std::net::IpAddr>() {
         if crate::sandbox::is_blocked_ip(&ip) {
+            #[cfg(test)]
+            if crate::sandbox::is_http_test_origin(&parsed) { return Ok(()); }
             return Err(
                 "OpenAPI server URL must not address a loopback, link-local or private network."
                     .into(),

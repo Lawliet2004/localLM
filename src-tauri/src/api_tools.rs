@@ -145,6 +145,11 @@ fn redact(value: &mut Value) {
 // Redact string values, never serialized JSON tokens: a credential such as
 // "true" must not corrupt a boolean or a number in an otherwise valid body.
 fn redact_known(value: &mut Value, secrets: &[&str]) -> bool {
+    let mut ordered = secrets.to_vec();
+    ordered.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    redact_known_values(value, &ordered)
+}
+fn redact_known_values(value: &mut Value, secrets: &[&str]) -> bool {
     match value {
         Value::String(text) => {
             let mut changed = false;
@@ -156,8 +161,18 @@ fn redact_known(value: &mut Value, secrets: &[&str]) -> bool {
             }
             changed
         }
-        Value::Array(items) => items.iter_mut().any(|v| redact_known(v, secrets)),
-        Value::Object(map) => map.values_mut().any(|v| redact_known(v, secrets)),
+        // Do not use `any`: it stops after the first match and leaves later
+        // occurrences in the response or persisted evidence unredacted.
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items { changed |= redact_known_values(item, secrets); }
+            changed
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for value in map.values_mut() { changed |= redact_known_values(value, secrets); }
+            changed
+        }
         _ => false,
     }
 }
@@ -739,6 +754,20 @@ mod tests {
         assert_eq!(body["text"], "token=[REDACTED]; code=[REDACTED]");
     }
     #[test]
+    fn credential_redaction_visits_every_nested_field_and_array_element() {
+        let mut body = json!({"a":"fixture-secret", "b":["fixture-secret", {"x":"fixture-secret", "y":["prefix fixture-secret suffix", true]}]});
+        assert!(redact_known(&mut body, &["fixture-secret"]));
+        assert!(!body.to_string().contains("fixture-secret"));
+        assert_eq!(body["b"][1]["y"][1], true);
+        assert!(!redact_known(&mut body, &["fixture-secret"]));
+    }
+    #[test]
+    fn longer_overlapping_credentials_are_redacted_before_their_prefixes() {
+        let mut body = json!(["abcdEFGH", "abcd"]);
+        assert!(redact_known(&mut body, &["abcd", "abcdEFGH"]));
+        assert_eq!(body, json!(["[REDACTED]", "[REDACTED]"]));
+    }
+    #[test]
     fn openapi_resolves_unique_operation() {
         let t = tempfile::tempdir().unwrap();
         std::fs::write(t.path().join("api.json"),json!({"openapi":"3.1.0","paths":{"/things/{id}":{"get":{"operationId":"getThing","responses":{"200":{"description":"ok"}}}}}}).to_string()).unwrap();
@@ -767,6 +796,7 @@ mod transport_tests {
             .await
             .expect("HTTP fixture needs permitted loopback sockets");
         let base = format!("http://{}/", listener.local_addr().unwrap());
+        crate::sandbox::HTTP_TEST_ORIGIN.scope(url(&base).unwrap(), async move {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
@@ -783,7 +813,7 @@ mod transport_tests {
             }
             assert!(String::from_utf8_lossy(&request).contains("Bearer fixture-secret"));
             let body =
-                json!({"ok":true,"access_token":"fixture-secret","echo":"Bearer fixture-secret"})
+                json!({"ok":true,"access_token":"fixture-secret","echo":"Bearer fixture-secret", "nested":["Bearer fixture-secret", {"echo":"fixture-secret"}]})
                     .to_string();
             let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: secret=fixture-secret\r\nX-Echo: Bearer fixture-secret\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
             stream.write_all(response.as_bytes()).await.unwrap();
@@ -828,6 +858,7 @@ mod transport_tests {
         .value;
         assert_eq!(compared["sameBody"], true);
         server.await.unwrap();
+        }).await;
     }
     #[tokio::test]
     #[ignore = "Requires permitted loopback TCP sockets; isolated HTTP fixtures only."]
@@ -837,6 +868,8 @@ mod transport_tests {
         let foreign = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/", listener.local_addr().unwrap());
         let foreign_url = format!("http://{}/", foreign.local_addr().unwrap());
+        crate::sandbox::HTTP_TEST_ORIGIN.scope(url(&base).unwrap(), async move {
+        assert!(vetted(&url(&foreign_url).unwrap()).await.is_err(), "fixture authority must not permit another port");
         let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let received = records.clone();
         let cross = foreign_url.clone();
@@ -982,7 +1015,8 @@ mod transport_tests {
                 .unwrap()["statusCode"],
             302
         );
-        assert!(records.lock().unwrap().len() - count <= 5);
+        // The initial request plus at most five followed redirects.
+        assert_eq!(records.lock().unwrap().len() - count, 6);
         assert_eq!(
             state
                 .http_sessions
@@ -1168,6 +1202,7 @@ mod transport_tests {
             .execute(&ctx, "http_session_close", json!({"session_id":id}))
             .await
             .unwrap();
+        }).await;
     }
 }
 

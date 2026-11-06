@@ -13,6 +13,27 @@
 
 use serde_json::Value;
 
+pub(crate) const MAX_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_ROUND_ARGUMENT_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) fn argument_budget(name: &str) -> usize {
+    match name.strip_prefix("workspace_").unwrap_or(name) {
+        "write_file" | "create_file" | "append_file" | "edit_lines" | "edit_file" => 7 * 1024 * 1024,
+        "apply_patch" | "multi_edit" => MAX_ARGUMENT_BYTES,
+        "write_file_base64" => 2 * 1024 * 1024,
+        "process_start" | "process_write" | "format_paths" => 2 * 1024 * 1024,
+        _ => 65_536,
+    }
+}
+
+pub(crate) fn check_argument_bytes(name: &str, bytes: usize) -> Result<(), String> {
+    let limit = if name.is_empty() { MAX_ARGUMENT_BYTES } else { argument_budget(name) };
+    if bytes > limit {
+        return Err(format!("Tool arguments exceed the {limit}-byte JSON limit. Split large writes or edits into smaller calls."));
+    }
+    Ok(())
+}
+
 /// One model-facing tool.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolSpec {

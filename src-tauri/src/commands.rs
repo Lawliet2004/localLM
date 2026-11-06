@@ -19,6 +19,14 @@ pub struct Bootstrap {
     remembered_tools: crate::store::RememberedTools,
     providers: Vec<ProviderConnection>,
     preferred_model: ModelSelection,
+    pending_conversation_ids: Vec<String>,
+}
+
+/// Reports live registry ownership only. Persisted run details and approvals
+/// have separate APIs; this snapshot does not reconnect a stream.
+#[tauri::command]
+pub fn list_active_runs(state: State<'_, AppState>) -> Result<Vec<crate::session_runs::ActiveRun>, String> {
+    state.session_runs.snapshots()
 }
 
 #[tauri::command]
@@ -34,6 +42,10 @@ pub async fn bootstrap(state: State<'_, AppState>) -> Result<Bootstrap, String> 
     if preferences.max_tokens != saved_preferences.max_tokens {
         store.save_preferences(&preferences)?;
     }
+    let mut pending_conversation_ids = Vec::new();
+    for id in store.pending_turn_conversations()? {
+        if !state.session_runs.is_active(&id)? { pending_conversation_ids.push(id); }
+    }
     Ok(Bootstrap {
         conversations: store.list_conversations()?,
         config,
@@ -42,6 +54,7 @@ pub async fn bootstrap(state: State<'_, AppState>) -> Result<Bootstrap, String> 
         remembered_tools: store.remembered_tools()?.unwrap_or_default(),
         providers,
         preferred_model: store.preferred_model()?,
+        pending_conversation_ids,
     })
 }
 
@@ -123,7 +136,7 @@ async fn resolve_provider_key(
             provider,
             state
                 .daytona_vault
-                .load(&providers::credential_id(&provider.id))?,
+                .load_blocking(&providers::credential_id(&provider.id)).await?,
         )
     }
 }
@@ -177,7 +190,7 @@ pub async fn test_provider_draft(
 ) -> Result<ProviderTestResult, String> {
     let _operation = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the active operation before testing a provider.")?;
     let key = draft.api_key.clone().unwrap_or_default();
     let provider = providers::connection_from_draft(draft)?;
@@ -192,7 +205,7 @@ pub async fn list_provider_models_draft(
 ) -> Result<Vec<providers::RemoteModel>, String> {
     let _operation = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the active operation before listing provider models.")?;
     let key = draft.api_key.clone().unwrap_or_default();
     let provider = providers::connection_from_draft(draft)?;
@@ -250,7 +263,7 @@ pub async fn save_preferred_model(
 ) -> Result<(), String> {
     let _operation = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the active operation before changing models.")?;
     state.database()?.save_preferred_model(&selection)
 }
@@ -263,8 +276,9 @@ pub async fn save_conversation_model(
 ) -> Result<(), String> {
     let _operation = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the active operation before changing models.")?;
+    let _turn = state.turns.acquire(&id)?;
     state.database()?.save_conversation_model(&id, &selection)
 }
 #[tauri::command]
@@ -273,6 +287,7 @@ pub fn create_conversation(
     project_id: Option<String>,
 ) -> Result<Conversation, String> {
     let store = state.database()?;
+    crate::workspace_ui::ensure_project_available(&store, project_id.as_deref())?;
     let conversation = store.create_conversation()?;
     // Chats always file under a folder: assign one in the same call so the row
     // is never unfiled, even when project_id is absent (falls back to the first
@@ -290,10 +305,11 @@ pub fn rename_conversation(
 }
 #[tauri::command]
 pub async fn delete_conversation(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let _operation = state
-        .operation
-        .try_lock()
-        .map_err(|_| "Stop the active operation before deleting a conversation.")?;
+    let (_operation, _turn) = acquire_conversation_delete(&state, &id)?;
+    {
+        let store = state.database()?;
+        crate::git_tools::ensure_no_conversation_worktree(&store, &id)?;
+    }
     state.automation.stop_conversation(&id).await;
     state.previews.stop_conversation(&id);
     // Stop every child this conversation owns before its rows disappear.
@@ -306,9 +322,90 @@ pub async fn delete_conversation(state: State<'_, AppState>, id: String) -> Resu
     store.delete_conversation(&id)?;
     crate::workspace_ui::remove_task_meta(&store, &id)
 }
+
+fn acquire_conversation_delete<'a>(state: &'a AppState, id: &str) -> Result<(tokio::sync::RwLockReadGuard<'a, ()>, crate::TurnGuard<'a>), String> {
+    let operation = state.operation.try_shared()
+        .map_err(|_| "Wait for the active operation before deleting a conversation.")?;
+    let turn = state.turns.acquire(id)
+        .map_err(|_| "Stop the active response in this conversation before deleting it.")?;
+    Ok((operation, turn))
+}
+
+#[cfg(test)]
+mod conversation_delete_tests {
+    use super::*;
+
+    #[test]
+    fn deletion_only_blocks_on_the_same_conversation_or_an_exclusive_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        let active = state.operation.try_shared().unwrap();
+        let turn = state.turns.acquire("active").unwrap();
+        assert!(acquire_conversation_delete(&state, "active").is_err());
+        assert!(acquire_conversation_delete(&state, "other").is_ok());
+        drop(turn); drop(active);
+        let exclusive = state.operation.try_lock().unwrap();
+        assert!(acquire_conversation_delete(&state, "other").is_err());
+        drop(exclusive);
+        assert!(acquire_conversation_delete(&state, "other").is_ok());
+    }
+
+    #[test]
+    fn orphan_recovery_is_scoped_and_never_changes_live_audit_rows() {
+        use crate::agent_run::{RunRecord, RunState};
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        let store = state.database().unwrap();
+        let orphan = store.create_conversation().unwrap().id;
+        let live = store.create_conversation().unwrap().id;
+        for (id, status) in [(&orphan, RunState::ExecutingTools), (&live, RunState::Generating)] {
+            store.save_run(&RunRecord { id: format!("run-{id}"), conversation_id: id.clone(), status,
+                model_provider: None, model_id: None, checkpoint: None, error: None, created_at: 1, updated_at: 1 }).unwrap();
+        }
+        store.save_run(&RunRecord { id: "child".into(), conversation_id: orphan.clone(), status: RunState::Generating,
+            model_provider: None, model_id: None, checkpoint: Some("subagent".into()), error: None, created_at: 2, updated_at: 2 }).unwrap();
+        let assistant = store.append_message(&orphan, "assistant", "partial", "streaming").unwrap();
+        let tool = store.append_message(&orphan, "tool", "{}", "streaming").unwrap();
+        let live_message = store.append_message(&live, "assistant", "live", "streaming").unwrap();
+        drop(store);
+        let registration = state.session_runs.register(&live).unwrap();
+        reconcile_orphaned_turn(&state, &live).unwrap();
+        reconcile_orphaned_turn(&state, &orphan).unwrap();
+        let store = state.database().unwrap();
+        assert_eq!(store.latest_run(&orphan).unwrap().unwrap().status, RunState::OutcomeUnknown);
+        assert_eq!(store.run("child").unwrap().unwrap().status, RunState::Generating);
+        assert_eq!(store.message_status(&assistant.id).unwrap().as_deref(), Some("interrupted"));
+        assert_eq!(store.message_status(&tool.id).unwrap().as_deref(), Some("streaming"));
+        assert_eq!(store.latest_run(&live).unwrap().unwrap().status, RunState::Generating);
+        assert_eq!(store.message_status(&live_message.id).unwrap().as_deref(), Some("streaming"));
+        drop(store);
+        drop(registration);
+        let turn = state.turns.acquire(&live).unwrap();
+        reconcile_orphaned_turn(&state, &live).unwrap();
+        assert_eq!(state.database().unwrap().message_status(&live_message.id).unwrap().as_deref(), Some("streaming"));
+        drop(turn);
+        reconcile_orphaned_turn(&state, &live).unwrap();
+        assert_eq!(state.database().unwrap().latest_run(&live).unwrap().unwrap().status, RunState::Cancelled);
+    }
+}
 #[tauri::command]
 pub fn get_messages(state: State<'_, AppState>, id: String) -> Result<Vec<Message>, String> {
+    reconcile_orphaned_turn(&state, &id)?;
     state.database()?.messages(&id)
+}
+
+/// A registration precedes acquisition of the turn lock. Checking again while
+/// holding that lock protects both that handoff and unrelated operations that
+/// own the same conversation without a registry entry.
+pub(crate) fn reconcile_orphaned_turn(state: &AppState, conversation_id: &str) -> Result<(), String> {
+    if state.session_runs.is_active(conversation_id)? { return Ok(()); }
+    let _turn = match state.turns.acquire(conversation_id) {
+        Ok(turn) => turn,
+        Err(error) if error == "Another model operation is in progress in this conversation." => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if state.session_runs.is_active(conversation_id)? { return Ok(()); }
+    state.database()?.recover_orphaned_turn(conversation_id)
 }
 #[tauri::command]
 pub fn get_conversation_tools(
@@ -325,8 +422,9 @@ pub async fn save_conversation_tools(
 ) -> Result<(), String> {
     let _operation = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the active operation before changing conversation tools.")?;
+    let _turn = state.turns.acquire(&id)?;
     state.database()?.save_conversation_tools(&id, &tools)
 }
 #[tauri::command]
@@ -529,7 +627,21 @@ pub fn get_conversation_run(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Option<crate::agent_run::RunRecord>, String> {
+    reconcile_orphaned_turn(&state, &conversation_id)?;
     state.database()?.latest_run(&conversation_id)
+}
+
+#[tauri::command]
+pub fn get_pending_turn(state: State<'_, AppState>, conversation_id: String) -> Result<Option<crate::store::PendingTurn>, String> {
+    if state.session_runs.is_active(&conversation_id)? { return Ok(None); }
+    state.database()?.pending_turn(&conversation_id)
+}
+
+#[tauri::command]
+pub fn discard_pending_turn(state: State<'_, AppState>, conversation_id: String, id: String) -> Result<(), String> {
+    if state.session_runs.is_active(&conversation_id)? { return Err("Stop the active response before discarding its saved request.".into()); }
+    let _turn = state.turns.acquire(&conversation_id)?;
+    state.database()?.discard_pending_turn(&conversation_id, &id)
 }
 
 #[tauri::command]

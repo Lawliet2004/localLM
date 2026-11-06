@@ -24,12 +24,50 @@ pub struct WorkspaceIndex {
     pub tasks: BTreeMap<String, TaskMeta>,
 }
 
+const WORKTREE_REMOVALS: &str = "workspace_worktree_removals_v1";
+
+fn removal_reservations(store: &crate::store::Store) -> Result<BTreeMap<String, String>, String> {
+    store.setting(WORKTREE_REMOVALS)
+}
+
+fn resolve_workspace_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent().and_then(|parent| std::fs::canonicalize(parent).ok())
+            .zip(path.file_name()).map(|(parent, name)| parent.join(name))
+            .unwrap_or_else(|| path.to_path_buf())
+    })
+}
+
+fn path_is_reserved(path: &std::path::Path, reservations: &BTreeMap<String, String>) -> bool {
+    if reservations.is_empty() { return false; }
+    let resolved = resolve_workspace_path(path);
+    reservations.keys().any(|root| resolved.starts_with(root))
+}
+
+pub(crate) fn ensure_workspace_available(store: &crate::store::Store, path: &str) -> Result<(), String> {
+    if path_is_reserved(std::path::Path::new(path), &removal_reservations(store)?) {
+        return Err("This worktree is being removed or needs recovery; choose another folder.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_project_available(store: &crate::store::Store, project_id: Option<&str>) -> Result<(), String> {
+    if let Some(id) = project_id {
+        let data = index(store)?;
+        if let Some(project) = data.projects.iter().find(|project| project.id == id) {
+            ensure_workspace_available(store, &project.path)?;
+        }
+    }
+    Ok(())
+}
+
 fn index(store: &crate::store::Store) -> Result<WorkspaceIndex, String> {
     let mut data: WorkspaceIndex = store.setting("workspace_index_v1")?;
     // Chats always file under a folder: a conversation whose task meta is
     // missing or points at a deleted project is healed into the first project
     // on the next index read (covers script-created and otherwise unfiled rows).
-    if let Some(project) = data.projects.first() {
+    let reservations = removal_reservations(store)?;
+    if let Some(project) = data.projects.iter().find(|project| !path_is_reserved(std::path::Path::new(&project.path), &reservations)) {
         let mut healed = false;
         for conversation in store.list_conversations()? {
             let filed = data
@@ -66,10 +104,12 @@ pub fn file_task(
         return Ok(());
     }
     let mut data = index(store)?;
+    let reservations = removal_reservations(store)?;
     let project = preferred
         .filter(|pid| data.projects.iter().any(|p| &p.id == pid))
-        .or_else(|| data.projects.first().map(|p| p.id.as_str()));
+        .or_else(|| data.projects.iter().find(|p| !path_is_reserved(std::path::Path::new(&p.path), &reservations)).map(|p| p.id.as_str()));
     if let Some(project) = project {
+        if let Some(folder) = data.projects.iter().find(|p| p.id == project) { ensure_workspace_available(store, &folder.path)?; }
         let project = project.to_string();
         data.tasks.entry(id.to_string()).or_default().project_id = Some(project);
         store.save_setting("workspace_index_v1", &data)?;
@@ -90,8 +130,10 @@ pub fn inherit_task_meta(
         .as_ref()
         .is_some_and(|id| data.projects.iter().any(|p| &p.id == id));
     if !valid {
-        meta.project_id = data.projects.first().map(|p| p.id.clone());
+        let reservations = removal_reservations(store)?;
+        meta.project_id = data.projects.iter().find(|p| !path_is_reserved(std::path::Path::new(&p.path), &reservations)).map(|p| p.id.clone());
     }
+    if let Some(project) = data.projects.iter().find(|p| Some(&p.id) == meta.project_id.as_ref()) { ensure_workspace_available(store, &project.path)?; }
     data.tasks.insert(new_id.to_string(), meta);
     store.save_setting("workspace_index_v1", &data)
 }
@@ -104,6 +146,69 @@ pub fn task_workspace(store: &crate::store::Store, id: &str) -> Result<Option<St
         .iter()
         .find(|p| Some(&p.id) == project)
         .map(|p| p.path.clone()))
+}
+
+/// Do not remove a worktree while another conversation is filed in it, even
+/// when that conversation selected a subdirectory as its workspace.
+pub(crate) fn reserve_worktree_removal(
+    store: &crate::store::Store,
+    path: &std::path::Path,
+    owner: &str,
+) -> Result<(), String> {
+    let data = index(store)?;
+    let worktree = std::fs::canonicalize(path).map_err(|e| format!("Cannot verify worktree location: {e}"))?;
+    for (id, task) in &data.tasks {
+        if id == owner { continue; }
+        let project = data.projects.iter().find(|project| Some(&project.id) == task.project_id.as_ref());
+        if let Some(project) = project {
+            let selected = match std::fs::canonicalize(&project.path) {
+                Ok(path) => path,
+                Err(_) if std::path::Path::new(&project.path).starts_with(&worktree) => {
+                    return Err("Another conversation's workspace is inside this worktree but cannot be verified; no worktree was removed.".into());
+                }
+                Err(_) => continue,
+            };
+            if selected.starts_with(&worktree) {
+                return Err("Another conversation uses this worktree. Move it to another folder before removing the worktree.".into());
+            }
+        }
+    }
+    let path = worktree.to_string_lossy().into_owned();
+    let mut reservations = removal_reservations(store)?;
+    if reservations.iter().any(|(root, existing_owner)| (worktree.starts_with(root) || std::path::Path::new(root).starts_with(&worktree)) && existing_owner != owner) {
+        return Err("Another worktree removal overlaps this folder.".into());
+    }
+    reservations.insert(path, owner.to_string());
+    store.save_setting(WORKTREE_REMOVALS, &reservations)?;
+    Ok(())
+}
+
+pub(crate) fn release_worktree_removal(store: &crate::store::Store, path: &str, owner: &str) -> Result<(), String> {
+    let mut reservations = removal_reservations(store)?;
+    let resolved = resolve_workspace_path(std::path::Path::new(path));
+    let key = resolved.to_string_lossy();
+    if reservations.get(key.as_ref()).is_some_and(|existing| existing == owner) {
+        reservations.remove(key.as_ref());
+        store.save_setting(WORKTREE_REMOVALS, &reservations)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn project_at_path(store: &crate::store::Store, path: &str) -> Result<Option<Project>, String> {
+    Ok(index(store)?.projects.into_iter().find(|project| project.path == path))
+}
+
+/// Only remove the specific entry that this isolation operation created, and
+/// only if no conversation still references it. The files are handled by Git.
+pub(crate) fn prune_isolation_project(store: &crate::store::Store, id: &str, path: &str) -> Result<(), String> {
+    let mut data = index(store)?;
+    if !data.projects.iter().any(|project| project.id == id && project.path == path)
+        || data.tasks.values().any(|task| task.project_id.as_deref() == Some(id)) {
+        return Ok(());
+    }
+    crate::document_index::forget_project(store, path)?;
+    data.projects.retain(|project| project.id != id);
+    store.save_setting("workspace_index_v1", &data)
 }
 
 #[tauri::command]
@@ -177,8 +282,9 @@ pub async fn set_task_workspace(
 ) -> Result<WorkspaceSelection, String> {
     let _guard = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the active operation.")?;
+    let _turn = conversation_id.as_deref().map(|id| state.turns.acquire(id)).transpose()?;
     select_task_workspace(&*state.database()?, &path, conversation_id.as_deref())
 }
 
@@ -188,6 +294,7 @@ pub(crate) fn select_task_workspace(
     conversation_id: Option<&str>,
 ) -> Result<WorkspaceSelection, String> {
     let path = std::fs::canonicalize(path).map_err(|e| format!("Cannot open workspace: {e}"))?;
+    ensure_workspace_available(store, &path.to_string_lossy())?;
     crate::workspace::Workspace::open(&path.to_string_lossy())?;
     let mut data = index(store)?;
     if let Some(id) = &conversation_id {
@@ -234,6 +341,11 @@ pub async fn remove_project(
         .map_err(|_| "Wait for the active operation.")?;
     let store = state.database()?;
     let mut data = index(&store)?;
+    for (conversation_id, task) in &data.tasks {
+        if task.project_id.as_deref() == Some(&id) {
+            crate::git_tools::ensure_no_conversation_worktree(&store, conversation_id)?;
+        }
+    }
     if let Some(project) = data.projects.iter().find(|project| project.id == id) {
         crate::document_index::forget_project(&store, &project.path)?;
     }
@@ -263,17 +375,17 @@ pub async fn save_task_meta(
 ) -> Result<WorkspaceIndex, String> {
     let _guard = state
         .operation
-        .try_lock()
+        .try_shared()
         .map_err(|_| "Wait for the active operation.")?;
+    let _turn = state.turns.acquire(&id)?;
     let store = state.database()?;
     if !store.conversation_exists(&id)? {
         return Err("Task no longer exists.".into());
     }
     let mut data = index(&store)?;
     if let Some(project) = &meta.project_id {
-        if !data.projects.iter().any(|p| &p.id == project) {
-            return Err("Project no longer exists.".into());
-        }
+        let folder = data.projects.iter().find(|p| &p.id == project).ok_or("Project no longer exists.")?;
+        ensure_workspace_available(&store, &folder.path)?;
     }
     data.tasks.insert(id, meta);
     store.save_setting("workspace_index_v1", &data)?;

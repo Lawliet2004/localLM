@@ -1,0 +1,44 @@
+/* Session and work surfaces extend the existing paper/forest token system. */
+.session-strip { display: flex; align-items: stretch; min-height: 40px; min-width: 0; border-bottom: 1px solid var(--border); background: var(--sidebar); }
+.session-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+.session-tab-item { display: flex; flex: 0 0 auto; align-items: center; max-width: 230px; border-inline-end: 1px solid var(--border); color: var(--secondary); }
+.session-tab-item.selected { background: var(--surface); color: var(--text); box-shadow: inset 0 -1px var(--accent); }
+.session-tab-item:hover { background: var(--hover); }
+.session-tab-item [role="tab"] { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 39px; padding: 8px 5px 8px 14px; border: 0; border-radius: 0; background: transparent; color: inherit; font: 12px/1.4 var(--font-sans); }
+.session-tab-title { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; max-width: 156px; }
+.session-tab-item svg { flex-shrink: 0; }
+.session-tab-close { display: grid; place-items: center; width: 28px; min-height: 32px; margin-inline-end: 3px; padding: 0; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--secondary); }
+.session-tab-close:hover { background: var(--active); color: var(--text); }
+.session-new { align-self: center; flex-shrink: 0; margin-inline: 5px; }
+.session-status { color: var(--accent); display: inline-flex; align-items: center; }
+.session-status.attention { color: var(--warn); }
+.session-working { animation: session-working 1.4s linear infinite; }
+@keyframes session-working { to { transform: rotate(360deg); } }
+.session-strip :is(button, [role="tab"]):focus-visible, .answer-navigation :is(summary, button):focus-visible { outline: 2px solid var(--focus-border); outline-offset: -2px; }
+.session-strip button:disabled { opacity: .5; cursor: default; }
+.chat-shell { position: relative; container-type: inline-size; }
+.composer-plan-label { font-size: 11px; color: var(--accent); }
+.approval-session { color: var(--secondary); font-size: 13px; overflow-wrap: anywhere; }
+.saved-request { border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-block: 16px; }
+.saved-request h2 { margin: 0 0 6px; font-size: 14px; }
+.saved-request p { color: var(--secondary); margin: 0 0 12px; line-height: 1.5; }
+.saved-request summary { cursor: pointer; color: var(--secondary); }
+.saved-request-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.answer-navigation { margin: 0 0 20px; padding-block: 9px; border-block: 1px solid var(--border); font: 12px/1.5 var(--font-sans); }
+.answer-navigation > summary { display: flex; align-items: center; gap: 7px; min-height: 28px; color: var(--secondary); cursor: pointer; }
+.answer-navigation > summary > span { margin-inline-start: auto; font-size: 11px; }
+.answer-navigation ol { list-style: none; margin: 8px 0 0; padding: 0; }
+.answer-navigation button { display: block; width: 100%; min-height: 30px; padding: 5px 0; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text); font: inherit; text-align: start; overflow-wrap: anywhere; }
+.answer-navigation button:hover { color: var(--accent); text-decoration: underline; text-underline-offset: .2em; }
+.answer-navigation .answer-subsection { padding-inline-start: 14px; }
+.desktop-app .message-assistant .copy-message { width: auto; min-height: 30px; height: auto; margin: 14px 0 0 -6px; padding: 5px 7px; gap: 6px; opacity: 1; font-size: 12px; }
+.commentary-label { color: var(--secondary); font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+.desktop-app .message-commentary > .markdown { color: var(--secondary); }
+.message-assistant .markdown :is(h1, h2, h3) { scroll-margin-block-start: 24px; }
+@media (max-width: 600px) {
+  .session-tab-item { max-width: 190px; }
+  .session-tab-title { max-width: 118px; }
+  .session-tab-close { min-height: 36px; width: 30px; }
+  .composer-plan-label { max-width: 85px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+@media (prefers-reduced-motion: reduce) { .session-working { animation: none; } }
