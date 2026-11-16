@@ -92,7 +92,7 @@ pub fn classify_execution_failure(message: &str) -> FailureClass {
     }
 }
 
-/// Conservative ceilings. The last round is reserved for a partial answer.
+/// Per-segment ceilings for parent turns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Budgets {
     pub max_rounds: u32,
@@ -121,18 +121,40 @@ impl Default for Budgets {
 }
 
 impl Budgets {
+    pub(crate) fn for_task(task: &crate::research_tasks::TaskBudgets) -> Self {
+        Self {
+            max_rounds: task.max_rounds as u32,
+            max_searches: task.max_searches as u32,
+            max_fetches: task.max_documents as u32,
+            max_retries: task.max_retries as u32,
+            ..Self::default()
+        }
+    }
+
     pub fn note_round(&mut self) {
         self.rounds_used = self.rounds_used.saturating_add(1);
     }
     pub fn exhausted(&self) -> bool {
-        self.rounds_used >= self.max_rounds
-            || self.searches_used >= self.max_searches
-            || self.fetches_used >= self.max_fetches
+        self.limit_reason().is_some()
     }
 
-    /// True when the next model round must be the partial answer, not another tool.
-    pub fn reserve_final_response(&self) -> bool {
-        self.exhausted() || self.rounds_used + 1 >= self.max_rounds
+    pub(crate) fn limit_reason(&self) -> Option<&'static str> {
+        if self.rounds_used >= self.max_rounds {
+            Some("model_rounds")
+        } else if self.searches_used >= self.max_searches {
+            Some("searches")
+        } else if self.fetches_used >= self.max_fetches {
+            Some("fetches")
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn reset_usage(&mut self) {
+        self.rounds_used = 0;
+        self.searches_used = 0;
+        self.fetches_used = 0;
+        self.retries_used = 0;
     }
 
     /// Atomically charge a tool name against its bounded family counter and
@@ -252,7 +274,6 @@ pub fn continuation_after_tool(
     _plan_mode: bool,
     tool_name: &str,
     result: &Value,
-    budgets: &Budgets,
     corrections_used: u32,
     deliverable_missing: bool,
 ) -> Continuation {
@@ -274,13 +295,6 @@ pub fn continuation_after_tool(
                 retryable: false,
             };
         }
-    }
-    if budgets.reserve_final_response() {
-        return Continuation::Partial {
-            unresolved: vec![format!(
-                "Budget exhausted during {tool_name} before every step finished."
-            )],
-        };
     }
     if deliverable_missing {
         if corrections_used == 0 {
@@ -504,28 +518,19 @@ mod tests {
         }
     }
     #[test]
-    fn round_budget_reserves_a_final_response_after_real_rounds() {
+    fn a_segment_uses_its_last_round_then_renews_all_its_counters() {
         let mut budgets = Budgets {
             max_rounds: 3,
             ..Budgets::default()
         };
-        assert!(!budgets.reserve_final_response());
-        budgets.note_round(); // Planning or ordinary response both consume a round.
+        assert!(budgets.try_note_tool("search"));
+        assert!(budgets.try_note_tool("visit"));
+        for _ in 0..2 { budgets.note_round(); }
+        assert!(!budgets.exhausted());
         budgets.note_round();
-        assert!(budgets.reserve_final_response());
-        assert!(matches!(
-            continuation_after_tool(
-                false,
-                "file_read",
-                &json!({"text":"data"}),
-                &budgets,
-                0,
-                false
-            ),
-            Continuation::Partial { .. }
-        ));
-        budgets.note_round();
-        assert!(budgets.exhausted());
+        assert_eq!(budgets.limit_reason(), Some("model_rounds"));
+        budgets.reset_usage();
+        assert_eq!(budgets, Budgets { max_rounds: 3, ..Budgets::default() });
     }
 
     fn ok_search() -> Value {
@@ -534,10 +539,9 @@ mod tests {
 
     #[test]
     fn search_success_keeps_tools_in_ordinary_chat_and_plan_mode() {
-        let budgets = Budgets::default();
         for plan_mode in [false, true] {
             assert!(!search_disables_tools(true, plan_mode));
-            match continuation_after_tool(plan_mode, "web_search", &ok_search(), &budgets, 0, false)
+            match continuation_after_tool(plan_mode, "web_search", &ok_search(), 0, false)
             {
                 Continuation::Proceed { evidence } => {
                     assert_eq!(evidence.as_deref(), Some("Partial hit."));
@@ -550,24 +554,18 @@ mod tests {
     #[test]
     fn failed_page_still_allows_another_source() {
         let result = json!({"isError": true, "message": "Page unavailable: HTTP 404"});
-        let next =
-            continuation_after_tool(false, "web_read", &result, &Budgets::default(), 0, false);
+        let next = continuation_after_tool(false, "web_read", &result, 0, false);
         assert!(matches!(next, Continuation::Proceed { .. }));
     }
 
     #[test]
-    fn budget_exhaustion_names_unresolved_work_and_reserves_a_final_response() {
+    fn exhausted_search_budget_renews_with_the_segment() {
         let mut budgets = Budgets::default();
         budgets.searches_used = budgets.max_searches;
-        match continuation_after_tool(false, "web_search", &ok_search(), &budgets, 0, false) {
-            Continuation::Partial { unresolved } => {
-                assert!(unresolved
-                    .iter()
-                    .any(|item| item.contains("Budget exhausted")));
-            }
-            other => panic!("expected a partial result, got {other:?}"),
-        }
-        assert!(budgets.reserve_final_response());
+        assert_eq!(budgets.limit_reason(), Some("searches"));
+        assert!(!budgets.try_note_tool("search"));
+        budgets.reset_usage();
+        assert!(budgets.try_note_tool("search"));
     }
 
     #[test]
@@ -583,7 +581,6 @@ mod tests {
             false,
             "file_write",
             &json!({"isError": true, "message": "Tool request timed out. Its remote outcome may be unknown."}),
-            &Budgets::default(),
             0,
             false,
         );
@@ -598,7 +595,6 @@ mod tests {
             true,
             "run_code",
             &json!({"isError": true, "denied": true, "message": "denied"}),
-            &Budgets::default(),
             0,
             false,
         );
@@ -613,12 +609,10 @@ mod tests {
 
     #[test]
     fn a_missing_deliverable_gets_one_correction_then_stops() {
-        let budgets = Budgets::default();
         let first = continuation_after_tool(
             false,
             "file_write",
             &json!({"isError": true, "message": "missing file"}),
-            &budgets,
             0,
             true,
         );
@@ -627,7 +621,6 @@ mod tests {
             false,
             "file_write",
             &json!({"isError": true, "message": "missing file"}),
-            &budgets,
             1,
             true,
         );

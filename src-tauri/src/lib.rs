@@ -73,6 +73,8 @@ pub mod plans;
 mod plugins;
 mod presets;
 mod process_tools;
+#[cfg(target_os = "linux")]
+mod process_guardian;
 mod workspace_preview;
 mod profile_tools;
 mod prompt;
@@ -85,6 +87,7 @@ mod ptc;
 mod ptc_contract_regressions;
 mod remote_database;
 mod research_tasks;
+mod task_goal;
 mod responses_adapter;
 mod runtime;
 pub mod runtime_archive;
@@ -485,6 +488,8 @@ pub fn run() {
             commands::bootstrap,
             hardware::hardware_status,
             execution::get_execution_config,
+            process_tools::get_owned_process,
+            process_tools::stop_owned_process,
             profile_tools::get_profile_config,
             profile_tools::save_profile_config,
             remote_database::list_database_profiles,
@@ -708,8 +713,8 @@ pub fn run() {
                 // and a `Drop`-based kill never fires — without this the
                 // children outlive the app, reparented to init and unreachable
                 // through the tool that started them.
-                state.processes.stop_all();
                 tauri::async_runtime::block_on(async {
+                    if let Err(error) = state.processes.shutdown().await { eprintln!("{error}"); }
                     state.automation.stop_all().await;
                     let _ = state.runtime.lock().await.stop().await;
                     state.terminals.lock().await.close_all().await;
@@ -785,3 +790,13 @@ mod tests {
         assert_eq!(remaining, 0);
     }
 }
+
+#[cfg(test)]
+mod audit_fixes_tests;
+
+#[cfg(test)]
+mod harness_reliability_tests;
+#[cfg(test)]
+mod harness_endurance_tests;
+#[cfg(test)]
+mod harness_comparison_tests;

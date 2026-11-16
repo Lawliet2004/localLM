@@ -109,7 +109,8 @@ fn zip_kind(bytes: &[u8]) -> Format {
     if archive.len() > MAX_ZIP_MEMBERS {
         return Format::Zip;
     }
-    let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    let Ok(names) = archive.file_names().map(|name| name.map(|name| name.into_owned()))
+        .collect::<Result<Vec<_>, _>>() else { return Format::Zip; };
     if names.iter().any(|name| name == "word/document.xml") {
         Format::Docx
     } else if names.iter().any(|name| name == "xl/workbook.xml") {
@@ -278,6 +279,8 @@ fn read_office(bytes: &[u8], format: Format) -> Result<Value, String> {
     if archive.len() > MAX_ZIP_MEMBERS {
         return Err("The office container has too many members.".into());
     }
+    let names = archive.file_names().map(|name| name.map(|name| name.into_owned()))
+        .collect::<Result<Vec<_>, _>>().map_err(|_| "The office container has an invalid member name.")?;
     let mut sections = Vec::new();
     match format {
         Format::Docx => {
@@ -285,17 +288,17 @@ fn read_office(bytes: &[u8], format: Format) -> Result<Value, String> {
             sections.push(json!({"section": "document", "text": office_text(&xml)}));
         }
         Format::Xlsx => {
-            if archive
-                .file_names()
+            if names
+                .iter()
                 .any(|name| name == "xl/sharedStrings.xml")
             {
                 let xml = member_text(&mut archive, "xl/sharedStrings.xml")?;
                 sections.push(json!({"section": "sharedStrings", "text": office_text(&xml)}));
             }
-            let sheets: Vec<String> = archive
-                .file_names()
+            let sheets: Vec<String> = names
+                .iter()
                 .filter(|name| name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"))
-                .map(str::to_string)
+                .cloned()
                 .take(MAX_SLIDES)
                 .collect();
             for sheet in sheets {
@@ -307,10 +310,10 @@ fn read_office(bytes: &[u8], format: Format) -> Result<Value, String> {
             }
         }
         Format::Pptx => {
-            let slides: Vec<String> = archive
-                .file_names()
+            let slides: Vec<String> = names
+                .iter()
                 .filter(|name| name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
-                .map(str::to_string)
+                .cloned()
                 .take(MAX_SLIDES)
                 .collect();
             if slides.is_empty() {
@@ -797,6 +800,20 @@ mod tests {
         let text = result["text"].as_str().unwrap_or_default();
         assert!(text.contains("Hello DOCX & entities"), "{text}");
         assert!(text.contains("Second paragraph"), "{text}");
+    }
+
+    #[test]
+    fn invalid_utf8_zip_member_name_is_rejected_without_panicking() {
+        let mut bytes = fixture_docx();
+        let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        for (header, flags, name) in [(0, 6, 30), (central, 8, 46)] {
+            let offset = header + flags;
+            let value = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) | 0x800;
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+            bytes[header + name] = 0xff;
+        }
+        assert!(matches!(sniff(&bytes), Format::Zip));
+        assert!(read_office(&bytes, Format::Docx).is_err());
     }
 
     #[test]

@@ -146,6 +146,18 @@ pub struct ResponseMetrics {
     pub tools_ms: Option<f64>,
     #[serde(default)]
     pub approval_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ChildMetrics>,
+}
+
+#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildMetrics {
+    pub run_id: String,
+    pub status: String,
+    pub rounds: Vec<InferenceRound>,
 }
 
 #[async_trait]
@@ -181,6 +193,12 @@ pub(crate) fn openai_reasoning_effort_supported(model: &str) -> bool {
     ]
     .iter()
     .any(|name| model == *name || model.starts_with(&format!("{name}-20")))
+}
+
+pub struct SubscriptionAuth {
+    vault: std::sync::Arc<crate::vault::Vault>,
+    provider: String,
+    current_token: std::sync::Mutex<String>,
 }
 
 pub enum Backend {
@@ -222,6 +240,7 @@ pub enum Backend {
         context_length: u32,
         max_output_tokens: Option<u32>,
         capabilities: crate::provider_capabilities::ModelCapabilities,
+        auth: Option<SubscriptionAuth>,
     },
 }
 
@@ -250,6 +269,18 @@ impl Backend {
         payload["response_format"] = json!({"type":"json_schema","json_schema":{"name":"child_result","schema":schema,"strict":true}});
         Ok(true)
     }
+    /// Only the owned local template uses literal XML control output. Native
+    /// provider APIs must use their structured tool channel.
+    pub fn uses_text_tool_calls(&self) -> bool {
+        matches!(self, Self::Local { .. })
+    }
+
+    /// Compatible local-style servers may stream a leading thinking wrapper
+    /// even when they use structured tools. This is separate from XML calls.
+    pub fn uses_inline_thinking(&self) -> bool {
+        !self.is_responses() && !matches!(self, Self::Claude { .. })
+    }
+
     pub fn capabilities(&self) -> crate::provider_capabilities::ModelCapabilities {
         match self {
             Self::Local { .. } => crate::provider_capabilities::ModelCapabilities::legacy(true),
@@ -265,9 +296,12 @@ impl Backend {
             report["structuredSchemaRequests"] = json!("supported-with-post-validation");
         }
         if let Self::OpenAi { base_url, model_id, capabilities, .. } = self {
-            if capabilities.controls.as_ref().is_none_or(|controls| controls.reasoning_effort == crate::providers::ToolSupport::Supported)
-                && crate::provider_capabilities::documented_river_reasoning(base_url, model_id, "auto").is_some() {
-                report["documentedReasoning"] = json!({"source":"documented", "sourceUrl":"https://docs.river.ai/guides/inference-controls/", "required":true, "efforts":["low","high","max"]});
+            if let Some(auto) = crate::provider_capabilities::documented_river_reasoning(base_url, model_id, "auto").filter(|_| {
+                capabilities.controls.as_ref().is_none_or(|controls| controls.reasoning_effort == crate::providers::ToolSupport::Supported)
+            }) {
+                let required = auto != "none";
+                let efforts: &[&str] = if required { &["low", "high", "max"] } else { &["none", "low", "high", "max"] };
+                report["documentedReasoning"] = json!({"source":"documented", "sourceUrl":"https://docs.river.ai/guides/inference-controls/", "required":required, "efforts":efforts});
             }
         }
         report
@@ -371,7 +405,17 @@ impl Backend {
             context_length,
             max_output_tokens: model.max_output_tokens,
             capabilities: crate::provider_capabilities::ModelCapabilities::from_model(model),
+            auth: None,
         })
+    }
+
+    /// Resolve the saved session for every request so a long turn can rotate
+    /// expiring credentials without rebuilding or replaying its tool history.
+    pub fn with_subscription_auth(mut self, vault: std::sync::Arc<crate::vault::Vault>, provider: &str) -> Self {
+        if let Self::Subscription { auth, .. } = &mut self {
+            *auth = Some(SubscriptionAuth { vault, provider: provider.into(), current_token: std::sync::Mutex::new(String::new()) });
+        }
+        self
     }
 
     pub fn is_responses(&self) -> bool {
@@ -445,7 +489,14 @@ impl Backend {
             Self::Local { key, .. } | Self::OpenAi { key, .. } | Self::Claude { key, .. } => key,
             Self::Subscription { access_token, .. } => access_token,
         };
-        crate::providers::sanitize_text(detail, key)
+        let mut safe = crate::providers::sanitize_text(detail, key);
+        if let Self::Subscription { auth: Some(auth), .. } = self {
+            match auth.current_token.lock() {
+                Ok(token) => safe = crate::providers::sanitize_text(&safe, &token),
+                Err(_) => return "Provider error details unavailable.".into(),
+            }
+        }
+        safe
     }
 
     pub fn usage(&self) -> Option<crate::providers::ProviderUsage> {
@@ -469,12 +520,22 @@ impl InferenceProvider for Backend {
             payload.as_object_mut().unwrap().remove("max_tokens");
         }
         let capabilities = self.capabilities();
+        let object = payload.as_object_mut().unwrap();
+        let may_omit_tools = object.remove("locallm_allow_omit_tools").is_some_and(|value| value == true);
+        if may_omit_tools && object.get("tool_choice").is_some_and(|choice| choice == "none")
+            && capabilities.controls.as_ref().is_some_and(|controls| controls.tool_choice == crate::providers::ToolSupport::Unsupported)
+        {
+            // This request explicitly prohibits calls. Omission enforces the
+            // same policy on a provider that rejects the control field.
+            for key in ["tools", "tool_choice", "parallel_tool_calls"] { object.remove(key); }
+        }
         if let Self::OpenAi { base_url, model_id, responses, .. } = self {
-            if crate::provider_capabilities::documented_river_reasoning(base_url, model_id, "auto").is_some() {
+            if let Some(auto) = crate::provider_capabilities::documented_river_reasoning(base_url, model_id, "auto") {
                 let requested = if *responses { payload.get("reasoning").and_then(|value| value.get("effort")) }
                     else { payload.get("reasoning_effort") };
-                if requested.is_some_and(|value| !matches!(value.as_str(), Some("low" | "high" | "max"))) {
-                    return Err("River GLM requires reasoning effort low, high, or max.".into());
+                if requested.is_some_and(|value| !matches!(value.as_str(), Some("low" | "high" | "max")) && !(auto == "none" && value == "none")) {
+                    let allowed = if auto == "none" { "none, low, high, or max" } else { "low, high, or max" };
+                    return Err(format!("River {model_id} requires reasoning effort {allowed}."));
                 }
             }
         }
@@ -823,8 +884,18 @@ impl InferenceProvider for Backend {
                 base_url,
                 access_token,
                 account_id,
+                auth,
                 ..
             } => {
+                let refreshed = if let Some(auth) = auth {
+                    let session = crate::subscription_auth::get_valid_session(&auth.vault, &auth.provider).await?;
+                    if &session.account_id != account_id {
+                        return Err("The subscription account changed during this task. Start a new turn to use the new account.".into());
+                    }
+                    *auth.current_token.lock().map_err(|_| "Subscription credential state is unavailable.".to_string())? = session.access_token.clone();
+                    Some(session)
+                } else { None };
+                let access_token = refreshed.as_ref().map(|session| session.access_token.as_str()).unwrap_or(access_token.as_str());
                 let mut req = client
                     .post(crate::providers::endpoint(base_url, "chat/completions"))
                     .bearer_auth(access_token)
@@ -867,6 +938,10 @@ impl InferenceProvider for Backend {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "inference_reliability_tests.rs"]
+mod reliability_regressions;
 
 #[cfg(test)]
 mod tests {
@@ -1677,6 +1752,35 @@ mod tests {
 #[cfg(test)]
 mod reasoning_payload_tests {
     use super::*;
+    #[test]
+    fn river_deepseek_effort_and_final_tool_suppression_follow_the_selected_contract() {
+        let mut backend = Backend::OpenAi {
+            responses: false, client: reqwest::Client::new(), base_url: "https://api.river.ai/v1".into(), key: String::new(),
+            model_id: "deepseek-ai/DeepSeek-V4.1-Flash-1017".into(), context_length: 131072,
+            max_output_tokens: Some(32768), capabilities: crate::provider_capabilities::ModelCapabilities::legacy(true),
+        };
+        for (mode, effort) in [("quick", "low"), ("auto", "none"), ("think", "high")] {
+            let payload = backend.payload(&json!({"messages":[],"locallm_reasoning_mode":mode})).unwrap();
+            assert_eq!(payload["reasoning_effort"], effort);
+        }
+        assert_eq!(backend.capability_report()["documentedReasoning"]["required"], false);
+        let mut final_request = json!({"messages":[],"tools":[{"type":"function"}],"tool_choice":"none","locallm_allow_omit_tools":true});
+        let supported = backend.payload(&final_request).unwrap();
+        assert_eq!(supported["tools"], final_request["tools"]);
+        assert_eq!(supported["tool_choice"], "none");
+        assert!(supported.get("locallm_allow_omit_tools").is_none());
+        if let Backend::OpenAi { capabilities, .. } = &mut backend {
+            capabilities.controls = Some(crate::provider_capabilities::Controls {
+                tool_choice: crate::providers::ToolSupport::Unsupported,
+                ..Default::default()
+            });
+        }
+        let unsupported = backend.payload(&final_request).unwrap();
+        for field in ["tools", "tool_choice", "locallm_allow_omit_tools"] { assert!(unsupported.get(field).is_none()); }
+        final_request.as_object_mut().unwrap().remove("locallm_allow_omit_tools");
+        assert!(backend.payload(&final_request).is_err());
+    }
+
     #[test]
     fn river_glm_effort_is_scoped_to_documented_endpoint_and_respects_overrides() {
         let backend = |base: &str, responses: bool| Backend::OpenAi {

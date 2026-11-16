@@ -395,6 +395,18 @@ pub(crate) fn decide_for_agent_tool(
         tool.requires_approval(args), tool.workspace_permission_roots())
 }
 
+/// The user explicitly chose this file for the prompt. A saved path or tool
+/// denial still takes precedence over that request.
+pub(crate) fn check_selected_file_read(store: &crate::store::Store, root: &std::path::Path, path: &str) -> Result<(), String> {
+    let rules = load_checked(store)?;
+    let canonical = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+    match decide_for_call_with_roots(&rules, crate::permissions::AccessMode::FullAccess, "workspace_read_file",
+        &serde_json::json!({"path":path}), true, false, Some((root, &canonical))) {
+        Decision::Deny(reason) => Err(reason),
+        _ => Ok(()),
+    }
+}
+
 /// Each explicit path has its own ordered decision. A broad Allow for one
 /// target cannot erase a later Deny or Ask on another target.
 fn classify_resources(alias: &str, args: &Value) -> Vec<(Action, String)> {
@@ -448,7 +460,7 @@ pub(crate) fn recheck_nested_call(
 /// tool alias under `Action::Tool`.
 pub fn classify(alias: &str, args: &Value) -> (Action, String) {
     match alias {
-        "shell_run" | "process_start" | "check_run" => {
+        "shell_run" | "process_start" | "check_run" | "verification_run" => {
             (Action::Command, string_arg(args, &["command"]))
         }
         "run_code" => (Action::Command, string_arg(args, &["code"])),

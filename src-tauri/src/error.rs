@@ -113,7 +113,7 @@ pub fn kind_for_code(code: &str) -> ErrorKind {
         | "replay-blocked" | "policy-denied" => ErrorKind::Denied,
         "cancelled" | "canceled" | "interrupted" | "aborted" => ErrorKind::Cancelled,
         "not-found" | "unknown-tool" | "unavailable-tool" | "missing-tool" => ErrorKind::NotFound,
-        "timeout" | "timed-out" | "deadline" => ErrorKind::Timeout,
+        "timeout" | "timed-out" | "deadline" | "checks-timed_out" => ErrorKind::Timeout,
         "limit-exceeded" | "too-large" | "too-many" | "quota-exceeded" | "budget-exhausted" => {
             ErrorKind::LimitExceeded
         }

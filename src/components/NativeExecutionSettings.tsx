@@ -92,10 +92,11 @@ export function NativeExecutionSettings({ kind }: { kind: 'bash' | 'python' }) {
             </div>
             <div className="preference-row preference-row-block">
               <div className="field-pair">
-                <label>Timeout (seconds)<input aria-label="Timeout (seconds)" type="number" min={1} max={kind === 'bash' ? 300 : 90} required value={policy.timeoutSeconds} onChange={event => change({ timeoutSeconds: Number(event.target.value) })} /></label>
+                <label>Timeout (seconds)<input aria-label="Timeout (seconds)" type="number" min={1} max={kind === 'bash' ? 3600 : 90} required value={policy.timeoutSeconds} onChange={event => change({ timeoutSeconds: Number(event.target.value) })} /></label>
                 <label>Memory limit (MiB)<input aria-label="Memory limit (MiB)" type="number" min={64} max={65536} placeholder="No limit" value={policy.memoryLimitMib ?? ''} onChange={event => change({ memoryLimitMib: event.target.value ? Number(event.target.value) : null })} /></label>
               </div>
               <p className="preference-desc">Memory is a per-process Unix limit inherited by children — leave empty on Windows. The model can request shorter timeouts.</p>
+              {kind === 'bash' && <p className="preference-desc">Managed commands and checks can run for up to 60 minutes. Foreground shell calls have a five-minute limit.</p>}
             </div>
           </div>
         </section>

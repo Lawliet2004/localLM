@@ -69,8 +69,13 @@ pub async fn get_session_events(
     conversation_id: String,
     from_seq: Option<u64>,
     limit: Option<u32>,
+    before_seq: Option<u64>,
+    latest: Option<bool>,
 ) -> Result<Vec<SessionEvent>, String> {
     let store = state.database()?;
+    if let Some(before) = before_seq.or_else(|| latest.unwrap_or(false).then_some(u64::MAX)) {
+        return store.session_events_before(&conversation_id, before, limit);
+    }
     store.session_events(&conversation_id, from_seq, limit)
 }
 

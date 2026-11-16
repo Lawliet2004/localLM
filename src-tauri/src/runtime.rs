@@ -817,7 +817,11 @@ http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
     #[ignore = "requires a cached upstream Windows CUDA runtime installation"]
     async fn recognizes_current_runtime_flags() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let current = inspect_runtime(&root.join(".local/runtime/llama-server.exe"))
+        let path = std::env::var_os("LOCALLM_ACCEPTANCE_RUNTIME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.join(".local/runtime/llama-server.exe"));
+        assert!(path.is_absolute(), "Choose an absolute acceptance runtime path");
+        let current = inspect_runtime(&path)
             .await
             .unwrap();
         assert!(current.no_agent);

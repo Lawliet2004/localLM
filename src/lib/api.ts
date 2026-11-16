@@ -77,6 +77,8 @@ export interface ModelDownloadInfo {
 }
 
 export const api = {
+  getOwnedProcess: (conversationId: string, id: string, cursor: number) => invoke<import('./ownedProcess').ProcessSnapshot>('get_owned_process', { conversationId, id, cursor }),
+  stopOwnedProcess: (conversationId: string, id: string) => invoke<import('./ownedProcess').ProcessSnapshot>('stop_owned_process', { conversationId, id }),
   rejectPresentation: (conversationId:string,messageId:string,program:string) => invoke<void>('reject_presentation',{conversationId,messageId,program}),
   getPresentationMode: (conversationId: string | null) => invoke<import('./types').PresentationModes>('get_presentation_mode', { conversationId }),
   setPresentationMode: (conversationId: string | null, mode: import('./types').PresentationMode | null) => invoke<void>('set_presentation_mode', { conversationId, mode }),
@@ -245,14 +247,14 @@ export const api = {
   localReasoningCapability: () => invoke<string | null>('local_reasoning_capability'),
   runtimeStatus: () => invoke<RuntimeStatus>('runtime_status'),
   retestToolCalling: () => invoke<{ supported: boolean; message: string }>('retest_tool_calling'),
-  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = [], connectorTools: ToolSelection[] = [], planMode = false, reasoningMode?: Preferences['reasoningMode'], presentationMode?: import('./types').PresentationMode, recoveryId?: string, resumeFailedMessageId?: string) => {
+  sendMessage: (conversationId: string, content: string, onEvent: (event: ChatEvent) => void, connectorIds: string[] = [], connectorTools: ToolSelection[] = [], planMode = false, reasoningMode?: Preferences['reasoningMode'], recoveryId?: string, resumeFailedMessageId?: string, resumeTaskId?: string) => {
     const channel = new Channel<ChatEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools, planMode, reasoningMode, presentationMode, recoveryId, resumeFailedMessageId });
+    return invoke<void>('send_message', { conversationId, content, channel, connectorIds, connectorTools, planMode, reasoningMode, recoveryId, resumeFailedMessageId, resumeTaskId });
   },
   cancelGeneration: (conversationId?: string) => invoke<void>('cancel_generation', { conversationId }),
   pauseGeneration: (conversationId?: string) => invoke<void>('pause_generation', { conversationId }),
-  resumeGeneration: (conversationId: string) => invoke<{ generation: number; question: string; pending: string[]; completed: string[]; checkpoint: string }>('resume_generation', { conversationId }),
+  resumeGeneration: (conversationId: string, taskId?: string) => invoke<{ taskId: string; question: string; pending: string[]; completed: string[]; checkpoint: string }>('resume_generation', { conversationId, taskId }),
   restartGeneration: () => invoke<{ replayedWriteIds: string[]; unconditionalSuccess: boolean }>('restart_generation'),
   resolveToolApproval: (id: string, allow: boolean) => invoke<void>('resolve_tool_approval', { id, allow }),
   resolveAskUser: (id: string, choice: string | null) => invoke<void>('resolve_ask_user', { id, choice }),
@@ -266,8 +268,8 @@ export const api = {
     listen<{ conversationId: string; seq: number }>('locallm://session-activity', event => {
       if (event.payload.conversationId === conversationId && Number.isSafeInteger(event.payload.seq)) onActivity(event.payload.seq);
     }),
-  getSessionEvents: (conversationId: string, fromSeq?: number | null, limit?: number | null) =>
-    invoke<SessionEvent[]>('get_session_events', { conversationId, fromSeq, limit }),
+  getSessionEvents: (conversationId: string, fromSeq?: number | null, limit?: number | null, page?: { beforeSeq?: number; latest?: boolean }) =>
+    invoke<SessionEvent[]>('get_session_events', { conversationId, fromSeq, limit, ...page }),
   forkSession: (conversationId: string, fromSeq: number) =>
     invoke<ForkSessionResult>('fork_session', { conversationId, fromSeq }),
   replaySession: (conversationId: string) =>

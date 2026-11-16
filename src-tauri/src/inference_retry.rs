@@ -413,6 +413,7 @@ mod tests {
                 capabilities: crate::provider_capabilities::ModelCapabilities::legacy(true),
             },
             "subscription" => Backend::Subscription {
+                auth: None,
                 client,
                 provider_name: "Fixture".into(),
                 base_url: url.into(),

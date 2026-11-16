@@ -17,7 +17,7 @@ pub struct ExecutionConfig {
     pub powershell_path: String,
     #[serde(default = "default_shell")]
     pub bash_path: String,
-    #[serde(default)]
+    #[serde(default = "ExecutionPolicy::shell_default")]
     pub bash: ExecutionPolicy,
     #[serde(default)]
     pub python: ExecutionPolicy,
@@ -37,6 +37,17 @@ pub struct ExecutionPolicy {
     pub always_ask: bool,
     pub memory_limit_mib: Option<u64>,
 }
+
+pub(crate) const MAX_MANAGED_SHELL_SECONDS: u64 = 3600;
+impl ExecutionPolicy {
+    fn shell_default() -> Self {
+        Self {
+            timeout_seconds: 600,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ExecutionPolicy {
     fn default() -> Self {
         Self {
@@ -136,7 +147,7 @@ impl Default for ExecutionConfig {
                 "pwsh"
             }),
             bash_path: default_shell(),
-            bash: ExecutionPolicy::default(),
+            bash: ExecutionPolicy::shell_default(),
             python: ExecutionPolicy::default(),
             python_venv: String::new(),
         }
@@ -173,7 +184,7 @@ impl ExecutionConfig {
         Ok(())
     }
     fn validate_limits(&self) -> Result<(), String> {
-        for (policy, maximum) in [(&self.bash, 300), (&self.python, 90)] {
+        for (policy, maximum) in [(&self.bash, MAX_MANAGED_SHELL_SECONDS), (&self.python, 90)] {
             if policy
                 .memory_limit_mib
                 .is_some_and(|mib| !(64..=65536).contains(&mib))
@@ -324,24 +335,56 @@ pub type ChunkCallback = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// process-wrap's KillOnDrop only sets Tokio's flag on Unix; that kills the
 /// leader, not its process group. Explicitly invoke the wrapper's tree kill
 /// when the execution future is dropped by Stop, cancellation or a timeout.
-pub(crate) struct ExecutionChild(Box<dyn process_wrap::tokio::ChildWrapper>);
+pub(crate) struct ExecutionChild {
+    inner: Box<dyn process_wrap::tokio::ChildWrapper>,
+    #[cfg(target_os = "linux")]
+    guardian: crate::process_guardian::Guardian,
+}
 impl std::ops::Deref for ExecutionChild {
     type Target = dyn process_wrap::tokio::ChildWrapper;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
+        self.inner.as_ref()
     }
 }
 impl std::ops::DerefMut for ExecutionChild {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut()
+        self.inner.as_mut()
     }
 }
 impl Drop for ExecutionChild {
     fn drop(&mut self) {
-        let _ = self.0.start_kill();
+        let _ = self.start_kill();
+    }
+}
+impl ExecutionChild {
+    #[cfg(unix)]
+    pub(crate) fn signal_process_group(&self, signal: rustix::process::Signal) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        { self.guardian.signal(signal) }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let pid = self.inner.id().and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+                .ok_or_else(|| std::io::Error::other("Owned process group is unavailable."))?;
+            rustix::process::kill_process_group(pid, signal).map_err(Into::into)
+        }
+    }
+
+    pub(crate) fn start_kill(&mut self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        { self.guardian.kill() }
+        #[cfg(not(target_os = "linux"))]
+        { self.inner.start_kill() }
     }
 }
 pub(crate) fn managed_spawn(command: tokio::process::Command) -> std::io::Result<ExecutionChild> {
+    #[cfg(target_os = "linux")]
+    let guardian = crate::process_guardian::Guardian::start()?;
+    #[cfg(target_os = "linux")]
+    let command = {
+        let mut command = command;
+        command.process_group(guardian.group());
+        command
+    };
     let mut command = CommandWrap::from(arm_parent_death_signal(command));
     command.wrap(KillOnDrop);
     #[cfg(windows)]
@@ -351,9 +394,13 @@ pub(crate) fn managed_spawn(command: tokio::process::Command) -> std::io::Result
         ));
         command.wrap(process_wrap::tokio::JobObject);
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     command.wrap(process_wrap::tokio::ProcessGroup::leader());
-    command.spawn().map(ExecutionChild)
+    command.spawn().map(|inner| ExecutionChild {
+        inner,
+        #[cfg(target_os = "linux")]
+        guardian,
+    })
 }
 
 /// Execute a short-lived command with one deadline for input, exit and output.
@@ -923,7 +970,7 @@ impl LocalExecution {
         }
         let timeout = request
             .timeout_seconds
-            .unwrap_or(self.config.bash.timeout_seconds)
+            .unwrap_or(self.config.bash.timeout_seconds.min(300))
             .min(self.config.bash.timeout_seconds);
         if request.command.trim().is_empty()
             || request.command.len() > 32768

@@ -1,0 +1,11 @@
+{
+  "baseCrate": "glib",
+  "baseVersion": "0.18.5",
+  "cratesIoChecksum": "233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5",
+  "advisory": "https://rustsec.org/advisories/RUSTSEC-2024-0429.html",
+  "upstreamFix": "https://github.com/gtk-rs/gtk-rs-core/pull/1343",
+  "changedSourceFile": "src/variant_iter.rs",
+  "originalSourceSha256": "1fd02859333761c45321b32f28b24233446b97d0022a90d3a937ed162585b90e",
+  "patchedSourceSha256": "a0f5ee8acb8faa089bcdfbc9a57372609fce7654026ccef7d9a224d05a654ccc",
+  "change": "Make the C out-argument mutable and pass &mut p. No version spoofing or API/ABI change."
+}

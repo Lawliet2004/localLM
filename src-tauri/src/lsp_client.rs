@@ -174,6 +174,9 @@ struct Session {
     next_id: u64,
     staged_edits: Vec<Value>,
     command_active: bool,
+    last_error_code: Option<i64>,
+    rust_analyzer: bool,
+    server_quiescent: Option<bool>,
     capabilities: Value,
     documents: BTreeMap<String, Document>,
     published: HashMap<String, Value>,
@@ -251,6 +254,9 @@ impl Session {
             next_id: 1,
             staged_edits: Vec::new(),
             command_active: false,
+            last_error_code: None,
+            rust_analyzer: false,
+            server_quiescent: None,
             capabilities: Value::Null,
             documents: BTreeMap::new(),
             published: HashMap::new(),
@@ -350,6 +356,10 @@ impl Session {
     }
     async fn handle_server(&mut self, message: &Value) -> Result<(), String> {
         let method = message["method"].as_str().unwrap_or("");
+        if method == "experimental/serverStatus" && message.get("id").is_none() {
+            self.server_quiescent = Some(message["params"]["quiescent"].as_bool()
+                .ok_or("Invalid language server readiness notification.")?);
+        }
         if let Some(id) = message.get("id") {
             if !(id.is_string() || id.is_number()) {
                 return Err("Invalid language server request ID.".into());
@@ -424,6 +434,7 @@ impl Session {
         Ok(())
     }
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.last_error_code = None;
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -442,6 +453,7 @@ impl Session {
             }
             if let Some(error) = message.get("error") {
                 let code = error["code"].as_i64().unwrap_or(-32603);
+                self.last_error_code = Some(code);
                 let message = error["message"]
                     .as_str()
                     .unwrap_or("Language server request failed.")
@@ -457,12 +469,54 @@ impl Session {
         }
         Err("LSP notification/request budget exceeded512 messages.".into())
     }
+    async fn wait_for_index(&mut self) -> Result<(), String> {
+        if !self.rust_analyzer { return Ok(()); }
+        for _ in 0..512 {
+            if self.server_quiescent == Some(true) { return Ok(()); }
+            let message = self.receive().await?;
+            if message.get("method").is_none() { return Err("Unexpected response while awaiting language server readiness.".into()); }
+            self.handle_server(&message).await?;
+        }
+        Err("Language server readiness exceeded its notification budget.".into())
+    }
+
+    /// Retry a completed ContentModified rejection only for pure queries over
+    /// the same source. The manager still owns timeout and cancellation.
+    async fn query(
+        &mut self, method: &str, params: Value, root: &std::path::Path,
+        document: Option<(&str, &str, &str)>,
+    ) -> Result<Value, String> {
+        let read = matches!(method, "textDocument/references" | "textDocument/documentSymbol"
+            | "textDocument/definition" | "textDocument/implementation" | "textDocument/hover"
+            | "textDocument/prepareCallHierarchy" | "callHierarchy/incomingCalls" | "callHierarchy/outgoingCalls");
+        for attempt in 0..3 {
+            match self.request(method, params.clone()).await {
+                Ok(value) => return Ok(value),
+                Err(_) if self.last_error_code == Some(-32801) && read && attempt < 2 && document.is_some() => {
+                    let (uri, text, sha) = document.unwrap();
+                    let path = reqwest::Url::parse(uri).ok().and_then(|uri| uri.to_file_path().ok())
+                        .ok_or("Invalid source URI while rechecking a language query.")?;
+                    let relative = path.strip_prefix(root).ok().and_then(|path| path.to_str())
+                        .ok_or("Language query snapshot is outside its workspace.")?;
+                    let current = crate::workspace::Workspace::open(root.to_str().ok_or("Invalid workspace path.")?)?
+                        .language_optional_source(relative)?;
+                    if current.as_deref() != Some(text) || crate::development_tools::hash(text.as_bytes()) != sha {
+                        return Err("Language query source changed; its rejected request was not retried.".into());
+                    }
+                    self.wait_for_index().await?;
+                    tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err("Language query remained unavailable after bounded retries.".into())
+    }
     async fn initialize(&mut self, server: &ServerConfig) -> Result<(), String> {
         let result=self.request("initialize",json!({"processId":std::process::id(),"rootUri":self.root,
             "clientInfo":{"name":"LocalLM","version":env!("CARGO_PKG_VERSION")},
             "workspaceFolders":[{"uri":self.root,"name":"workspace"}],"initializationOptions":server.initialization_options,
-            "capabilities":{"general":{"positionEncodings":["utf-16"]},"workspace":{"workspaceFolders":true,"configuration":true,"applyEdit":true,"workspaceEdit":{"documentChanges":true,"resourceOperations":["create","rename","delete"],"failureHandling":"transactional"}},
-                "textDocument":{"synchronization":{"dynamicRegistration":false,"didSave":false},"documentSymbol":{"hierarchicalDocumentSymbolSupport":true},"references":{"dynamicRegistration":false},"definition":{"dynamicRegistration":false,"linkSupport":true},"implementation":{"dynamicRegistration":false,"linkSupport":true},"hover":{"dynamicRegistration":false,"contentFormat":["markdown","plaintext"]},
+            "capabilities":{"general":{"positionEncodings":["utf-16"]},"window":{"workDoneProgress":true},"experimental":{"serverStatusNotification":true},"workspace":{"workspaceFolders":true,"configuration":true,"applyEdit":true,"workspaceEdit":{"documentChanges":true,"resourceOperations":["create","rename","delete"],"failureHandling":"transactional"}},
+                "textDocument":{"callHierarchy":{"dynamicRegistration":false},"synchronization":{"dynamicRegistration":false,"didSave":false},"documentSymbol":{"hierarchicalDocumentSymbolSupport":true},"references":{"dynamicRegistration":false},"definition":{"dynamicRegistration":false,"linkSupport":true},"implementation":{"dynamicRegistration":false,"linkSupport":true},"hover":{"dynamicRegistration":false,"contentFormat":["markdown","plaintext"]},
                     "codeAction":{"dynamicRegistration":false,"codeActionLiteralSupport":{"codeActionKind":{"valueSet":["","quickfix","refactor","refactor.extract","refactor.inline","refactor.rewrite","source","source.organizeImports","source.fixAll"]}},"dataSupport":true,"disabledSupport":true,"isPreferredSupport":true,"resolveSupport":{"properties":["edit"]},"honorsChangeAnnotations":true},"rename":{"dynamicRegistration":false,"prepareSupport":true,"honorsChangeAnnotations":true},"publishDiagnostics":{"versionSupport":true},"diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false}}}})).await?;
         let capabilities = result
             .get("capabilities")
@@ -478,12 +532,13 @@ impl Session {
             );
         }
         self.capabilities = capabilities.clone();
+        self.rust_analyzer = result["serverInfo"]["name"].as_str() == Some("rust-analyzer");
         self.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}))
             .await?;
         if !server.settings.is_null() {
             self.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeConfiguration","params":{"settings":server.settings}})).await?;
         }
-        Ok(())
+        self.wait_for_index().await
     }
     async fn open_document(
         &mut self,
@@ -833,7 +888,7 @@ impl Manager {
                         return Err("Language server says this symbol cannot be renamed.".into());
                     }
                 }
-                session.request(method, params).await?
+                session.query(method, params, &canonical, document).await?
             };
             session.command_active = false;
             let reply = Reply {

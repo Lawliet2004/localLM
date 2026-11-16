@@ -6,7 +6,7 @@ export function partitionActivity(turns: Message[][], events: SessionEvent[]): S
   const messages = new Map(turns.flatMap((turn, index) => turn.map(message => [message.id, index] as const)));
   const runs = new Map<string, number>();
   for (const event of events) {
-    if (!event.runId || !['user_msg', 'turn_end', 'model_round_resumed'].includes(event.eventType)) continue;
+    if (!event.runId || !['user_msg', 'turn_start', 'turn_end', 'model_round_resumed'].includes(event.eventType)) continue;
     const payload = event.payload as { messageId?: string; failedMessageId?: string } | null;
     const index = messages.get(payload?.messageId ?? payload?.failedMessageId ?? '');
     if (index !== undefined) runs.set(event.runId, index);

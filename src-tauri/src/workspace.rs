@@ -677,7 +677,9 @@ impl Workspace {
         if name != "recover_patch" {
             patch::ensure_clear(&self.directory)?;
         }
-        match name {
+        let instruction_paths = ["path", "source", "destination"].iter()
+            .filter_map(|key| arguments[*key].as_str().map(str::to_owned)).collect::<Vec<_>>();
+        let result = match name {
             "apply_patch" | "copy_file" | "move_file" | "delete_file" | "recover_patch"
             | "file_info" | "write_file" | "write_file_base64" | "append_file" | "multi_edit"
             | "edit_lines" | "list_tree" | "delete_directory" | "copy_directory"
@@ -937,7 +939,30 @@ impl Workspace {
                 documents::call(&self.directory, name, arguments)
             }
             _ => Err("Unknown workspace tool.".into()),
-        }
+        };
+        result.map(|mut value| {
+            let mut paths = instruction_paths;
+            if let Some(changes) = value["changes"].as_array() {
+                for change in changes {
+                    for key in ["path", "destination"] {
+                        if let Some(path) = change[key].as_str() { paths.push(path.to_owned()); }
+                    }
+                }
+            }
+            let mut files = std::collections::BTreeMap::new();
+            for path in paths {
+                // Use the validated workspace root; discover refuses external
+                // paths and linked instruction files, and excludes root rules.
+                for file in crate::instructions::discover(&self.root, &self.root.join(path)).files {
+                    files.entry(file.path.clone()).or_insert(file);
+                }
+            }
+            if !files.is_empty() {
+                let chain = crate::instructions::InstructionChain { files: files.into_values().collect() };
+                value["instructions"] = json!(chain.render());
+            }
+            value
+        })
     }
     /// Run the project formatter for one written file.
     ///
@@ -1053,10 +1078,10 @@ impl Workspace {
     pub fn tools(self: Arc<Self>) -> Vec<crate::connectors::AgentTool> {
         let mut definitions=vec![
             ("list_files","List up to 500 entries in a workspace directory. Use path . for the root.",json!({"path":{"type":"string"}}),vec!["path"]),
-            ("read_file","Read UTF-8 workspace text with line numbers and SHA-256. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":500}}),vec!["path"]),
+            ("read_file","Read UTF-8 workspace text with line numbers and SHA-256. Use a workspace-relative path and select the lines needed. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":500}}),vec!["path"]),
             ("create_file","Create a new UTF-8 file inside the workspace. Existing files are never overwritten. Parent directory must exist.",json!({"path":{"type":"string"},"content":{"type":"string"}}),vec!["path","content"]),
             ("create_directory","Create one directory inside the workspace. Parent directory must exist.",json!({"path":{"type":"string"}}),vec!["path"]),
-            ("edit_file","Replace one unique text match in an existing UTF-8 file. Requires the SHA-256 from a fresh read_file; fails when the file changed or the match is missing, and fails on an ambiguous match unless replace_all is set. Smart quotes, dash variants, exotic spaces, trailing whitespace and CRLF are tolerated when matching, and the line endings of the replaced region are preserved. Returns a unified diff of the change for review. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"expected_sha256":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean","description":"Replace every occurrence of old_text instead of requiring a unique match. Default false."}}),vec!["path","expected_sha256","old_text","new_text"]),
+            ("edit_file","Replace one unique text match in an existing UTF-8 file. Requires the SHA-256 from a fresh read_file; fails when the file changed or the match is missing, and fails on an ambiguous match unless replace_all is set. Smart quotes, dash variants, exotic spaces, trailing whitespace and CRLF are tolerated when matching, and the line endings of the replaced region are preserved. Returns a unified diff of the change for review. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"expected_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"SHA-256 from a fresh read of this file."},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean","description":"Replace every occurrence of old_text instead of requiring a unique match. Default false."}}),vec!["path","expected_sha256","old_text","new_text"]),
         ];
         definitions.extend(search::definitions());
         definitions.extend(patch::definitions());

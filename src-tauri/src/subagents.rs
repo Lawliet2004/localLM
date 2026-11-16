@@ -10,6 +10,9 @@
 //! default); denials become errored results, never silent skips.
 
 use serde::{Deserialize, Serialize};
+mod lifecycle;
+mod usage;
+pub(crate) use usage::for_parent as usage_for_parent;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -428,7 +431,10 @@ impl BackendSnapshot {
                 self.key.clone(),
                 self.account_id.clone(),
                 &model,
-            )
+            ).map(|backend| backend.with_subscription_auth(
+                Arc::new(crate::vault::Vault::new(self.data_dir.join("credentials"))),
+                if self.api_format == crate::providers::CHATGPT_SUBSCRIPTION { "chatgpt" } else { "grok" },
+            ))
         } else {
             let provider = crate::providers::ProviderConnection {
                 id: "snapshot".into(),
@@ -708,6 +714,7 @@ pub struct SubagentRegistry {
     flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
     cancels: Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     mailbox: Mutex<HashMap<String, Vec<String>>>,
+    slots: Mutex<HashMap<std::path::PathBuf, std::sync::Weak<tokio::sync::Semaphore>>>,
 }
 
 impl SubagentRegistry {
@@ -716,6 +723,7 @@ impl SubagentRegistry {
             flags: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
             mailbox: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
         }
     }
     pub fn register(&self, child_run_id: &str) -> Arc<AtomicBool> {
@@ -728,6 +736,15 @@ impl SubagentRegistry {
             .insert(child_run_id.to_string(), flag.clone());
         cancels.insert(child_run_id.to_string(), cancel);
         flag
+    }
+    fn slots_for(&self, db: &std::path::Path) -> Result<Arc<tokio::sync::Semaphore>, String> {
+        let key = db.canonicalize().map_err(|_| "Child admission needs an existing application database.".to_string())?;
+        let mut slots = self.slots.lock().map_err(|_| "Child admission is unavailable.".to_string())?;
+        slots.retain(|_, semaphore| semaphore.strong_count() > 0);
+        if let Some(semaphore) = slots.get(&key).and_then(std::sync::Weak::upgrade) { return Ok(semaphore); }
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+        slots.insert(key, Arc::downgrade(&semaphore));
+        Ok(semaphore)
     }
     /// Async wakeup for a live child. A receiver subscribed after the
     /// interrupt still observes the stored `true`, so no wakeup is lost.
@@ -769,12 +786,11 @@ impl SubagentRegistry {
             .unwrap_or_default()
     }
     pub fn deliver(&self, child_run_id: &str, message: &str) -> bool {
-        let live = self
+        let flags = self
             .flags
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(child_run_id);
-        if !live {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !flags.contains_key(child_run_id) {
             return false;
         }
         self.mailbox
@@ -783,6 +799,7 @@ impl SubagentRegistry {
             .entry(child_run_id.to_string())
             .or_default()
             .push(message.to_string());
+        drop(flags);
         true
     }
     pub fn retire(&self, child_run_id: &str) {
@@ -896,8 +913,23 @@ pub fn tool_allowed(filter: &Option<Vec<String>>, tool: &crate::connectors::Agen
     })
 }
 
-fn child_system_prompt(snapshot: &BackendSnapshot, request: &ChildRequest) -> String {
-    let mut prompt = snapshot.system_prompt.clone();
+fn child_system_prompt(snapshot: &BackendSnapshot, request: &ChildRequest) -> Result<String, String> {
+    let project = if snapshot.workspace_path.is_empty() { String::new() } else {
+        crate::instructions::chain(std::path::Path::new(&snapshot.workspace_path)).render()
+    };
+    let policy = match crate::store::Store::open(&snapshot.db_path) {
+        Ok(store) => crate::capabilities::ToolPolicy::resolve(&store),
+        Err(error) => crate::capabilities::ToolPolicy::closed(error),
+    };
+    let skills = if snapshot.active_skills.is_empty() || policy.denial("skills_reader").is_some() {
+        String::new()
+    } else {
+        crate::skills::Skills::new(snapshot.data_dir.join("skills")).instructions(&snapshot.active_skills)?
+    };
+    let aliases = snapshot.allowed_tool_aliases.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut prompt = crate::prompt::frozen_system_for_project(
+        &snapshot.system_prompt, &skills, &project, None, &aliases, false,
+    );
     if let Some(persona) = &request.persona {
         prompt.push_str(&format!("\nAdopt this persona for the subtask: {persona}"));
     }
@@ -910,7 +942,7 @@ fn child_system_prompt(snapshot: &BackendSnapshot, request: &ChildRequest) -> St
     prompt.push_str(
         "\nYou are a subagent: solve ONLY the assigned subtask and report back concisely.",
     );
-    prompt
+    Ok(prompt)
 }
 
 /// Enforce the requested output schema fully (nested types, enums, ranges,
@@ -1177,7 +1209,7 @@ pub async fn drive_child(
         return Err("Subagent was interrupted before starting.".into());
     }
     let tools: Vec<&crate::connectors::AgentTool> = tools.iter().map(|tool| tool.tool()).collect();
-    let mut system = child_system_prompt(snapshot, request);
+    let mut system = child_system_prompt(snapshot, request)?;
     system.push_str(&format!(
         "\nModel capability metadata (not independent verification): {}",
         backend.capability_report()
@@ -1196,8 +1228,6 @@ pub async fn drive_child(
     backend.prepare_preferences(&mut preferences)?;
     let mut answer = String::new();
     let max_rounds = request.max_rounds.min(8);
-    // Monotonic per-run sequence: (run_id, seq) is the primary key.
-    let mut event_seq: u64 = 1;
     for round in 0..max_rounds {
         if cancel.is_set() {
             if let Ok(store) = state.database() {
@@ -1219,7 +1249,7 @@ pub async fn drive_child(
         let mut payload = serde_json::json!({
             "messages": messages, "temperature": preferences.temperature,
             "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
-            "stream": true, "cache_prompt": true,
+            "stream": true, "cache_prompt": true, "stream_options":{"include_usage":true},
         });
         if snapshot.inference_slots >= 2 {
             payload["id_slot"] = serde_json::json!(1);
@@ -1245,6 +1275,7 @@ pub async fn drive_child(
             Ok(result) => result?,
             Err(_) => return Err("Subagent context check timed out.".into()),
         };
+        let mut measurement = usage::ChildRound::new(snapshot, request, child_run_id, round);
         let response = match tokio::select! {
             _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
             result = tokio::time::timeout(Duration::from_secs(600), backend.stream(&payload)) => result,
@@ -1252,13 +1283,16 @@ pub async fn drive_child(
             Ok(result) => result?,
             Err(_) => return Err("Subagent model did not respond within ten minutes.".into()),
         };
-        let outcome = collect_stream(backend, response, &mut answer, &mut cancel).await?;
+        let outcome = collect_measured_stream(backend, response, &mut answer, &mut cancel, &mut measurement).await;
+        measurement.finish(outcome.is_ok())?;
+        let outcome = outcome?;
         if outcome.finish == "length" {
             return Err("Subagent hit the response token limit.".into());
         }
         let calls = outcome.calls;
         crate::arex::validate_batch(&calls)?;
         if calls.is_empty() {
+            if answer.trim().is_empty() { return Err("Subagent returned no visible final answer.".into()); }
             break;
         }
         if round + 1 >= max_rounds && !calls.iter().any(|c| c.name == "finish") {
@@ -1306,6 +1340,7 @@ pub async fn drive_child(
                     continue;
                 }
             }
+            record_tool_call(&*state.database()?, child_run_id, round, &call)?;
             let rule_decision = match state.database() {
                 Ok(store) => child_rule_decision(&store, request.policy, tool, &call),
                 Err(_) => crate::permission_rules::Decision::Deny("Permission settings are unreachable.".into()),
@@ -1326,7 +1361,7 @@ pub async fn drive_child(
                 };
                 match decision {
                     Some(true) => tokio::select! {
-                        _ = cancel.cancelled() => return Err(cancelled_tool_call(state, child_run_id, round, &call, &mut event_seq)),
+                        _ = cancel.cancelled() => return Err(cancelled_tool_call(state, child_run_id, round, &call)),
                         result = call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call, emit.as_ref(), true) => result,
                     },
                     _ => crate::tool_envelope::failure_notice("denied", "Denied by the subagent approval pin (reads-only). Ask the parent for what you need instead.", false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({"denied":true})),
@@ -1337,7 +1372,7 @@ pub async fn drive_child(
                 // Dropping the call future aborts in-flight work; managed
                 // child processes die with the execution wrapper on drop.
                 tokio::select! {
-                    _ = cancel.cancelled() => return Err(cancelled_tool_call(state, child_run_id, round, &call, &mut event_seq)),
+                    _ = cancel.cancelled() => return Err(cancelled_tool_call(state, child_run_id, round, &call)),
                     result = call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call, emit.as_ref(), false) => result,
                 }
             };
@@ -1357,10 +1392,9 @@ pub async fn drive_child(
                 |artifact| state.database()?.save_artifact(artifact),
             );
             if let Ok(store) = state.database() {
-                event_seq += 1;
                 let _ = store.append_run_event(&crate::agent_run::RunEvent {
                     run_id: child_run_id.to_string(),
-                    seq: event_seq,
+                    seq: 0,
                     step_id: format!("round-{round}"),
                     tool_call_id: Some(call.id.clone()),
                     event_type: "tool_result".into(),
@@ -1395,18 +1429,30 @@ pub async fn drive_child(
 /// Durable audit record for a tool call abandoned mid-flight: the work future
 /// is dropped (managed processes die with it), the side effect is reported as
 /// unknown, and the call is never replayed.
+fn record_tool_call(
+    store: &crate::store::Store,
+    child_run_id: &str,
+    round: usize,
+    call: &crate::tool_calls::ToolCall,
+) -> Result<(), String> {
+    store.append_run_event(&crate::agent_run::RunEvent {
+        run_id: child_run_id.into(), seq: 0, step_id: format!("round-{round}"),
+        tool_call_id: Some(call.id.clone()), event_type: "tool_call".into(),
+        payload: serde_json::json!({"tool":call.name,"arguments":call.arguments}),
+        created_at: crate::store::now(),
+    })
+}
+
 fn cancelled_tool_call(
     state: &crate::AppState,
     child_run_id: &str,
     round: usize,
     call: &crate::tool_calls::ToolCall,
-    event_seq: &mut u64,
 ) -> String {
     if let Ok(store) = state.database() {
-        *event_seq += 1;
         let _ = store.append_run_event(&crate::agent_run::RunEvent {
             run_id: child_run_id.to_string(),
-            seq: *event_seq,
+            seq: 0,
             step_id: format!("round-{round}"),
             tool_call_id: Some(call.id.clone()),
             event_type: "tool_cancelled".into(),
@@ -1424,13 +1470,11 @@ fn cancelled_tool_call_detached(
     child_run_id: &str,
     round: usize,
     call: &crate::tool_calls::ToolCall,
-    event_seq: &mut u64,
 ) -> String {
     if let Ok(store) = store.lock() {
-        *event_seq += 1;
         let _ = store.append_run_event(&crate::agent_run::RunEvent {
             run_id: child_run_id.to_string(),
-            seq: *event_seq,
+            seq: 0,
             step_id: format!("round-{round}"),
             tool_call_id: Some(call.id.clone()),
             event_type: "tool_cancelled".into(),
@@ -1749,45 +1793,8 @@ pub async fn run_child_inline(
 ) -> Result<(String, String), String> {
     validate_child_request(&request)?;
     let backend = snapshot.backend()?;
-    let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
-    let now = crate::store::now();
-    let record = SubagentRun {
-        id: format!("sub-{}", uuid::Uuid::new_v4()),
-        conversation_id: request.conversation_id.clone(),
-        parent_run_id: request.parent_run_id.clone(),
-        child_run_id: child_run_id.clone(),
-        depth: request.depth + 1,
-        status: "running".into(),
-        label: request.label.clone(),
-        prompt: request.prompt.clone(),
-        error: None,
-        created_at: now,
-        updated_at: now,
-    };
-    {
-        let store = state.database()?;
-        store.save_run(&crate::agent_run::RunRecord {
-            id: child_run_id.clone(),
-            conversation_id: request.conversation_id.clone(),
-            status: crate::agent_run::RunState::Preparing,
-            model_provider: None,
-            model_id: Some(snapshot.model_id.clone()),
-            checkpoint: Some("subagent".into()),
-            error: None,
-            created_at: now,
-            updated_at: now,
-        })?;
-        store.insert_subagent_run(&record)?;
-        let _ = store.append_run_event(&crate::agent_run::RunEvent {
-            run_id: child_run_id.clone(),
-            seq: 0,
-            step_id: "start".into(),
-            tool_call_id: None,
-            event_type: "subagent_start".into(),
-            payload: serde_json::json!({"parentRun": request.parent_run_id, "depth": record.depth, "label": request.label}),
-            created_at: now,
-        });
-    }
+    let mut lease = lifecycle::ChildLease::create(state.subagents.clone(), snapshot, &request, false)?;
+    let child_run_id = lease.id.clone();
     let capability_policy = crate::capabilities::ToolPolicy::guard(state.database());
     let owned = local_tools(snapshot, &capability_policy);
     let tools = merge_child_tools(owned, inherit, &request.tool_filter, &capability_policy);
@@ -1799,14 +1806,7 @@ pub async fn run_child_inline(
     // nested children resolve to the same cells, so a grandchild cannot
     // escape the budget either.
     let _turn_binding = bind_child_to_parent(state, &request.parent_run_id, &child_run_id);
-    let interrupt = state.subagents.register(&child_run_id);
-    // Per-child watch for interrupts plus the app-wide (generation-scoped)
-    // cancel: a parent's Stop interrupts its inline child promptly.
-    let cancel = ChildCancel::new(
-        interrupt,
-        state.subagents.cancellation(&child_run_id),
-        Some(state.cancel_signal().subscribe()),
-    );
+    let cancel = lease.cancellation(Some(state.cancel_signal().subscribe()));
     let answer = drive_child(
         state,
         snapshot,
@@ -1819,42 +1819,8 @@ pub async fn run_child_inline(
         emit,
     )
     .await;
-    state.subagents.retire(&child_run_id);
-    match answer {
-        Ok(answer) => {
-            if let Ok(store) = state.database() {
-                let _ = store.update_subagent_run(&record.id, "completed", None);
-                let _ = store.update_run_status(
-                    &child_run_id,
-                    crate::agent_run::RunState::Completed,
-                    None,
-                    None,
-                );
-            }
-            Ok((child_run_id, answer))
-        }
-        Err(error) => {
-            let cancelled = error == INTERRUPTED || error.starts_with("Subagent was interrupted");
-            if let Ok(store) = state.database() {
-                let _ = store.update_subagent_run(
-                    &record.id,
-                    if cancelled { "interrupted" } else { "failed" },
-                    Some(&error),
-                );
-                let _ = store.update_run_status(
-                    &child_run_id,
-                    if cancelled {
-                        crate::agent_run::RunState::Cancelled
-                    } else {
-                        crate::agent_run::RunState::Failed
-                    },
-                    Some(&error),
-                    None,
-                );
-            }
-            Err(error)
-        }
-    }
+    lease.finish(&answer)?;
+    answer.map(|answer| (child_run_id, answer))
 }
 
 /// Background child: supervisor task with its own SQLite connection and
@@ -1865,55 +1831,18 @@ pub fn spawn_background(
     request: ChildRequest,
 ) -> Result<String, String> {
     validate_child_request(&request)?;
-    let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
-    let record_id = format!("sub-{}", uuid::Uuid::new_v4());
-    let store = crate::store::Store::open(&snapshot.db_path)?;
-    let now = crate::store::now();
-    store.save_run(&crate::agent_run::RunRecord {
-        id: child_run_id.clone(),
-        conversation_id: request.conversation_id.clone(),
-        status: crate::agent_run::RunState::Preparing,
-        model_provider: None,
-        model_id: Some(snapshot.model_id.clone()),
-        checkpoint: Some("subagent".into()),
-        error: None,
-        created_at: now,
-        updated_at: now,
-    })?;
-    store.insert_subagent_run(&SubagentRun {
-        id: record_id,
-        conversation_id: request.conversation_id.clone(),
-        parent_run_id: request.parent_run_id.clone(),
-        child_run_id: child_run_id.clone(),
-        depth: request.depth + 1,
-        status: "running".into(),
-        label: request.label.clone(),
-        prompt: request.prompt.clone(),
-        error: None,
-        created_at: now,
-        updated_at: now,
-    })?;
+    // Reject invalid snapshots before publishing a running row.
+    snapshot.backend()?;
     let registry = global_registry();
-    let interrupt = registry.register(&child_run_id);
-    // Detached children get only the per-child interrupt watch — never the
-    // app-wide generation cancel — so an unrelated Stop cannot kill a
-    // background run that outlives its parent's turn.
-    let cancel = ChildCancel::new(interrupt, registry.cancellation(&child_run_id), None);
+    let mut lease = lifecycle::ChildLease::create(registry.clone(), &snapshot, &request, true)?;
+    let child_run_id = lease.id.clone();
+    let cancel = lease.cancellation(None);
     let task_child = child_run_id.clone();
-    let task_registry = registry.clone();
-    // Background tasks need an AppState for cancellation checks only; build a
-    // minimal handle-free path by reusing drive pieces without &AppState.
     tauri::async_runtime::spawn(async move {
-        let outcome = run_background_core(
-            snapshot,
-            request,
-            cancel,
-            task_registry.clone(),
-            task_child.clone(),
-        )
-        .await;
-        task_registry.retire(&task_child);
-        let _ = outcome;
+        let outcome = run_background_core(snapshot, request, cancel, registry, task_child).await;
+        if let Err(error) = lease.finish(&outcome) {
+            eprintln!("Could not persist a background child outcome: {error}");
+        }
     });
     Ok(child_run_id)
 }
@@ -1924,7 +1853,7 @@ async fn run_background_core(
     cancel: ChildCancel,
     registry: Arc<SubagentRegistry>,
     child_run_id: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let store = Arc::new(Mutex::new(crate::store::Store::open(&snapshot.db_path)?));
     let capability_policy = match store.lock() {
         Ok(store) => crate::capabilities::ToolPolicy::resolve(&store),
@@ -1939,7 +1868,7 @@ async fn run_background_core(
         .filter(|tool| tool_allowed(&request.tool_filter, tool))
         .collect();
     // Drive without &AppState: cancellation comes from the interrupt watch.
-    let answer = drive_detached(
+    drive_detached(
         &snapshot,
         &request,
         tools,
@@ -1949,71 +1878,7 @@ async fn run_background_core(
         &child_run_id,
         store.clone(),
     )
-    .await;
-    let record = store
-        .lock()
-        .map_err(|e| e.to_string())?
-        .subagent_runs_for_conversation(&request.conversation_id)?
-        .into_iter()
-        .find(|row| row.child_run_id == child_run_id);
-    match answer {
-        Ok(answer) => {
-            if let Ok(s) = store.lock() {
-                if let Some(row) = record {
-                    let _ = s.update_subagent_run(&row.id, "completed", None);
-                }
-                let _ = s.update_run_status(
-                    &child_run_id,
-                    crate::agent_run::RunState::Completed,
-                    None,
-                    None,
-                );
-                let notice = serde_json::json!({
-                    "request": {"connector": "Subagents", "name": "subagent", "arguments": {}, "decision": "allowed", "authorization": "background child settled"},
-                    "result": {"childRunId": child_run_id, "status": "completed", "summary": answer.chars().take(1500).collect::<String>()},
-                });
-                let _ = s.append_message(
-                    &request.conversation_id,
-                    "tool",
-                    &notice.to_string(),
-                    "complete",
-                );
-            }
-        }
-        Err(error) => {
-            let cancelled = error == INTERRUPTED || error.starts_with("Subagent was interrupted");
-            if let Ok(s) = store.lock() {
-                if let Some(row) = record {
-                    let _ = s.update_subagent_run(
-                        &row.id,
-                        if cancelled { "interrupted" } else { "failed" },
-                        Some(&error),
-                    );
-                }
-                let _ = s.update_run_status(
-                    &child_run_id,
-                    if cancelled {
-                        crate::agent_run::RunState::Cancelled
-                    } else {
-                        crate::agent_run::RunState::Failed
-                    },
-                    Some(&error),
-                    None,
-                );
-                let notice = serde_json::json!({
-                    "request": {"connector": "Subagents", "name": "subagent", "arguments": {}, "decision": "allowed", "authorization": "background child settled"},
-                    "result": {"childRunId": child_run_id, "status": if cancelled { "interrupted" } else { "failed" }, "error": error},
-                });
-                let _ = s.append_message(
-                    &request.conversation_id,
-                    "tool",
-                    &notice.to_string(),
-                    "complete",
-                );
-            }
-        }
-    }
-    Ok(())
+    .await
 }
 
 /// Detached driver: same bounds as drive_child without &AppState.
@@ -2033,7 +1898,7 @@ pub async fn drive_detached(
     if cancel.is_set() {
         return Err("Subagent was interrupted before starting.".into());
     }
-    let mut system = child_system_prompt(snapshot, request);
+    let mut system = child_system_prompt(snapshot, request)?;
     system.push_str(&format!(
         "\nModel capability metadata (not independent verification): {}",
         backend.capability_report()
@@ -2052,7 +1917,6 @@ pub async fn drive_detached(
         };
         detached_tool_limits(snapshot, &tools, &policy)
     };
-    let mut event_seq: u64 = 1;
     if !limits.is_empty() {
         let names: Vec<&str> = limits
             .iter()
@@ -2065,14 +1929,13 @@ pub async fn drive_detached(
         if let Ok(s) = store.lock() {
             let _ = s.append_run_event(&crate::agent_run::RunEvent {
                 run_id: child_run_id.to_string(),
-                seq: event_seq,
+                seq: 0,
                 step_id: "setup".into(),
                 tool_call_id: None,
                 event_type: "child_tool_limits".into(),
                 payload: serde_json::json!({"unavailable": limits}),
                 created_at: crate::store::now(),
             });
-            event_seq += 1;
         }
     }
     let mut messages = vec![
@@ -2109,7 +1972,7 @@ pub async fn drive_detached(
         let mut payload = serde_json::json!({
             "messages": messages, "temperature": preferences.temperature,
             "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
-            "stream": true, "cache_prompt": true,
+            "stream": true, "cache_prompt": true, "stream_options":{"include_usage":true},
         });
         if snapshot.inference_slots >= 2 {
             payload["id_slot"] = serde_json::json!(1);
@@ -2134,6 +1997,7 @@ pub async fn drive_detached(
             Ok(result) => result?,
             Err(_) => return Err("Subagent context check timed out.".into()),
         };
+        let mut measurement = usage::ChildRound::new(snapshot, request, child_run_id, round);
         let response = match tokio::select! {
             _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
             result = tokio::time::timeout(Duration::from_secs(600), backend.stream(&payload)) => result,
@@ -2141,12 +2005,15 @@ pub async fn drive_detached(
             Ok(result) => result?,
             Err(_) => return Err("Subagent model did not respond within ten minutes.".into()),
         };
-        let outcome = collect_stream(backend, response, &mut answer, &mut cancel).await?;
+        let outcome = collect_measured_stream(backend, response, &mut answer, &mut cancel, &mut measurement).await;
+        measurement.finish(outcome.is_ok())?;
+        let outcome = outcome?;
         crate::arex::validate_batch(&outcome.calls)?;
         if outcome.finish == "length" {
             return Err("Subagent hit the response token limit.".into());
         }
         if outcome.calls.is_empty() {
+            if answer.trim().is_empty() { return Err("Subagent returned no visible final answer.".into()); }
             break;
         }
         if round + 1 >= max_rounds && !outcome.calls.iter().any(|c| c.name == "finish") {
@@ -2201,6 +2068,7 @@ pub async fn drive_detached(
                     continue;
                 }
             }
+            record_tool_call(&*store.lock().map_err(|_| "Child event store is unavailable.")?, child_run_id, round, &call)?;
             let rule_decision = match store.lock() {
                 Ok(store) => child_rule_decision(&store, request.policy, tool, &call),
                 Err(_) => crate::permission_rules::Decision::Deny("Permission settings are unreachable.".into()),
@@ -2239,7 +2107,7 @@ pub async fn drive_detached(
                 // else fails loud. Awaited inside the cancel select so an
                 // interrupt cannot strand behind a blocked read.
                 tokio::select! {
-                    _ = cancel.cancelled() => return Err(cancelled_tool_call_detached(&store, child_run_id, round, &call, &mut event_seq)),
+                    _ = cancel.cancelled() => return Err(cancelled_tool_call_detached(&store, child_run_id, round, &call)),
                     result = harness_detached(snapshot, request, alias, call.arguments.clone()) => match result {
                         Ok(value) => crate::tool_envelope::normalize(value, tool.envelope_family()),
                         Err(error) => crate::tool_envelope::normalize_error(&error, crate::tool_envelope::Cause::default(), tool.envelope_family()),
@@ -2249,7 +2117,7 @@ pub async fn drive_detached(
                 // Dropping the call future aborts in-flight work; managed
                 // child processes die with the execution wrapper on drop.
                 tokio::select! {
-                    _ = cancel.cancelled() => return Err(cancelled_tool_call_detached(&store, child_run_id, round, &call, &mut event_seq)),
+                    _ = cancel.cancelled() => return Err(cancelled_tool_call_detached(&store, child_run_id, round, &call)),
                     result = tokio::time::timeout(tool.timeout(), tool.call(call.arguments.clone())) => match result {
                         Ok(Ok(value)) => crate::tool_envelope::normalize(value, tool.envelope_family()),
                         Ok(Err(error)) => crate::tool_envelope::normalize_error(&error, crate::tool_envelope::Cause::default(), tool.envelope_family()),
@@ -2272,11 +2140,10 @@ pub async fn drive_detached(
                 crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
                 |artifact| store.lock().map_err(|_| "Artifact store is unavailable.".to_string())?.save_artifact(artifact),
             );
-            event_seq += 1;
             if let Ok(s) = store.lock() {
                 let _ = s.append_run_event(&crate::agent_run::RunEvent {
                     run_id: child_run_id.to_string(),
-                    seq: event_seq,
+                    seq: 0,
                     step_id: format!("round-{round}"),
                     tool_call_id: Some(call.id.clone()),
                     event_type: "tool_result".into(),
@@ -2314,18 +2181,42 @@ struct StreamOutcome {
     assistant_message: serde_json::Value,
 }
 
+#[cfg(test)]
 async fn collect_stream(
     backend: &crate::inference::Backend,
     response: reqwest::Response,
     answer: &mut String,
     cancel: &mut ChildCancel,
 ) -> Result<StreamOutcome, String> {
+    collect_stream_inner(backend, response, answer, cancel, None).await
+}
+
+async fn collect_measured_stream(
+    backend: &crate::inference::Backend,
+    response: reqwest::Response,
+    answer: &mut String,
+    cancel: &mut ChildCancel,
+    measurement: &mut usage::ChildRound,
+) -> Result<StreamOutcome, String> {
+    collect_stream_inner(backend, response, answer, cancel, Some(measurement)).await
+}
+
+async fn collect_stream_inner(
+    backend: &crate::inference::Backend,
+    response: reqwest::Response,
+    answer: &mut String,
+    cancel: &mut ChildCancel,
+    mut measurement: Option<&mut usage::ChildRound>,
+) -> Result<StreamOutcome, String> {
     let mut stream = response.bytes_stream();
     let mut decoder = crate::sse::SseDecoder::inference();
     let mut protocol = crate::sse::ModelStream::for_backend(backend);
     let mut calls = crate::tool_calls::ToolCalls::default();
     let mut text = String::new();
+    let mut thinking = crate::chat::ThinkFilter::new();
+    answer.clear();
     let mut finish = String::new();
+    let mut received_bytes = 0usize;
     'stream: loop {
         // Interrupt wins over the per-chunk deadman: dropping the body stream
         // aborts the HTTP read rather than waiting out the 300s timeout.
@@ -2349,15 +2240,32 @@ async fn collect_stream(
             if let Some(error) = value.get("error") {
                 return Err(backend.stream_error(error));
             }
+            if let Some(measured) = measurement.as_deref_mut() { measured.measurement.usage.observe(&value); }
             if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
                 finish = reason.to_string();
             }
             let delta = &value["choices"][0]["delta"];
             calls.push(delta)?;
             let chunk = delta["content"].as_str().unwrap_or("");
-            answer.push_str(chunk);
-            text.push_str(chunk);
-            if answer.len() > 1_048_576 {
+            if let Some(measured) = measurement.as_deref_mut() {
+                let token = !chunk.is_empty() || delta["reasoning_content"].as_str().or_else(|| delta["reasoning"].as_str()).is_some_and(|text| !text.is_empty())
+                    || delta["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty());
+                if token && measured.measurement.first_token_ms.is_none() { measured.measurement.first_token_ms = Some(measured.elapsed_ms()); }
+            }
+            received_bytes = received_bytes.saturating_add(chunk.len())
+                .saturating_add(delta["reasoning_content"].as_str().or_else(|| delta["reasoning"].as_str()).unwrap_or("").len());
+            if received_bytes > 1_048_576 { return Err("Subagent output exceeded 1 MiB.".into()); }
+            let (visible, _) = if backend.uses_inline_thinking() { thinking.feed(chunk) }
+                else { (chunk.to_string(), String::new()) };
+            if !visible.trim().is_empty() {
+                if let Some(measured) = measurement.as_deref_mut() {
+                    if measured.measurement.first_visible_answer_ms.is_none() {
+                        measured.measurement.first_visible_answer_ms = Some(measured.elapsed_ms());
+                    }
+                }
+            }
+            text.push_str(&visible);
+            if text.len() + thinking.buffer.len() > 1_048_576 {
                 return Err("Subagent output exceeded 1 MiB.".into());
             }
             if protocol.done {
@@ -2365,22 +2273,29 @@ async fn collect_stream(
             }
         }
     }
-    if !matches!(finish.as_str(), "stop" | "tool_calls" | "length") {
+    if !matches!(finish.as_str(), "stop" | "tool_calls" | "length" | "refusal") {
         return Err(format!(
             "Subagent returned an unsupported finish reason: '{finish}'."
         ));
     }
-    if calls.is_empty() && (text.contains("<tool_call>") || text.contains("<function=")) {
+    text.push_str(&thinking.flush().0);
+    let mut text_parsed = false;
+    if backend.uses_text_tool_calls() && calls.is_empty() && finish != "refusal"
+        && !matches!(crate::chat::decide_text_tool_call(&text, 0), crate::chat::TextCallDecision::NotACall) {
         let parsed = crate::tool_calls::parse_text_tool_calls(&text)
             .ok_or("Subagent produced an incomplete tool call.")?;
         calls = crate::tool_calls::ToolCalls::from_parsed(parsed);
         let visible = crate::tool_calls::strip_text_tool_calls(&text);
-        answer.truncate(answer.len().saturating_sub(text.len()));
-        answer.push_str(&visible);
         text = visible;
+        text_parsed = true;
     }
     let calls = calls.finish()?;
-    let assistant_message = protocol.assistant_message(&text, &calls);
+    if finish == "tool_calls" && calls.is_empty() {
+        return Err("Subagent reported tool calls but returned none.".into());
+    }
+    let mut assistant_message = protocol.assistant_message(&text, &calls);
+    if text_parsed { crate::sse::canonicalize_text_calls(&mut assistant_message); }
+    *answer = text;
     Ok(StreamOutcome {
         finish,
         calls,
@@ -2489,7 +2404,13 @@ pub async fn run_workflow(
             parent_run_id: parent_run_id.to_string(),
             conversation_id: conversation_id.to_string(),
         };
-        ids.push(spawn_background(snapshot.clone(), request)?);
+        match spawn_background(snapshot.clone(), request) {
+            Ok(id) => ids.push(id),
+            Err(error) => {
+                for id in &ids { state.subagents.interrupt(id); }
+                return Err(error);
+            }
+        }
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     let mut global_cancel = state.cancel_signal().subscribe();
@@ -2779,10 +2700,7 @@ mod tests {
     #[tokio::test]
     async fn child_streams_use_native_claude_completion_and_text_tool_fallback() {
         use crate::inference::InferenceProvider;
-        use tokio::io::AsyncWriteExt;
         for claude in [true, false] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let wire = if claude {
                 [
                     r#"{"type":"content_block_start","index":9,"content_block":{"type":"tool_use","id":"a","name":"clock","input":{}}}"#,
@@ -2791,18 +2709,11 @@ mod tests {
                     r#"{"type":"message_stop"}"#,
                 ].iter().map(|event|format!("data: {event}\n\n")).collect::<String>()
             } else {
-                let chunk = serde_json::json!({"choices":[{"delta":{"content":"Checking <function=clock>{}</function>"},"finish_reason":"stop"}]});
+                let chunk = serde_json::json!({"choices":[{"delta":{"content":"Checking\n<function=clock>{}</function>"},"finish_reason":"stop"}]});
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             };
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wire}",wire.len()).as_bytes()).await.unwrap();
-                // Keep the request socket alive until the client has consumed
-                // the body, rather than closing it with unread request bytes.
-                use tokio::io::AsyncReadExt;
-                let mut bytes = [0; 4096];
-                let _ = stream.read(&mut bytes).await;
-            });
+            let (base, _, server) = crate::test_support::scripted_sse(vec![wire]).await;
+            let endpoint = base.trim_end_matches("/v1").to_owned();
             let client = reqwest::Client::builder().no_proxy().build().unwrap();
             let backend = if claude {
                 crate::inference::Backend::Claude {
@@ -3987,6 +3898,7 @@ mod tests {
         );
         let registry = global_registry();
         let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
+        fixture_run(&store.lock().unwrap(), &child_run_id, &request.conversation_id);
         let flag = registry.register(&child_run_id);
         let cancel = ChildCancel::new(flag, registry.cancellation(&child_run_id), None);
         let interrupt_id = child_run_id.clone();
@@ -4039,6 +3951,7 @@ mod tests {
         );
         let registry = global_registry();
         let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
+        fixture_run(&store.lock().unwrap(), &child_run_id, &request.conversation_id);
         let flag = registry.register(&child_run_id);
         let cancel = ChildCancel::new(flag, registry.cancellation(&child_run_id), None);
         let interrupt_id = child_run_id.clone();
@@ -4091,6 +4004,7 @@ mod tests {
         );
         let registry = global_registry();
         let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
+        fixture_run(&store.lock().unwrap(), &child_run_id, &request.conversation_id);
         let flag = registry.register(&child_run_id);
         let cancel = ChildCancel::new(flag, registry.cancellation(&child_run_id), None);
         let interrupt_id = child_run_id.clone();
@@ -4405,3 +4319,72 @@ mod tests {
         assert!(registry.cancellation("child-late").is_none());
     }
 }
+
+#[cfg(test)]
+mod audit_fixes_children {
+    use super::*;
+    use crate::inference::InferenceProvider;
+    use serde_json::json;
+
+    fn backend(base: String, responses: bool) -> crate::inference::Backend {
+        crate::inference::Backend::OpenAi { responses,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(), base_url: base,
+            key: String::new(), model_id:"fixture".into(), context_length:32768,
+            max_output_tokens:Some(1024), capabilities:crate::provider_capabilities::ModelCapabilities::legacy(true) }
+    }
+    fn text_wire(text: &str) -> String {
+        format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":text}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}))
+    }
+
+    #[tokio::test]
+    async fn compatible_child_separates_inline_thinking_from_answer() {
+        let (base, _, server) = crate::test_support::scripted_sse(vec![text_wire("<think>Internal draft</think>Final answer")]).await;
+        let backend = backend(base, false);
+        let response = backend.stream(&backend.payload(&json!({"messages":[{"role":"user","content":"answer"}],"stream":true})).unwrap()).await.unwrap();
+        let mut answer = String::new();
+        let outcome = collect_stream(&backend, response, &mut answer, &mut ChildCancel::none()).await.unwrap();
+        assert_eq!(outcome.finish, "stop");
+        assert_eq!(answer, "Final answer");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_validates_only_the_final_round() {
+        let first = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content":"I will inspect the file.","tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"workspace_read_file","arguments":"{\"path\":\"a.txt\"}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}));
+        let (base, _, server) = crate::test_support::scripted_sse(vec![first, text_wire("{\"ok\":true}")]).await;
+        let backend = backend(base, false);
+        let mut answer = String::new();
+        let mut messages = vec![json!({"role":"user","content":"Return JSON after reading."})];
+        for round in 0..2 {
+            let response = backend.stream(&backend.payload(&json!({"messages":messages,"stream":true})).unwrap()).await.unwrap();
+            let outcome = collect_stream(&backend, response, &mut answer, &mut ChildCancel::none()).await.unwrap();
+            messages.push(outcome.assistant_message);
+            if round == 0 { messages.push(json!({"role":"tool","tool_call_id":"c1","content":"file contents"})); }
+        }
+        let schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
+        check_output_schema(&schema, "{\"ok\":true}").unwrap();
+        check_output_schema(&schema, &answer).unwrap();
+        assert_eq!(answer, "{\"ok\":true}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_responses_example_is_text_and_replays_without_conflict() {
+        let output = json!([{"type":"message","id":"msg1","role":"assistant","content":[{"type":"output_text","text":"<function=workspace_read_file>{\"path\":\"a.txt\"}</function>","annotations":[]}]}]);
+        let wire = format!("data: {}\n\n", json!({"type":"response.completed","response":{"status":"completed","output":output}}));
+        let (base, _, server) = crate::test_support::scripted_sse(vec![wire]).await;
+        let backend = backend(base, true);
+        let response = backend.stream(&backend.payload(&json!({"messages":[{"role":"user","content":"Read it."}],"stream":true})).unwrap()).await.unwrap();
+        let outcome = collect_stream(&backend, response, &mut String::new(), &mut ChildCancel::none()).await.unwrap();
+        assert!(outcome.calls.is_empty());
+        backend.payload(&json!({"messages":[{"role":"user","content":"Read it."},outcome.assistant_message],"stream":true})).unwrap();
+        server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reliability_tests;

@@ -5,6 +5,16 @@ import type { Message, SessionEvent } from '../lib/types';
 const event = (seq: number, eventType: string, payload: unknown, toolCallId?: string, runId = 'run'): SessionEvent => ({ id: String(seq), conversationId: 'chat', runId, seq, eventType, payload, toolCallId, createdAt: seq, ignorable: false });
 const assistant = (status: Message['status'] = 'complete'): Message => ({ id: 'answer', conversationId: 'chat', role: 'assistant', status, content: 'Answer first.', reasoning: 'Private thought.', createdAt: 1 });
 const props = { renderMessage: (m: Message) => <p>{m.content}</p>, renderTool: (m: Message) => <p>{JSON.parse(m.content).request.name}</p> };
+it('attaches a running shell handle to its call before the tool returns', () => {
+  const first = event(1, 'tool_call', { name: 'shell_run' }, 'shell');
+  const other = event(2, 'tool_call', { name: 'shell_run' }, 'shell', 'different-run');
+  const started = event(3, 'process_started', { processId: 'proc-owned' }, 'shell');
+  const [live, separate] = activityTools([first, other, started], []);
+  expect(JSON.parse(live.content).result.data).toEqual({ processId: 'proc-owned', processState: 'running' });
+  expect(JSON.parse(separate.content).result).toEqual({});
+  const settled = event(4, 'tool_result', { name: 'shell_run', result: { data: { processState: 'timed_out' } } }, 'shell');
+  expect(JSON.parse(activityTools([first, started, settled], [])[0].content).result.data.processState).toBe('timed_out');
+});
 it('puts collapsed reasoning and activity before the final answer', () => {
   const { container } = render(<ActivityTimeline {...props} messages={[assistant()]} events={[event(1, 'tool_call', { name: 'web_search' }, 's'), event(2, 'tool_result', { name: 'web_search', result: {} }, 's')]} />);
   expect(container.textContent).toMatch(/Reasoning.*web_search.*Answer first/s);
@@ -35,6 +45,7 @@ it('preserves reasoning from each assistant message without duplicating journal 
   const first = { ...assistant(), id: 'first', reasoning: 'First investigation' };
   const second = { ...assistant(), id: 'second', reasoning: 'Second investigation' };
   render(<ActivityTimeline {...props} messages={[first, second]} events={[event(1, 'reasoning', { text: 'First investigation' })]} />);
+  fireEvent.click(screen.getByText('Reasoning'));
   fireEvent.click(screen.getByText('Reasoning'));
   expect(screen.getByText('First investigation')).toBeInTheDocument();
   expect(screen.getByText('Second investigation')).toBeInTheDocument();
@@ -119,6 +130,7 @@ it('interleaves recorded reasoning rounds with the actions they precede', () => 
     event(6, 'model_response', { content: 'Fixed.', final: true }),
   ];
   const { container } = render(<ActivityTimeline {...props} messages={[message]} events={events} />);
+  for (const disclosure of screen.getAllByTestId('turn-reasoning')) fireEvent.click(disclosure.querySelector('summary')!);
   expect(container.textContent).toMatch(/Reasoning · 1.2s.*First thought.*Inspecting.*read_file.*Reasoning · 2.3s.*Second thought.*Fixed/s);
   expect(screen.getAllByTestId('turn-reasoning')).toHaveLength(2);
 });
@@ -134,6 +146,7 @@ it('renders typed live reasoning in order and uses the same result on replay', (
   expect(screen.getByLabelText('Reasoning in progress')).toBeInTheDocument();
   view.rerender(<ActivityTimeline {...props} messages={[{ ...message, status: 'complete' }]} events={[tool, done, delta, started, delta]} />);
   expect(screen.getByTestId('turn-reasoning')).toBe(disclosure);
+  fireEvent.click(disclosure.querySelector('summary')!);
   expect(view.container.textContent).toMatch(/Reasoning · 1.2s.*First thought.*read_file.*Inspecting/s);
   expect(screen.getAllByTestId('turn-reasoning')).toHaveLength(1);
 });

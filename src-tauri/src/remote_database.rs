@@ -235,6 +235,21 @@ fn mysql_cell(row: &sqlx_mysql::MySqlRow, i: usize) -> Value {
         .map(bounded_text)
         .unwrap_or_else(|| json!({"type":kind,"omitted":true}))
 }
+
+// MySQL 8.4 exposes some information_schema text as VARBINARY/BLOB.
+// Decode UTF-8 only at this known metadata boundary. Arbitrary query results
+// retain their binary omission contract instead of guessing an encoding.
+pub(crate) fn mysql_metadata_cell(row: &sqlx_mysql::MySqlRow, i: usize) -> Value {
+    if row.try_get_raw(i).is_ok_and(|raw| raw.is_null()) { return Value::Null; }
+    row.try_get::<String, _>(i).ok()
+        .or_else(|| row.try_get::<Vec<u8>, _>(i).ok().and_then(|bytes| String::from_utf8(bytes).ok()))
+        .map(bounded_text).unwrap_or_else(|| json!({"omitted":true,"metadataTextUnavailable":true}))
+}
+
+pub(crate) fn mysql_metadata_named(row: &sqlx_mysql::MySqlRow, key: &str) -> Value {
+    row.columns().iter().position(|column| column.name().eq_ignore_ascii_case(key))
+        .map(|index| mysql_metadata_cell(row, index)).unwrap_or_else(|| json!({"unavailable":true}))
+}
 fn bounded_text(v: String) -> Value {
     if v.len() > 65536 {
         json!({"type":"text","bytes":v.len(),"sha256":dev::hash(v.as_bytes()),"omitted":true})
@@ -357,7 +372,7 @@ pub async fn query(
                 columns = row.columns().iter().map(|c| c.name().to_string()).collect();
             }
             let values = (0..row.len())
-                .map(|i| mysql_cell(&row, i))
+                .map(|i| if alias == "database_schema" { mysql_metadata_cell(&row, i) } else { mysql_cell(&row, i) })
                 .collect::<Vec<_>>();
             bytes += serde_json::to_vec(&values)
                 .map_err(|e| e.to_string())?
@@ -688,6 +703,7 @@ mod acceptance {
         };
         let mut source = admin.clone();
         source.id = "dev-db-mysql-source".into();
+        source.username = "acceptance_reader".into();
         source.scratch_profile_id = Some(admin.id.clone());
         source.dump_executable =
             std::env::var("LOCALLM_ACCEPTANCE_MYSQL_DUMP").expect("Configure installed mysqldump");
@@ -698,12 +714,15 @@ mod acceptance {
             .unwrap()
             .save_setting(KEY, &vec![source.clone(), admin.clone()])
             .unwrap();
-        for p in [&source, &admin] {
-            state.daytona_vault.save(&p.id, secret.as_bytes()).unwrap();
-        }
+        let source_password = uuid::Uuid::new_v4().simple().to_string();
+        state.daytona_vault.save(&source.id, source_password.as_bytes()).unwrap();
+        state.daytona_vault.save(&admin.id, secret.as_bytes()).unwrap();
         let mut connection = MySqlConnection::connect_with(&mysql_options(&admin, &secret))
             .await
             .unwrap();
+        use sqlx_core::executor::Executor;
+        connection.execute(format!("CREATE USER 'acceptance_reader'@'%' IDENTIFIED BY '{source_password}'").as_str()).await.unwrap();
+        connection.execute("GRANT SELECT ON locallm_acceptance.* TO 'acceptance_reader'@'%'").await.unwrap();
         sqlx_core::query::query::<MySql>("CREATE TABLE source_guard(id INTEGER PRIMARY KEY, name VARCHAR(128) NOT NULL, CONSTRAINT positive_id CHECK(id>0))").execute(&mut connection).await.unwrap();
         sqlx_core::query::query::<MySql>("INSERT INTO source_guard VALUES (1,'original')")
             .execute(&mut connection)
@@ -730,17 +749,33 @@ mod acceptance {
         .is_err());
         let owner = state.database().unwrap().create_conversation().unwrap().id;
         let ctx = crate::development_tools::tests::context(&state, t.path(), &owner, &[]);
+        let schema = query(&state, &source, "database_schema", &json!({"limit":200})).await.unwrap();
+        println!("MYSQL_SCHEMA_EVIDENCE {}", schema);
+        assert_eq!(schema["rows"][0][0], source.database);
+        assert_eq!(schema["rows"][0][1], "source_guard");
+        assert!(schema["rows"][0][3].is_string());
+        let binary = query(&state, &source, "database_query", &json!({"sql":"SELECT CAST('abc' AS BINARY) AS binary_guard"})).await.unwrap();
+        assert_eq!(binary["rows"][0][0]["omitted"], true, "binary user data must retain explicit omission");
         let result=crate::database_rehearsal::execute(&ctx,&source,json!({"sql":"ALTER TABLE source_guard ADD COLUMN rehearsed TEXT; INSERT INTO source_guard(id,name) VALUES(2,'scratch');"})).await.unwrap();
         assert_eq!(result["isError"], false, "{result}");
         assert_eq!(result["cleanupComplete"], true);
         assert_eq!(result["originalModified"], false);
+        assert_eq!(result["sourcePreservation"]["unchanged"], true);
         assert_eq!(result["result"]["ddlImplicitCommit"], true);
-        assert!(!result["result"]["after"]["constraints"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        let after = &result["result"]["after"];
+        assert!(after["constraints"].as_array().unwrap().iter().any(|constraint|
+            constraint == &json!({"name":"positive_id","table":"source_guard","type":"CHECK","enforced":"YES"})), "{after}");
+        assert!(after["checks"].as_array().unwrap().iter().any(|check|
+            check["constraint_name"] == "positive_id" && check["check_clause"].as_str().is_some_and(|clause| clause.contains("id") && clause.contains(">"))));
+        assert!(after["columns"].as_array().unwrap().iter().any(|column|
+            column["table_name"] == "source_guard" && column["column_name"] == "rehearsed"));
+        assert_eq!(after["quickIntegrityCoverageComplete"], true, "{after}");
+        assert_eq!(after["quickIntegrity"], json!([
+            {"table":"source_guard","operation":"check","messageType":"status","message":"OK"}
+        ]));
         let failed=crate::database_rehearsal::execute(&ctx,&source,json!({"sql":"ALTER TABLE source_guard ADD COLUMN partial TEXT; INSERT INTO source_guard(id,name) VALUES(-1,'constraint failure');"})).await.unwrap();
         assert_eq!(failed["isError"], true);
+        assert!(failed["message"].as_str().unwrap().starts_with("MySQL migration failed"), "{failed}");
         assert_eq!(failed["cleanupComplete"], true);
         assert_eq!(failed["originalModified"], false);
         let repeated = crate::database_rehearsal::cleanup_tool(
@@ -750,6 +785,16 @@ mod acceptance {
         .await
         .unwrap();
         assert_eq!(repeated["cleanupComplete"], true);
+        for rehearsal in [&result, &failed] {
+            let id = rehearsal["rehearsalId"].as_str().unwrap();
+            let database = sqlx_core::query::query::<MySql>(
+                "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?",
+            ).bind(format!("locallm_rehearsal_{id}")).fetch_optional(&mut connection).await.unwrap();
+            let role = sqlx_core::query::query::<MySql>(
+                "SELECT User FROM mysql.user WHERE User=? AND Host='%'",
+            ).bind(format!("llm_{}", &id[..24])).fetch_optional(&mut connection).await.unwrap();
+            assert!(database.is_none() && role.is_none(), "scratch resources survived cleanup");
+        }
         let rows = query(
             &state,
             &source,
@@ -760,6 +805,12 @@ mod acceptance {
         .unwrap();
         assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
         assert_eq!(rows["columns"].as_array().unwrap().len(), 2);
+        assert_eq!(rows["rows"][0][1], "original");
+        println!("MYSQL_REHEARSAL_EVIDENCE {}", json!({
+            "successful":{"constraint":after["constraints"],"quickIntegrity":after["quickIntegrity"],"cleanupComplete":result["cleanupComplete"],"sourceUnchanged":result["sourcePreservation"]["unchanged"]},
+            "failed":{"message":failed["message"],"cleanupComplete":failed["cleanupComplete"],"sourceUnchanged":failed["sourcePreservation"]["unchanged"]},
+            "verifiedScratchRolesAndSchemasAbsent":true
+        }));
         sqlx_core::query::query::<MySql>("DROP TABLE source_guard")
             .execute(&mut connection)
             .await

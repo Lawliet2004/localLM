@@ -445,6 +445,17 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
+            // Observation sealing precedes the final bounded pipe drain. A
+            // terminal check also needs its final output, not just the source
+            // observation record. Wait on process state without report polling.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let page = state.processes.poll(&owner, t.path().to_str().unwrap(),
+                        json!({"id":launched["processId"],"wait_ms":0})).await.unwrap();
+                    if page["state"] != "running" { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
             std::fs::write(t.path().join("main.rs"), "after completion").unwrap();
             let args = json!({"evidence_id":launched["evidenceId"]});
             let report = crate::harness::execute(&ctx, "verification_report", args.clone())
@@ -663,7 +674,9 @@ pub(crate) mod tests {
         let t = tempfile::tempdir().unwrap();
         let (state, owner, tools) = setup(t.path());
         let ctx = context(&state, t.path(), &owner, &tools);
-        let session=crate::harness::execute(&ctx,"http_session_create",json!({"base_url":"https://example.com/api/","headers":{"Authorization":"Bearer fixture-secret"}})).await.unwrap().value;
+        // This test makes no HTTP request. A public literal keeps origin and
+        // offline policy coverage independent of external DNS availability.
+        let session=crate::harness::execute(&ctx,"http_session_create",json!({"base_url":"https://93.184.216.34/api/","headers":{"Authorization":"Bearer fixture-secret"}})).await.unwrap().value;
         let id = session["sessionId"].clone();
         let foreign = context(&state, t.path(), "other", &tools);
         assert!(

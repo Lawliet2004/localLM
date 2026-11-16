@@ -96,6 +96,18 @@ fn matching<'a>(
     })
 }
 
+/// Shell hooks have opaque side effects, including hooks with empty stdout.
+fn has_tool_hook(state: &crate::AppState, workspace: &str, alias: &str, event: &str) -> bool {
+    workspace_available(workspace) && hook_context(state).is_ok_and(|(hooks, _)|
+        matching(&hooks, event, alias).next().is_some())
+}
+pub fn has_post_use(state: &crate::AppState, workspace: &str, alias: &str) -> bool {
+    has_tool_hook(state, workspace, alias, EVENT_POST_TOOL)
+}
+pub fn has_pre_use(state: &crate::AppState, workspace: &str, alias: &str) -> bool {
+    has_tool_hook(state, workspace, alias, EVENT_PRE_TOOL)
+}
+
 /// One hook invocation. Returns (exit_code, stdout, stderr) — or a synthetic
 /// timeout result so callers can apply their own severity.
 async fn run_hook(

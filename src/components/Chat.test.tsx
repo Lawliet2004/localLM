@@ -206,8 +206,8 @@ describe('chat action reporting and submission', () => {
     const assistant: Message = {...user,id:'a',role:'assistant',content:'Updated the styles.'};
     const tool: Message = {...user,id:'t',role:'tool',content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'styles.css'}},result:{diff:'--- a/styles.css\n+++ b/styles.css\n@@ -1 +1 @@\n-old\n+new'}})};
     render(<Chat {...props} messages={[user,assistant,tool]} />);
-    expect(screen.getByText('Edited 1 file')).toBeVisible();
-    expect(screen.getByRole('button', { name: 'View changes' })).toBeVisible();
+    expect(screen.getByText('Changed 1 file')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'View diffs' })).toBeVisible();
   });
   it('shows send failures before the first message is saved', () => {
     render(<Chat {...props} messages={[]} chatError="Connector parallel-web is not connected." />);
@@ -385,7 +385,31 @@ it('renders live activity timeline during generation', () => {
     />
   );
   expect(screen.getByRole('status')).toHaveTextContent('Querying system_time…');
-  expect(screen.getByText('ExecutingTools')).toBeInTheDocument();
+  expect(screen.getByText('Using tools')).toBeInTheDocument();
+});
+
+it('keeps one writing cue once answer text is on screen', () => {
+  const messages: Message[] = [
+    { id: 'user-1', conversationId: 'chat', role: 'user', content: 'Hello', reasoning: '', status: 'complete', createdAt: 0 },
+    { id: 'assistant-1', conversationId: 'chat', role: 'assistant', content: 'Here is the answer', reasoning: '', status: 'streaming', createdAt: 1 },
+  ];
+  const view = render(<Chat {...props} messages={messages} generating liveActivity={{ activity: 'Generating response…' }} />);
+  const answer = screen.getByRole('article', { name: 'assistant message' });
+  expect(within(answer).getByText('Here is the answer')).toBeInTheDocument();
+  expect(screen.queryByText('Writing the answer')).not.toBeInTheDocument();
+  expect(within(answer).queryByRole('button', { name: 'Copy message' })).not.toBeInTheDocument();
+  view.rerender(<Chat {...props} messages={messages} generating liveActivity={{ state: 'ExecutingTools', activity: 'Reading src/App.tsx' }} />);
+  expect(screen.getByRole('status')).toHaveTextContent('Reading src/App.tsx');
+  expect(screen.getByText('Using tools')).toBeInTheDocument();
+});
+
+it('names the answer while the model has not written yet', () => {
+  const messages: Message[] = [
+    { id: 'user-1', conversationId: 'chat', role: 'user', content: 'Hello', reasoning: '', status: 'complete', createdAt: 0 },
+    { id: 'assistant-1', conversationId: 'chat', role: 'assistant', content: '', reasoning: '', status: 'streaming', createdAt: 1 },
+  ];
+  render(<Chat {...props} messages={messages} generating />);
+  expect(screen.getByRole('status')).toHaveTextContent('Writing the answer');
 });
 
 it('inspects bounded tool output artifact on demand', async () => {
@@ -557,6 +581,8 @@ it('renders reasoning block with thinking indicator while streaming and thought 
   const { rerender } = render(<Chat {...props} messages={[streamingMsg]} generating={true} />);
 
   expect(screen.getByText('Reasoning')).toBeInTheDocument();
+  expect(screen.queryByText('Analyzing query parameters...')).not.toBeInTheDocument();
+  fireEvent.click(screen.getByText('Reasoning'));
   expect(screen.getByText('Analyzing query parameters...')).toBeInTheDocument();
 
   const completedMsg: Message = {

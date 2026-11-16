@@ -73,6 +73,8 @@ describe('mixed conversation fixture', () => {
     // One stable reasoning disclosure for the turn.
     const reasoning = screen.getAllByTestId('turn-reasoning');
     expect(reasoning).toHaveLength(1);
+    expect(reasoning[0]).not.toHaveTextContent('constant');
+    fireEvent.click(reasoning[0].querySelector('summary')!);
     expect(reasoning[0]).toHaveTextContent('constant');
 
     // Search card with validated citation links.

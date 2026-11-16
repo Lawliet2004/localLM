@@ -1,8 +1,9 @@
+import { useOwnedProcess } from '../lib/ownedProcess';
 import { useToolOutput } from '../lib/toolOutput';
 import { FileResult } from './FileResult';
 import { partitionActivity } from '../lib/activity';
 import { WorkSummary } from './WorkSummary';
-import { AnswerSources, collectAnswerSources } from './AnswerSources';
+import { AnswerSources, useAnswerEvidence, answerSourceLinks } from './AnswerSources';
 import { ScreenshotPreview } from './ScreenshotPreview';
 import { type Dispatch, type SetStateAction, type ReactNode, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, Check, ChevronDown, Copy, Cpu, FileText, Folder, Play, Plus, SendHorizontal, Settings, Square, X } from 'lucide-react';
@@ -24,10 +25,23 @@ import { PlanChecklist, todosFromPlanEvents, useConversationTodos } from './Plan
 import { AnswerNavigation } from './AnswerNavigation';
 import { CanvasPanel } from './CanvasPanel';
 import { artifactVersions, extractArtifacts, findArtifact } from '../lib/canvas';
-import type { PendingTurn, RunRecord } from '../lib/types';
+import type { PendingTurn, RunRecord, SessionEvent, TaskOutcome } from '../lib/types';
 import { MessageRenderer } from '../genui/MessageRenderer';
 import { ResearchContext, type HostClaim } from '../genui/grounding';
 import { usePresentationMode } from '../hooks/usePresentationMode';
+
+const ACTIVITY_STATE_LABELS: Record<string, string> = {
+  Preparing: 'Preparing',
+  ExecutingTools: 'Using tools',
+  queued: 'Queued',
+  generating: 'Writing',
+  awaiting_approval: 'Needs approval',
+  Streaming: 'Writing',
+};
+
+function activityStateLabel(state: string) {
+  return ACTIVITY_STATE_LABELS[state] ?? state.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/_/g, ' ');
+}
 
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_SOURCES: string[] = [];
@@ -60,7 +74,7 @@ interface Props {
   connectorTools?: ToolSelection[];
   onSend: (content: string) => Promise<void>;
   onCancel: () => void;
-  onResume?: () => void;
+  onResume?: (taskId?: string) => void;
   onContinueFailed?: (messageId: string) => void;
   paused?: boolean;
   onConfigure: () => void;
@@ -87,10 +101,25 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
   const request = record.request && typeof record.request === 'object' ? (record.request as Record<string, unknown>) : record;
   const name = typeof request.name === 'string' ? request.name : 'Tool';
   const connector = typeof request.connector === 'string' ? request.connector : 'Connector';
+  const displayConnector = connector === 'Harness' ? 'Local' : connector;
   const localName = typeof request.localServerName === 'string' && request.localServerName ? request.localServerName : undefined;
   const result = record.result;
   const resultRecord = result !== null && typeof result === 'object' && !Array.isArray(result) ? (result as Record<string, unknown>) : null;
   const dataRecord = resultRecord && resultRecord.data && typeof resultRecord.data === 'object' && !Array.isArray(resultRecord.data) ? (resultRecord.data as Record<string, unknown>) : null;
+  const payload = dataRecord ?? resultRecord;
+  const processData = payload?.process && typeof payload.process === 'object' ? payload.process as Record<string, unknown> : payload;
+  const processId = ['process_start', 'shell_run', 'process_poll', 'process_write', 'process_stop', 'check_run', 'check_report', 'verification_run', 'verification_report'].includes(name)
+    ? typeof processData?.id === 'string' ? processData.id : typeof payload?.processId === 'string' ? payload.processId : typeof resultRecord?.processId === 'string' ? resultRecord.processId : undefined : undefined;
+  const nativeProcess = resultRecord?.metadata && typeof resultRecord.metadata === 'object'
+    ? (resultRecord.metadata as Record<string, unknown>).family === 'harness' : request.connector === 'Harness';
+  const savedProcessState = processData?.state ?? payload?.processState ?? payload?.processStatus ?? payload?.status;
+  const ownedProcess = useOwnedProcess(message.conversationId, nativeProcess && (savedProcessState === 'running' || !savedProcessState) ? processId : undefined);
+  const process = ownedProcess.snapshot ?? processData;
+  const processState = processId ? String(process?.state ?? payload?.processState ?? payload?.processStatus ?? payload?.status
+    ?? (resultRecord?.isError ? 'failed' : 'exited')) : undefined;
+  const frames = Array.isArray(process?.output) ? process.output as { stream?: string; text?: string }[] : [];
+  const processStdout = frames.filter(frame => frame.stream !== 'stderr').map(frame => frame.text ?? '').join('');
+  const processStderr = frames.filter(frame => frame.stream === 'stderr').map(frame => frame.text ?? '').join('');
   const logsRecord = dataRecord && dataRecord.logs && typeof dataRecord.logs === 'object' && !Array.isArray(dataRecord.logs) ? (dataRecord.logs as Record<string, unknown>) : null;
   // A tool result is either the `locallm.tool-envelope/1` envelope (whose
   // payload lives under `data`) or a legacy bare object. Both shapes are
@@ -106,18 +135,18 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
     : undefined;
   const resultStatus = dataRecord && typeof dataRecord.resultStatus === 'string' ? dataRecord.resultStatus : undefined;
   const diff = typeof dataRecord?.diff === 'string' ? dataRecord.diff : typeof resultRecord?.diff === 'string' ? resultRecord.diff : null;
-  const stdout = message.status === 'streaming' && output.stdout ? output.stdout : typeof logsRecord?.stdout === 'string' ? logsRecord.stdout : resultRecord && typeof resultRecord.stdout === 'string' ? resultRecord.stdout : '';
-  const stderr = message.status === 'streaming' && output.stderr ? output.stderr : typeof logsRecord?.stderr === 'string' ? logsRecord.stderr : resultRecord && typeof resultRecord.stderr === 'string' ? resultRecord.stderr : '';
-  const exitCode = dataRecord && typeof dataRecord.exitCode === 'number' ? dataRecord.exitCode : resultRecord && typeof resultRecord.exitCode === 'number' ? resultRecord.exitCode : null;
-  const durationMs = typeof dataRecord?.durationMs === 'number' ? dataRecord.durationMs : resultRecord && typeof resultRecord.durationMs === 'number' ? resultRecord.durationMs : undefined;
+  const stdout = processStdout || (message.status === 'streaming' && output.stdout ? output.stdout : typeof logsRecord?.stdout === 'string' ? logsRecord.stdout : resultRecord && typeof resultRecord.stdout === 'string' ? resultRecord.stdout : typeof dataRecord?.stdout === 'string' ? dataRecord.stdout : '');
+  const stderr = processStderr || (message.status === 'streaming' && output.stderr ? output.stderr : typeof logsRecord?.stderr === 'string' ? logsRecord.stderr : resultRecord && typeof resultRecord.stderr === 'string' ? resultRecord.stderr : typeof dataRecord?.stderr === 'string' ? dataRecord.stderr : '');
+  const exitCode = typeof process?.exitCode === 'number' ? process.exitCode : dataRecord && typeof dataRecord.exitCode === 'number' ? dataRecord.exitCode : resultRecord && typeof resultRecord.exitCode === 'number' ? resultRecord.exitCode : null;
+  const durationMs = typeof process?.durationMs === 'number' ? process.durationMs : typeof dataRecord?.durationMs === 'number' ? dataRecord.durationMs : resultRecord && typeof resultRecord.durationMs === 'number' ? resultRecord.durationMs : undefined;
   const errorRecord = resultRecord && resultRecord.error && typeof resultRecord.error === 'object' && !Array.isArray(resultRecord.error) ? (resultRecord.error as Record<string, unknown>) : null;
-  const error = typeof errorRecord?.message === 'string' ? errorRecord.message : resultRecord && typeof resultRecord.error === 'string' ? resultRecord.error : null;
+  const error = typeof ownedProcess.snapshot?.error === 'string' ? ownedProcess.snapshot.error : typeof errorRecord?.message === 'string' ? errorRecord.message : resultRecord && typeof resultRecord.error === 'string' ? resultRecord.error : null;
   const errorCode = typeof errorRecord?.code === 'string' ? errorRecord.code : undefined;
   const envelopeStatus = resultRecord && typeof resultRecord.status === 'string' ? resultRecord.status : undefined;
   const isError = resultRecord !== null && resultRecord.isError === true;
   const failed = message.status === 'error' || isError || Boolean(error) || (exitCode !== null && exitCode !== 0) || ['error', 'failed', 'failure', 'denied', 'cancelled', 'unknown'].includes(envelopeStatus ?? '');
   const decision = typeof request.decision === 'string' ? request.decision : undefined;
-  const status = message.status === 'interrupted'
+  const status = ownedProcess.notice && processState === 'running' ? 'interrupted' : processState === 'running' ? 'running' : ['stopped', 'unknown'].includes(processState ?? '') ? 'interrupted' : ['failed', 'timed_out'].includes(processState ?? '') ? 'failed' : message.status === 'interrupted'
     ? 'interrupted'
     : decision === 'denied'
     ? 'failed'
@@ -144,29 +173,33 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
   const originalBytes = resultRecord && typeof resultRecord._originalBytes === 'number' ? resultRecord._originalBytes : null;
   const authorization = typeof request.authorization === 'string' ? request.authorization : undefined;
 
-  const fallbackStdout = message.status === 'streaming' ? stdout : stdout || (!resultRecord && typeof result === 'string' ? result : (structuredResult ? '' : (resultRecord ? JSON.stringify(resultRecord, null, 2) : message.content)));
+  const fallbackStdout = message.status === 'streaming' ? stdout : stdout || (!resultRecord && typeof result === 'string' ? result : (structuredResult ? '' : (processId ? '' : resultRecord ? JSON.stringify(resultRecord, null, 2) : message.content)));
   const structuredJson = structuredResult !== undefined && structuredResult !== null
     ? (() => { try { return JSON.stringify(structuredResult, null, 2); } catch { return String(structuredResult); } })()
     : null;
 
-  if (/^(read_file|view_file|file_read)$/.test(name) && status === 'completed' && typeof resultRecord?._artifactId !== 'string' && typeof resultRecord?.content === 'string') {
+  if (/^(workspace_read_file|read_file|view_file|file_read)$/.test(name) && status === 'completed' && typeof resultRecord?._artifactId !== 'string' && typeof payload?.content === 'string') {
     const args = request.arguments as Record<string, unknown> | undefined;
-    return <article className="message message-tool" aria-label="tool message"><FileResult path={String(resultRecord.path ?? args?.path ?? 'File')} content={resultRecord.content} totalLines={typeof resultRecord.totalLines === 'number' ? resultRecord.totalLines : undefined} sha256={typeof resultRecord.sha256 === 'string' ? resultRecord.sha256 : undefined} raw={record} /></article>;
+    return <article className="message message-tool" aria-label="tool message"><FileResult path={String(payload.path ?? args?.path ?? 'File')} content={payload.content} totalLines={typeof payload.totalLines === 'number' ? payload.totalLines : undefined} sha256={typeof payload.sha256 === 'string' ? payload.sha256 : undefined} raw={record} /></article>;
   }
 
   return (
     <article className="message message-tool" aria-label="tool message">
       <ToolResultExtras name={name} result={resultRecord} conversationId={message.conversationId} />
+      {ownedProcess.notice && <p className="process-notice" role="status">{ownedProcess.notice}</p>}
+      {ownedProcess.snapshot?.truncated && <p className="process-notice">Earlier output was truncated. Showing retained process output.</p>}
       <CommandRunCard
-        onStop={onStop}
+        onStop={processId && nativeProcess && nativeAvailable && !ownedProcess.notice ? () => void ownedProcess.stop() : message.status === 'streaming' ? onStop : undefined}
+        stopLabel={processId ? 'Stop process' : 'Stop response'}
         toolName={name}
         command={command}
         code={code}
         language={language}
         cwd={cwd}
-        environment={localName ?? connector}
+        environment={localName ?? displayConnector}
         localServerId={localName ? connector : undefined}
         status={status}
+        lifecycleState={processState}
         decision={decision}
         isError={isError}
         exitCode={exitCode}
@@ -221,9 +254,9 @@ const MessageBody = memo(function MessageBody({ message, suppressReasoning = fal
       {attached.length > 0 && <div className="markdown">{attached.map((file, index) => <details key={index} className="message-attachment"><summary>{file.name}</summary>{file.imageUrl ? <img src={file.imageUrl} alt={file.name} style={{ maxWidth: '100%', maxHeight: 320 }} /> : <pre>{file.content}</pre>}</details>)}</div>}
       {message.metrics && <ResponseMetrics message={message} />}
       {(message.status === 'interrupted' || message.status === 'error') && (
-        <p className="message-state">{message.error || (message.status === 'interrupted' ? 'Response stopped' : 'Response interrupted by an error')}</p>
+        <p className={`message-state message-state-${message.status}`} role="status">{message.error || (message.status === 'interrupted' ? 'Response stopped before it finished.' : 'The response stopped because of an error.')}</p>
       )}
-      {message.content && !commentary && (
+      {message.content && !commentary && message.status !== 'streaming' && (
         <button
           className="icon-button copy-message"
           aria-label="Copy message"
@@ -246,6 +279,40 @@ const MessageBody = memo(function MessageBody({ message, suppressReasoning = fal
       {copyError && <small role="alert">{copyError}</small>}
     </article>
   );
+});
+
+const ConversationTurn = memo(function ConversationTurn({ messages, events, run, generating, onSendPrompt, onOpenCanvas, onStop, onResume }: {
+  messages: Message[]; events: SessionEvent[]; run?: RunRecord | null; generating: boolean;
+  onSendPrompt: (text: string) => void; onOpenCanvas: (code: string, language: string) => void; onStop: () => void;
+  onResume?: (taskId?: string) => void;
+}) {
+  const evidence = useAnswerEvidence(messages, events);
+  const sourceLinks = useMemo(() => answerSourceLinks(evidence.sources), [evidence.sources]);
+  const research = useMemo(() => {
+    const claims: HostClaim[] = events.filter(event => event.eventType === 'verification').flatMap(event => {
+      const claims = (event.payload as { claims?: unknown[] })?.claims;
+      return Array.isArray(claims) ? claims.slice(0, 100).flatMap(raw => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+        const claim = raw as { claim?: unknown; status?: unknown; sources?: unknown };
+        return typeof claim.claim === 'string' && typeof claim.status === 'string' ? [{ claim: claim.claim.slice(0, 4000), verdict: claim.status,
+          citations: Array.isArray(claim.sources) ? claim.sources.filter((id): id is string => typeof id === 'string').flatMap(reference => evidence.sources.find(source => source.url === reference)?.ids ?? [reference]).slice(0, 32) : [] }] : [];
+      }) : [];
+    });
+    return { sources: evidence.sources, claims };
+  }, [events, evidence.sources]);
+  const renderMessage = useCallback((message: Message, variant?: 'commentary') => <MessageBody message={message} suppressReasoning commentary={variant === 'commentary'} sourceLinks={sourceLinks} onSendPrompt={onSendPrompt} onOpenCanvas={onOpenCanvas} />, [sourceLinks, onSendPrompt, onOpenCanvas]);
+  const renderTool = useCallback((message: Message) => <ToolMessage message={message} onStop={onStop} />, [onStop]);
+  const user = messages.find(message => message.role === 'user');
+  return <div className="conversation-turn">
+    {user && <MessageBody message={user} />}
+    <ResearchContext.Provider value={research}>
+      <WorkSummary messages={messages} events={events} run={run} onResume={onResume}>
+        <ActivityTimeline events={events} messages={messages} generating={generating} renderMessage={renderMessage} renderTool={renderTool} />
+      </WorkSummary>
+    </ResearchContext.Provider>
+    <AnswerSources messages={messages} events={events} evidence={evidence} />
+    {run && ['failed', 'outcome_unknown', 'paused', 'cancelled'].includes(run.status) && <p role="status" className="run-outcome">Run {run.status.replace(/_/g, ' ')}. Review the activity above before retrying.</p>}
+  </div>;
 });
 
 export function Chat({
@@ -290,7 +357,7 @@ export function Chat({
   projectName,
 }: Props) {
   const presentation = usePresentationMode(conversationKey);
-  const sessionActivity = useSessionActivity(conversationKey, generating);
+  const { events: sessionActivity, hasEarlier, loadingEarlier, historyError, loadEarlier } = useSessionActivity(conversationKey, generating);
   const planFallback = todosFromPlanEvents(sessionActivity);
   const todos = useConversationTodos(conversationKey, generating, planFallback);
   const [localAttachments, setLocalAttachments] = useState<Record<string, Attachment[]>>({});
@@ -402,15 +469,37 @@ export function Chat({
     ['error', 'interrupted'].includes(lastResponse.status) ||
     (lastTool && ['error', 'streaming'].includes(lastTool.status))
   );
+  const previousTurns = useRef<Message[][]>([]);
+  const previousActivity = useRef<SessionEvent[][]>([]);
   const turns = useMemo(() => {
     const grouped: Message[][] = [];
     for (const message of messages) {
       if (message.role === 'user' || !grouped.length) grouped.push([]);
       grouped[grouped.length - 1].push(message);
     }
-    return grouped;
+    const previous = new Map(previousTurns.current.map(turn => [turn[0]?.id, turn]));
+    const stable = grouped.map(turn => { const old = previous.get(turn[0]?.id); return old && old.length === turn.length && old.every((message, i) => message === turn[i]) ? old : turn; });
+    previousTurns.current = stable;
+    return stable;
   }, [messages]);
-  const turnActivity = useMemo(() => partitionActivity(turns, sessionActivity), [turns, sessionActivity]);
+  const turnActivity = useMemo(() => {
+    const next = partitionActivity(turns, sessionActivity).map((events, index) => {
+      const old = previousActivity.current[index];
+      return old && old.length === events.length && old.every((event, i) => event === events[i]) ? old : events;
+    });
+    previousActivity.current = next;
+    return next;
+  }, [turns, sessionActivity]);
+  const resumableRuns = useMemo(() => {
+    const lastSegments = new Map<string, SessionEvent>();
+    for (const event of sessionActivity) {
+      if (event.eventType !== 'turn_end') continue;
+      const outcome = event.payload as TaskOutcome | null;
+      const id = outcome?.taskId ?? outcome?.resumeTaskId;
+      if (id) lastSegments.set(id, event);
+    }
+    return new Set([...lastSegments.values()].filter(event => (event.payload as TaskOutcome).resumeTaskId).map(event => event.runId));
+  }, [sessionActivity]);
   const recoverable = lastResponse?.status === 'error' && sessionActivity.some(event => {
     if (event.eventType !== 'turn_end') return false;
     const payload = event.payload as { messageId?: string; recoveryAvailable?: boolean };
@@ -442,6 +531,10 @@ export function Chat({
     const artifact = findArtifact(canvasArtifactsRef.current, code, language);
     if (artifact) setCanvasSel({ group: artifact.groupKey, version: artifact.version });
   }, []);
+  const transcriptActions = useRef({ sendFromUi, onCancel });
+  transcriptActions.current = { sendFromUi, onCancel };
+  const sendTranscriptPrompt = useCallback((text: string) => transcriptActions.current.sendFromUi(text), []);
+  const stopTranscriptResponse = useCallback(() => transcriptActions.current.onCancel(), []);
 
   async function retry() {
     if (!lastPrompt || !ready || generating || loading || disabled || submitting.current.has(conversationKey)) return;
@@ -526,6 +619,10 @@ export function Chat({
 
   const isHome = !loading && !messages.length && !generating && !pendingTurn;
   const genericActivity = !liveActivity?.activity || /^(Thinking|Generating response|Streaming response)[….]*$/.test(liveActivity.activity);
+  const streamingAnswer = [...(turns[turns.length - 1] ?? [])].reverse().find(message => message.role === 'assistant' && message.status === 'streaming');
+  const answerHasText = Boolean(streamingAnswer?.content.trim());
+  const showLiveStatus = generating && !(genericActivity && answerHasText);
+  const liveLabel = genericActivity ? 'Writing the answer' : (liveActivity?.activity || 'Working');
 
   return (
     <div className="chat-shell" id="active-session-content" role="tabpanel" aria-label="Active conversation">
@@ -554,21 +651,15 @@ export function Chat({
           <p className="loading-state" role="status">Opening conversation…</p>
         ) : messages.length || generating || pendingTurn ? (
           <div className="messages">
+            {hasEarlier && <div className="earlier-activity">
+              <button type="button" className="secondary" disabled={loadingEarlier} onClick={loadEarlier}>{loadingEarlier ? 'Loading earlier activity…' : 'Load earlier activity'}</button>
+              {historyError && <p role="status">{historyError}</p>}
+            </div>}
             {turns.map((turn, turnIndex) => {
-              const user = turn.find(message => message.role === 'user');
-              const activity = turnActivity[turnIndex];
-              const evidenceSources = collectAnswerSources(turn, activity);
-              const hostClaims: HostClaim[] = activity.filter(event => event.eventType === "verification").flatMap(event => {
-                const claims = (event.payload as {claims?:unknown[]})?.claims;
-                return Array.isArray(claims) ? claims.slice(0,100).flatMap(raw => { if (!raw || typeof raw !== "object" || Array.isArray(raw)) return []; const claim = raw as {claim?:unknown;status?:unknown;sources?:unknown}; return typeof claim.claim === "string" && typeof claim.status === "string" ? [{claim:claim.claim.slice(0,4000),verdict:claim.status,citations:Array.isArray(claim.sources)?claim.sources.filter((id): id is string => typeof id === "string").flatMap(reference => evidenceSources.find(source => source.url === reference)?.ids ?? [reference]).slice(0,32):[]}] : []; }) : [];
-              });
-              const sourceLinks = JSON.stringify(Object.fromEntries(evidenceSources.flatMap(source => source.ids.map(id => [id, source.url]))));
-              return <div key={turn[0].id} className="conversation-turn">
-                {user && <MessageBody message={user} />}
-                <ResearchContext.Provider value={{sources:evidenceSources,claims:hostClaims}}><WorkSummary messages={turn} events={activity} run={turnIndex === turns.length - 1 ? latestRun : undefined}><ActivityTimeline events={activity} messages={turn} generating={generating && turnIndex === turns.length - 1} renderMessage={(m, variant) => <MessageBody message={m} suppressReasoning commentary={variant === 'commentary'} sourceLinks={sourceLinks} onSendPrompt={sendFromUi} onOpenCanvas={openCanvas} />} renderTool={m => <ToolMessage message={m} onStop={onCancel} />} /></WorkSummary></ResearchContext.Provider>
-                <AnswerSources messages={turn} events={activity} />
-                {turnIndex === turns.length - 1 && latestRun && ['failed', 'outcome_unknown', 'paused', 'cancelled'].includes(latestRun.status) && <p role="status" className="run-outcome">Run {latestRun.status.replace(/_/g, ' ')}. Review the activity above before retrying.</p>}
-              </div>;
+              const latest = turnIndex === turns.length - 1;
+              const events = turnActivity[turnIndex];
+              const canResume = !generating && !pendingTurn && (latest || events.some(event => event.eventType === 'turn_end' && resumableRuns.has(event.runId)));
+              return <ConversationTurn key={turn[0].id} messages={turn} events={events} run={latest ? latestRun : undefined} generating={generating && latest} onSendPrompt={sendTranscriptPrompt} onOpenCanvas={openCanvas} onStop={stopTranscriptResponse} onResume={canResume ? onResume : undefined} />;
             })}
             {pendingTurn && !generating && <section className="saved-request" aria-label="Saved unsent request">
               <h2>Unsent request saved</h2>
@@ -579,11 +670,11 @@ export function Chat({
                 <button type="button" className="secondary" disabled={loading || recoveryBusy} onClick={onDiscardPending}>Discard saved request</button>
               </div>
             </section>}
-            {generating && (
+            {showLiveStatus && (
               <div className="activity-live" role="status">
                 <ActivityIndicator />
-                <span className={genericActivity ? "sr-only" : "activity-live-text"}>{liveActivity?.activity || 'Generating response…'}</span>
-                {!genericActivity && liveActivity?.state && <span className="activity-badge">{liveActivity.state}</span>}
+                <span className="activity-live-text">{liveLabel}</span>
+                {!genericActivity && liveActivity?.state && <span className="activity-badge">{activityStateLabel(liveActivity.state)}</span>}
               </div>
             )}
           </div>
@@ -846,7 +937,7 @@ export function Chat({
                 </div>
               )}
 
-              {paused && !generating && onResume && <button type="button" className="send-button" aria-label="Resume response" onClick={onResume}><Play size={15} fill="currentColor" /></button>}
+              {paused && !generating && onResume && !pendingTurn && !turnActivity[turnActivity.length - 1]?.some(event => event.eventType === 'turn_end') && <button type="button" className="send-button" aria-label="Resume response" onClick={() => onResume()}><Play size={15} fill="currentColor" /></button>}
               {generating ? (
                 <>
                   <button type="button" className="send-button send-stop" aria-label="Stop response" onClick={onCancel}><Square size={15} fill="currentColor" /></button>

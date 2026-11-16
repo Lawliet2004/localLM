@@ -63,6 +63,8 @@ pub struct PendingTurn {
     pub conversation_id: String,
     pub content: String,
     pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_task_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -430,7 +432,7 @@ impl Store {
     /// The version lives in SQLite's `PRAGMA user_version`, so the store can
     /// tell which additive steps have already run and can refuse to open a
     /// database written by a **newer** build instead of corrupting it.
-    const SCHEMA_VERSION: u32 = 2;
+    const SCHEMA_VERSION: u32 = 3;
 
     /// The schema version recorded in the database.
     fn schema_version(connection: &Connection) -> Result<u32> {
@@ -629,6 +631,15 @@ impl Store {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS research_tasks_conversation ON research_tasks(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS research_task_runs(
+                task_id TEXT PRIMARY KEY REFERENCES research_tasks(id) ON DELETE CASCADE,
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS research_task_segments(
+                task_id TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                PRIMARY KEY (task_id, run_id)
+            );
             CREATE TABLE IF NOT EXISTS snapshots(
                 id TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -670,6 +681,27 @@ impl Store {
                 content TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );").map_err(db_error)?;
+        }
+        for (table, column) in [
+            ("snapshots", "workspace_json"),
+            ("staged_reverts", "targets_json"),
+            ("pending_turns", "resume_task_id"),
+            ("research_tasks", "context_json"),
+        ] {
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                params![table, column], |row| row.get(0),
+            ).map_err(db_error)?;
+            if !exists {
+                connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])
+                    .map_err(db_error)?;
+            }
+        }
+        if version < 3 {
+            connection.execute(
+                "DELETE FROM settings WHERE instr(key,'pending_resume:')=1 OR instr(key,'pending_resume_task:')=1",
+                [],
+            ).map_err(db_error)?;
         }
         let has_error: bool = connection
             .query_row(
@@ -722,8 +754,8 @@ impl Store {
     /// authoritative connection.
     ///
     /// It marks every message still flagged `streaming` as interrupted and
-    /// every run still in a live state as cancelled — the state a crash
-    /// leaves behind. It must not run on any later connection: a tool that is
+    /// every run still in a live state as cancelled or outcome-unknown. It
+    /// must not run on any later connection: a tool that is
     /// executing right now has a `streaming` audit row, and flipping it to
     /// `interrupted` defeats the `OLD.status!='streaming'` guard on the
     /// `native_tool_round_edit` trigger, which then deletes the native
@@ -732,8 +764,12 @@ impl Store {
         self.connection
             .execute_batch(
                 "UPDATE messages SET status='interrupted' WHERE status='streaming';
-                 UPDATE runs SET status='cancelled' WHERE status IN
-                   ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round');",
+                 UPDATE runs SET status=CASE WHEN checkpoint='subagent' OR status='executing_tools'
+                   THEN 'outcome_unknown' ELSE 'cancelled' END
+                   WHERE status IN ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round');
+                 UPDATE subagent_runs SET status='interrupted',
+                   error='The application restarted before this child settled. Dispatched operations may have an unknown outcome.',
+                   updated_at=strftime('%s','now')*1000 WHERE status='running';",
             )
             .map_err(db_error)?;
         crate::presentation_store::recover_interrupted(&self.connection)?;
@@ -961,27 +997,18 @@ impl Store {
         Ok(latest)
     }
     pub fn append_run_event(&self, event: &crate::agent_run::RunEvent) -> Result<()> {
-        let seq = if event.seq > 0 {
-            event.seq as i64
-        } else {
-            // Harness-nested child events arrive without a sequence; allocate
-            // the next one so the (run_id, seq) primary key never collides.
-            self.connection
-                .query_row(
-                    "SELECT COALESCE(MAX(seq), -1) + 1 FROM run_events WHERE run_id=?1",
-                    [&event.run_id],
-                    |row| row.get(0),
-                )
-                .map_err(db_error)?
-        };
         let payload = serde_json::to_string(&event.payload).map_err(|e| e.to_string())?;
+        // Allocate and insert under the same SQLite write lock. Independent
+        // child connections must not observe and claim the same next number.
         self.connection
             .execute(
                 "INSERT INTO run_events(run_id, seq, step_id, tool_call_id, event_type, payload, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, CASE WHEN ?2>0 THEN ?2 ELSE
+                   (SELECT COALESCE(MAX(seq), -1) + 1 FROM run_events WHERE run_id=?1)
+                 END, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     event.run_id,
-                    seq,
+                    event.seq as i64,
                     event.step_id,
                     event.tool_call_id,
                     event.event_type,
@@ -1218,6 +1245,38 @@ impl Store {
             return Err("Subagent run no longer exists.".into());
         }
         Ok(())
+    }
+    /// A child has one terminal fact shared by lineage and run history.
+    pub(crate) fn settle_subagent(
+        &self,
+        child: &str,
+        status: &str,
+        run_status: crate::agent_run::RunState,
+        error: Option<&str>,
+    ) -> Result<()> {
+        // Reserve the writer before reading unmatched calls. A deferred WAL
+        // read transaction cannot upgrade after another child has committed.
+        let tx = rusqlite::Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        if matches!(run_status, crate::agent_run::RunState::OutcomeUnknown | crate::agent_run::RunState::Cancelled) {
+            let events = self.run_events(child)?;
+            for call in events.iter().filter(|event| event.event_type == "tool_call" && event.tool_call_id.is_some()) {
+                if events.iter().any(|event| event.event_type == "tool_result" && event.tool_call_id == call.tool_call_id) { continue; }
+                self.append_run_event(&crate::agent_run::RunEvent {
+                    run_id: child.into(), seq: 0, step_id: call.step_id.clone(), tool_call_id: call.tool_call_id.clone(),
+                    event_type: "tool_result".into(),
+                    payload: serde_json::json!({"result":crate::tool_envelope::failure_notice(
+                        "child-interrupted", "The worker ended before this dispatched call settled. Its outcome is unknown; do not automatically retry.",
+                        false, crate::tool_envelope::SIDE_UNKNOWN, &serde_json::json!({}))}),
+                    created_at: now(),
+                })?;
+            }
+        }
+        tx.execute("UPDATE subagent_runs SET status=?2,error=?3,updated_at=?4 WHERE child_run_id=?1 AND status='running'",
+            params![child, status, error, now()]).map_err(db_error)?;
+        tx.execute("UPDATE runs SET status=?2,error=?3,updated_at=?4 WHERE id=?1 AND status IN ('preparing','generating','awaiting_approval','executing_tools','preparing_next_round')",
+            params![child, run_status.as_str(), error, now()]).map_err(db_error)?;
+        tx.commit().map_err(db_error)
     }
     pub fn subagent_runs_for_conversation(
         &self,
@@ -2041,6 +2100,10 @@ impl Store {
         if event.seq > 0 {
             return self.insert_session_event(event, event.seq);
         }
+        if !self.connection.is_autocommit() {
+            let seq = self.next_session_event_seq(&event.conversation_id)?;
+            return self.insert_session_event(event, seq);
+        }
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
@@ -2083,20 +2146,40 @@ impl Store {
         from_seq: Option<u64>,
         limit: Option<u32>,
     ) -> Result<Vec<crate::sessions::SessionEvent>> {
-        let from_seq = from_seq.unwrap_or(0) as i64;
+        self.session_event_page(conversation_id, from_seq.unwrap_or(0), limit, false)
+    }
+
+    pub(crate) fn run_session_event_payload(&self, run_id: &str, event_type: &str) -> Result<Option<serde_json::Value>> {
+        let payload: Option<String> = self.connection.query_row(
+            "SELECT payload FROM session_events WHERE run_id=?1 AND event_type=?2 ORDER BY seq DESC LIMIT 1",
+            params![run_id, event_type], |row| row.get(0),
+        ).optional().map_err(db_error)?;
+        payload.map(|text| serde_json::from_str(&text).map_err(|error| error.to_string())).transpose()
+    }
+
+    pub(crate) fn session_events_before(
+        &self, conversation_id: &str, before_seq: u64, limit: Option<u32>,
+    ) -> Result<Vec<crate::sessions::SessionEvent>> {
+        self.session_event_page(conversation_id, before_seq, limit, true)
+    }
+
+    fn session_event_page(
+        &self, conversation_id: &str, seq: u64, limit: Option<u32>, backward: bool,
+    ) -> Result<Vec<crate::sessions::SessionEvent>> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
         let limit = limit.unwrap_or(1000).min(5000) as i64;
+        let range = if backward { "seq < ?2 ORDER BY seq DESC" } else { "seq >= ?2 ORDER BY seq ASC" };
         let mut statement = self
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, conversation_id, run_id, seq, step_id, tool_call_id, event_type, payload, ignorable, created_at
                  FROM session_events
-                 WHERE conversation_id = ?1 AND seq >= ?2
-                 ORDER BY seq ASC
+                 WHERE conversation_id = ?1 AND {range}
                  LIMIT ?3",
-            )
+            ))
             .map_err(db_error)?;
         let rows = statement
-            .query_map(params![conversation_id, from_seq, limit], |row| {
+            .query_map(params![conversation_id, seq, limit], |row| {
                 let payload_text: String = row.get(7)?;
                 let payload: serde_json::Value =
                     serde_json::from_str(&payload_text).unwrap_or(serde_json::Value::Null);
@@ -2116,8 +2199,9 @@ impl Store {
                 })
             })
             .map_err(db_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(db_error)
+        let mut events = rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_error)?;
+        if backward { events.reverse(); }
+        Ok(events)
     }
     /// Read a fixed journal prefix in pages. Replay snapshots the high-water
     /// mark before reading; a live writer cannot extend the replay.
@@ -2893,6 +2977,26 @@ impl Store {
         self.connection.execute("INSERT INTO message_inference(message_id,metrics_json) VALUES(?1,?2) ON CONFLICT(message_id) DO UPDATE SET metrics_json=excluded.metrics_json", params![message_id, value]).map_err(db_error)?;
         Ok(())
     }
+    pub(crate) fn refresh_delegated_metrics(&self, owner: &str, parent: &str) -> Result<()> {
+        // Snapshot the entire child tree and publish it under one writer
+        // reservation; a slower sibling must not overwrite newer counters.
+        let tx = rusqlite::Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let saved: Option<(String, String)> = self.connection.query_row(
+            "SELECT m.id,i.metrics_json FROM session_events e
+             JOIN messages m ON m.id=json_extract(e.payload,'$.messageId')
+             JOIN message_inference i ON i.message_id=m.id
+             WHERE e.conversation_id=?1 AND e.run_id=?2 AND e.event_type='turn_end'
+             ORDER BY e.seq DESC LIMIT 1",
+            params![owner,parent], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional().map_err(db_error)?;
+        if let Some((id, text)) = saved {
+            let mut metrics: crate::inference::ResponseMetrics = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            metrics.children = crate::subagents::usage_for_parent(self, owner, parent)?;
+            self.save_message_metrics(&id, &metrics)?;
+        }
+        tx.commit().map_err(db_error)
+    }
     pub(crate) fn latest_turn_audit_ids(&self, conversation_id: &str) -> Result<Vec<String>> {
         let mut statement = self.connection.prepare(
             "SELECT id FROM messages WHERE conversation_id=?1 AND role='tool' AND status='complete'
@@ -2918,7 +3022,10 @@ impl Store {
         content: &str,
         status: &str,
     ) -> Result<Message> {
-        let tx = self.connection.unchecked_transaction().map_err(db_error)?;
+        // Background completions share this conversation with the parent.
+        // Reserve the writer before reading its last message timestamp.
+        let tx = rusqlite::Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_error)?;
         let message = self.insert_message_row(conversation_id, role, content, status, self.next_message_time(conversation_id)?)?;
         tx.commit().map_err(db_error)?;
         Ok(message)
@@ -2962,9 +3069,9 @@ impl Store {
 
     pub fn pending_turn(&self, conversation_id: &str) -> Result<Option<PendingTurn>> {
         self.connection.query_row(
-            "SELECT id, conversation_id, content, created_at FROM pending_turns WHERE conversation_id=?1",
+            "SELECT id, conversation_id, content, created_at, resume_task_id FROM pending_turns WHERE conversation_id=?1",
             [conversation_id],
-            |row| Ok(PendingTurn { id: row.get(0)?, conversation_id: row.get(1)?, content: row.get(2)?, created_at: row.get(3)? }),
+            |row| Ok(PendingTurn { id: row.get(0)?, conversation_id: row.get(1)?, content: row.get(2)?, created_at: row.get(3)?, resume_task_id: row.get(4)? }),
         ).optional().map_err(db_error)
     }
 
@@ -2977,15 +3084,20 @@ impl Store {
     /// Save a request before it can wait for an execution slot. A recovered
     /// request must name the exact saved record and use its original content.
     pub fn stage_pending_turn(&self, conversation_id: &str, content: &str, recovery_id: Option<&str>) -> Result<PendingTurn> {
+        self.stage_pending_turn_with_resume(conversation_id, content, recovery_id, None)
+    }
+
+    pub fn stage_pending_turn_with_resume(&self, conversation_id: &str, content: &str, recovery_id: Option<&str>, resume_task_id: Option<&str>) -> Result<PendingTurn> {
         let content = content.trim();
         if content.is_empty() || content.len() > 1_048_576 { return Err("Enter a message no larger than 1 MiB.".into()); }
         if let Some(saved) = self.pending_turn(conversation_id)? {
-            if recovery_id == Some(saved.id.as_str()) && saved.content == content { return Ok(saved); }
+            if recovery_id == Some(saved.id.as_str()) && saved.content == content
+                && resume_task_id.is_none_or(|id| saved.resume_task_id.as_deref() == Some(id)) { return Ok(saved); }
             return Err("This conversation has a saved unsent request. Send it or discard its recovery copy first.".into());
         }
         if recovery_id.is_some() { return Err("The saved request no longer exists; it was not sent.".into()); }
-        let pending = PendingTurn { id: uuid::Uuid::new_v4().to_string(), conversation_id: conversation_id.into(), content: content.into(), created_at: now() };
-        self.connection.execute("INSERT INTO pending_turns(conversation_id,id,content,created_at) VALUES(?1,?2,?3,?4)", params![conversation_id, pending.id, pending.content, pending.created_at]).map_err(db_error)?;
+        let pending = PendingTurn { id: uuid::Uuid::new_v4().to_string(), conversation_id: conversation_id.into(), content: content.into(), created_at: now(), resume_task_id: resume_task_id.map(str::to_owned) };
+        self.connection.execute("INSERT INTO pending_turns(conversation_id,id,content,created_at,resume_task_id) VALUES(?1,?2,?3,?4,?5)", params![conversation_id, pending.id, pending.content, pending.created_at, pending.resume_task_id]).map_err(db_error)?;
         Ok(pending)
     }
 
@@ -3022,7 +3134,9 @@ impl Store {
         if content.is_empty() || content.len() > 1_048_576 {
             return Err("Enter a message no larger than 1 MiB.".into());
         }
-        let transaction = self.connection.unchecked_transaction().map_err(db_error)?;
+        let transaction = self.connection.is_autocommit()
+            .then(|| self.connection.unchecked_transaction()).transpose().map_err(db_error)?;
+        let connection = &self.connection;
         let assistant = Message {
             metrics: None,
             id: uuid::Uuid::new_v4().to_string(),
@@ -3035,37 +3149,37 @@ impl Store {
             error: None,
         };
         if let Some(id) = pending_id {
-            let removed = transaction.execute("DELETE FROM pending_turns WHERE conversation_id=?1 AND id=?2 AND content=?3", params![conversation_id, id, content]).map_err(db_error)?;
+            let removed = connection.execute("DELETE FROM pending_turns WHERE conversation_id=?1 AND id=?2 AND content=?3", params![conversation_id, id, content]).map_err(db_error)?;
             if removed != 1 { return Err("The saved request changed or was discarded; it was not sent.".into()); }
         }
-        let existing: bool = transaction
+        let existing: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id=?1)",
                 [conversation_id],
                 |row| row.get(0),
             )
             .map_err(db_error)?;
-        transaction.execute("DELETE FROM settings WHERE key=?1", [format!("failed_model_round:{conversation_id}")]).map_err(db_error)?;
+        connection.execute("DELETE FROM settings WHERE key=?1", [format!("failed_model_round:{conversation_id}")]).map_err(db_error)?;
         let user_id = uuid::Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'user',?3,'complete',?4)", params![user_id, conversation_id, content, assistant.created_at]).map_err(db_error)?;
+        connection.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'user',?3,'complete',?4)", params![user_id, conversation_id, content, assistant.created_at]).map_err(db_error)?;
         if let Some(model_content) = model_content {
-            transaction
+            connection
                 .execute(
                     "INSERT INTO model_message_contents(message_id,content_json) VALUES(?1,?2)",
                     params![user_id, model_content.to_string()],
                 )
                 .map_err(db_error)?;
         }
-        transaction.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'assistant','','streaming',?3)", params![assistant.id, conversation_id, assistant.created_at]).map_err(db_error)?;
+        connection.execute("INSERT INTO messages(id,conversation_id,role,content,status,created_at) VALUES(?1,?2,'assistant','','streaming',?3)", params![assistant.id, conversation_id, assistant.created_at]).map_err(db_error)?;
         if existing {
-            transaction
+            connection
                 .execute(
                     "UPDATE conversations SET updated_at=?1 WHERE id=?2",
                     params![assistant.created_at, conversation_id],
                 )
                 .map_err(db_error)?;
         } else {
-            transaction
+            connection
                 .execute(
                     "UPDATE conversations SET title=?1,updated_at=?2 WHERE id=?3",
                     params![
@@ -3076,7 +3190,7 @@ impl Store {
                 )
                 .map_err(db_error)?;
         }
-        transaction.commit().map_err(db_error)?;
+        if let Some(transaction) = transaction { transaction.commit().map_err(db_error)?; }
         Ok(assistant)
     }
 
@@ -3419,24 +3533,81 @@ impl Store {
         let findings = serde_json::to_string(&task.findings).map_err(|error| error.to_string())?;
         let pending =
             serde_json::to_string(&task.pending_work).map_err(|error| error.to_string())?;
+        let context = serde_json::to_string(&task.context).map_err(|error| error.to_string())?;
         self.connection
             .execute(
-                "INSERT INTO research_tasks(id, conversation_id, question, status, budgets_json, operations_json, results_json, requirements_json, findings_json, pending_json, created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                "INSERT INTO research_tasks(id, conversation_id, question, status, budgets_json, operations_json, results_json, requirements_json, findings_json, pending_json, created_at, updated_at, context_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                  ON CONFLICT(id) DO UPDATE SET status=excluded.status, budgets_json=excluded.budgets_json,
                  operations_json=excluded.operations_json, results_json=excluded.results_json,
                  requirements_json=excluded.requirements_json, findings_json=excluded.findings_json,
-                 pending_json=excluded.pending_json, updated_at=excluded.updated_at",
-                params![task.id, task.conversation_id, task.question, task.status.as_str(), budgets, operations, results, requirements, findings, pending, task.created_at, task.updated_at],
+                 pending_json=excluded.pending_json, updated_at=excluded.updated_at, context_json=excluded.context_json",
+                params![task.id, task.conversation_id, task.question, task.status.as_str(), budgets, operations, results, requirements, findings, pending, task.created_at, task.updated_at, context],
             )
             .map_err(db_error)?;
         Ok(())
     }
 
+    pub(crate) fn start_research_task(&self, task: &crate::research_tasks::ResearchTask, run_id: &str) -> Result<()> {
+        let transaction = self.connection.is_autocommit()
+            .then(|| self.connection.unchecked_transaction()).transpose().map_err(db_error)?;
+        let connection = &self.connection;
+        self.save_research_task(task)?;
+        // The old binding is the only segment older databases recorded.
+        // Retain it before moving the current binding to the new run.
+        connection.execute("INSERT OR IGNORE INTO research_task_segments(task_id,run_id)
+                    SELECT task_id,run_id FROM research_task_runs WHERE task_id=?1", [&task.id]).map_err(db_error)?;
+        connection.execute("INSERT OR IGNORE INTO research_task_segments(task_id,run_id) VALUES (?1,?2)",
+            params![task.id, run_id]).map_err(db_error)?;
+        connection.execute("INSERT INTO research_task_runs(task_id,run_id) VALUES (?1,?2)
+                    ON CONFLICT(task_id) DO UPDATE SET run_id=excluded.run_id", params![task.id, run_id]).map_err(db_error)?;
+        if let Some(transaction) = transaction { transaction.commit().map_err(db_error)?; }
+        Ok(())
+    }
+
+    pub(crate) fn visit_research_resume_audits(
+        &self,
+        conversation: &str,
+        task_id: &str,
+        mut visit: impl FnMut(&str, &str) -> Result<()>,
+    ) -> Result<()> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, content FROM messages WHERE conversation_id=?1 AND role='tool'
+             AND CASE WHEN json_valid(content) THEN
+                 coalesce(json_extract(content,'$.request.runId'),json_extract(content,'$.runId'))
+             END IN (
+                 SELECT run_id FROM research_task_segments WHERE task_id=?2
+                 UNION SELECT run_id FROM research_task_runs WHERE task_id=?2
+             ) ORDER BY created_at, rowid"
+        ).map_err(db_error)?;
+        let mut rows = statement.query(params![conversation, task_id]).map_err(db_error)?;
+        while let Some(row) = rows.next().map_err(db_error)? {
+            let id: String = row.get(0).map_err(db_error)?;
+            let content: String = row.get(1).map_err(db_error)?;
+            visit(&id, &content)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn research_task_run(&self, task: &crate::research_tasks::ResearchTask) -> Result<Option<crate::agent_run::RunRecord>> {
+        let id: Option<String> = self.connection.query_row(
+            "SELECT run_id FROM research_task_runs WHERE task_id=?1", [&task.id], |row| row.get(0)
+        ).optional().map_err(db_error)?;
+        let id = match id {
+            Some(id) => Some(id),
+            None => self.connection.query_row(
+                "SELECT id FROM runs WHERE conversation_id=?1 AND (checkpoint IS NULL OR checkpoint!='subagent')
+                 AND created_at<=?2 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![task.conversation_id,task.created_at], |row| row.get(0),
+            ).optional().map_err(db_error)?,
+        };
+        match id { Some(id) => self.run(&id), None => Ok(None) }
+    }
+
     pub fn research_task(&self, id: &str) -> Result<Option<crate::research_tasks::ResearchTask>> {
         self.connection
             .query_row(
-                "SELECT id, conversation_id, question, status, budgets_json, operations_json, results_json, requirements_json, findings_json, pending_json, created_at, updated_at FROM research_tasks WHERE id=?1",
+                "SELECT id, conversation_id, question, status, budgets_json, operations_json, results_json, requirements_json, findings_json, pending_json, created_at, updated_at, context_json FROM research_tasks WHERE id=?1",
                 [id],
                 |row| {
                     let status_str: String = row.get(3)?;
@@ -3446,6 +3617,9 @@ impl Store {
                     let requirements_str: String = row.get(7)?;
                     let findings_str: String = row.get(8)?;
                     let pending_str: String = row.get(9)?;
+                    let context = row.get::<_, Option<String>>(12)?.map(|text| serde_json::from_str(&text))
+                        .transpose().map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                            12, rusqlite::types::Type::Text, Box::new(error)))?.unwrap_or_default();
                     Ok(crate::research_tasks::ResearchTask {
                         id: row.get(0)?,
                         conversation_id: row.get(1)?,
@@ -3459,6 +3633,7 @@ impl Store {
                         pending_work: serde_json::from_str(&pending_str).unwrap_or_default(),
                         created_at: row.get(10)?,
                         updated_at: row.get(11)?,
+                        context,
                     })
                 },
             )
@@ -3469,7 +3644,7 @@ impl Store {
     pub fn running_research_task_ids(&self) -> Result<Vec<String>> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM research_tasks WHERE status IN ('running','paused') ORDER BY updated_at DESC LIMIT 50")
+            .prepare("SELECT id FROM research_tasks WHERE status IN ('running','paused') ORDER BY updated_at DESC")
             .map_err(db_error)?;
         let ids = statement
             .query_map([], |row| row.get(0))
@@ -3486,7 +3661,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id FROM research_tasks WHERE conversation_id=?1 AND status IN ('running','paused') ORDER BY updated_at DESC LIMIT 20",
+                "SELECT id FROM research_tasks WHERE conversation_id=?1 AND status IN ('running','paused','budget_exhausted') ORDER BY updated_at DESC LIMIT 20",
             )
             .map_err(db_error)?;
         let ids: Vec<String> = statement
@@ -3850,7 +4025,7 @@ mod tests {
                 "complete",
             )
             .unwrap();
-        let metrics = crate::inference::ResponseMetrics { model: "fixture.gguf".into(), total_ms: 5820.0, preparation_ms: Some(100.0), tools_ms: Some(200.0), approval_ms: Some(300.0),
+        let metrics = crate::inference::ResponseMetrics { children: Vec::new(), model: "fixture.gguf".into(), total_ms: 5820.0, preparation_ms: Some(100.0), tools_ms: Some(200.0), approval_ms: Some(300.0), reasoning_effort: None,
             rounds: vec![crate::inference::InferenceRound { phase: None, complete: true, first_token_ms: Some(820.0), first_visible_answer_ms: Some(1200.0), reasoning_ms: Some(400.0), duration_ms: 5820.0,
                 usage: serde_json::from_value(serde_json::json!({"inputTokens":1085,"outputTokens":123,"promptMs":1000.0,"generationMs":5000.0,"processedPromptTokens":385})).unwrap() }] };
         store.save_message_metrics(&message.id, &metrics).unwrap();

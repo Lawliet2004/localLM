@@ -118,6 +118,7 @@ struct Exec<'a> {
     nonce: String,
     budget: Arc<crate::mcp_input::CallBudget>,
     cancel: tokio::sync::watch::Receiver<bool>,
+    may_mutate: bool,
 }
 
 impl<'a> Exec<'a> {
@@ -134,6 +135,7 @@ impl<'a> Exec<'a> {
             nonce: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
             budget: Arc::new(crate::mcp_input::CallBudget::new(std::time::Duration::from_secs(MAX_PLAN_SECS))),
             cancel: ctx.state.cancel_signal().subscribe(),
+            may_mutate: false,
         }
     }
 
@@ -763,7 +765,7 @@ impl<'a> Exec<'a> {
             {
                 let denied = crate::tool_envelope::failure_notice(
                     "denied",
-                    "Not repeated: an earlier attempt this turn had an uncertain outcome.",
+                    "A previous attempt was already recorded or may have changed data. This action was not repeated. Inspect the saved outcome.",
                     false,
                     crate::tool_envelope::SIDE_UNKNOWN,
                     &json!({"blocked": true}),
@@ -771,7 +773,7 @@ impl<'a> Exec<'a> {
                 let audit = json!({"connector": tool.connector, "name": tool.tool.name, "arguments": tool_args,
                     "decision": "denied", "accessMode": self.ctx.access_mode,
                     "authorization": "turn replay protection",
-                    "program": true, "callId": call_id, "stepId": self.ctx.step_id});
+                    "program": true, "callId": call_id, "runId": self.ctx.run_id, "stepId": self.ctx.step_id});
                 if let Ok(store) = self.ctx.state.database() {
                     let _ = store.append_message(
                         &self.ctx.conversation_id,
@@ -784,7 +786,7 @@ impl<'a> Exec<'a> {
                     .push(json!({"tool": tool_name, "status": "denied", "callId": call_id}));
                 return Err(Abort {
                     status: "denied",
-                    message: "Not repeated: an earlier attempt this turn had an uncertain outcome."
+                    message: "A previous attempt was already recorded or may have changed data. This action was not repeated. Inspect the saved outcome."
                         .into(),
                 });
             }
@@ -850,6 +852,7 @@ impl<'a> Exec<'a> {
         } else { false };
         let mut hook_blocked = false;
         let allow = if allow {
+            self.may_mutate |= crate::verification_progress::step_may_mutate(self.ctx, tool);
             let verdict = self.await_bounded(crate::hooks::pre_use(
                 self.ctx.state, &self.ctx.conversation_id, &self.ctx.snapshot.workspace_path, &tool.alias, &tool_args,
             )).await?;
@@ -871,7 +874,7 @@ impl<'a> Exec<'a> {
         let audit = json!({"connector": tool.connector, "name": tool.tool.name, "arguments": tool_args,
             "decision": if allow { "allowed" } else { "denied" }, "accessMode": self.ctx.access_mode,
             "authorization": if hook_blocked { "pre-use hook" } else if denial_reason.is_some() { "permission rule" } else if automatic { "auto-approved plan call" } else { "user approval decision" },
-            "program": true, "callId": call_id, "stepId": self.ctx.step_id});
+            "program": true, "callId": call_id, "runId": self.ctx.run_id, "stepId": self.ctx.step_id});
         let row = {
             let store = self
                 .ctx
@@ -1155,6 +1158,7 @@ impl<'a> Exec<'a> {
                     "Tool '{tool_name}' is not a trusted read and cannot join a 'parallel' block."
                 )));
             }
+            self.may_mutate |= crate::verification_progress::step_may_mutate(self.ctx, tool);
             let bind = call.get("as").and_then(Value::as_str).map(str::to_string);
             let call_id = format!("plan-{}-{}", self.nonce, self.tool_calls);
             members.push(Member {
@@ -1297,7 +1301,7 @@ impl<'a> Exec<'a> {
             let audit = json!({"connector": tool.connector, "name": tool.tool.name, "arguments": member.args,
                 "decision": if permission_denied { "denied" } else { "allowed" }, "accessMode": self.ctx.access_mode,
                 "authorization": if hook_blocked { "pre-use hook" } else if permission_denied { "permission rule" } else { "auto-approved plan parallel read" },
-                "program": true, "callId": call_id, "stepId": self.ctx.step_id});
+                "program": true, "callId": call_id, "runId": self.ctx.run_id, "stepId": self.ctx.step_id});
             {
                 let store = self
                     .ctx
@@ -1478,6 +1482,7 @@ pub async fn execute_plan(ctx: &HarnessCtx<'_>, plan: &Value) -> Result<HarnessO
         "value": value,
         "partial": exec.calls.iter().filter(|call| call["status"] == "ok").count(),
         "unresolved": (exec.top_attempted..body.len()).collect::<Vec<_>>(),
+        "workspaceEffects": if exec.may_mutate { "possible" } else { "none" },
     });
     // An aborted plan is never automatically replayable: a completed write
     // inside it may have applied real side effects, so failure certainty is
@@ -1810,6 +1815,7 @@ mod tests {
                 }
             };
             let (result, ()) = tokio::join!(task, update);
+            assert_eq!(result["workspaceEffects"], "possible", "configured hooks may mutate even around trusted reads");
             assert_eq!(result["error"]["code"], "denied", "parallel={parallel}: {result}");
             assert!(!result.to_string().contains("hook-secret-value"));
             let rows = state.database().unwrap().messages(&ctx.conversation_id).unwrap();
@@ -2005,6 +2011,7 @@ mod tests {
         .await;
         assert_eq!(result["status"], "success", "{result}");
         // Bindings land in statement order even if completion was unordered.
+        assert_eq!(result["workspaceEffects"], "none");
         let pair = result["value"].as_array().unwrap();
         assert!(pair[0].as_str().unwrap().contains("alpha"), "{pair:?}");
         assert!(pair[1].as_str().unwrap().contains("beta"), "{pair:?}");

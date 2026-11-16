@@ -142,6 +142,12 @@ pub fn failed(result: &Value) -> bool {
         )
 }
 
+/// An excerpt may be partial while its underlying operation is confirmed.
+pub fn operation_status(result: &Value) -> Option<&str> {
+    result.pointer("/metadata/outcomeStatus").and_then(Value::as_str)
+        .or_else(|| result["status"].as_str())
+}
+
 /// Merge the producer's original fields beside the envelope so legacy
 /// consumers (audit rows, UI, research postprocessing, `isError` checks) keep
 /// working. Envelope keys always win; nothing is dropped from `data`.
@@ -340,6 +346,10 @@ fn normalize_inner(result: Value, family: Family) -> Value {
         } else if status_hint == "rolled_back" {
             metadata["sideEffects"] = json!(SIDE_ROLLED_BACK);
         }
+        let status = if status == Status::Success && metadata["truncated"] == true {
+            metadata["outcomeStatus"] = json!("success");
+            Status::Partial
+        } else { status };
         let mut envelope = make(status, result.clone(), Vec::new(), error, metadata);
         merge_compat(&mut envelope, &result);
         return envelope;
@@ -594,12 +604,17 @@ pub fn legacy_execution_to_envelope(legacy: &Value, duration_ms: u128) -> Value 
         .and_then(Value::as_bool)
         .unwrap_or(true);
     let message = legacy.get("error").and_then(Value::as_str).unwrap_or("");
-    let truncated = message.contains("exceeded")
+    let process_state = legacy["processState"].as_str();
+    let truncated = legacy["truncated"].as_bool().unwrap_or_else(|| process_state.is_none() && (message.contains("exceeded")
         || message.contains("truncated")
-        || message.contains("Truncated");
+        || message.contains("Truncated")));
     let (status, error) = if is_error {
-        let code = if message.contains("timed out") {
+        let code = if process_state == Some("timed_out") || message.contains("timed out") {
             "timeout"
+        } else if process_state == Some("stopped") {
+            "cancelled"
+        } else if process_state == Some("unknown") {
+            "outcome-unknown"
         } else if truncated {
             "output-truncated"
         } else if exit_code.is_number() {
@@ -608,16 +623,24 @@ pub fn legacy_execution_to_envelope(legacy: &Value, duration_ms: u128) -> Value 
             "execution-failed"
         };
         (
-            Status::Failure,
-            Some(json!({"code": code, "message": if message.is_empty() {
+            match process_state {
+                Some("stopped") => Status::Cancelled,
+                Some("unknown") => Status::Unknown,
+                _ => Status::Failure,
+            },
+            Some(error_object(code, if message.is_empty() {
                 "Execution failed without a diagnostic message."
             } else {
                 message
-            }, "retryable": false})),
+            }, false, SIDE_UNKNOWN)),
         )
+    } else if truncated {
+        (Status::Partial, None)
     } else {
         (Status::Success, None)
     };
+    let mut metadata = json!({"durationMs": duration_ms, "truncated": truncated});
+    if status == Status::Partial { metadata["outcomeStatus"] = json!("success"); }
     let mut envelope = make(
         status,
         json!({
@@ -631,8 +654,13 @@ pub fn legacy_execution_to_envelope(legacy: &Value, duration_ms: u128) -> Value 
         }),
         Vec::new(),
         error,
-        json!({"durationMs": duration_ms, "truncated": truncated}),
+        metadata,
     );
+    for field in ["processId", "processState", "nextCursor", "hasMore"] {
+        if let Some(value) = legacy.get(field) {
+            envelope["data"][field] = value.clone();
+        }
+    }
     // Compatibility: keep the legacy flat fields beside the envelope.
     if let (Some(map), Some(legacy_map)) = (envelope.as_object_mut(), legacy.as_object()) {
         for (key, val) in legacy_map {
@@ -741,6 +769,16 @@ mod tests {
         let timed_out = json!({"provider":"local","exitCode":null,"stdout":"","stderr":"","error":"Execution timed out.","isError":true,"durationMs":3});
         let envelope = legacy_execution_to_envelope(&timed_out, 3);
         assert_eq!(envelope["error"]["code"], "timeout");
+    }
+
+    #[test]
+    fn a_clipped_successful_command_keeps_its_exit_and_lifecycle() {
+        let result = normalize(json!({"processId":"proc-owned","processState":"exited","exitCode":0,"stdout":"out","stderr":"","isError":false,"truncated":true}), Family::Harness);
+        assert_eq!(validate_envelope(&result).unwrap(), Status::Partial);
+        assert_eq!(operation_status(&result), Some("success"));
+        assert_eq!(result["data"]["processId"], "proc-owned");
+        assert_eq!(result["data"]["processState"], "exited");
+        assert!(!failed(&result));
     }
 
     #[test]

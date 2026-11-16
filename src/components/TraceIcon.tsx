@@ -1,6 +1,7 @@
 import type { ComponentType, ReactNode } from 'react';
 import {
   Archive,
+  Compass,
   FileDiff,
   FileSearch,
   FolderSearch,
@@ -12,19 +13,9 @@ import {
   Wrench,
 } from 'lucide-react';
 
-/** Semantic category of an activity-trail entry. Drives icon + tint. */
-export type TraceKind =
-  | 'web'
-  | 'edit'
-  | 'task'
-  | 'command'
-  | 'search'
-  | 'folder'
-  | 'explore'
-  | 'read'
-  | 'tool'
-  | 'thought'
-  | 'system';
+import type { ToolKind } from '../lib/toolActivity';
+export { toolKindOf } from '../lib/toolActivity';
+export type TraceKind = ToolKind;
 
 type IconComponent = ComponentType<{ size?: number | string; className?: string }>;
 
@@ -35,7 +26,7 @@ export const TRACE_ICONS: Record<TraceKind, IconComponent> = {
   command: SquareTerminal,
   search: Search,
   folder: FolderSearch,
-  explore: FolderSearch,
+  explore: Compass,
   read: FileSearch,
   tool: Wrench,
   thought: Sparkles,
@@ -49,28 +40,6 @@ export function TraceIcon({ kind, size = 13, children }: { kind: TraceKind; size
       {children ?? <Icon size={size} />}
     </i>
   );
-}
-
-interface ToolLikeArgs {
-  [key: string]: unknown;
-}
-
-/**
- * Classify a tool invocation into a trace kind.
- * Precedence mirrors the verb logic in CommandRunCard so icon and label agree.
- */
-export function toolKindOf(name: string, args: ToolLikeArgs = {}, result: ToolLikeArgs = {}): TraceKind {
-  if (/web_search|web_open|web_find|web_fetch/.test(name)) return 'web';
-  if (/apply_patch|edit|create_file|write_file|append_file|write_to_file|replace/.test(name) || typeof result.diff === 'string') return 'edit';
-  if (name === 'manage_task' || name === 'plan_submit') return 'task';
-  if (args.command || args.CommandLine || args.code || /exec|run_code|terminal|run_command/.test(name)) return 'command';
-  const hasPath = Boolean(args.path ?? args.AbsolutePath ?? args.TargetFile ?? args.file);
-  const isSearchName = /search|grep|find|list_files|list_tree|locate/.test(name);
-  if (/read_file|view_file|open_file|cat/.test(name) || (hasPath && !isSearchName)) return 'read';
-  if (/list_dir|browse_dir/.test(name)) return 'folder';
-  if (isSearchName) return 'search';
-  if (args.command || args.CommandLine || args.code || /exec|run_code|terminal|run_command/.test(name)) return 'command';
-  return 'tool';
 }
 
 /**

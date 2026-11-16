@@ -1,6 +1,8 @@
 use std::{collections::HashMap, sync::Mutex};
 use tokio::sync::oneshot;
 
+pub(crate) const CHOICE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Default)]
 pub struct Approvals(Mutex<HashMap<String, oneshot::Sender<bool>>>);
 pub struct PendingApproval<'a> {
@@ -48,7 +50,23 @@ impl Approvals {
 /// types a freeform answer. `None` means declined/dismissed.
 #[derive(Default)]
 pub struct ChoiceApprovals(Mutex<HashMap<String, oneshot::Sender<Option<String>>>>);
+
+pub(crate) struct PendingChoice<'a> {
+    approvals: &'a ChoiceApprovals,
+    id: &'a str,
+}
+
+impl Drop for PendingChoice<'_> {
+    fn drop(&mut self) {
+        self.approvals.remove(self.id);
+    }
+}
+
 impl ChoiceApprovals {
+    pub(crate) fn guard<'a>(&'a self, id: &'a str) -> PendingChoice<'a> {
+        PendingChoice { approvals: self, id }
+    }
+
     pub fn request_choice(&self) -> Result<(String, oneshot::Receiver<Option<String>>), String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
@@ -115,6 +133,23 @@ mod tests {
             let _pending = approvals.guard(&id);
         }
         assert!(approvals.resolve(&id, true).is_err());
+    }
+
+    #[test]
+    fn choice_deadline_is_separate_and_cancellation_removes_the_prompt() {
+        use std::time::Duration;
+        let execution = Duration::from_secs(300);
+        for name in ["ask_user", "plan_submit"] {
+            let tool = crate::connectors::AgentTool::harness(name).unwrap();
+            assert!(tool.call_deadline(execution, true) > CHOICE_WAIT);
+            assert_eq!(tool.call_deadline(execution, false), execution);
+        }
+        let choices = ChoiceApprovals::default();
+        let (id, mut receiver) = choices.request_choice().unwrap();
+        drop(choices.guard(&id));
+        assert!(receiver.try_recv().is_err());
+        assert!(choices.pending_ids().is_empty());
+        assert!(choices.resolve_choice(&id, Some("late".into())).is_err());
     }
     #[tokio::test]
     async fn decisions_are_single_use_and_bound_to_request() {

@@ -1,5 +1,5 @@
 import { safeSourceUrl, sourceIdentity } from '../lib/sources';
-import { memo, useCallback, useState, useEffect, useMemo, useRef, type ReactNode } from 'react';
+import { memo, useState, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import { ArrowDown, Check, Copy, ChevronRight, FileCode, FileText, AlertCircle, XCircle, Atom, ExternalLink, LoaderCircle } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
 import { AccumulatedAnsiParser, type AnsiLine } from '../lib/ansi';
@@ -35,6 +35,7 @@ export interface CommandRunCardProps {
   environment?: string;
   localServerId?: string;
   status: 'running' | 'completed' | 'failed' | 'interrupted' | 'awaiting_approval';
+  lifecycleState?: string;
   decision?: 'allowed' | 'denied' | string;
   isError?: boolean;
   exitCode?: number | null;
@@ -51,6 +52,7 @@ export interface CommandRunCardProps {
   originalBytes?: number | null;
   authorization?: string;
   onStop?: () => void;
+  stopLabel?: string;
 }
 
 interface WebSource {
@@ -79,20 +81,20 @@ function domainOf(url?: string): string | undefined {
 }
 
 /** One terminal channel (stdout or stderr) with its own gutter and fold. */
-const OutputChannel = memo(function OutputChannel({ name, lines, live, following, onBrowse }: { name?: 'stdout' | 'stderr'; lines: AnsiLine[]; live: boolean; following: boolean; onBrowse: () => void }) {
+const OutputChannel = memo(function OutputChannel({ name, lines, live, following }: { name?: 'stdout' | 'stderr'; lines: AnsiLine[]; live: boolean; following: boolean }) {
+  // Folded: the last 30 lines, following the stream. Expanded: one scrollable
+  // view of the most recent lines, capped so very long output stays responsive.
   const [folded, setFolded] = useState(true);
   const foldable = lines.length > 30;
-  const pageSize = 500;
-  const [page, setPage] = useState<number | null>(null);
-  const pageCount = Math.ceil(lines.length / pageSize);
-  const currentPage = Math.min(page ?? pageCount - 1, pageCount - 1);
+  const expandedCap = 2000;
   const tail = useRef(0);
   const hasStreamed = useRef(live);
   if (live) hasStreamed.current = true;
   if (hasStreamed.current && following) tail.current = Math.max(0, lines.length - 30);
-  const offset = foldable && folded ? Math.min(tail.current, Math.max(0, lines.length - 30)) : pageCount > 1 ? currentPage * pageSize : 0;
-  const visible = lines.slice(offset, offset + (foldable && folded ? 30 : pageSize));
-  useEffect(() => { if (following) setPage(null); }, [following]);
+  const foldedOffset = Math.min(tail.current, Math.max(0, lines.length - 30));
+  const expandedOffset = Math.max(0, lines.length - expandedCap);
+  const offset = foldable && folded ? foldedOffset : expandedOffset;
+  const visible = foldable && folded ? lines.slice(offset, offset + 30) : lines.slice(offset);
   return (
     <div className={name ? `output-channel channel-${name}` : 'output-channel'}>
       {name && <p className="channel-label">{name}</p>}
@@ -119,16 +121,12 @@ const OutputChannel = memo(function OutputChannel({ name, lines, live, following
           </div>
         ))}
       </div>
-      {!folded && pageCount > 1 && <nav className="terminal-pages" aria-label={`${name ?? 'Command'} output pages`}>
-        <button type="button" disabled={currentPage === 0} onClick={() => { onBrowse(); setPage(currentPage - 1); }}>Previous lines</button>
-        <span>{offset + 1}–{Math.min(offset + pageSize, lines.length)} of {lines.length} lines</span>
-        <button type="button" disabled={currentPage === pageCount - 1} onClick={() => { onBrowse(); setPage(currentPage + 1); }}>Next lines</button>
-      </nav>}
       {foldable && (
         <div className="terminal-folding-bar">
           <button type="button" className="fold-toggle-btn" onClick={() => setFolded(previous => !previous)}>
-            {folded ? lines.length > pageSize ? `Browse all ${lines.length} lines` : `Show all ${lines.length} lines` : 'Show fewer lines'}
+            {folded ? `Show all ${lines.length} lines` : 'Show fewer lines'}
           </button>
+          {!folded && lines.length > expandedCap && <span className="muted">Showing the last {expandedCap} of {lines.length} lines</span>}
         </div>
       )}
     </div>
@@ -162,6 +160,7 @@ export function CommandRunCard({
   localServerId,
   status,
   decision,
+  lifecycleState,
   isError,
   exitCode,
   stdout = '',
@@ -177,6 +176,7 @@ export function CommandRunCard({
   originalBytes,
   authorization,
   onStop,
+  stopLabel = 'Stop response',
 }: CommandRunCardProps) {
   const [activeTab, setActiveTab] = useState<'terminal' | 'diff' | 'code' | 'raw' | 'result'>(diff ? 'diff' : structuredResult ? 'result' : 'terminal');
   const [copied, setCopied] = useState(false);
@@ -189,9 +189,11 @@ export function CommandRunCard({
   const [loadingArtifact, setLoadingArtifact] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const [scrolledUp, setScrolledUp] = useState(false);
-  const pauseFollowing = useCallback(() => setScrolledUp(true), []);
-
-  useEffect(() => { if (status === 'failed' || status === 'awaiting_approval') setExpanded(true); }, [status]);
+  // A card opened while running stays open after it completes, so the output
+  // the user watched is still there. Failed and waiting cards open on their own.
+  useEffect(() => {
+    if (status === 'failed' || status === 'awaiting_approval') { setExpanded(true); setInspected(true); }
+  }, [status]);
 
   const path = typeof args?.path === 'string'
     ? args.path
@@ -225,19 +227,20 @@ export function CommandRunCard({
     ? args.toolAction
     : undefined;
 
-  const isWeb = /web_search|web_open|web_find|web_fetch/.test(toolName);
-  const isEdit = /edit|create_file|write_to_file|replace/.test(toolName) || Boolean(diff);
-  const isSearch = isWeb || /search|grep|find|list_files|locate/.test(toolName);
-  const isRead = /read_file|view_file|open_file|cat/.test(toolName) || (Boolean(path) && !isEdit && !isSearch);
-  const isTask = toolName === 'manage_task';
-  const isCommand = Boolean(command || code || /exec|run_code|terminal|run_command/.test(toolName));
+  const category = toolKindOf(toolName, { ...args, ...(command ? { command } : {}), ...(code ? { code } : {}) }, diff ? { diff } : {});
+  const isWeb = category === 'web';
+  const isEdit = category === 'edit';
+  const isSearch = isWeb || category === 'search' || category === 'folder';
+  const isRead = category === 'read';
+  const isTask = category === 'task';
+  const isCommand = category === 'command';
 
   const kind = isWeb ? 'Web' : isEdit ? 'Edit' : isSearch ? 'Explore' : isRead ? 'Read' : isCommand ? 'Terminal' : 'Tool';
 
   let displayVerb = kind;
   const unsettled = status === 'awaiting_approval' || status === 'failed' || status === 'interrupted';
   if (isWeb) {
-    displayVerb = unsettled ? 'Browse' : status === 'running' ? 'Browsing' : toolName === 'web_open' ? 'Opened' : toolName === 'web_fetch_url' || toolName === 'web_fetch' ? 'Fetched' : toolName === 'web_find' ? 'Found' : 'Searched the web';
+    displayVerb = unsettled ? 'Browse' : status === 'running' ? 'Browsing' : ['web_open', 'visit'].includes(toolName) ? 'Opened' : toolName === 'web_fetch_url' || toolName === 'web_fetch' ? 'Fetched' : toolName === 'web_find' ? 'Found' : 'Searched the web';
   } else if (isEdit) displayVerb = unsettled ? 'Edit' : status === 'running' ? 'Editing' : 'Edited';
   else if (isRead) displayVerb = unsettled ? 'Read' : status === 'running' ? 'Reading' : 'Read';
   else if (isSearch) displayVerb = unsettled ? 'Search' : status === 'running' ? 'Searching' : 'Searched';
@@ -257,12 +260,16 @@ export function CommandRunCard({
     ? args.Query
     : typeof args?.query === 'string'
     ? args.query
+    : Array.isArray(args?.query) && args.query.every(value => typeof value === 'string')
+    ? args.query.join(' · ')
     : typeof args?.question === 'string'
     ? args.question
     : typeof args?.Pattern === 'string'
     ? args.Pattern
     : typeof args?.url === 'string'
     ? args.url
+    : Array.isArray(args?.url) && args.url.every(value => typeof value === 'string')
+    ? args.url.join(' · ')
     : typeof args?.term === 'string'
     ? args.term
     : undefined;
@@ -401,6 +408,9 @@ export function CommandRunCard({
         </span>
       );
     }
+    if (lifecycleState === 'stopped' || lifecycleState === 'unknown') {
+      return <span className="status-badge interrupted" data-testid="status-interrupted"><AlertCircle size={12} />{lifecycleState === 'stopped' ? 'Stopped' : 'Process outcome unknown'}</span>;
+    }
     if (status === 'interrupted') {
       return (
         <span className="status-badge interrupted" data-testid="status-interrupted">
@@ -413,7 +423,7 @@ export function CommandRunCard({
       return (
         <span className="status-badge failure" data-testid="status-failed">
           <AlertCircle size={12} />
-          Failed{exitCode != null && <span data-testid={`status-exit-${exitCode}`}>Exit {exitCode}</span>}
+          Failed{exitCode != null && <span data-testid={`status-exit-${exitCode}`}><span aria-hidden="true"> · </span>Exit {exitCode}</span>}
         </span>
       );
     }
@@ -423,7 +433,6 @@ export function CommandRunCard({
           <span className="status-badge success" data-testid="status-exit-0">
             <Check size={14} />
             <span className="exit-text">Exit 0</span>
-            <span className="finished-tag">finished</span>
           </span>
         );
       }
@@ -437,14 +446,7 @@ export function CommandRunCard({
     return (
       <span className="status-badge success" data-testid="status-finished">
         <Check size={14} />
-        {isCommand ? (
-          <>
-            <span className="finished-text sr-only">Finished</span>
-            <span className="finished-tag">finished</span>
-          </>
-        ) : (
-          <span className="finished-text">Finished</span>
-        )}
+        <span className="finished-text">Finished</span>
       </span>
     );
   };
@@ -487,7 +489,7 @@ export function CommandRunCard({
 
         <div className="header-right" onClick={e => e.stopPropagation()}>
           {renderStatusBadge()}
-          {status === 'running' && onStop && <button type="button" aria-label="Stop command" onClick={e => { e.preventDefault(); e.stopPropagation(); onStop(); }}>Stop</button>}
+          {status === 'running' && onStop && <button type="button" aria-label={stopLabel} onClick={e => { e.preventDefault(); e.stopPropagation(); onStop(); }}>Stop</button>}
 
           {durationMs !== undefined && (
             <span className="duration-pill" title="Execution duration">
@@ -501,11 +503,10 @@ export function CommandRunCard({
 
       {(expanded || inspected) && <div className="card-body">
         {path && path !== displayTitle && <p className="muted">{path}</p>}
-        {(cwd || (command && environment) || localServerId || authorization) && (
+        {/* Working directory and environment already appear in the header. */}
+        {(localServerId || authorization) && (
           <p className="tool-meta">
             {[
-              cwd ? <span key="cwd">Working directory <code className="tool-meta-value">{cwd}</code></span> : null,
-              command && environment ? <span key="env">Environment <code className="tool-meta-value">{environment}</code></span> : null,
               localServerId ? <span key="lsid">Local server <code className="tool-meta-value">{localServerId}</code></span> : null,
               authorization ? <span key="auth">Authorization: {authorization}</span> : null,
             ].filter(Boolean).reduce<ReactNode[]>((items, item) => items.length ? [...items, <span key={`sep-${items.length}`} aria-hidden="true">·</span>, item] : [item], [])}
@@ -515,11 +516,8 @@ export function CommandRunCard({
         {error && <p className="error-banner" role="alert">{error}</p>}
         {(resultStatus || envelopeStatus) && (
           <p className="muted" data-testid="result-status">
-            Structured result: {resultStatus ?? 'n/a'}{envelopeStatus ? ` · outcome ${envelopeStatus}` : ''}
+            Result: {resultStatus ?? 'unknown'}{envelopeStatus ? ` · ${envelopeStatus}` : ''}
           </p>
-        )}
-        {environment === 'Workspace' && toolName === 'edit_file' && (
-          <p>Review the unified diff below before continuing. Re-read the file when the hash no longer matches.</p>
         )}
         {isWeb && (webAnswer || webSources.length > 0) && (
           <div className="web-result-summary">
@@ -549,7 +547,8 @@ export function CommandRunCard({
           </div>
         )}
 
-        {command && (
+        {/* The header already shows a single-line command; repeat it only when the header truncates or drops lines. */}
+        {command && (command.includes('\n') || command.trim() !== firstLine || firstLine.length > 120) && (
           <div className="tool-input" data-testid="command-input">
             <CodeBlock code={command} language="bash" streaming={status === 'running'} ariaLabel={`Command: ${command}`} />
           </div>
@@ -643,8 +642,8 @@ export function CommandRunCard({
               </div>
             ) : (
               <>
-                {stdoutLines.length > 0 && <OutputChannel name={stderrLines.length ? 'stdout' : undefined} lines={stdoutLines} live={status === 'running'} following={!scrolledUp} onBrowse={pauseFollowing} />}
-                {stderrLines.length > 0 && <OutputChannel name="stderr" lines={stderrLines} live={status === 'running'} following={!scrolledUp} onBrowse={pauseFollowing} />}
+                {stdoutLines.length > 0 && <OutputChannel name={stderrLines.length ? 'stdout' : undefined} lines={stdoutLines} live={status === 'running'} following={!scrolledUp} />}
+                {stderrLines.length > 0 && <OutputChannel name="stderr" lines={stderrLines} live={status === 'running'} following={!scrolledUp} />}
               </>
             )}
             {scrolledUp && hasOutput && (

@@ -7,7 +7,7 @@ import https from "node:https";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-//#region src/web/types.ts
+// src/web/types.ts
 function emptySearchMeta() {
 	return {
 		answers: [],
@@ -33,8 +33,7 @@ function mergeSearchMeta(base, extra) {
 		suggestions: uniq([...base.suggestions, ...extra.suggestions]).slice(0, 8)
 	};
 }
-//#endregion
-//#region src/web/config/defaults.ts
+// src/web/config/defaults.ts
 var DEFAULT_CONFIG = {
 	extractEvidenceWithModel: false,
 	enabled: true,
@@ -213,8 +212,7 @@ function createConfig(overrides) {
 	};
 	return base;
 }
-//#endregion
-//#region src/web/ranking/url_normalizer.ts
+// src/web/ranking/url_normalizer.ts
 /**
 * URL Normalizer: Normalizes URLs for canonical deduplication while preserving
 * meaningful identifying parameters and removing tracking/marketing parameters.
@@ -282,8 +280,7 @@ function extractDomain(urlStr) {
 		return "unknown";
 	}
 }
-//#endregion
-//#region src/web/ranking/deduplicator.ts
+// src/web/ranking/deduplicator.ts
 /**
 * Computes Token Jaccard similarity between two strings.
 */
@@ -350,8 +347,7 @@ function deduplicateSearchResults(results) {
 	}
 	return uniqueResults;
 }
-//#endregion
-//#region src/web/search/result_fusion.ts
+// src/web/search/result_fusion.ts
 function fuseSearchResults(queryResults) {
 	const allResults = [];
 	for (const group of queryResults) for (const r of group.results) allResults.push({
@@ -360,8 +356,7 @@ function fuseSearchResults(queryResults) {
 	});
 	return deduplicateSearchResults(allResults);
 }
-//#endregion
-//#region node_modules/fflate/esm/index.mjs
+// node_modules/fflate/esm/index.mjs
 var require = createRequire("/");
 var _a;
 try {
@@ -691,8 +686,7 @@ var td = typeof TextDecoder != "undefined" && /*#__PURE__*/ new TextDecoder();
 try {
 	td.decode(et, { stream: true });
 } catch (e) {}
-//#endregion
-//#region src/web/chunking/tokenizer.ts
+// src/web/chunking/tokenizer.ts
 var ApproximateTokenCounter = class {
 	count(text) {
 		if (!text) return 0;
@@ -703,8 +697,7 @@ var ApproximateTokenCounter = class {
 	}
 };
 var defaultTokenCounter = new ApproximateTokenCounter();
-//#endregion
-//#region src/web/chunking/semantic_chunker.ts
+// src/web/chunking/semantic_chunker.ts
 function chunkDocument(doc, options = {}) {
 	const targetTokens = options.targetTokens ?? 600;
 	const overlapTokens = options.overlapTokens ?? 80;
@@ -808,8 +801,7 @@ function chunkDocument(doc, options = {}) {
 	}
 	return chunks;
 }
-//#endregion
-//#region src/web/documents/document_store.ts
+// src/web/documents/document_store.ts
 /**
 * Document Store: full stored document text with stable evidence references.
 *
@@ -1304,8 +1296,7 @@ function latin1ToBytes(latin1) {
 	for (let i = 0; i < latin1.length; i++) bytes[i] = latin1.charCodeAt(i) & 255;
 	return bytes;
 }
-//#endregion
-//#region src/web/router/request_normalizer.ts
+// src/web/router/request_normalizer.ts
 var KNOWN_LOCATIONS = /* @__PURE__ */ new Set([
 	"ranaghat",
 	"tokyo",
@@ -1454,8 +1445,7 @@ function normalizeRequest(rawQuery) {
 		dateExpressions
 	};
 }
-//#endregion
-//#region src/web/router/freshness.ts
+// src/web/router/freshness.ts
 function detectFreshnessRequirement(query) {
 	const q = query.toLowerCase();
 	if (/\b(right now|live|current temperature|realtime|at this moment)\b/i.test(q)) return "realtime";
@@ -1465,8 +1455,7 @@ function detectFreshnessRequirement(query) {
 	if (/\b(this year|2025|2026|2024|annual)\b/i.test(q)) return "year";
 	return "any";
 }
-//#endregion
-//#region src/web/router/vertical_router.ts
+// src/web/router/vertical_router.ts
 function routeVertical(query) {
 	const q = query.toLowerCase().trim();
 	if (/\b(weather|temperature|forecast|rain|snow|humidity|wind speed|weather report)\b/i.test(q)) return "WEATHER";
@@ -1478,8 +1467,7 @@ function routeVertical(query) {
 	if (/\b(research paper|arxiv|benchmark comparison|eval results|swe-bench)\b/i.test(q)) return "ACADEMIC";
 	return "GENERAL_WEB";
 }
-//#endregion
-//#region src/web/router/intent_router.ts
+// src/web/router/intent_router.ts
 function routeRequest(question) {
 	const trimmed = question.trim();
 	const freshness = detectFreshnessRequirement(trimmed);
@@ -1520,8 +1508,7 @@ function routeRequest(question) {
 		reasoning: `Requires web search in vertical ${vertical} with freshness ${freshness}`
 	};
 }
-//#endregion
-//#region src/web/planning/fallback_planner.ts
+// src/web/planning/fallback_planner.ts
 function planQueriesDeterministically(question, freshness = "any", maxQueries = 4) {
 	const queries = [];
 	const cleanQ = question.trim();
@@ -1559,8 +1546,7 @@ function planQueriesDeterministically(question, freshness = "any", maxQueries = 
 	});
 	return queries.slice(0, maxQueries);
 }
-//#endregion
-//#region src/web/planning/query_schema.ts
+// src/web/planning/query_schema.ts
 /**
 * Query Planner Schema: Structured schema definition for query planning.
 */
@@ -1598,8 +1584,7 @@ var QUERY_PLAN_SCHEMA = {
 	} },
 	required: ["queries"]
 };
-//#endregion
-//#region src/web/planning/query_planner.ts
+// src/web/planning/query_planner.ts
 var QueryPlanner = class {
 	llmProvider;
 	constructor(llmProvider) {
@@ -1678,8 +1663,7 @@ Return valid JSON: {"queries": [{"query": "...", "purpose": "...", "freshness": 
 		}];
 	}
 };
-//#endregion
-//#region src/web/search/result_normalizer.ts
+// src/web/search/result_normalizer.ts
 function normalizeRawSearchResult(raw, queryId, rank, page = 1) {
 	const url = String(raw.url || raw.link || "").trim();
 	const title = String(raw.title || "Untitled").trim();
@@ -1703,8 +1687,7 @@ function normalizeRawSearchResult(raw, queryId, rank, page = 1) {
 		}
 	};
 }
-//#endregion
-//#region src/web/extraction/metadata.ts
+// src/web/extraction/metadata.ts
 function extractPageMetadata(html) {
 	const meta = {};
 	const canonicalMatch = html.match(/<link\s+[^>]*rel=["']canonical["'][^>]*href=["']([^"']+)["']/i) || html.match(/<link\s+[^>]*href=["']([^"']+)["'][^>]*rel=["']canonical["']/i);
@@ -1741,8 +1724,7 @@ function extractPageMetadata(html) {
 	} catch {}
 	return meta;
 }
-//#endregion
-//#region src/web/extraction/main_content.ts
+// src/web/extraction/main_content.ts
 /**
 * Main Content Extractor: Extracts readable article/page text, strips boilerplate
 * (nav, ads, cookie notices, scripts, footers), preserves heading structure,
@@ -1845,8 +1827,7 @@ function extractMainContent(html, fallbackTitle = "") {
 		tables
 	};
 }
-//#endregion
-//#region src/web/search/searxng_provider.ts
+// src/web/search/searxng_provider.ts
 /**
 * Normalize SearXNG's version-varying meta fields into SearchMeta. Answers may
 * be plain strings or {answer,url} objects; infoboxes expose `infobox`/`content`
@@ -2133,8 +2114,7 @@ var SearXNGProvider = class SearXNGProvider {
 		}
 	}
 };
-//#endregion
-//#region src/web/search/search_service.ts
+// src/web/search/search_service.ts
 var SearchService = class {
 	provider;
 	maxConcurrent;
@@ -2224,8 +2204,7 @@ var SearchService = class {
 		}
 	}
 };
-//#endregion
-//#region src/web/search/google_provider.ts
+// src/web/search/google_provider.ts
 var GoogleSearchProvider = class {
 	apiKey;
 	cxId;
@@ -2283,8 +2262,7 @@ var GoogleSearchProvider = class {
 		}
 	}
 };
-//#endregion
-//#region src/web/ranking/source_quality.ts
+// src/web/ranking/source_quality.ts
 var DOMAIN_RULES = {
 	"docs.": {
 		type: "official_documentation",
@@ -2479,8 +2457,7 @@ function assessSourceQuality(urlStr, title) {
 		isPrimary: false
 	};
 }
-//#endregion
-//#region src/web/ranking/freshness_score.ts
+// src/web/ranking/freshness_score.ts
 function calculateFreshnessScore(publishedAt, freshnessReq, vertical, currentDate = /* @__PURE__ */ new Date()) {
 	if (!publishedAt) {
 		if (freshnessReq === "realtime" || freshnessReq === "day") return .35;
@@ -2501,8 +2478,7 @@ function calculateFreshnessScore(publishedAt, freshnessReq, vertical, currentDat
 	const score = Math.exp(-Math.LN2 * ageDays / halfLifeDays);
 	return Math.min(1, Math.max(.05, score));
 }
-//#endregion
-//#region src/web/ranking/search_ranker.ts
+// src/web/ranking/search_ranker.ts
 function rankSearchResults(results, options) {
 	const queryWords = options.query.toLowerCase().replace(/[^\w\s]/g, "").split(/\s+/).filter((w) => w.length > 2);
 	return results.map((result) => {
@@ -2527,8 +2503,7 @@ function rankSearchResults(results, options) {
 		};
 	}).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 }
-//#endregion
-//#region src/web/security/ssrf_guard.ts
+// src/web/security/ssrf_guard.ts
 var SSRFError = class extends Error {
 	constructor(message) {
 		super(`SSRF Protection Blocked: ${message}`);
@@ -2607,16 +2582,14 @@ function isSafeUrl(rawUrl) {
 		return false;
 	}
 }
-//#endregion
-//#region src/web/fetch/fetch_policy.ts
+// src/web/fetch/fetch_policy.ts
 function selectPagesToFetch(results, mode, config) {
 	let targetCount = config.normalPages;
 	if (mode === "fast") targetCount = config.fastPages;
 	if (mode === "deep") targetCount = config.deepPages;
 	return results.filter((r) => isSafeUrl(r.url)).slice(0, targetCount);
 }
-//#endregion
-//#region src/web/fetch/http_fetcher.ts
+// src/web/fetch/http_fetcher.ts
 var HttpFetcher = class {
 	globalConcurrency;
 	perDomainConcurrency;
@@ -2643,8 +2616,7 @@ var HttpFetcher = class {
 		}
 	}
 };
-//#endregion
-//#region src/web/fetch/github_fast_path.ts
+// src/web/fetch/github_fast_path.ts
 /**
 * GitHub fast path: github.com pages are heavy JS shells that the raw,
 * no-render fetcher extracts poorly, while the underlying content is freely
@@ -2713,8 +2685,7 @@ function isUsableRawResponse(status, mime, body, kind) {
 	if (kind === "blob") return body.trim().length > 0;
 	return (!mime || /^(text\/(plain|markdown)|application\/octet-stream)/.test(mime)) && body.trim().length > 60;
 }
-//#endregion
-//#region src/web/fetch/wayback.ts
+// src/web/fetch/wayback.ts
 /**
 * Wayback Machine fallback: recovers a failed page fetch from the Internet
 * Archive. Only consulted after a live fetch fails or returns no usable body,
@@ -2782,8 +2753,7 @@ async function fetchViaWayback(originalUrl, fetcher, options = {}) {
 		return null;
 	}
 }
-//#endregion
-//#region src/web/fetch/challenge.ts
+// src/web/fetch/challenge.ts
 var CHALLENGE_MISS_REASON = "challenge_detected";
 var BODY_SCAN_LIMIT = 65536;
 var BODY_MARKERS = [
@@ -2823,8 +2793,7 @@ function detectChallenge(status, body) {
 	}
 	return null;
 }
-//#endregion
-//#region src/web/fetch/cascade.ts
+// src/web/fetch/cascade.ts
 /**
 * In-process fetch cascade modeled on self-hosted SearXNG stacks:
 * GitHub raw content → live HTML fetch → Wayback Machine.
@@ -2992,8 +2961,7 @@ async function fetchPageCascade(url, fetcher, options = {}) {
 		error: skippedLive ? "chronic domain skipped live fetch" : failureDetail || "fetch failed"
 	};
 }
-//#endregion
-//#region src/web/fetch/domain_stats.ts
+// src/web/fetch/domain_stats.ts
 var DOMAIN_RECORD_TTL_SECONDS = 7776e3;
 var DomainStatsStore = class {
 	storage;
@@ -3088,8 +3056,7 @@ async function orderByDomainHealth(results, stats) {
 		deprioritized
 	};
 }
-//#endregion
-//#region src/web/extraction/extraction_fallback.ts
+// src/web/extraction/extraction_fallback.ts
 function fallbackSnippetExtraction(title, snippet, _url) {
 	const text = `${title}\n\n${snippet}`.trim();
 	return {
@@ -3104,8 +3071,7 @@ function fallbackSnippetExtraction(title, snippet, _url) {
 		tables: []
 	};
 }
-//#endregion
-//#region src/web/retrieval/embeddings.ts
+// src/web/retrieval/embeddings.ts
 /**
 * Computes cosine similarity between two unit vectors.
 */
@@ -3183,8 +3149,7 @@ var LocalHashingEmbeddingProvider = class {
 		return texts.map((t) => this.vectorize(t));
 	}
 };
-//#endregion
-//#region src/web/retrieval/bm25.ts
+// src/web/retrieval/bm25.ts
 var InMemoryBM25 = class {
 	k1;
 	b;
@@ -3254,8 +3219,7 @@ var InMemoryBM25 = class {
 		return limit ? scores.slice(0, limit) : scores;
 	}
 };
-//#endregion
-//#region src/web/retrieval/rrf.ts
+// src/web/retrieval/rrf.ts
 function reciprocalRankFusion(rankings, k = 60) {
 	const scoreMap = /* @__PURE__ */ new Map();
 	for (const ranking of rankings) for (const entry of ranking) {
@@ -3272,8 +3236,7 @@ function reciprocalRankFusion(rankings, k = 60) {
 	result.sort((a, b) => b.rrfScore - a.rrfScore);
 	return result;
 }
-//#endregion
-//#region src/web/retrieval/diversity.ts
+// src/web/retrieval/diversity.ts
 /**
 * Filters chunks to ensure no single document contributes more than maxChunksPerDocument.
 */
@@ -3289,8 +3252,7 @@ function applyDocumentDiversity(chunks, maxChunksPerDoc = 2) {
 	}
 	return filtered;
 }
-//#endregion
-//#region src/web/retrieval/hybrid_retriever.ts
+// src/web/retrieval/hybrid_retriever.ts
 var HybridRetriever = class {
 	embeddingProvider;
 	options;
@@ -3348,8 +3310,7 @@ var HybridRetriever = class {
 		return applyDocumentDiversity(fusedChunks, maxPerDoc).slice(0, limit);
 	}
 };
-//#endregion
-//#region src/web/reranking/cross_encoder.ts
+// src/web/reranking/cross_encoder.ts
 var LocalCrossEncoderReranker = class {
 	tokenize(text) {
 		return text.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/).filter((t) => t.length > 1);
@@ -3397,8 +3358,7 @@ var LocalCrossEncoderReranker = class {
 		return scored.slice(0, limit);
 	}
 };
-//#endregion
-//#region src/web/reranking/reranker.ts
+// src/web/reranking/reranker.ts
 /** Exponential recency decay over a 90-day scale; 0 for missing or future dates. */
 function recencyScore(publishedAt) {
 	if (!publishedAt) return 0;
@@ -3472,8 +3432,7 @@ var ResilientReranker = class {
 		return applyRecencyBlend(ranked, this.recencyWeight).slice(0, limit);
 	}
 };
-//#endregion
-//#region src/web/evidence/source_registry.ts
+// src/web/evidence/source_registry.ts
 var SourceManager = class {
 	sources = /* @__PURE__ */ new Map();
 	urlToId = /* @__PURE__ */ new Map();
@@ -3516,8 +3475,7 @@ var SourceManager = class {
 		return lines.join("\n");
 	}
 };
-//#endregion
-//#region src/web/security/injection_guard.ts
+// src/web/security/injection_guard.ts
 var SUSPICIOUS_DIRECTIVE_PATTERNS = [
 	/ignore\s+(all\s+)?(previous|prior|above)\s+instructions/gi,
 	/disregard\s+(all\s+)?(previous|prior|above)\s+instructions/gi,
@@ -3552,8 +3510,7 @@ function sanitizeWebEvidence(rawText) {
 		neutralizedDirectives
 	};
 }
-//#endregion
-//#region src/web/evidence/extractor.ts
+// src/web/evidence/extractor.ts
 var EvidenceExtractor = class {
 	llmProvider;
 	constructor(llmProvider) {
@@ -3641,8 +3598,7 @@ Rules:
 		return this.deterministicExtract(question, chunk, sourceId);
 	}
 };
-//#endregion
-//#region src/web/evidence/deduplicator.ts
+// src/web/evidence/deduplicator.ts
 function deduplicateFacts(facts) {
 	const claims = [];
 	let claimCounter = 1;
@@ -3670,8 +3626,7 @@ function deduplicateFacts(facts) {
 	}
 	return claims;
 }
-//#endregion
-//#region src/web/evidence/conflict_detector.ts
+// src/web/evidence/conflict_detector.ts
 function detectEvidenceConflicts(claims) {
 	const processed = [...claims];
 	for (let i = 0; i < processed.length; i++) for (let j = i + 1; j < processed.length; j++) {
@@ -3696,8 +3651,7 @@ function detectEvidenceConflicts(claims) {
 	}
 	return processed;
 }
-//#endregion
-//#region src/web/context/token_budget.ts
+// src/web/context/token_budget.ts
 function allocateEvidenceBudget(claims, question, config) {
 	const questionTokens = defaultTokenCounter.count(question);
 	const systemBudget = config.systemBudget;
@@ -3736,8 +3690,7 @@ function allocateEvidenceBudget(claims, question, config) {
 		droppedCount
 	};
 }
-//#endregion
-//#region src/web/context/context_builder.ts
+// src/web/context/context_builder.ts
 function buildGroundedContext(question, sources, claims, options = {}) {
 	const curDate = options.currentDate || (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
 	const systemPrompt = `You are a grounded answer synthesizer.
@@ -3821,14 +3774,12 @@ async function buildModelBudgetedContext(question, sources, claims, config, curr
 		result = buildBudgetedContext(question, sources, result.allocation.claims.slice(0, -1), config, currentDate);
 	}
 }
-//#endregion
-//#region src/web/security/content_sanitizer.ts
+// src/web/security/content_sanitizer.ts
 function escapeHtml(text) {
 	if (!text) return "";
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
 }
-//#endregion
-//#region src/web/generation/citation_renderer.ts
+// src/web/generation/citation_renderer.ts
 function validateAndCleanCitations(text, sources) {
 	const citedSourceIds = [];
 	const invalidSourceIds = [];
@@ -3874,8 +3825,7 @@ function renderSourcesSection(citedIds, sources) {
 	});
 	return lines.join("\n");
 }
-//#endregion
-//#region src/web/verification/claim_verifier.ts
+// src/web/verification/claim_verifier.ts
 var ClaimVerifier = class {
 	llmProvider;
 	constructor(llmProvider) {
@@ -4093,8 +4043,7 @@ function addsCurrentWording(claim, passage) {
 	const source = normalizeText(passage);
 	return CURRENT_MARKERS.some((marker) => hasMarker(claimed, marker) && !hasMarker(source, marker));
 }
-//#endregion
-//#region src/web/verification/claim_extractor.ts
+// src/web/verification/claim_extractor.ts
 /**
 * Claim Extractor: Decomposes a synthesized answer into externally verifiable atomic claims.
 */
@@ -4108,8 +4057,7 @@ function extractAtomicClaims(answerText) {
 	}
 	return claims;
 }
-//#endregion
-//#region src/web/generation/answer_generator.ts
+// src/web/generation/answer_generator.ts
 var AnswerGenerator = class {
 	llmProvider;
 	constructor(llmProvider) {
@@ -4180,8 +4128,7 @@ var AnswerGenerator = class {
 		}
 	}
 };
-//#endregion
-//#region src/web/verification/research_retry.ts
+// src/web/verification/research_retry.ts
 /** Normalize a query for repeat detection. */
 function normalizeQueryText(query) {
 	return query.toLowerCase().replace(/[^\w\s]/g, "").split(/\s+/).filter(Boolean).sort().join(" ");
@@ -4220,8 +4167,7 @@ function evaluateResearchRetry(verification, currentRetryCount, maxRetries = 1, 
 		reason: `Found ${unsupported.length} unsupported claim(s). Initiating targeted research.`
 	};
 }
-//#endregion
-//#region src/web/planning/research_state.ts
+// src/web/planning/research_state.ts
 function initResearchState(question) {
 	const requirements = splitRequirements(question);
 	return {
@@ -4302,8 +4248,7 @@ function classifyRequirements(state, evidence) {
 		};
 	});
 }
-//#endregion
-//#region src/web/verticals/weather/weather_provider.ts
+// src/web/verticals/weather/weather_provider.ts
 var weatherTemperature = (celsius, unit) => unit === "fahrenheit" ? celsius * 9 / 5 + 32 : celsius;
 function validateWeatherRequest(location, forecastDays = 3) {
 	if (typeof location !== "string" || !location.trim() || location.length > 200) throw new Error("Weather requires an explicit location of 1–200 characters.");
@@ -4493,8 +4438,7 @@ var WeatherProvider = class {
 		].filter(Boolean).join(", ")}\nAs of ${report.observedAt} (${report.timezone}), Open-Meteo model data.\nCurrent Temperature: ${temp(cur.temperatureC)} (Feels like ${temp(cur.apparentTemperatureC)})\nHumidity: ${cur.humidityPercent}%\nWind Speed: ${cur.windKph} km/h\n` + report.forecast.map((f) => `${f.date}: High ${temp(f.maxC)}, Low ${temp(f.minC)}, Rain probability ${f.precipitationProbabilityPercent}%`).join("\n");
 	}
 };
-//#endregion
-//#region src/web/extraction/structured_content.ts
+// src/web/extraction/structured_content.ts
 /** Parse public structured documents without treating their contents as HTML. */
 function extractStructuredContent(body, mime) {
 	const source = body.replace(/^\uFEFF/, "");
@@ -4550,8 +4494,7 @@ function extractStructuredContent(body, mime) {
 		rows: rows.length
 	};
 }
-//#endregion
-//#region src/web/verticals/currency/currency_provider.ts
+// src/web/verticals/currency/currency_provider.ts
 var CurrencyProvider = class {
 	parseQuery(query) {
 		const match = query.toUpperCase().match(/(?:(\d+(?:\.\d+)?)\s*)?\b([A-Z]{3})\s+(?:TO|IN)\s+([A-Z]{3})\b/);
@@ -4584,8 +4527,7 @@ var CurrencyProvider = class {
 		return `${r.amount} ${r.baseCurrency} = ${r.convertedAmount} ${r.targetCurrency} (1 ${r.baseCurrency} = ${r.rate} ${r.targetCurrency}, as of ${r.lastUpdated}; indicative rate from ExchangeRate-API).`;
 	}
 };
-//#endregion
-//#region src/web/verticals/time/time_provider.ts
+// src/web/verticals/time/time_provider.ts
 var CITY_TIMEZONES = {
 	tokyo: "Asia/Tokyo",
 	japan: "Asia/Tokyo",
@@ -4647,8 +4589,7 @@ var TimeProvider = class {
 		return `Current time in ${report.location} (${report.timezone}): ${report.timeFormatted}, ${report.dateFormatted}`;
 	}
 };
-//#endregion
-//#region src/web/cache/sqlite.ts
+// src/web/cache/sqlite.ts
 var InMemoryStorageAdapter = class {
 	stores = /* @__PURE__ */ new Map();
 	getTable(table) {
@@ -4683,8 +4624,7 @@ var InMemoryStorageAdapter = class {
 		else this.stores.clear();
 	}
 };
-//#endregion
-//#region src/web/cache/search_cache.ts
+// src/web/cache/search_cache.ts
 var FRESHNESS_TTL_SECONDS = {
 	realtime: 300,
 	day: 3600,
@@ -4720,8 +4660,7 @@ var SearchCache = class {
 		if (meta.answers.length || meta.infoboxes.length || meta.corrections.length || meta.suggestions.length) await this.storage.set("search_cache", `${this.makeKey(provider, query, freshness)}::meta`, meta, ttlSeconds);
 	}
 };
-//#endregion
-//#region src/web/cache/document_cache.ts
+// src/web/cache/document_cache.ts
 var DocumentCache = class {
 	storage;
 	constructor(storage = new InMemoryStorageAdapter()) {
@@ -4736,8 +4675,7 @@ var DocumentCache = class {
 		await this.storage.set("document_cache", norm, doc, ttlSeconds);
 	}
 };
-//#endregion
-//#region src/web/observability/logger.ts
+// src/web/observability/logger.ts
 var PipelineLogger = class {
 	events = [];
 	enabled;
@@ -4758,8 +4696,7 @@ var PipelineLogger = class {
 		return this.events;
 	}
 };
-//#endregion
-//#region src/web/observability/trace.ts
+// src/web/observability/trace.ts
 var TraceCollector = class {
 	trace;
 	stageTimers = /* @__PURE__ */ new Map();
@@ -4805,8 +4742,7 @@ var TraceCollector = class {
 		return { ...this.trace };
 	}
 };
-//#endregion
-//#region src/web/models/retrieval_providers.ts
+// src/web/models/retrieval_providers.ts
 async function post(options, path, body) {
 	const url = new URL(path, options.baseUrl);
 	if (![
@@ -4880,8 +4816,7 @@ var LocalModelReranker = class {
 		}));
 	}
 };
-//#endregion
-//#region src/web/planning/coverage.ts
+// src/web/planning/coverage.ts
 function comparisonEntities(question) {
 	if (!/\b(compare|versus|vs\.?)\b/i.test(question)) return [];
 	const match = question.match(/(?:compare\s+(?:.*?\bfor\s+)?)(.+?)\s+(?:and|versus|vs\.?)\s+(.+?)(?:\s+(?:using|on|in terms of)\b|[?!.]|$)/i) || question.match(/(.+?)\s+(?:versus|vs\.?)\s+(.+?)(?:[?!.]|$)/i);
@@ -4902,8 +4837,7 @@ function coverageMatrix(question, evidence) {
 		covered: evidence.some((e) => e.claim.toLowerCase().includes(entity.toLowerCase()) && pattern.test(e.claim))
 	})));
 }
-//#endregion
-//#region src/web/observability/metrics.ts
+// src/web/observability/metrics.ts
 function formatDiagnosticReport(session) {
 	const t = session.trace;
 	const compressionRatio = t.finalEvidenceTokens > 0 ? (t.extractedTokens / t.finalEvidenceTokens).toFixed(1) + "x" : "N/A";
@@ -4938,8 +4872,7 @@ Conflicting claims: ${t.conflictingClaims}
 Total latency: ${t.totalLatencyMs}ms
 -----------------------------------`.trim();
 }
-//#endregion
-//#region src/web/index.ts
+// src/web/index.ts
 var WebSearchEngine = class {
 	config;
 	searchProvider;
@@ -5875,8 +5808,7 @@ var WebSearchEngine = class {
 		};
 	}
 };
-//#endregion
-//#region src/web/models/local_provider.ts
+// src/web/models/local_provider.ts
 var LocalOpenAICompatibleProvider = class {
 	baseUrl;
 	modelName;
@@ -6009,8 +5941,7 @@ var LocalOpenAICompatibleProvider = class {
 		}
 	}
 };
-//#endregion
-//#region scripts/web-storage.mjs
+// scripts/web-storage.mjs
 /** Dedicated research database: never expose arbitrary SQL to a model. */
 var SqliteStorage = class {
 	constructor(path) {
@@ -6075,8 +6006,7 @@ var SqliteStorage = class {
 		this.db.close();
 	}
 };
-//#endregion
-//#region src/web/fetch/robots_policy.ts
+// src/web/fetch/robots_policy.ts
 /** RFC 9309 group selection and longest matching path, including * and $. */
 var RobotsChecker = class {
 	parseRobotsTxt(text) {
@@ -6126,8 +6056,7 @@ var RobotsChecker = class {
 		return allowed;
 	}
 };
-//#endregion
-//#region src/web/fetch/rate_limiter.ts
+// src/web/fetch/rate_limiter.ts
 /** Bounded global/per-domain semaphore. Wake all waiters to avoid cross-queue starvation. */
 var BoundedConcurrencyLimiter = class {
 	globalActive = 0;
@@ -6156,8 +6085,7 @@ var BoundedConcurrencyLimiter = class {
 		};
 	}
 };
-//#endregion
-//#region scripts/web-transport.mjs
+// scripts/web-transport.mjs
 var denied = new BlockList();
 for (const [address, prefix] of [
 	["0.0.0.0", 8],
@@ -6379,8 +6307,7 @@ var PinnedPageFetcher = class {
 		}
 	}
 };
-//#endregion
-//#region scripts/web-render.mjs
+// scripts/web-render.mjs
 /**
 * Last-resort render for pages a static fetch cannot read.
 *
@@ -6920,8 +6847,7 @@ async function renderPage(url, { timeoutMs = 2e4, maxBytes = 5242880, virtualTim
 		await closeQuiet(browser);
 	}
 }
-//#endregion
-//#region scripts/web-worker.mjs
+// scripts/web-worker.mjs
 /** Bounded page shape returned to the model for visit/fetch-url calls. */
 function shapeDocument(doc) {
 	return {
@@ -7151,5 +7077,4 @@ try {
 } finally {
 	storage?.close();
 }
-//#endregion
 export {};

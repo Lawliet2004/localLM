@@ -240,6 +240,9 @@ fn rewrap_envelope(
     };
     let mut metadata = result.get("metadata").cloned().unwrap_or_else(|| json!({}));
     metadata["truncated"] = json!(true);
+    if let Some(outcome) = crate::tool_envelope::operation_status(result).filter(|outcome| *outcome != status.as_str()) {
+        metadata["outcomeStatus"] = json!(outcome);
+    }
     metadata["artifactId"] = json!(artifact_id);
     metadata["originalBytes"] = json!(size_bytes);
     metadata["sha256"] = json!(sha256);
@@ -321,16 +324,18 @@ fn native_summary(
                 "message":"See artifact.","retryable":false,
                 "sideEffects":result.pointer("/error/sideEffects").and_then(Value::as_str).unwrap_or("unknown")})
         };
+        let bounded_status = if status == "success" { "partial" } else { status };
+        let mut metadata = json!({"family":result["metadata"]["family"],"truncated":true,
+            "sideEffects":result.pointer("/metadata/sideEffects").and_then(Value::as_str).unwrap_or("unknown")});
+        if let Some(outcome) = crate::tool_envelope::operation_status(result).filter(|outcome| *outcome != bounded_status) {
+            metadata["outcomeStatus"] = json!(outcome);
+        }
         crate::tool_envelope::make(
-            crate::tool_envelope::Status::parse(if status == "success" {
-                "partial"
-            } else {
-                status
-            })?,
+            crate::tool_envelope::Status::parse(bounded_status)?,
             data,
             Vec::new(),
             if error.is_null() { None } else { Some(error) },
-            json!({"family":result["metadata"]["family"],"truncated":true,"sideEffects":result.pointer("/metadata/sideEffects").and_then(Value::as_str).unwrap_or("unknown")}),
+            metadata,
         )
     } else {
         data
@@ -485,7 +490,7 @@ fn lifecycle_excerpt(
         // The tool's own `status` says whether the PROCESS is still running.
         // The envelope's `status` describes the call, so the process state
         // needs its own field to survive bounding.
-        if let Some(value) = source.get("status").and_then(Value::as_str) {
+        if let Some(value) = source.get("processState").or_else(|| source.get("status")).and_then(Value::as_str) {
             insert(&["processStatus"], &json!(value));
         }
         if let Some(value) = source.get("exitCode") {
@@ -667,6 +672,25 @@ fn development_excerpt(
     if serialized_len(&out) > budget {
         return None;
     }
+    if tool == "verification_report" {
+        let mut summary = out.clone();
+        let payload = if crate::tool_envelope::is_envelope(&out) { &mut summary["data"] } else { &mut summary };
+        if let Some(verdict) = source.pointer("/check/report/verdict").and_then(Value::as_str) {
+            payload["check"]["report"]["verdict"] = json!(truncate_utf8(verdict, 32));
+        }
+        if source["completionPending"] == true {
+            payload["completionPending"] = json!(true);
+        }
+        if let Some(message) = result.pointer("/error/message").and_then(Value::as_str) {
+            summary["error"]["message"] = json!(truncate_utf8(message, 160));
+            if let Some(kind) = result.pointer("/error/kind") {
+                summary["error"]["kind"] = kind.clone();
+            }
+        }
+        if serialized_len(&summary) <= budget {
+            out = summary;
+        }
+    }
     Some(out)
 }
 
@@ -684,7 +708,7 @@ fn artifact_page_excerpt(result: &Value, tool: &str, budget: usize) -> Option<Va
     let source = if enveloped { &result["data"] } else { result };
     let text = source["excerpt"].as_str()?;
     source["id"].as_str()?;
-    let mut data = json!({"excerpt":"", "limit":0, "hasMore":true});
+    let mut data = json!({"excerpt":"", "limit":0, "hasMore":true,"nextOffset":source["offset"]});
     for key in ["id", "tool", "offset", "totalChars"] {
         data[key] = source.get(key)?.clone();
     }
@@ -706,6 +730,7 @@ fn artifact_page_excerpt(result: &Value, tool: &str, budget: usize) -> Option<Va
         page["excerpt"] = json!(&text[..boundaries[kept]]);
         page["limit"] = json!(kept);
         page["hasMore"] = json!(kept < chars || source["hasMore"] == true);
+        page["nextOffset"] = json!(source["offset"].as_u64().unwrap_or_default().saturating_add(kept as u64));
     };
     if serialized_len(&out) > budget {
         return None;
@@ -725,13 +750,23 @@ fn artifact_page_excerpt(result: &Value, tool: &str, budget: usize) -> Option<Va
 
 /// A full-result pointer is published only after durable capture succeeds.
 pub(crate) fn capture_tool_result(
-    result: Value,
+    mut result: Value,
     tool: &str,
     owner: &str,
     run: Option<&str>,
     budget: usize,
     save: impl FnOnce(&ArtifactRecord) -> Result<(), String>,
 ) -> (Value, Option<String>) {
+    // Keep one copy of large canonical payload fields in new model history
+    // and captured artifacts. The legacy readers still accept either shape.
+    if crate::tool_envelope::is_envelope(&result) {
+        for field in ["content", "diff", "stdout", "stderr"] {
+            if result.get(field).is_some_and(|value|
+                result["data"].get(field) == Some(value) || result["data"]["logs"].get(field) == Some(value)) {
+                if let Some(fields) = result.as_object_mut() { fields.remove(field); }
+            }
+        }
+    }
     let original_status = result.get("status").cloned();
     let (mut bounded, artifact) = bound_tool_result(result, tool, owner, run, budget);
     let Some(artifact) = artifact else { return (bounded, None); };
@@ -778,18 +813,35 @@ pub(crate) fn capture_tool_result(
 }
 
 fn file_read_excerpt(result: &Value, tool: &str, artifact: &ArtifactRecord, budget: usize) -> Option<Value> {
-    if !matches!(tool, "read_file" | "workspace_read_file") {
+    if !matches!(tool, "read_file" | "workspace_read_file" | "file_read") {
         return None;
     }
     let envelope = crate::tool_envelope::is_envelope(result);
-    if envelope && result.pointer("/metadata/family") != Some(&json!("workspace")) {
+    let trusted_family = if tool == "file_read" { "harness" } else { "workspace" };
+    if envelope && result.pointer("/metadata/family") != Some(&json!(trusted_family)) {
         return None;
     }
     let source = if envelope { &result["data"] } else { result };
     let sha = source["sha256"].as_str().filter(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))?;
     let total = source["totalLines"].as_u64()?;
     let path = source["path"].as_str()?;
-    let mut out = native_summary(result, json!({"sha256":sha,"totalLines":total}), artifact, budget)?;
+    let instructions = source["instructions"].as_str();
+    let mut essential = json!({"sha256":sha,"totalLines":total});
+    if instructions.is_some() {
+        essential["instructionsIncomplete"] = json!(true);
+        essential["instructionsNotice"] = json!("Read applicable project rules in the full artifact before editing this path.");
+    }
+    let mut out = native_summary(result, essential, artifact, budget)?;
+    // Rules (or their recovery notice) take priority over optional path copies
+    // and content excerpts. Every insertion still obeys the serialized bound.
+    if let Some(instructions) = instructions {
+        let mut candidate = out.clone();
+        let target = if envelope { &mut candidate["data"] } else { &mut candidate };
+        target["instructions"] = json!(instructions);
+        target.as_object_mut()?.remove("instructionsIncomplete");
+        target.as_object_mut()?.remove("instructionsNotice");
+        if serialized_len(&candidate) <= budget { out = candidate; }
+    }
     if envelope {
         let mut candidate = out.clone();
         candidate["data"]["path"] = json!(path);
@@ -1359,6 +1411,7 @@ pub fn read_window(record: &ArtifactRecord, offset: usize, limit: usize) -> Valu
         "limit": limit,
         "excerpt": excerpt,
         "hasMore": end < total,
+        "nextOffset": end,
     })
 }
 
@@ -1706,6 +1759,7 @@ mod tests {
                 assert_eq!(bounded["id"], record.id);
                 assert_eq!(bounded["offset"], offset);
                 let excerpt = bounded["excerpt"].as_str().unwrap();
+                assert_eq!(bounded["nextOffset"], offset + excerpt.chars().count());
                 assert!(
                     !excerpt.is_empty(),
                     "paging must make progress at budget {budget}"
@@ -1756,6 +1810,7 @@ mod tests {
                     assert_eq!(data["id"], record.id, "paging must retain the original artifact, budget {budget}");
                     assert_eq!(data["offset"], offset);
                     let excerpt = data["excerpt"].as_str().unwrap();
+                    assert_eq!(data["nextOffset"], offset + excerpt.chars().count());
                     assert!(!excerpt.is_empty(), "paging must make progress at budget {budget}");
                     if data["hasMore"] == true {
                         assert_eq!(data["limit"], excerpt.chars().count());
@@ -1934,7 +1989,6 @@ mod tests {
             false,
             "web_search",
             &bounded,
-            &crate::continuation::Budgets::default(),
             0,
             false,
         );
@@ -1976,7 +2030,6 @@ mod tests {
             false,
             "file_write",
             &bounded,
-            &crate::continuation::Budgets::default(),
             0,
             false,
         );
@@ -2007,7 +2060,6 @@ mod tests {
             false,
             "run_code",
             &bounded,
-            &crate::continuation::Budgets::default(),
             0,
             false,
         );

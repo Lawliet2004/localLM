@@ -123,11 +123,8 @@ impl Drop for GracefulChild {
         {
             runtime.spawn(async move {
                 #[cfg(unix)]
-                if let Some(pid) = child
-                    .id()
-                    .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
                 {
-                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::INT);
+                    let _ = child.signal_process_group(rustix::process::Signal::INT);
                 }
                 #[cfg(not(unix))]
                 let _ = child.start_kill();
@@ -213,14 +210,9 @@ async fn record_for(cmd: tokio::process::Command, seconds: u64) -> Result<Value,
             Err(_) => {
                 #[cfg(unix)]
                 {
-                    let pid = child.id().ok_or("Owned recorder PID unavailable.")?;
-                    // Managed spawn creates a private process group; the unreaped
-                    // child still owns this PID. Never signal a named/global session.
-                    if rustix::process::kill_process_group(
-                        rustix::process::Pid::from_raw(pid as i32)
-                            .ok_or("Invalid owned recorder PID.")?,
-                        rustix::process::Signal::INT,
-                    )
+                    // Managed ownership supplies the correct group, including
+                    // platforms whose crash guardian is its group leader.
+                    if child.signal_process_group(rustix::process::Signal::INT)
                     .is_err()
                     {
                         return Err(

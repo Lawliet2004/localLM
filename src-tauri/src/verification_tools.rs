@@ -16,8 +16,23 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     run["properties"]["server"] = json!({"type":"string","minLength":1,"maxLength":64});
     run["required"] = json!(["command"]);
     vec![("verification_run".into(),"Run checks against an explicit set of source files, saving immutable source hashes, command and execution-configuration fingerprint. Returns evidenceId and processId; inspect verification_report. Coverage excludes unselected files and dependencies.".into(),run),
-    ("verification_report".into(),"Read an owned check and compare selected source hashes with its pre-run snapshot. verifiedCurrent requires a recognized passing suite and unchanged selected files. No command is rerun. Returns reportId for immutable comparisons.".into(),dev::schema(json!({"evidence_id":id,"wait_ms":{"type":"integer","minimum":0,"maximum":1000}}),&["evidence_id"])),
+    ("verification_report".into(),"Read an owned check without rerunning it. For a running check, use wait_ms up to 30000 to wait for its terminal state. A terminal report compares the source hashes and returns an immutable reportId. verifiedCurrent requires a recognized passing suite and unchanged selected files.".into(),dev::schema(json!({"evidence_id":id,"wait_ms":{"type":"integer","minimum":0,"maximum":crate::check_tools::MAX_REPORT_WAIT_MS}}),&["evidence_id"])),
     ("verification_compare".into(),"Compare two immutable verification reports from this conversation/workspace. Reports test counts and freshness separately; does not imply equal test selection or complete coverage.".into(),dev::schema(json!({"before_id":id,"after_id":id}),&["before_id","after_id"]))].into_iter().map(crate::tool_spec::ToolSpec::from).collect()
+}
+
+pub(crate) fn source_freshness(root: &str, evidence: &Value) -> Result<Value, String> {
+    let mut freshness = dev::freshness(root, &evidence["sources"]);
+    if evidence["mode"] == "workspace" {
+        let inventory = crate::source_inventory::inventory(root)?;
+        let previous: std::collections::BTreeSet<_> = evidence["sources"]["files"]
+            .as_object().into_iter().flatten().map(|(path, _)| path.as_str()).collect();
+        let current: std::collections::BTreeSet<_> = inventory["paths"]
+            .as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let membership = previous == current && inventory["complete"] == true;
+        freshness["membershipMatches"] = json!(membership);
+        if !membership { freshness["matches"] = json!(false); }
+    }
+    Ok(freshness)
 }
 pub async fn execute(
     ctx: &crate::harness::HarnessCtx<'_>,
@@ -99,6 +114,7 @@ pub async fn execute(
                     .as_slice(),
             );
             let runtime_identity = dev::runtime_identity(&config);
+            let working_directory = config.bash.working_directory.clone();
             let mut call = args.clone();
             for key in ["source_paths", "mode", "server"] {
                 call.as_object_mut().unwrap().remove(key);
@@ -140,7 +156,7 @@ pub async fn execute(
                     )
                 })?;
             Ok(
-                json!({"evidenceId":id,"processId":result["processId"],"check":result,"sourceSnapshot":snap,"verifiedCurrent":false,"message":"Check launch is not a passing result; read verification_report."}),
+                json!({"evidenceId":id,"processId":result["processId"],"workingDirectory":working_directory,"check":result,"sourceSnapshot":snap,"verifiedCurrent":false,"message":"Check launch is not a passing result; read verification_report."}),
             )
         }
         "verification_report" => {
@@ -161,31 +177,15 @@ pub async fn execute(
                         .map_err(|e| e.to_string())?
                         .as_slice(),
                 );
+            let check=crate::check_tools::execute(&ctx.state.processes,owner,root,config.clone(),"check_report",json!({"id":evidence["processId"],"format":evidence["format"],"wait_ms":args["wait_ms"].as_u64().unwrap_or(0)})).await?;
+            if check["report"]["verdict"] == "running" || check["process"]["observationPending"] == true {
+                return Ok(json!({"evidenceId":args["evidence_id"],"processId":evidence["processId"],"check":check,
+                    "completionPending":true,"verifiedCurrent":false,
+                    "message":"The command or its source observation is still settling. Recheck verification_report for this evidence ID."}));
+            }
             let runtime_matches = evidence["runtimeIdentity"]["complete"] == true
                 && evidence["runtimeIdentity"] == dev::runtime_identity(&config);
-            let check=crate::check_tools::execute(&ctx.state.processes,owner,root,config,"check_report",json!({"id":evidence["processId"],"format":evidence["format"],"wait_ms":args["wait_ms"].as_u64().unwrap_or(0)})).await?;
-            let mut freshness = dev::freshness(root, &evidence["sources"]);
-            if evidence["mode"] == "workspace" {
-                let inventory = crate::source_inventory::inventory(root)?;
-                let previous = evidence["sources"]["files"]
-                    .as_object()
-                    .into_iter()
-                    .flatten()
-                    .map(|(p, _)| p.clone())
-                    .collect::<std::collections::BTreeSet<_>>();
-                let current = inventory["paths"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<std::collections::BTreeSet<_>>();
-                let membership = previous == current && inventory["complete"] == true;
-                freshness["membershipMatches"] = json!(membership);
-                if !membership {
-                    freshness["matches"] = json!(false);
-                }
-            }
+            let freshness = source_freshness(root, &evidence)?;
             let observation = evidence["observationId"].as_str()
                 .and_then(|id| dev::load(db, owner, root, id, "verification_observation").ok())
                 .unwrap_or(json!({"complete":false,"warnings":["completion_evidence_missing_running_or_restarted"],"changed":[]}));
@@ -207,6 +207,11 @@ pub async fn execute(
             let mut result = json!({"root":dev::canonical(root)?,"evidenceId":args["evidence_id"],"processId":evidence["processId"],"command":evidence["command"],"sourceSnapshot":evidence["sources"],"freshness":freshness,"runtimeMatches":runtime_matches,"configurationMatches":config_matches,"configurationSha256":evidence["configurationSha256"],"cwd":evidence["cwd"],"isError":check["isError"]==true,
                 "selection":evidence["selection"],"observation":observation,"coverageComplete":coverage_complete,"changedDuringObservation":changed_selected,
                 "verifiedCurrent":check["report"]["testsPassed"]==true&&freshness["matches"]==true&&config_matches&&runtime_matches&&coverage_complete&&!changed_selected&&observation["complete"]==true,"check":check,"observedAt":crate::store::now()});
+            if check["isError"] == true {
+                result["message"] = check["message"].clone();
+                result["code"] = check["code"].clone();
+                result["sideEffects"] = json!("none");
+            }
             result["reportId"] = json!(dev::save(db, owner, run, "verification_report", &result)?);
             Ok(result)
         }

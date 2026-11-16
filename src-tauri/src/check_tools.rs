@@ -788,7 +788,7 @@ fn report(
         "incomplete"=>"Report evidence is incomplete; no full-suite pass is claimed.",
         "command_failed"=>"The command exited unsuccessfully. Inspect the report and process output before correcting the failure.",
         "failed"=>"The report contains test or runner failures, even if the command returned zero.",
-        "timed_out"=>"Checks timed out. The command may have changed files; do not blindly replay it.",
+        "timed_out"=>process["message"].as_str().unwrap_or("Checks reached the configured shell lifetime."),
         "stopped"=>"Checks were stopped before a successful completion was confirmed.",
         _=>"Check completion is unknown; do not assume the command or its side effects completed.",
     };
@@ -831,6 +831,8 @@ pub(crate) fn effective_config(
     }
     config
 }
+
+pub(crate) const MAX_REPORT_WAIT_MS: u64 = 30_000;
 pub async fn execute(
     registry: &crate::process_tools::ProcessRegistry,
     owner: &str,
@@ -847,9 +849,10 @@ pub(crate) async fn execute_observed(
     workspace: &str,
     mut config: crate::execution::ExecutionConfig,
     alias: &str,
-    args: Value,
+    mut args: Value,
     completion: Option<crate::verification_observer::Completion>,
 ) -> Result<Value, String> {
+    crate::process_tools::align_arguments(alias, &mut args);
     match alias {
         "check_run" => {
             let args: RunArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -883,14 +886,9 @@ pub(crate) async fn execute_observed(
         }
         "check_report" => {
             let args: ReportArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-            let wait = args.wait_ms.unwrap_or(0);
-            if wait > 1000 {
-                return Err("Report wait_ms must be0–1000.".into());
-            }
-            // Check ownership before any delay; the snapshot rechecks it too.
-            registry.retained_output(owner, workspace, &args.id)?;
+            let wait = args.wait_ms.unwrap_or(0).min(MAX_REPORT_WAIT_MS);
             if wait > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                registry.wait_for_terminal(owner, workspace, &args.id, std::time::Duration::from_millis(wait)).await?;
             }
             let snapshot = registry.retained_output(owner, workspace, &args.id)?;
             // Parsing a large report is read-only CPU work. Offload it so
@@ -919,8 +917,8 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     let offset = json!({"type":"integer","minimum":0,"maximum":1000000,"default":0});
     let limit = json!({"type":"integer","minimum":0,"maximum":200,"default":50,"description":"Case detail page size;0 returns summary only. Failing cases sort first, then source order."});
     vec![
-        ("check_run".into(),"Run a build, test suite or check with the configured approved shell. Returns an owned process ID and structured report promptly; use check_report for completion, process_stop for cancellation, and process_poll for raw output. Launch success does not mean tests passed: inspect report.verdict/testsPassed/counts. No implicit command retry. Uses configured environment/time/memory/approval limits; CI=1/NO_COLOR/CARGO_TERM_COLOR=never defaults respect explicit saved environment overrides.".into(),schema(json!({"command":{"type":"string","minLength":1,"maxLength":32768},"cwd":{"type":"string","maxLength":4096},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300},"yield_ms":{"type":"integer","minimum":0,"maximum":1000,"default":100},"format":format,"case_offset":offset,"max_cases":limit}),&["command"])),
-        ("check_report".into(),"Read structured build/test evidence from a conversation/workspace-owned process without rerunning it. Parses Cargo/libtest, Vitest/Jest JSON or text, TAP, or locallm.check-report/1 JSON. Reports failed commands, zero tests, missing/invalid reports, timeout, stop, unknown outcomes and log loss explicitly. A successful exit without recognized tests never claims testsPassed. Page case details with sourceSha256 pin; inspect raw output via process_poll.".into(),schema(json!({"id":{"type":"string","minLength":1,"maxLength":128},"format":format,"wait_ms":{"type":"integer","minimum":0,"maximum":1000,"default":0},"case_offset":offset,"max_cases":limit,"expected_sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"}}),&["id"])),
+        ("check_run".into(),"Run a build, test suite or check with the configured approved shell. Returns an owned process ID and structured report promptly; use check_report for completion, process_stop for cancellation, and process_poll for raw output. Launch success does not mean tests passed: inspect report.verdict/testsPassed/counts. No implicit command retry. Uses configured environment/time/memory/approval limits; CI=1/NO_COLOR/CARGO_TERM_COLOR=never defaults respect explicit saved environment overrides.".into(),schema(json!({"command":{"type":"string","minLength":1,"maxLength":32768},"cwd":{"type":"string","maxLength":4096},"timeout_seconds":{"type":"integer","minimum":1,"maximum":crate::execution::MAX_MANAGED_SHELL_SECONDS,"description":"Process lifetime. Reduced to the configured shell timeout when larger. timeout_secs is an alias."},"timeout_secs":{"type":"integer","minimum":1,"maximum":crate::execution::MAX_MANAGED_SHELL_SECONDS,"description":"Alias of timeout_seconds."},"yield_ms":{"type":"integer","minimum":0,"maximum":1000,"default":100,"description":"Initial wait in milliseconds. Larger values are reduced to 1000."},"format":format,"case_offset":offset,"max_cases":limit}),&["command"])),
+        ("check_report".into(),"Read structured build/test evidence from an owned process without rerunning it. For a running check, wait up to 30 seconds for its terminal state. Parses Cargo/libtest, Vitest/Jest, TAP, and locallm.check-report/1. A successful exit without recognized tests does not claim testsPassed. Page case details with sourceSha256; inspect raw output via process_poll.".into(),schema(json!({"id":{"type":"string","minLength":1,"maxLength":128},"format":format,"wait_ms":{"type":"integer","minimum":0,"maximum":MAX_REPORT_WAIT_MS,"default":0},"case_offset":offset,"max_cases":limit,"expected_sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"}}),&["id"])),
     ].into_iter().map(crate::tool_spec::ToolSpec::from).collect()
 }
 

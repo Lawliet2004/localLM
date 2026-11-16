@@ -297,11 +297,13 @@ async fn parent_completion_checkpoint_preserves_durable_lifecycle_state() {
         // This is the actual completion helper used immediately after the
         // model-visible result is stored. It must not undo the tool's durable
         // pause/cancel with the loop's older Running copy, even before settle.
-        crate::chat::persist_completed_tool(
+        crate::chat::persist_tool_outcome(
             &state.database().unwrap(),
             &mut cached,
             alias,
             Some("completed call".into()),
+            &json!({"status":"success"}),
+            true,
         )
         .unwrap();
         assert_eq!(

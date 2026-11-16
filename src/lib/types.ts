@@ -42,7 +42,21 @@ export interface Message {
   id: string; conversationId: string; role: 'user' | 'assistant' | 'tool';
   content: string; reasoning: string; status: 'complete' | 'streaming' | 'interrupted' | 'error' | 'paused'; createdAt: number;
 }
-export interface PendingTurn { id: string; conversationId: string; content: string; createdAt: number }
+export interface PendingTurn { id: string; conversationId: string; content: string; createdAt: number; resumeTaskId?: string }
+export interface TaskOutcome {
+  status?: string;
+  stopReason?: string;
+  taskId?: string | null;
+  taskStatus?: string | null;
+  delivered?: boolean;
+  partial?: boolean;
+  resumeTaskId?: string | null;
+  pendingWork?: string[];
+  unfinishedTodos?: unknown[];
+  unfinishedTasks?: unknown[];
+  unresolvedOperations?: { id: string; kind: string; error?: string | null }[];
+  verification?: { status?: string };
+}
 export interface InferenceRound {
   phase?: string;
   usage: {
@@ -54,7 +68,8 @@ export interface InferenceRound {
   firstVisibleAnswerMs?: number | null; reasoningMs?: number | null;
   firstTokenMs: number | null; durationMs: number; complete: boolean;
 }
-export interface ResponseMetrics { preparationMs?: number | null; toolsMs?: number | null; approvalMs?: number | null; model: string; rounds: InferenceRound[]; totalMs: number }
+export interface ChildMetrics { runId: string; status: string; rounds: InferenceRound[] }
+export interface ResponseMetrics { preparationMs?: number | null; toolsMs?: number | null; approvalMs?: number | null; reasoningEffort?: string; model: string; rounds: InferenceRound[]; totalMs: number; children?: ChildMetrics[] }
 export interface InstalledModel {
   id: string; filename: string; path: string; bytes: number; repo: string | null;
   revision: string | null; files: string[]; complete: boolean; received?: number;
@@ -205,7 +220,7 @@ export interface ArtifactRecord {
 }
 
 export type ToolStreamEvent =
-  | { type: 'started'; toolCallId: string; toolName: string; command?: string; language?: string; cwd?: string }
+  | { type: 'started'; toolCallId: string; toolName: string; arguments?: Record<string, unknown>; command?: string; language?: string; cwd?: string }
   | { type: 'outputChunk'; toolCallId: string; stream: 'stdout' | 'stderr' | string; chunk: string }
   | { type: 'finished'; toolCallId: string; exitCode?: number | null; durationMs: number; error?: string | null };
 export interface Hit {
@@ -230,6 +245,7 @@ export interface ChatEvent {
   messageId: string;
   content: string;
   reasoning: string;
+  replaceDraft?: boolean;
   approval?: ToolApproval | null;
   context?: ContextUsage;
   runId?: string;

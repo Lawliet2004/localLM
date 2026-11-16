@@ -240,8 +240,8 @@ it('renders structured result separately from logs with outcome status', () => {
     />
   );
   fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
-  expect(screen.getByTestId('result-status')).toHaveTextContent('Structured result: ok');
-  expect(screen.getByTestId('result-status')).toHaveTextContent('outcome success');
+  expect(screen.getByTestId('result-status')).toHaveTextContent('Result: ok');
+  expect(screen.getByTestId('result-status')).toHaveTextContent('Result: ok · success');
   const resultViewport = screen.getByTestId('result-viewport');
   expect(resultViewport).toHaveTextContent('"answer": 42');
   expect(resultViewport.querySelector('.hljs-attr')).toHaveTextContent('"answer"');
@@ -376,24 +376,23 @@ it('labels interrupted runs with a neutral badge', () => {
   expect(screen.getByText('Stopped · outcome unknown')).toBeInTheDocument();
 });
 
-it('bounds a large log to 500 DOM lines while keeping every page and full copy available', () => {
-  const output = Array.from({ length: 1600 }, (_, i) => `record ${i + 1}`).join('\n');
+it('shows the most recent 2000 lines when expanded and keeps the full copy available', () => {
+  const output = Array.from({ length: 2100 }, (_, i) => `record ${i + 1}`).join('\n');
   const writeText = vi.fn().mockResolvedValue(undefined);
   Object.assign(navigator, { clipboard: { writeText } });
   const { container } = render(<CommandRunCard toolName="execute_command" status="running" stdout={output} />);
-  fireEvent.click(screen.getByRole('button', { name: 'Browse all 1600 lines' }));
-  expect(container.querySelectorAll('.terminal-line').length).toBeLessThanOrEqual(500);
-  expect(screen.getByText('record 1600')).toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: 'Previous lines' }));
-  expect(screen.getByText('record 1001')).toBeInTheDocument();
-  expect(container.querySelectorAll('.terminal-line')).toHaveLength(500);
+  fireEvent.click(screen.getByRole('button', { name: 'Show all 2100 lines' }));
+  expect(container.querySelectorAll('.terminal-line')).toHaveLength(2000);
+  expect(screen.getByText('record 2100')).toBeInTheDocument();
+  expect(screen.queryByText('record 100')).toBeNull();
+  expect(screen.getByText('Showing the last 2000 of 2100 lines')).toBeInTheDocument();
   fireEvent.click(screen.getByTitle('Copy terminal output'));
   expect(writeText).toHaveBeenCalledWith(output);
 });
 it('reveals failures after a running row was collapsed and keeps stop actionable', () => {
   const stop = vi.fn();
   const view = render(<CommandRunCard toolName="execute_command" command="test" status="running" onStop={stop} />);
-  fireEvent.click(screen.getByRole('button', { name: 'Stop command' })); expect(stop).toHaveBeenCalledOnce();
+  fireEvent.click(screen.getByRole('button', { name: 'Stop response' })); expect(stop).toHaveBeenCalledOnce();
   const row = screen.getByTestId('command-run-card');
   (row as HTMLDetailsElement).open = false;
   fireEvent(row, new Event('toggle'));

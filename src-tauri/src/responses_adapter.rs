@@ -20,6 +20,10 @@ fn optional_bool(value: &Value, field: &str, default: bool) -> Result<bool, Stri
             .ok_or_else(|| format!("Responses {field} must be a boolean.")),
     }
 }
+fn incomplete_function(item: &Value) -> bool {
+    item["type"] == "function_call" && item["status"] == "incomplete"
+}
+
 fn native_item(item: &Value) -> Result<(), String> {
     if !item.is_object() {
         return Err("Responses output item must be an object.".into());
@@ -271,6 +275,19 @@ pub fn request(internal: &Value, model: &str) -> Result<Value, String> {
     Ok(out)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartKind {
+    Text,
+    Refusal,
+    ReasoningSummary,
+}
+
+struct Part {
+    kind: PartKind,
+    text: String,
+    finalized: bool,
+}
+
 #[derive(Default)]
 struct Item {
     id: String,
@@ -279,7 +296,8 @@ struct Item {
     call_id: String,
     name: String,
     arguments: String,
-    parts: BTreeMap<(u64, String), String>,
+    arguments_finalized: bool,
+    parts: BTreeMap<u64, Part>,
     done: bool,
 }
 #[derive(Default)]
@@ -364,6 +382,13 @@ impl Stream {
         if state.kind != "function_call" || state.done || item_id.is_some_and(|id| id != state.id) {
             return Err("Responses argument does not match its active function item.".into());
         }
+        if state.arguments_finalized {
+            return if final_value && text == state.arguments {
+                Ok(())
+            } else {
+                Err("Responses arguments changed after completion; no tool was executed.".into())
+            };
+        }
         let fragment = if final_value {
             text.strip_prefix(&state.arguments)
                 .ok_or("Conflicting final Responses function arguments.")?
@@ -371,6 +396,7 @@ impl Stream {
             text
         };
         crate::tool_spec::check_argument_bytes(&state.name, state.arguments.len().saturating_add(fragment.len()))?;
+        state.arguments_finalized = final_value;
         if !fragment.is_empty() {
             state.arguments.push_str(fragment);
             delta.get_mut("tool_calls")
@@ -386,7 +412,7 @@ impl Stream {
         index: u64,
         part: u64,
         item_id: Option<&str>,
-        field: &str,
+        kind: PartKind,
         text: &str,
         final_value: bool,
         delta: &mut Value,
@@ -398,25 +424,52 @@ impl Stream {
         if state.done || item_id.is_some_and(|id| id != state.id) || part >= 128 {
             return Err("Invalid Responses text item or part index.".into());
         }
-        if (field == "reasoning_content" && state.kind != "reasoning")
-            || (field == "content" && state.kind != "message")
-        {
+        let (item_kind, field) = match kind {
+            PartKind::Text | PartKind::Refusal => ("message", "content"),
+            PartKind::ReasoningSummary => ("reasoning", "reasoning_content"),
+        };
+        if state.kind != item_kind {
             return Err("Responses text kind does not match its item.".into());
         }
-        let accumulated = state.parts.entry((part, field.into())).or_default();
+        let accumulated = state.parts.entry(part).or_insert_with(|| Part {
+            kind,
+            text: String::new(),
+            finalized: false,
+        });
+        if accumulated.kind != kind {
+            return Err("Responses text part changed kind; no tool was executed.".into());
+        }
+        if accumulated.finalized {
+            return if final_value && text == accumulated.text {
+                Ok(())
+            } else {
+                Err("Responses text changed after completion.".into())
+            };
+        }
         let fragment = if final_value {
-            text.strip_prefix(accumulated.as_str())
+            text.strip_prefix(accumulated.text.as_str())
                 .ok_or("Conflicting final Responses text.")?
         } else {
             text
         };
-        accumulated.push_str(fragment);
+        accumulated.text.push_str(fragment);
+        accumulated.finalized = final_value;
         let previous = delta[field].as_str().unwrap_or("").to_string();
         delta[field] = json!(previous + fragment);
         Ok(())
     }
-    fn finish_item(&mut self, index: u64, item: &Value, delta: &mut Value) -> Result<(), String> {
-        native_item(item)?;
+    fn finish_item(
+        &mut self,
+        index: u64,
+        item: &Value,
+        allow_incomplete: bool,
+        delta: &mut Value,
+    ) -> Result<(), String> {
+        // Incomplete function arguments remain drafts. Their identity,
+        // prefix and byte limits still have to match the streamed item.
+        if !(allow_incomplete && incomplete_function(item)) {
+            native_item(item)?;
+        }
         if !self.items.contains_key(&index) {
             self.start(index, item, delta)?;
         }
@@ -430,45 +483,59 @@ impl Stream {
             }
             return Err("Conflicting repeated Responses output item.".into());
         }
-        match item["type"].as_str() {
+        let part_count = match item["type"].as_str() {
             Some("function_call") => {
                 if state.call_id != string(item, "call_id")? || state.name != string(item, "name")?
                 {
                     return Err("Conflicting final Responses function identity.".into());
                 }
                 self.argument(index, None, string(item, "arguments")?, true, delta)?;
+                0
             }
             Some("message") => {
-                for (part, value) in item["content"].as_array().ok_or("Responses message content must be an array.")?.iter().enumerate() {
-                    let text = if value["type"] == "refusal" {
-                        string(value, "refusal")?
+                let parts = item["content"]
+                    .as_array()
+                    .ok_or("Responses message content must be an array.")?;
+                for (part, value) in parts.iter().enumerate() {
+                    let (kind, text) = if value["type"] == "refusal" {
+                        (PartKind::Refusal, string(value, "refusal")?)
                     } else {
-                        string(value, "text")?
+                        (PartKind::Text, string(value, "text")?)
                     };
-                    self.part(index, part as u64, None, "content", text, true, delta)?;
+                    self.part(index, part as u64, None, kind, text, true, delta)?;
                 }
+                parts.len()
             }
             Some("reasoning") => {
-                if let Some(parts) = item["summary"].as_array() {
-                    for (part, value) in parts.iter().enumerate() {
-                        if value["type"] != "summary_text" {
-                            return Err("Unsupported Responses reasoning summary.".into());
-                        }
-                        self.part(
-                            index,
-                            part as u64,
-                            None,
-                            "reasoning_content",
-                            string(value, "text")?,
-                            true,
-                            delta,
-                        )?;
+                let parts = item["summary"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for (part, value) in parts.iter().enumerate() {
+                    if value["type"] != "summary_text" {
+                        return Err("Unsupported Responses reasoning summary.".into());
                     }
+                    self.part(
+                        index,
+                        part as u64,
+                        None,
+                        PartKind::ReasoningSummary,
+                        string(value, "text")?,
+                        true,
+                        delta,
+                    )?;
                 }
+                parts.len()
             }
             _ => return Err("Unsupported Responses output item.".into()),
+        };
+        let state = self.items
+            .get_mut(&index)
+            .ok_or("Responses output item was not initialized.")?;
+        if state.parts.len() != part_count {
+            return Err("Final Responses output omits a streamed text part.".into());
         }
-        self.items.get_mut(&index).ok_or("Responses output item was not initialized.")?.done = true;
+        state.done = true;
         self.output.insert(index, item.clone());
         Ok(())
     }
@@ -524,6 +591,13 @@ impl Stream {
                 .as_u64()
                 .ok_or("Missing Responses text part index.")?;
                 let final_value = kind.ends_with(".done");
+                let part_kind = if reasoning {
+                    PartKind::ReasoningSummary
+                } else if kind.starts_with("response.refusal.") {
+                    PartKind::Refusal
+                } else {
+                    PartKind::Text
+                };
                 let text = string(
                     value,
                     if !final_value {
@@ -538,18 +612,15 @@ impl Stream {
                     index,
                     part,
                     Some(string(value, "item_id")?),
-                    if reasoning {
-                        "reasoning_content"
-                    } else {
-                        "content"
-                    },
+                    part_kind,
                     text,
                     final_value,
                     &mut delta,
                 )?;
             }
             "response.output_item.done" => {
-                self.finish_item(Self::index(value)?, &value["item"], &mut delta)?
+                // A later response.completed still requires complete items.
+                self.finish_item(Self::index(value)?, &value["item"], true, &mut delta)?
             }
             "response.completed" | "response.incomplete" => {
                 let response = &value["response"];
@@ -569,17 +640,21 @@ impl Stream {
                 if output.len() > MAX_ITEMS {
                     return Err("Responses output item limit exceeded.".into());
                 }
+                if incomplete && response["incomplete_details"]["reason"] != "max_output_tokens" {
+                    return Err("Responses generation was incomplete; no tool was executed.".into());
+                }
                 for (index, item) in output.iter().enumerate() {
-                    self.finish_item(index as u64, item, &mut delta)?;
+                    self.finish_item(index as u64, item, incomplete, &mut delta)?;
                 }
                 if self.items.len() != output.len() || self.items.values().any(|item| !item.done) {
                     return Err("Responses terminal output omits streamed items.".into());
                 }
-                if incomplete && response["incomplete_details"]["reason"] != "max_output_tokens" {
-                    return Err("Responses generation was incomplete; no tool was executed.".into());
-                }
                 finish = Some(if incomplete {
                     "length"
+                } else if output.iter().any(|item| item["content"].as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "refusal")))
+                {
+                    "refusal"
                 } else if self.calls > 0 {
                     "tool_calls"
                 } else {
@@ -616,7 +691,7 @@ impl Stream {
         Ok(Some(out))
     }
     pub fn replay(&self) -> Option<Value> {
-        if self.completed {
+        if self.completed && !self.output.values().any(incomplete_function) {
             Some(json!(self.output.values().collect::<Vec<_>>()))
         } else {
             None
@@ -802,7 +877,7 @@ mod tests {
         let refusal = json!({"type":"message","id":"refusal-id","role":"assistant","content":[{"type":"refusal","refusal":"Cannot comply"}]});
         let value = stream.push(&complete(json!([refusal]))).unwrap().unwrap();
         assert_eq!(value["choices"][0]["delta"]["content"], "Cannot comply");
-        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+        assert_eq!(value["choices"][0]["finish_reason"], "refusal");
         let incomplete = json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}});
         assert_eq!(
             Stream::default().push(&incomplete).unwrap().unwrap()["choices"][0]["finish_reason"],

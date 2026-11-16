@@ -61,7 +61,6 @@ async fn failed_plan_is_a_model_visible_failure_with_no_success_continuation() {
                 false,
                 "ptc_run",
                 &normalized,
-                &Default::default(),
                 0,
                 false
             ),

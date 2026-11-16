@@ -22,6 +22,7 @@ pub enum ToolStreamEvent {
         command: Option<String>,
         language: Option<String>,
         cwd: Option<String>,
+        arguments: Value,
     },
     OutputChunk {
         tool_call_id: String,
@@ -40,6 +41,7 @@ pub enum ToolStreamEvent {
 pub struct ThinkFilter {
     pub inside_think: bool,
     pub buffer: String,
+    answer_started: bool,
 }
 
 impl ThinkFilter {
@@ -57,6 +59,9 @@ impl ThinkFilter {
         let mut reasoning = String::new();
 
         for ch in text.chars() {
+            // Thinking is a leading protocol wrapper. Literal tags in the
+            // answer's code/examples must never reopen the thinking channel.
+            if self.answer_started && !self.inside_think { answer.push(ch); continue; }
             self.buffer.push(ch);
             let target = if self.inside_think {
                 "</think>"
@@ -75,10 +80,14 @@ impl ThinkFilter {
                     if self.inside_think {
                         reasoning.push(first_char);
                     } else {
+                        self.answer_started |= !first_char.is_whitespace();
                         answer.push(first_char);
                     }
                 }
-                if self.buffer == target {
+                if self.answer_started && !self.inside_think {
+                    answer.push_str(&self.buffer);
+                    self.buffer.clear();
+                } else if self.buffer == target {
                     self.buffer.clear();
                     self.inside_think = !self.inside_think;
                 }
@@ -107,8 +116,8 @@ const FINAL_ANSWER_INSTRUCTION: &str =
     "Give the user a visible final answer now, using the conversation and tool results already collected. State any unresolved work or missing evidence honestly. Do not call tools, repeat progress updates, or expose private reasoning.";
 const EMPTY_FINAL_ANSWER_ERROR: &str =
     "The model finished without a visible answer after tool work completed. Please retry the request.";
-const RESEARCH_STALLED: &str = "Research stopped because repeated web calls made no progress or reached the research budget. Give the best answer supported by the results already collected, cite each source with its URL (https://…) where available, and clearly state any unresolved questions. Do not claim the research or unfinished plan steps are complete. Do not call tools.";
-const RESEARCH_STALLED_FALLBACK: &str = "Research stopped after repeated unproductive web calls or reaching its research budget. The model could not produce a supported final answer. The collected tool results remain available; unresolved claims have not been verified.";
+const RESEARCH_STALLED: &str = "Research stopped because repeated web calls made no progress. Give the best answer supported by the results already collected, cite each source with its URL (https://…) where available, and clearly state any unresolved questions. Do not claim the research or unfinished plan steps are complete. Do not call tools.";
+const RESEARCH_STALLED_FALLBACK: &str = "Research stopped after repeated unproductive web calls. The model could not produce a supported final answer. The collected tool results remain available; unresolved claims have not been verified.";
 
 #[derive(Default)]
 struct ResearchProgress {
@@ -224,7 +233,7 @@ impl ResearchProgress {
     }
 
     fn stopped(&self) -> bool {
-        self.stagnant >= 3 || self.calls >= 16
+        self.stagnant >= 3
     }
 }
 fn tool_execution_error(value: &Value) -> Option<String> {
@@ -246,12 +255,7 @@ fn tool_execution_error(value: &Value) -> Option<String> {
 }
 
 const PLAN_MODE_INSTRUCTION: &str = "Plan mode is on. Investigate with read-only tools first, then call plan_submit with a concise numbered plan (one action per step, 3-12 steps). Do not modify files or run mutating commands until the plan is approved.";
-const PLAN_MODE_ACTIVE: &str =
-    "Plan mode is on. Phase 1 is done. Phase 2: execute the checklist one task at a time.";
 const PLAN_IMPLEMENT_INSTRUCTION: &str = "The plan above is ready. Implement it in order, one task at a time. Work only on the current in_progress task. When it is done, mark it completed with the offered todo tools (todo_write saves the whole list) and start the next pending task. Do not skip ahead or start two tasks at once. Use the offered web tools (search/visit or web_search/web_open) for facts, and local_run_code when offered for exact math or science. Continue through the plan while making progress, then summarize the answer or call finish when offered. If evidence remains unavailable, report the unresolved steps honestly.";
-const PLAN_FOCUS_MARKER: &str = "The plan above is ready.";
-const PLAN_SEPARATOR: &str = "\n\n---\n\n";
-const EMPTY_PLAN_ERROR: &str = "The model returned an empty plan. Please retry the request.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum FinalizationAction {
@@ -281,25 +285,6 @@ fn arm_research_finalization(plan_mode: bool, tool_name: &str, result: &Value) -
     None
 }
 
-fn replace_in_content(message: &mut Value, from: &str, to: &str) {
-    match message.get_mut("content") {
-        Some(Value::String(content)) => {
-            *content = content.replacen(from, to, 1);
-        }
-        Some(Value::Array(parts)) => {
-            for part in parts.iter_mut() {
-                if let Some(Value::String(text)) = part.get_mut("text") {
-                    if text.contains(from) {
-                        *text = text.replacen(from, to, 1);
-                        break;
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 fn plan_focus_message(todos: &[crate::plans::Todo]) -> String {
     match crate::plans::current_task_line(todos) {
         Some(focus) => format!("{PLAN_IMPLEMENT_INSTRUCTION}\n\n{focus}"),
@@ -307,70 +292,77 @@ fn plan_focus_message(todos: &[crate::plans::Todo]) -> String {
     }
 }
 
-fn is_plan_implement_message(message: &Value) -> bool {
-    if message["role"] != "user" {
-        return false;
+fn unfinished_work_reminder(
+    store: &crate::store::Store,
+    conversation: &str,
+    task: Option<&crate::research_tasks::ResearchTask>,
+    verification: &crate::verification_progress::Progress,
+    checks_offered: bool,
+) -> Result<Option<String>, String> {
+    let mut notes = Vec::new();
+    if !verification.pending_processes().is_empty() {
+        notes.push("Collect the terminal check_report or verification_report for checks you already started before handing off.".into());
+    } else if checks_offered && verification.needs_verification() {
+        notes.push(verification.reminder());
     }
-    match message.get("content") {
-        Some(Value::String(text)) => text.contains(PLAN_FOCUS_MARKER),
-        Some(Value::Array(parts)) => parts.iter().any(|part| {
-            part.get("text")
-                .and_then(|value| value.as_str())
-                .is_some_and(|text| text.contains(PLAN_FOCUS_MARKER))
-        }),
-        _ => false,
+    if task.and_then(|task| task.context.goal.as_ref())
+        .is_some_and(|goal| goal.has_actionable_work(verification))
+    {
+        notes.push("Pending goal items remain. Call goal_status, complete the remaining independent work, and record concrete blockers.".into());
     }
+    if task.is_some_and(|task| task.operations.iter().any(|op| {
+        matches!(op.kind.as_str(), "todo_add" | "todo_update" | "todo_write" | "task_create" | "task_update" | "plan_submit")
+    })) {
+        let unfinished_todos = store.todos(conversation)?.into_iter()
+            .any(|todo| todo.status != crate::plans::COMPLETED);
+        let unfinished_tasks = store.tasks(conversation)?.into_iter()
+            .any(|task| matches!(task.state.as_str(), crate::tasks::PENDING | crate::tasks::IN_PROGRESS));
+        if unfinished_todos || unfinished_tasks {
+            notes.push("The active checklist has unfinished work. Continue the actionable steps and update their status before handing off.".into());
+        }
+    }
+    Ok((!notes.is_empty()).then(|| notes.join(" ")))
 }
 
-fn set_message_text(message: &mut Value, text: &str) {
-    match message.get_mut("content") {
-        Some(Value::String(content)) => {
-            *content = text.to_string();
-        }
-        Some(Value::Array(parts)) => {
-            if let Some(part) = parts.iter_mut().find(|part| part.get("text").is_some()) {
-                part["text"] = json!(text);
-            } else {
-                message["content"] = json!(text);
+async fn wait_for_pending_checks(
+    state: &AppState,
+    conversation: &str,
+    workspace: &str,
+    processes: Vec<&str>,
+    waiting: impl FnOnce(),
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    if processes.is_empty() { return true; }
+    waiting();
+    let lifetime = Duration::from_secs(crate::execution::MAX_MANAGED_SHELL_SECONDS + 5);
+    let complete = futures_util::future::join_all(processes.into_iter().map(|id| {
+        state.processes.wait_for_terminal(conversation, workspace, id, lifetime)
+    }));
+    tokio::pin!(complete);
+    let mut pace = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.changed() => return false,
+            _ = &mut complete => return true,
+            _ = pace.tick() => {
+                if state.with_run_control(|control| control.pause).unwrap_or(true) {
+                    return false;
+                }
             }
         }
-        _ => {
-            message["content"] = json!(text);
-        }
     }
 }
 
-/// Keep the Phase-2 user turn pointed at the single current checklist item.
+/// Append focus after a settled tool exchange. Earlier prompts stay stable,
+/// including any user text that happens to quote the implementation guidance.
 fn refresh_plan_focus(messages: &mut Vec<Value>, todos: &[crate::plans::Todo]) {
     let text = plan_focus_message(todos);
-    if let Some(message) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| is_plan_implement_message(message))
-    {
-        set_message_text(message, &text);
-    } else {
-        messages.push(json!({"role": "user", "content": text}));
+    let last_focus = messages.iter().rev().find(|message| message["_plan_focus"] == true);
+    if last_focus.is_some_and(|message| message["content"] == text) {
+        return;
     }
-}
-
-/// Park the plan on the transcript and retarget the draft so Phase 2 is not
-/// still told "do not implement".
-fn begin_plan_implementation(messages: &mut Vec<Value>, plan_text: &str) -> Result<(), String> {
-    let plan_text = plan_text.trim();
-    if plan_text.is_empty() {
-        return Err(EMPTY_PLAN_ERROR.into());
-    }
-    if let Some(draft) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| message["role"] == "user")
-    {
-        replace_in_content(draft, PLAN_MODE_INSTRUCTION, PLAN_MODE_ACTIVE);
-    }
-    messages.push(json!({"role": "assistant", "content": plan_text}));
-    messages.push(json!({"role": "user", "_continuation": true, "content": PLAN_IMPLEMENT_INSTRUCTION}));
-    Ok(())
+    messages.push(json!({"role":"user","_continuation":true,"_plan_focus":true,"content":text}));
 }
 
 fn inject_plan_mode(plan: &mut TurnPlan, plan_mode: bool) {
@@ -517,44 +509,36 @@ fn strip_call_markup(text: &str) -> String {
 /// truncate. Small local models can loop a whole answer once the context
 /// already contains a draft; nothing else bounds that until the 4 MiB cap.
 fn repetition_cut(text: &str) -> Option<usize> {
-    const ANCHOR: usize = 240; // normalized tail chars searched earlier
-    const MIN_REPEAT: usize = 400; // re-emitted normalized chars before cutting
-    if text.len() < ANCHOR + MIN_REPEAT {
-        return None;
-    }
-    let mut norm: Vec<char> = Vec::with_capacity(text.len());
-    let mut map: Vec<usize> = Vec::with_capacity(text.len());
+    const MIN_PERIOD: usize = 400;
+    const MAX_PERIOD: usize = 4096;
+    if text.len() < 3 * MIN_PERIOD || crate::tool_calls::without_presentation_fences(text) != text { return None; }
+    // Code, structured data and tables legitimately repeat boilerplate. Their
+    // hard output budget still applies; this heuristic only guards prose.
+    if text.trim_start().starts_with(['{', '[', '<']) || text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with('|') || line.contains('\t') || line.matches(',').count() >= 3
+    }) { return None; }
+    // Bound work on a long unique answer. Three consecutive copies are needed;
+    // a second standalone example or an earlier shared ending is insufficient.
+    let mut window = text.len().saturating_sub(32 * 1024);
+    while !text.is_char_boundary(window) { window += 1; }
+    let mut norm = Vec::new();
+    let mut map = Vec::new();
     let mut last_ws = true;
-    for (i, ch) in text.char_indices() {
+    for (index, ch) in text[window..].char_indices() {
         if ch.is_whitespace() {
-            if !last_ws {
-                norm.push(' ');
-                map.push(i);
-            }
+            if !last_ws { norm.push(' '); map.push(window + index); }
             last_ws = true;
-        } else {
-            norm.push(ch);
-            map.push(i);
-            last_ws = false;
-        }
+        } else { norm.push(ch); map.push(window + index); last_ws = false; }
     }
     let n = norm.len();
-    if n < ANCHOR + MIN_REPEAT {
-        return None;
+    for period in MIN_PERIOD..=MAX_PERIOD.min(n / 3) {
+        let a = &norm[n - 3 * period..n - 2 * period];
+        let b = &norm[n - 2 * period..n - period];
+        let c = &norm[n - period..];
+        if a == b && b == c { return Some(map[n - 2 * period]); }
     }
-    let tail = n - ANCHOR;
-    let needle = &norm[tail..];
-    // The tail's first occurrence in earlier output fixes the offset between
-    // the original block and its re-emission.
-    let p = norm[..tail].windows(ANCHOR).position(|w| w == needle)?;
-    let offset = tail - p;
-    // Walk back while the copy still matches its source: the repetition
-    // begins at the start of the re-emitted block, not midway through it.
-    let mut start = tail;
-    while start > offset && norm[start - 1] == norm[start - 1 - offset] {
-        start -= 1;
-    }
-    (n - start >= MIN_REPEAT).then(|| map[start])
+    None
 }
 
 /// Deterministic citation footer for a stalled research answer that reached
@@ -723,7 +707,7 @@ async fn run_finish_call(
         }),
         crate::tool_envelope::Family::Harness,
     );
-    let audit = json!({"connector":"Harness","localServerName":null,"name":"finish","arguments":call.arguments,"decision":"allowed","accessMode":access_mode,"authorization":"finish is the model's answer channel on a finalizing round","callId":call.id,"stepId":step_id,"assistantContent":round_answer});
+    let audit = json!({"connector":"Harness","localServerName":null,"name":"finish","arguments":call.arguments,"decision":"allowed","accessMode":access_mode,"authorization":"finish is the model's answer channel on a finalizing round","callId":call.id,"runId":run.id,"stepId":step_id,"assistantContent":round_answer});
     let row = state.database()?.append_message(
         conversation_id,
         "tool",
@@ -811,6 +795,8 @@ pub struct ChatEvent {
     pub content: String,
     pub reasoning: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace_draft: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_secs: Option<f64>,
@@ -823,6 +809,20 @@ pub struct ChatEvent {
 }
 
 impl ChatEvent {
+    fn draft(
+        run: &crate::agent_run::RunRecord,
+        step_id: &str,
+        seq: u32,
+        activity: &str,
+        message_id: &str,
+        content: &str,
+        reasoning: &str,
+    ) -> Self {
+        let mut event = Self::new(run, Some(step_id), seq, activity, message_id, content, reasoning, None, None);
+        event.replace_draft = Some(true);
+        event
+    }
+
     pub fn progress(
         run_id: &str,
         step_id: &str,
@@ -842,6 +842,7 @@ impl ChatEvent {
             message_id: message_id.to_string(),
             content: String::new(),
             reasoning: String::new(),
+            replace_draft: None,
             approval,
             elapsed_secs: None,
             round_index: None,
@@ -873,6 +874,7 @@ impl ChatEvent {
             message_id: message_id.to_string(),
             content: content.to_string(),
             reasoning: reasoning.to_string(),
+            replace_draft: None,
             approval,
             elapsed_secs: None,
             round_index: None,
@@ -906,8 +908,9 @@ pub fn emit_session_event(
         ignorable,
         created_at: crate::store::now(),
     };
-    if let Ok(seq) = store.append_session_event(&ev) {
-        crate::sessions::notify_activity(conversation_id, seq);
+    match store.append_session_event(&ev) {
+        Ok(seq) => crate::sessions::notify_activity(conversation_id, seq),
+        Err(error) => eprintln!("Could not persist session event {event_type}: {error}"),
     }
 }
 
@@ -920,6 +923,8 @@ pub struct TurnPlan {
     /// Frozen model-visible tool schemas (stable bytes for prompt cache).
     pub tool_definitions: Vec<Value>,
     pub tool_notice: Option<String>,
+    workspace_path: String,
+    goal: Option<crate::task_goal::Goal>,
     /// Injections logged as context_injection events; only kinds listed in
     /// `prompt::VOLATILE_KINDS` actually reach the model on the user draft.
     pub injections: Vec<(String, String)>,
@@ -1038,6 +1043,21 @@ pub(crate) async fn assemble_turn(
     new_chat_preset: Option<&str>,
     reasoning_override: Option<crate::store::ReasoningMode>,
 ) -> Result<TurnPlan, String> {
+    assemble_turn_for_task(state, conversation_id, content, connector_ids, connector_tools,
+        new_chat_preset, reasoning_override, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn assemble_turn_for_task(
+    state: &AppState,
+    conversation_id: &str,
+    content: &str,
+    connector_ids: Vec<String>,
+    connector_tools: Option<Vec<crate::connectors::ToolSelection>>,
+    new_chat_preset: Option<&str>,
+    reasoning_override: Option<crate::store::ReasoningMode>,
+    resumed_task: Option<&crate::research_tasks::ResearchTask>,
+) -> Result<TurnPlan, String> {
     let (exists, preset_id) = {
         let store = state.database()?;
         let exists = !conversation_id.is_empty() && store.conversation_exists(conversation_id)?;
@@ -1054,6 +1074,9 @@ pub(crate) async fn assemble_turn(
         crate::workspace_ui::task_workspace(&store, conversation_id)?
             .unwrap_or(store.workspace_path()?)
     };
+    if let Some(workspace) = resumed_task.and_then(|task| task.context.workspace.as_ref()) {
+        workspace.verify(std::path::Path::new(&workspace_path))?;
+    }
     let mut connector_ids = connector_ids;
     // Runtime preset intersects the requested sources (config patch, no fork).
     let preset = crate::presets::get(&preset_id)?;
@@ -1069,6 +1092,27 @@ pub(crate) async fn assemble_turn(
     connector_ids.retain(|id| id != "__daytona");
     let use_workspace = connector_ids.iter().any(|id| id == "__workspace")
         && preset.sources.iter().any(|source| source == "__workspace");
+    let saved_goal = resumed_task.and_then(|task| task.context.goal.as_ref());
+    let requested_goal = crate::task_goal::requested_path(content);
+    let (goal, goal_text) = if let Some(path) = saved_goal.map(|goal| goal.path.as_str()).or(requested_goal) {
+        if !use_workspace || capability_policy.denial("workspace_files").is_some() {
+            return Err("Enable Workspace files for this conversation before opening a goal file.".into());
+        }
+        let relative = crate::task_goal::relative_path(&workspace_path, path)?;
+        crate::permission_rules::check_selected_file_read(&*state.database()?, std::path::Path::new(&workspace_path), relative)?;
+        let (loaded, text) = crate::task_goal::read(&workspace_path, relative)?;
+        if let Some(saved) = saved_goal {
+            if saved.sha256 != loaded.sha256 {
+                return Err("The goal file changed. Start a new /goal request to review the updated requirements.".into());
+            }
+            (Some(saved.clone()), None)
+        } else {
+            (Some(loaded), Some(text))
+        }
+    } else {
+        (None, None)
+    };
+    let coding_surface = use_workspace && (goal.is_some() || preset.id == crate::presets::CODING);
     let use_execution = connector_ids.iter().any(|id| id == "__execution")
         && preset.sources.iter().any(|source| source == "__execution");
     connector_ids.retain(|id| id != "__execution");
@@ -1439,6 +1483,7 @@ pub(crate) async fn assemble_turn(
             let session = crate::subscription_auth::get_valid_session(&state.daytona_vault, kind).await?;
             let (token, account_id) = (session.access_token, session.account_id);
             Backend::subscription(&provider.name, &provider.base_url, token, account_id, model)?
+                .with_subscription_auth(state.daytona_vault.clone(), kind)
         } else if provider.api_format == crate::providers::OPENAI_CHAT_COMPLETIONS
             || provider.api_format == crate::providers::OPENAI_RESPONSES
             || provider.api_format == crate::providers::FREETOKEN_OPENAI_COMPAT
@@ -1564,6 +1609,14 @@ pub(crate) async fn assemble_turn(
             preferences.reasoning_mode = mode;
         }
         backend.prepare_preferences(&mut preferences)?;
+        if coding_surface && preferences.max_tokens > 0 && backend.context_is_estimate() {
+            let round_limit = match preferences.reasoning_mode {
+                crate::store::ReasoningMode::Think => 16_384,
+                _ => 8_192,
+            };
+            preferences.max_tokens = crate::context::fit_response_budget(
+                preferences.max_tokens.min(round_limit), context_length);
+        }
         let previous = if exists {
             store.messages(conversation_id)?
         } else {
@@ -1580,6 +1633,9 @@ pub(crate) async fn assemble_turn(
                 &store.model_contents(conversation_id)?,
             )?,
         };
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            crate::compaction::restore_handoff(&store, conversation_id, &checkpoint.artifact_id, &mut history)?;
+        }
         crate::automation::remove_model_images(&mut history);
         if !supports_images
             && (draft_content.is_array()
@@ -1675,15 +1731,41 @@ pub(crate) async fn assemble_turn(
             crate::arex::RESEARCH_GUIDANCE.into(),
         ));
     }
-    if let Some(guidance) = crate::authoring::task_hint(content, &tools.iter().map(|t| t.alias.as_str()).collect::<Vec<_>>()) {
+    if coding_surface {
+        let scope = if use_execution {
+            format!("The shell lifetime is {} seconds. Omit timeout_seconds to use that limit. shell_run timeout_secs is only a wait. Start longer jobs with process_start and collect the final state. Run each goal gate from cwd '.' with verification_run and collect verification_report for the affected source. For running checks, wait on the saved evidenceId with wait_ms instead of repeating the command. Batch independent reads and reserve time for the final checks and handoff.", execution_config.bash.timeout_seconds)
+        } else {
+            "Local execution is turned off for this turn.".into()
+        };
+        injections.push(("workspace_context".into(), format!(
+            "Selected workspace: {workspace_path}. Use workspace-relative paths and the SHA-256 from a fresh read for edits. {scope}"
+        )));
+    }
+    if let Some(goal) = &goal {
+        tools.retain(|tool| !matches!(tool.alias.as_str(), "worktree_enter" | "worktree_exit" | "session_move"));
+        if backend.supports_tools() {
+            for alias in ["goal_status", "goal_update"] {
+                tools.push(crate::connectors::AgentTool::harness(alias)?);
+            }
+        }
+        let details = if let Some(text) = goal_text.as_deref() {
+            format!("\n\n{text}")
+        } else {
+            String::new()
+        };
+        injections.push(("goal_file".into(), format!(
+            "The user selected the goal file {} (SHA-256 {}). Use goal_status to inspect saved criteria and goal_update to record evidence or blockers. Continue independent work through the pending criteria. The goal applies to the selected workspace under its current permissions.{details}", goal.path, goal.sha256
+        )));
+    }
+    if let Some(guidance) = crate::authoring::task_hint(goal_text.as_deref().unwrap_or(content), &tools.iter().map(|t| t.alias.as_str()).collect::<Vec<_>>()) {
         injections.push(("development_task".into(), guidance));
     }
-    if crate::tool_discovery::attach(&mut tools)? {
+    if crate::tool_discovery::attach_for_turn(&mut tools, coding_surface)? {
         injections.push(("tool_discovery".into(),"Some authorized tool schemas are deferred to keep the request bounded. Use tool_search to find names and exact input schemas, then tool_invoke to call a discovered tool. Its original validation, approvals and audit still apply. Discovery does not change the advertised schema set or broaden selected sources.".into()));
     }
     crate::prompt::sort_tools_by_alias(&mut tools);
     let ptc_sdk = if preset.id == crate::presets::CODE {
-        let aliases: Vec<String> = crate::tool_discovery::advertised(tools.iter())
+        let aliases: Vec<String> = crate::tool_discovery::advertised_for_turn(tools.iter(), coding_surface)
             .into_iter()
             .map(|tool| tool.alias.clone())
             .collect();
@@ -1719,12 +1801,13 @@ pub(crate) async fn assemble_turn(
             .collect::<Vec<_>>()
             .join(",")
     );
-    let tool_definitions = freeze_tool_catalog(
+    let tool_definitions = freeze_tool_catalog_for_turn(
         &*state.database()?,
         conversation_id,
         exists,
         selection_hash,
         &mut tools,
+        coding_surface,
     )?;
     let id_slot = match &backend {
         Backend::Local { .. } if state.session_runs.running_count() <= 1 => Some(0),
@@ -1736,6 +1819,8 @@ pub(crate) async fn assemble_turn(
         tools,
         tool_definitions,
         tool_notice,
+        workspace_path,
+        goal,
         injections,
         skill_instructions,
         project_instructions,
@@ -1752,6 +1837,7 @@ pub(crate) async fn assemble_turn(
     })
 }
 
+#[cfg(test)]
 fn freeze_tool_catalog(
     store: &crate::store::Store,
     conversation_id: &str,
@@ -1759,8 +1845,19 @@ fn freeze_tool_catalog(
     hash: String,
     tools: &mut [crate::connectors::AgentTool],
 ) -> Result<Vec<Value>, String> {
+    freeze_tool_catalog_for_turn(store, conversation_id, exists, hash, tools, false)
+}
+
+fn freeze_tool_catalog_for_turn(
+    store: &crate::store::Store,
+    conversation_id: &str,
+    exists: bool,
+    hash: String,
+    tools: &mut [crate::connectors::AgentTool],
+    coding_surface: bool,
+) -> Result<Vec<Value>, String> {
     crate::prompt::sort_tools_by_alias(tools);
-    let advertised = crate::tool_discovery::advertised(tools.iter());
+    let advertised = crate::tool_discovery::advertised_for_turn(tools.iter(), coding_surface);
     let aliases: Vec<String> = advertised.iter().map(|tool| tool.alias.clone()).collect();
     let defs: Vec<Value> = advertised.iter().map(|tool| tool.definition()).collect();
     if !exists || conversation_id.is_empty() {
@@ -1772,14 +1869,7 @@ fn freeze_tool_catalog(
                 serde_json::from_str(&freeze.tools_json).unwrap_or_else(|_| defs.clone());
             let frozen_aliases: Vec<String> =
                 serde_json::from_str(&freeze.aliases_json).unwrap_or_else(|_| aliases.clone());
-            // Descriptions may contain discovery noise and stay frozen, but a
-            // changed input contract must reach the model before dispatch.
-            let compatible = frozen_aliases == aliases
-                && frozen_defs.len() == defs.len()
-                && frozen_defs.iter().zip(&defs).all(|(frozen, current)| {
-                    frozen["function"]["name"] == current["function"]["name"]
-                        && frozen["function"]["parameters"] == current["function"]["parameters"]
-                });
+            let compatible = frozen_aliases == aliases && frozen_defs == defs;
             if compatible {
                 return Ok(frozen_defs);
             }
@@ -1859,6 +1949,9 @@ struct TurnRounds<'a> {
     failed_model_round: bool,
     outcome: Option<Value>,
     partial_work: bool,
+    budget_exhausted: bool,
+    research_task_id: Option<String>,
+    initial_task: Option<(crate::research_tasks::ResearchTask, std::collections::HashSet<String>)>,
 }
 
 impl<'a> TurnRounds<'a> {
@@ -1906,36 +1999,48 @@ impl<'a> TurnRounds<'a> {
     // The turn's budget cell is shared: nested dispatch paths (plan
     // steps, parallel reads) charge searches/fetches against the same
     // counters before they run, so loops cannot overspend the turn.
-    let budgets = std::sync::Arc::new(std::sync::Mutex::new(crate::continuation::Budgets::default()));
+    let (mut task, resumed_blocks) = self.initial_task.take().ok_or("Task intake was not committed.")?;
+    if task.context.goal.is_some() {
+        let store = state.database()?;
+        task.context.verification.refresh_goal_evidence(&store, &conversation_id, &snapshot.workspace_path);
+        store.save_research_task(&task)?;
+    }
+    let mut segment_started = tokio::time::Instant::now();
+    let segment_lifetime = Duration::from_secs(task.budgets.task_timeout_secs);
+    let mut segment = 1;
+    let mut segment_made_progress = false;
+    let mut completed_calls = std::collections::HashSet::new();
+    let mut earlier_web_lookup = false;
+    let operation_lifetime = task.budgets.operation_timeout_secs;
+    let max_model_retries = if self.recovery_only { 0 } else { task.budgets.max_retries };
+    let budgets = std::sync::Arc::new(std::sync::Mutex::new(crate::continuation::Budgets::for_task(&task.budgets)));
     if let Ok(mut map) = state.turn_budgets.lock() { map.insert(run.id.clone(), budgets.clone()); }
     let _budget_registration = TurnBudgetRegistration { map: &state.turn_budgets, run_id: run.id.clone() };
     let mut corrections_used = 0u32;
     // Plan mode: mutating tools refuse until plan_submit is approved.
     let mut plan_approved = false;
-    // Verify actual terminal outcomes after the latest observed mutation.
-    // The reminder remains bounded to one corrective round per parent turn.
-    let mut verification = crate::verification_progress::Progress::default();
+    let mut verification = task.context.verification.clone();
     let result = async {
     let development_task = plan.injections.iter().any(|(kind, _)| kind == "development_task");
-    let mut check_nudged = false;
+    let mut finish_nudged_at = None;
     let check_run_offered = plan.tools.iter().any(|tool| matches!(tool.alias.as_str(), "check_run" | "verification_run"));
     let mut repairs_used = 0u32;
     let mut output_recoveries = 0u32;
+    let mut model_retries = 0;
     let mut round_preferences = plan.preferences.clone();
     // Non-retryable signatures are shared for the run: nested dispatch
     // paths refuse to replay them even inside a later plan in this turn.
-    let blocked_calls = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::<String>::new()));
+    let blocked_calls = std::sync::Arc::new(std::sync::Mutex::new(resumed_blocks));
     if let Ok(mut map) = state.turn_blocked.lock() { map.insert(run.id.clone(), blocked_calls.clone()); }
     let _blocked_registration = TurnBlockedRegistration { map: &state.turn_blocked, run_id: run.id.clone() };
     let mut paused_exit = false;
     let mut evidence_note: Option<String> = None;
-    let question = content.chars().take(4000).collect::<String>();
-    let mut ledger = crate::research_tasks::ResearchTask::new(&conversation_id, if question.trim().is_empty() { "continue" } else { &question }, crate::research_tasks::TaskBudgets::default()).ok();
+    let mut ledger = Some(task);
     if let Some(task) = ledger.as_ref() {
-        save_ledger(state, task);
+        self.research_task_id = Some(task.id.clone());
     }
-    let max_rounds = if self.recovery_only { 1 } else { budgets.lock().map(|b| b.max_rounds).unwrap_or(64) as usize };
-    for round in 0..max_rounds {
+    'rounds: for round in 0.. {
+        if self.recovery_only && round > 0 { break; }
         // Only the last executed round may provide the saved model content;
         // an earlier round's value must not survive into a finishing exit.
         self.replay_answer = None;
@@ -1951,39 +2056,34 @@ impl<'a> TurnRounds<'a> {
             return Ok(false);
         }
         let step_id = format!("step-{round}");
-        // Capture the workspace before the step so a bad edit can be
-        // reverted to the state the user left it in. The capture is
-        // best-effort: a failed snapshot must never stop the turn.
-        let snapshot_paths = match state.database() {
-            Ok(store) => crate::snapshots::tracked_paths(&store, &conversation_id),
-            Err(_) => Vec::new(),
-        };
-        if !snapshot_paths.is_empty() && !snapshot.workspace_path.is_empty() {
-            if let Ok(store) = state.database() {
-                let _ = crate::snapshots::capture(
-                    &store,
-                    &conversation_id,
-                    round as i64,
-                    std::path::Path::new(&snapshot.workspace_path),
-                    &snapshot_paths,
-                );
+        if model_retries == 0 && !self.recovery_only && !tool_use_denied && self.research_fallback.is_none() && !self.finalization_retried {
+            let mut budget = budgets.lock().map_err(|_| "The turn budget is unavailable.")?;
+            let limit = budget.limit_reason()
+                .or_else(|| (segment_started.elapsed() >= segment_lifetime).then_some("elapsed_time"));
+            if let Some(reason) = limit {
+                // Renew only at a settled round boundary. The transcript, permission
+                // decisions, process handles and task ledger carry into the next segment.
+                if segment_made_progress {
+                    earlier_web_lookup |= budget.searches_used > 0 || budget.fetches_used > 0;
+                    budget.reset_usage();
+                    segment += 1;
+                    segment_started = tokio::time::Instant::now();
+                    segment_made_progress = false;
+                    let store = state.database()?;
+                    emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), None,
+                        "work_segment_continued", json!({"segment":segment,"reason":reason}), true);
+                    let _ = channel.send(ChatEvent::progress(&run.id, &step_id, &assistant.id, "Continuing task…", None));
+                } else {
+                    self.partial_work = true;
+                    self.budget_exhausted = true;
+                    let handoff = "Partial result. The work segment ended without progress. Report confirmed results, the blocker, and what remains unfinished.";
+                    self.research_fallback = Some(handoff.into());
+                    messages.push(json!({"role":"user","_continuation":true,"content":handoff}));
+                }
             }
         }
-        // Plan mode gates mutating tools behind plan_submit approval;
-        // read-only tools stay offered for investigation, so there is no
-        // tool-free planning pass anymore.
-        let planning = false;
-        if plan_mode && round > 0 {
-            if let Ok(todos) = state.database()?.todos(&conversation_id) {
-                refresh_plan_focus(messages, &todos);
-            }
-        }
-        let finalizing = self.recovery_only || self.research_fallback.is_some() || self.finalization_retried || budgets.lock().map(|b| b.reserve_final_response()).unwrap_or(true);
-        if budgets.lock().map(|b| b.reserve_final_response()).unwrap_or(true) && self.research_fallback.is_none() {
-            self.partial_work = true;
-            self.research_fallback = Some("Partial result. The model round budget is exhausted. State the completed work and name unresolved steps without claiming completion.".into());
-            messages.push(json!({"role":"user","_continuation":true,"content":self.research_fallback.as_deref().unwrap_or_default()}));
-        }
+        let finalizing = self.recovery_only || self.research_fallback.is_some() || self.finalization_retried;
+        let final_budget_round = self.budget_exhausted;
         if let Ok(mut b) = budgets.lock() { b.note_round(); }
         let _ = run.transition_to(crate::agent_run::RunState::Generating);
         let _ = state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id));
@@ -1994,7 +2094,7 @@ impl<'a> TurnRounds<'a> {
             step_id: step_id.clone(),
             tool_call_id: None,
             event_type: "step_start".into(),
-            payload: json!({"round": round}),
+            payload: json!({"round": round, "segment": segment}),
             created_at: crate::store::now(),
         });
         if let Ok(store) = state.database() {
@@ -2005,7 +2105,7 @@ impl<'a> TurnRounds<'a> {
                 Some(&step_id),
                 None,
                 "step_start",
-                json!({"round": round}),
+                json!({"round": round, "segment": segment}),
                 false,
             );
         }
@@ -2029,13 +2129,13 @@ impl<'a> TurnRounds<'a> {
             event.notice = Some("Context reached 80%. Older activity was archived; continuing this response.".into());
             let _ = channel.send(event);
         }
-        let payload = plan.backend.payload(&request_payload(messages, &plan.tool_definitions, &round_preferences, tool_use_denied, finalizing, planning, plan.id_slot, plan.local_arex()))?;
+        let payload = plan.backend.payload(&request_payload(messages, &plan.tool_definitions, &round_preferences, tool_use_denied, finalizing, plan.id_slot, plan.local_arex()))?;
         self.seq += 1;
         let _ = channel.send(ChatEvent::new(
             run,
             Some(&step_id),
             self.seq,
-            if planning { "Creating plan…" } else { "Generating response…" },
+            "Generating response…",
             &assistant.id,
             "",
             "",
@@ -2045,17 +2145,15 @@ impl<'a> TurnRounds<'a> {
 
         if response_metrics.preparation_ms.is_none() {
             response_metrics.preparation_ms = Some(response_started.elapsed().as_secs_f64() * 1000.0);
+            response_metrics.reasoning_effort = payload.get("reasoning_effort").or_else(|| payload.pointer("/reasoning/effort"))
+                .and_then(Value::as_str).map(str::to_owned);
         }
         let round_start_time = Instant::now();
         *active_measurement = Some((round_start_time, crate::inference::InferenceRound {
             phase: None, usage: Default::default(), first_token_ms: None, first_visible_answer_ms: None, reasoning_ms: None, duration_ms: 0.0, complete: false,
         }));
         self.failed_model_round = true;
-        let response = tokio::select! {
-            _ = cancellation.changed() => return Ok(false),
-            result = tokio::time::timeout(Duration::from_secs(600), plan.backend.stream(&payload)) => result.map_err(|_| "Model did not respond within ten minutes.")??,
-        };
-        let mut stream = response.bytes_stream();
+        let model_deadline = tokio::time::Instant::now() + segment_lifetime.max(Duration::from_secs(900));
         let mut decoder = SseDecoder::inference();
         let mut protocol = crate::sse::ModelStream::for_backend(&plan.backend);
         let mut usage = crate::inference::InferenceUsage::default();
@@ -2077,26 +2175,54 @@ impl<'a> TurnRounds<'a> {
         // same round a second time.
         let mut suppressed_round_recorded = false;
         let answer_len_before_round = answer.len();
+        let reasoning_len_before_round = reasoning.len();
         // The verbatim-loop detector needs enough output to compare; it
         // then runs once per further ~1 KiB of generated text.
         let mut next_rep_check = 1_200usize;
         let mut repetition_stopped = false;
+        let interrupted = 'attempt: {
+        let response = tokio::select! {
+            _ = cancellation.changed() => return Ok(false),
+            result = tokio::time::timeout(Duration::from_secs(600), plan.backend.stream(&payload)) => result,
+        };
+        let mut stream = match response {
+            Ok(result) => result?.bytes_stream(),
+            Err(_) => break 'attempt Some(("response_timeout", "Model did not respond within ten minutes.".into())),
+        };
         'stream: loop {
             let flush_deadline = [reasoning_item.flush_deadline(), tool_drafts.flush_deadline()].into_iter().flatten().min();
             let next = tokio::select! {
                 _ = cancellation.changed() => return Ok(false),
+                _ = tokio::time::sleep_until(model_deadline) => break 'attempt Some(("generation_timeout", "The model stream exceeded the generation deadline.".into())),
                 _ = tokio::time::sleep_until(flush_deadline.unwrap_or_else(tokio::time::Instant::now)), if flush_deadline.is_some() => {
                     reasoning_item.flush_pending();
                     tool_drafts.flush_pending();
                     continue;
                 },
-                next = tokio::time::timeout(Duration::from_secs(300), stream.next()) => next.map_err(|_| "Model stopped responding.")?,
+                next = tokio::time::timeout(Duration::from_secs(300), stream.next()) => next,
             };
-            let Some(bytes) = next else { decoder.finish()?; return Err("Model stream ended without a completion marker.".into()); };
-            for event in decoder.push(&bytes.map_err(|error| plan.backend.stream_read_error(error))?)? {
+            let bytes = match next {
+                Ok(Some(Ok(bytes))) => bytes,
+                Ok(Some(Err(error))) => {
+                    let reason = if error.is_timeout() { "provider_read_timeout" } else { "stream_interrupted" };
+                    break 'attempt Some((reason, plan.backend.stream_read_error(error)));
+                }
+                Ok(None) => break 'attempt Some(("stream_interrupted", decoder.finish().err()
+                    .unwrap_or_else(|| "Model stream ended without a completion marker.".into()))),
+                Err(_) => break 'attempt Some(("stream_idle_timeout", "The model stopped sending data for five minutes.".into())),
+            };
+            for event in decoder.push(&bytes)? {
                 let value = protocol.push(&event)?;
                 let Some(value) = value else {if protocol.done{break 'stream;}continue;};
-                if let Some(error) = value.get("error") { return Err(plan.backend.stream_error(error)); }
+                if let Some(error) = value.get("error") {
+                    let message = plan.backend.stream_error(error);
+                    if matches!(error["code"].as_str().or_else(|| error["type"].as_str()),
+                        Some("inference_timeout" | "overloaded_error" | "server_error"))
+                    {
+                        break 'attempt Some(("provider_stream_error", message));
+                    }
+                    return Err(message);
+                }
                 usage.observe(&value);
                 if let Some(reason) = value["choices"][0]["finish_reason"].as_str() { finish_reason = reason.to_string(); }
                 let delta = &value["choices"][0]["delta"];
@@ -2112,7 +2238,9 @@ impl<'a> TurnRounds<'a> {
                     }
                 }
 
-                let (ans_chunk, filter_thought) = think_filter.feed(raw_content);
+                let (ans_chunk, filter_thought) = if plan.backend.uses_inline_thinking() {
+                    think_filter.feed(raw_content)
+                } else { (raw_content.to_string(), String::new()) };
                 let mut thought_chunk = filter_thought;
                 if !api_thought.is_empty() {
                     thought_chunk.push_str(api_thought);
@@ -2135,7 +2263,12 @@ impl<'a> TurnRounds<'a> {
                 if answer.len() + reasoning.len() > 4_194_304 { return Err("Model output exceeded 4 MiB.".into()); }
                 reasoning_item.push(&thought_chunk);
                 if delta.get("tool_calls").is_some_and(|calls| !calls.is_null()) { tool_drafts.observe(&calls); }
-                if round_answer.len() >= next_rep_check {
+                if round_answer.len() >= next_rep_check && !messages.iter().rev()
+                    .find(|m| m["role"] == "user" && m["_continuation"] != true)
+                    .and_then(|m| m["content"].as_str()).is_some_and(|request| {
+                        let request = request.to_lowercase();
+                        ["repeat", "repetition", "duplicate", "copies", "boilerplate", " times", "identical"].iter().any(|word| request.contains(word))
+                    }) {
                     next_rep_check = round_answer.len() + 1024;
                     // A loop may have re-emitted the block more than once;
                     // keep cutting until only the first copy remains.
@@ -2160,7 +2293,7 @@ impl<'a> TurnRounds<'a> {
                         run,
                         Some(&step_id),
                         self.seq,
-                        if think_filter.is_thinking() || !thought_chunk.is_empty() { "Thinking…" } else if planning { "Drafting plan…" } else { "Streaming response…" },
+                        if think_filter.is_thinking() || !thought_chunk.is_empty() { "Thinking…" } else { "Streaming response…" },
                         &assistant.id,
                         &ans_chunk,
                         &thought_chunk,
@@ -2178,12 +2311,48 @@ impl<'a> TurnRounds<'a> {
                 if protocol.done{break 'stream;}
             }
         }
+        None
+        };
+        if let Some((reason, error)) = interrupted {
+            if model_retries >= max_model_retries {
+                return Err(error);
+            }
+            // The terminal event is the dispatch boundary. Only this
+            // attempt's uncommitted draft is discarded; past tools stay in
+            // the request history and are never executed by the retry.
+            drop(reasoning_item);
+            drop(tool_drafts);
+            answer.truncate(answer_len_before_round);
+            reasoning.truncate(reasoning_len_before_round);
+            if let Some((start, mut measurement)) = active_measurement.take() {
+                measurement.duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+                response_metrics.rounds.push(measurement);
+            }
+            model_retries += 1;
+            run.transition_to(crate::agent_run::RunState::PreparingNextRound)?;
+            {
+                let store = state.database()?;
+                store.update_message(&assistant.id, answer, reasoning, "streaming")?;
+                store.update_run_status(&run.id, run.status, None, Some(&step_id))?;
+                emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), None,
+                    "model_round_retry", json!({"reason":reason,"attempt":model_retries}), true);
+            }
+            self.seq += 1;
+            let _ = channel.send(ChatEvent::draft(run, &step_id, self.seq, "Model connection interrupted · retrying…",
+                &assistant.id, answer, reasoning));
+            tokio::select! {
+                _ = cancellation.changed() => return Ok(false),
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+            }
+            continue 'rounds;
+        }
+        model_retries = 0;
         self.failed_model_round = false;
         if repetition_stopped {
             if !calls.is_empty() {
                 return Err("Model output repeated before its tool calls completed. Unfinished tool calls were not executed.".into());
             }
-            finish_reason = "stop".into();
+            return Err("Response interrupted after the model repeated earlier output. The visible response is partial; send a follow-up to continue.".into());
         }
         if let Some((start, mut measurement)) = active_measurement.take() {
             measurement.duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -2233,73 +2402,6 @@ impl<'a> TurnRounds<'a> {
         drop(reasoning_item);
         tool_drafts.finish(finish_reason != "length" && calls.validated().is_ok());
         drop(tool_drafts);
-        if planning {
-            // No tools were offered in this round, so its answer is the
-            // plan. Park it in the transcript, then let the ordinary tool
-            // loop run Phase 2 from the next round on.
-            check_finish_reason(&finish_reason)?;
-            begin_plan_implementation(messages, &round_answer)?;
-            // Native backends keep the planning round's own output items
-            // (including reasoning) for the implementation rounds.
-            let plan_message = protocol.assistant_message(round_answer.trim(), &[]);
-            if crate::history::saved_native_message(&plan_message).is_some() {
-                if let Some(slot) = messages.iter_mut().rev().find(|message| message["role"] == "assistant") {
-                    *slot = plan_message;
-                }
-            }
-            let plan_text = round_answer.trim();
-            if let Ok(store) = state.database() {
-                let existing = store.todos(&conversation_id).unwrap_or_default();
-                if existing.is_empty() {
-                    let seeded = crate::plans::parse_plan_steps(plan_text);
-                    if !seeded.is_empty() {
-                        let _ = store.save_todos(&conversation_id, &seeded);
-                    }
-                }
-                if let Ok(todos) = store.todos(&conversation_id) {
-                    refresh_plan_focus(messages, &todos);
-                }
-            }
-            answer.push_str(PLAN_SEPARATOR);
-            state.database()?.update_message(&assistant.id, answer, reasoning, "streaming")?;
-            if let Ok(store) = state.database() {
-                emit_session_event(
-                    &store,
-                    &conversation_id,
-                    Some(&run.id),
-                    Some(&step_id),
-                    None,
-                    "plan_created",
-                    json!({"round": round, "chars": plan_text.len(), "content": plan_text}),
-                    false,
-                );
-                emit_session_event(
-                    &store,
-                    &conversation_id,
-                    Some(&run.id),
-                    Some(&step_id),
-                    None,
-                    "step_end",
-                    json!({"round": round, "phase": "plan", "toolCallsCount": 0}),
-                    false,
-                );
-            }
-            let _ = run.transition_to(crate::agent_run::RunState::PreparingNextRound);
-            state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id))?;
-            self.seq += 1;
-            channel.send(ChatEvent::new(
-                run,
-                Some(&step_id),
-                self.seq,
-                "Plan ready · implementing…",
-                &assistant.id,
-                PLAN_SEPARATOR,
-                "",
-                None,
-                None,
-            )).map_err(|error| error.to_string())?;
-            continue;
-        }
         // Handle length BEFORE empty-answer finalization and text-call repair.
         // Otherwise a thinking-only cutoff disables tools on the next round,
         // and an unfinished file call can never become a real write.
@@ -2354,7 +2456,7 @@ impl<'a> TurnRounds<'a> {
             continue;
         }
         let mut text_parsed_calls = false;
-        if !finalizing && calls.is_empty() {
+        if !finalizing && calls.is_empty() && finish_reason != "refusal" && plan.backend.uses_text_tool_calls() {
             match decide_text_tool_call(&round_answer, repairs_used) {
                 // Some templates (AREX-family) emit literal tool-call text;
                 // execute it through the normal permissioned dispatch.
@@ -2392,7 +2494,7 @@ impl<'a> TurnRounds<'a> {
                 &round_answer,
                 content,
                 plan.tools.iter().any(|tool| tool.connector == "Harness" && matches!(tool.alias.as_str(), "web_search" | "search")),
-                budgets.lock().map(|b| b.searches_used > 0 || b.fetches_used > 0).unwrap_or(false),
+                earlier_web_lookup || budgets.lock().map(|b| b.searches_used > 0 || b.fetches_used > 0).unwrap_or(false),
                 self.web_lookup_retried,
             )
         {
@@ -2414,20 +2516,26 @@ impl<'a> TurnRounds<'a> {
             state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id))?;
             continue;
         }
-        // A final answer while a workspace write is unverified gets one
-        // corrective round, mirroring the missing-lookup retry above.
-        if !finalizing && !tool_use_denied && calls.is_empty() && finish_reason == "stop"
-            && verification.needs_verification() && check_run_offered && !check_nudged
-        {
-            check_nudged = true;
+        let reminder = if !finalizing && !tool_use_denied && calls.is_empty() && finish_reason == "stop"
+            && finish_nudged_at != Some(completed_calls.len()) {
+            unfinished_work_reminder(&*state.database()?, &conversation_id, ledger.as_ref(), &verification, check_run_offered)?
+        } else { None };
+        if let Some(reminder) = reminder {
+            finish_nudged_at = Some(completed_calls.len());
             answer.truncate(answer_len_before_round);
+            state.database()?.update_message(&assistant.id, answer, reasoning, "streaming")?;
+            self.seq += 1;
+            let _ = channel.send(ChatEvent::draft(run, &step_id, self.seq, "Checking remaining work…", &assistant.id, answer, reasoning));
+            if !wait_for_pending_checks(state, &conversation_id, &snapshot.workspace_path, verification.pending_processes(),
+                || { let _ = channel.send(ChatEvent::progress(&run.id, &step_id, &assistant.id, "Waiting for checks to finish…", None)); },
+                &mut cancellation).await { return Ok(false); }
             let nudge_reply = protocol.assistant_message(&round_answer, &[]);
             if crate::history::saved_native_message(&nudge_reply).is_some() {
                 messages.push(nudge_reply);
             } else {
                 messages.push(json!({"role":"assistant","content":round_answer}));
             }
-            messages.push(json!({"role":"user","_continuation":true,"content":verification.reminder()}));
+            messages.push(json!({"role":"user","_continuation":true,"content":reminder}));
             if let Ok(store) = state.database() {
                 emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), None,
                     "verify_before_finish", json!({"round":round}), false);
@@ -2444,9 +2552,7 @@ impl<'a> TurnRounds<'a> {
             // runs through the same control path as the tool loop; any
             // other call is suppressed — stripped from the answer and still
             // judged "no visible answer" for the retry/fallback decision.
-            let has_markup = is_text_tool_call(&round_answer)
-                || round_answer.contains("<tool_call")
-                || round_answer.contains("<function=");
+            let has_markup = finish_reason != "refusal" && plan.backend.uses_text_tool_calls() && is_text_tool_call(&round_answer);
             if has_markup {
                 let stripped = strip_call_markup(&round_answer);
                 if answer.ends_with(&round_answer) {
@@ -2529,7 +2635,7 @@ impl<'a> TurnRounds<'a> {
             // On a finalizing round a suppressed call attempt still counts
             // as no visible answer; retry once, then use the grounded result.
             let final_answer = if calls.is_empty() && !suppressed_call { &round_answer } else { "" };
-            match finalization_action(final_answer, self.research_fallback.as_deref(), self.finalization_retried || budgets.lock().map(|b| b.exhausted()).unwrap_or(true), research_progress.stopped()) {
+            match finalization_action(final_answer, self.research_fallback.as_deref(), self.finalization_retried || final_budget_round, research_progress.stopped()) {
                 FinalizationAction::Complete => {
                     // A retried stalled answer is accepted without URL
                     // citations; the collected sources are attached
@@ -2607,6 +2713,9 @@ impl<'a> TurnRounds<'a> {
             }
         }
         let calls = calls.finish()?;
+        if finish_reason == "tool_calls" && calls.is_empty() {
+            return Err("Model reported tool calls but returned none.".into());
+        }
         self.replay_answer = Some(if calls.is_empty() {crate::history::saved_native_message(&protocol.assistant_message(&round_answer,&calls)).unwrap_or_else(||json!(round_answer))} else {Value::Null});
         crate::arex::validate_batch(&calls)?;
         if !calls.is_empty() && matches!(&plan.backend, Backend::Local { .. }) {
@@ -2639,6 +2748,7 @@ impl<'a> TurnRounds<'a> {
             if round_answer.trim().is_empty() {
                 return Err(EMPTY_FINAL_ANSWER_ERROR.into());
             }
+            if let Some(measurement) = response_metrics.rounds.last_mut() { measurement.phase = Some("answer".into()); }
             if stalled_uncited {
                 if let Some(footer) = sources_footer(&research_evidence) {
                     answer.push_str(&footer);
@@ -2684,8 +2794,6 @@ impl<'a> TurnRounds<'a> {
                     )).map_err(|error| error.to_string())?;
                 }
             }
-            let _ = run.transition_to(crate::agent_run::RunState::Completed);
-            let _ = state.database()?.update_run_status(&run.id, run.status, None, Some(&step_id));
             if let Ok(store) = state.database() {
                 emit_session_event(
                     &store,
@@ -2702,12 +2810,7 @@ impl<'a> TurnRounds<'a> {
         }
         if tool_use_denied { return Err("Tool use stopped after your denial. Send a new message to authorize further actions.".into()); }
         let mut round_model_message=protocol.assistant_message(&round_answer,&calls);
-        if text_parsed_calls {
-            // Calls parsed from literal text are absent from the native
-            // output; keeping it would fail replay parity and, for Claude,
-            // fabricate tool_use blocks the provider never emitted.
-            if let Some(object)=round_model_message.as_object_mut(){object.remove("locallm_responses_output");object.remove("locallm_claude_content");}
-        }
+        if text_parsed_calls { crate::sse::canonicalize_text_calls(&mut round_model_message); }
         let mut round_model_saved=false;
         messages.push(round_model_message.clone());
         if let Ok(store) = state.database() {
@@ -2746,7 +2849,7 @@ impl<'a> TurnRounds<'a> {
                 Ok(resolved)=>resolved,
                 Err(error)=>{
                     let result=crate::tool_envelope::failure_notice("unavailable-tool",&error,false,crate::tool_envelope::SIDE_NONE,&json!({}));
-                    let store=state.database()?;let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":"Unavailable","name":call.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"unavailable"},"result":result}).to_string(),"complete")?;
+                    let store=state.database()?;let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":"Unavailable","name":call.name,"arguments":call.arguments,"callId":call.id,"runId":run.id,"stepId":step_id,"decision":"unavailable"},"result":result}).to_string(),"complete")?;
                     crate::history::remember_native_round(&store,&row,&round_model_message,&mut round_model_saved)?;
                     emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":row.id,"result":result}), false);
                     messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));call_index+=1;continue;
@@ -2767,8 +2870,11 @@ impl<'a> TurnRounds<'a> {
             }else{None};
             if let Some(end)=group_end.filter(|end|*end>call_index+1){
                 let reserved = crate::history::reserve_native_read_round(&*state.database()?,&conversation_id,
-                    &json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":"allowed","accessMode":plan.access_mode,"authorization":"auto-approved read group (reserved before dispatch)","callId":call.id,"stepId":step_id,"assistantContent":round_answer}),
+                    &json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":"allowed","accessMode":plan.access_mode,"authorization":"auto-approved read group (reserved before dispatch)","callId":call.id,"runId":run.id,"stepId":step_id,"assistantContent":round_answer}),
                     &round_model_message,&mut round_model_saved)?;
+                if calls[call_index..end].iter().any(|call| crate::hooks::has_pre_use(state, &snapshot.workspace_path, &call.name)) {
+                    verification.invalidate();
+                }
                 prefetch_read_group(state,plan,snapshot,&conversation_id,run,&step_id,&assistant.id,round,channel,&cancellation,&mut ledger,&calls[call_index..end],&mut prefetched).await;
                 if let Some(entry)=prefetched.get_mut(&call.id){entry.audit_row=reserved;}
             }
@@ -2787,7 +2893,7 @@ impl<'a> TurnRounds<'a> {
             if let Some(reason) = capability_denial {
                 let result = crate::tool_envelope::failure_notice("capability-disabled", &reason, false, crate::tool_envelope::SIDE_NONE, &json!({}));
                 let store = state.database()?;
-                let recorded=store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"capability disabled"},"result":result}).to_string(), "complete")?;
+                let recorded=store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"runId":run.id,"stepId":step_id,"decision":"denied","authorization":"capability disabled"},"result":result}).to_string(), "complete")?;
                 crate::history::remember_native_round(&store,&recorded,&round_model_message,&mut round_model_saved)?;
                 emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":recorded.id,"result":result}), false);
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
@@ -2799,19 +2905,7 @@ impl<'a> TurnRounds<'a> {
             {
                 let result = crate::tool_envelope::failure_notice("plan-approval-required", "Plan mode: call plan_submit and get the plan approved before running mutating tools. Read-only tools, todos and plan_submit stay available.", true, crate::tool_envelope::SIDE_NONE, &json!({}));
                 let store = state.database()?;
-                let recorded = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"plan approval pending"},"result":result}).to_string(), "complete")?;
-                crate::history::remember_native_round(&store,&recorded,&round_model_message,&mut round_model_saved)?;
-                emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":recorded.id,"result":result}), false);
-                messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
-                continue;
-            }
-            // A finish attempt while a workspace write is unverified gets
-            // one refusal carrying the nudge; the retry is accepted.
-            if call.name == "finish" && verification.needs_verification() && check_run_offered && !check_nudged {
-                check_nudged = true;
-                let result = crate::tool_envelope::failure_notice("verify-before-finish", &verification.reminder(), true, crate::tool_envelope::SIDE_NONE, &json!({}));
-                let store = state.database()?;
-                let recorded = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"verify before finish nudge"},"result":result}).to_string(), "complete")?;
+                let recorded = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"runId":run.id,"stepId":step_id,"decision":"denied","authorization":"plan approval pending"},"result":result}).to_string(), "complete")?;
                 crate::history::remember_native_round(&store,&recorded,&round_model_message,&mut round_model_saved)?;
                 emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":recorded.id,"result":result}), false);
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
@@ -2824,7 +2918,7 @@ impl<'a> TurnRounds<'a> {
             if state.with_run_control(|control| crate::agent_run::pause_blocks_new_tool(control.pause)).unwrap_or(false) {
                 let notice = crate::agent_run::pause_notice(false);
                 if let Some(task) = ledger.as_mut() {
-                    let _ = task.pause_before_new_tool(&call.id, &call.name);
+                    let _ = task.pause_before_new_tool(&call.name);
                     save_ledger(state, task);
                 }
                 let paused = crate::tool_envelope::failure_notice("paused", notice, false, crate::tool_envelope::SIDE_NONE, &json!({"paused":true}));
@@ -2845,7 +2939,7 @@ impl<'a> TurnRounds<'a> {
                 Err(error) => {
                     let result = crate::tool_envelope::failure_notice("invalid-arguments", &error, false, crate::tool_envelope::SIDE_NONE, &json!({}));
                     let store = state.database()?;
-                    let recorded=store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"invalid"},"result":result}).to_string(), "complete")?;
+                    let recorded=store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"runId":run.id,"stepId":step_id,"decision":"invalid"},"result":result}).to_string(), "complete")?;
                 crate::history::remember_native_round(&store,&recorded,&round_model_message,&mut round_model_saved)?;
                     emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":recorded.id,"result":result}), false);
                     messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
@@ -2853,12 +2947,30 @@ impl<'a> TurnRounds<'a> {
                 }
               }
             }
+            if !finalizing && !tool_use_denied && call.name == "finish"
+                && finish_nudged_at != Some(completed_calls.len())
+            {
+                let reminder = unfinished_work_reminder(&*state.database()?, &conversation_id, ledger.as_ref(), &verification, check_run_offered)?;
+                if let Some(reminder) = reminder {
+                    finish_nudged_at = Some(completed_calls.len());
+                    if !wait_for_pending_checks(state, &conversation_id, &snapshot.workspace_path, verification.pending_processes(),
+                        || { let _ = channel.send(ChatEvent::progress(&run.id, &step_id, &assistant.id, "Waiting for checks to finish…", None)); },
+                        &mut cancellation).await { return Ok(false); }
+                    let result = crate::tool_envelope::failure_notice("verify-before-finish", &reminder, true, crate::tool_envelope::SIDE_NONE, &json!({}));
+                    let store = state.database()?;
+                    let recorded = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"runId":run.id,"stepId":step_id,"decision":"denied","authorization":"work pending before finish"},"result":result}).to_string(), "complete")?;
+                    crate::history::remember_native_round(&store,&recorded,&round_model_message,&mut round_model_saved)?;
+                    emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":recorded.id,"result":result}), false);
+                    messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
+                    continue;
+                }
+            }
             let signature = crate::continuation::tool_signature(tool, &call.arguments);
             // A prefetched member is never "re-dispatched": its outcome is
             // real, so an uncertain sibling cannot retroactively suppress it.
             if !was_prefetched && blocked_calls.lock().map(|set|set.contains(&signature)).unwrap_or(true) {
-                let skipped = crate::tool_envelope::failure_notice("uncertain-outcome-not-repeated", "Not repeated: the previous attempt had an uncertain outcome.", false, crate::tool_envelope::SIDE_UNKNOWN, &json!({}));
-                let store=state.database()?;let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"turn replay protection"},"result":skipped}).to_string(),"complete")?;
+                let skipped = crate::tool_envelope::failure_notice("uncertain-outcome-not-repeated", "A previous attempt was already recorded or may have changed data. This action was not repeated. Inspect the saved outcome.", false, crate::tool_envelope::SIDE_NONE, &json!({}));
+                let store=state.database()?;let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"runId":run.id,"stepId":step_id,"decision":"denied","authorization":"turn replay protection"},"result":skipped}).to_string(),"complete")?;
                 crate::history::remember_native_round(&store,&row,&round_model_message,&mut round_model_saved)?;
                 emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":row.id,"result":skipped}), false);
                 messages.push(json!({"role":"tool","tool_call_id":call.id,"content":skipped.to_string()}));
@@ -2890,7 +3002,7 @@ impl<'a> TurnRounds<'a> {
                         &json!({}),
                     );
                     let store = state.database()?;
-                    let row = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"stepId":step_id,"decision":"denied","authorization":"permission rule"},"result":skipped}).to_string(), "complete")?;
+                    let row = store.append_message(&conversation_id, "tool", &json!({"request":{"connector":tool.connector,"name":tool.tool.name,"arguments":call.arguments,"callId":call.id,"runId":run.id,"stepId":step_id,"decision":"denied","authorization":"permission rule"},"result":skipped}).to_string(), "complete")?;
                     crate::history::remember_native_round(&store, &row, &round_model_message, &mut round_model_saved)?;
                     emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"callId":call.id,"name":tool.tool.name,"decision":"denied","result":skipped,"messageId":row.id}), false);
                     messages.push(json!({"role":"tool","tool_call_id":call.id,"content":skipped.to_string()}));
@@ -2965,11 +3077,17 @@ impl<'a> TurnRounds<'a> {
                     gate_failure = Some(("capability-disabled", reason, "capability disabled"));
                 }
             }
-            let budget_error=if allow&&!was_prefetched&&gate_failure.is_none() {crate::continuation::admit_tool(state,&run.id,&call.name,&call.arguments).err()}else{None};
+            let budget_error = if allow && !was_prefetched && gate_failure.is_none() {
+                crate::continuation::admit_tool(state, &run.id, &call.name, &call.arguments).err()
+            } else { None };
             if allow && budget_error.is_none() && !was_prefetched && gate_failure.is_none() {
                 // Approval and hooks can take time. Do not announce execution
                 // or dispatch until current permissions and capabilities have
                 // been checked again after the hook finishes.
+                if crate::hooks::has_pre_use(state, &snapshot.workspace_path, &call.name) {
+                    crate::snapshots::capture_before_tool(state, &conversation_id, round, &snapshot.workspace_path, None);
+                    verification.invalidate();
+                }
                 let verdict = tokio::select! {
                     _ = cancellation.changed() => {
                         settle_unconsumed_reads(state, plan, &conversation_id, run, &step_id, &mut ledger, &calls, &mut prefetched, messages, &mut self.seq);
@@ -2987,7 +3105,7 @@ impl<'a> TurnRounds<'a> {
                 if state.with_run_control(|control| crate::agent_run::pause_blocks_new_tool(control.pause)).unwrap_or(true) {
                     let notice = crate::agent_run::pause_notice(false);
                     if let Some(task) = ledger.as_mut() {
-                        let _ = task.pause_before_new_tool(&call.id, &call.name);
+                        let _ = task.pause_before_new_tool(&call.name);
                         save_ledger(state, task);
                     }
                     let paused = crate::tool_envelope::failure_notice("paused", notice, false, crate::tool_envelope::SIDE_NONE, &json!({"paused":true}));
@@ -3012,7 +3130,7 @@ impl<'a> TurnRounds<'a> {
             if !allow { tool_use_denied = true; }
             let dispatched_or_ready = allow && budget_error.is_none() && (!was_prefetched || prefetched_dispatched);
             let authorization = if let Some((_, _, reason)) = &gate_failure { *reason } else if was_prefetched && !prefetched_dispatched { "group stopped before dispatch" } else if budget_error.is_some() {"turn tool-budget admission denied"} else if blocked_by_denial { "blocked by an earlier denial in this turn" } else { automatic_reason.unwrap_or("user approval decision") };
-            let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":if dispatched_or_ready { "allowed" } else { "denied" },"accessMode":plan.access_mode,"authorization":authorization,"callId":call.id,"stepId":step_id,"assistantContent":round_answer});
+            let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":if dispatched_or_ready { "allowed" } else { "denied" },"accessMode":plan.access_mode,"authorization":authorization,"callId":call.id,"runId":run.id,"stepId":step_id,"assistantContent":round_answer});
             let row = if let Some(row)=prefetched.get_mut(&call.id).and_then(|entry|entry.audit_row.take()) {
                 state.database()?.update_message(&row.id,&audit.to_string(),"","streaming")?;
                 row
@@ -3060,6 +3178,7 @@ impl<'a> TurnRounds<'a> {
                     message_id: assistant.id.clone(),
                     content: String::new(),
                     reasoning: String::new(),
+                    replace_draft: None,
                     approval: None,
                     elapsed_secs: Some(0.0),
                     round_index: Some(round),
@@ -3071,6 +3190,7 @@ impl<'a> TurnRounds<'a> {
                         command: cmd_arg,
                         language: lang_arg,
                         cwd: cwd_arg,
+                        arguments: json!({"path":call.arguments["path"],"query":call.arguments["query"],"url":call.arguments["url"]}),
                     }),
                 });
             }
@@ -3083,10 +3203,22 @@ impl<'a> TurnRounds<'a> {
                     json!({"isError":true,"message":note})
                 } else {
                     recent_calls.push((call.name.clone(), args_text));
+                    if !was_prefetched {
+                        let workspace_write = call.name.strip_prefix("workspace_").is_some_and(crate::workspace::is_write_call)
+                            || matches!(call.name.as_str(), "file_write" | "format_paths" | "lsp_rename" | "lsp_apply_edit");
+                        if workspace_write || matches!(call.name.as_str(), "shell_run" | "process_start" | "process_write" | "ptc_run" | "run_code" | "local_run_code" | "local_execute_command" | "lsp_execute_command") {
+                            crate::snapshots::capture_before_tool(state, &conversation_id, round, &snapshot.workspace_path,
+                                workspace_write.then_some(&call.arguments));
+                        }
+                    }
                     let timeout_secs = state
                         .database()
                         .map(|store| crate::sandbox::effective_timeout_secs(&store, tool.timeout().as_secs()))
-                        .unwrap_or(tool.timeout().as_secs());
+                        .unwrap_or(tool.timeout().as_secs())
+                        .min(operation_lifetime);
+                    let execution_budget = Duration::from_secs(timeout_secs);
+                    let mut dispatch_args = call.arguments.clone();
+                    crate::process_tools::limit_wait(&call.name, &mut dispatch_args, execution_budget);
                     let app_state: &AppState = state;
                     let mut pending_events: Vec<crate::harness::PendingEvent> = Vec::new();
                     let emit_tool_channel = channel.clone();
@@ -3108,6 +3240,7 @@ impl<'a> TurnRounds<'a> {
                             message_id: emit_tool_msg_id.clone(),
                             content: String::new(),
                             reasoning: String::new(),
+                            replace_draft: None,
                             approval: None,
                             elapsed_secs: Some(tool_exec_start.elapsed().as_secs_f64()),
                             round_index: Some(round),
@@ -3145,7 +3278,7 @@ impl<'a> TurnRounds<'a> {
                                     }
                                     match &pre.outcome {
                                         Some(Ok(Ok(value))) => settle_catalog_op(&store, task, &call.id, value),
-                                        _ => { let _ = store.save_research_task(task); }
+                                        outcome => settle_interrupted_catalog_read(&store, task, &call.id, outcome),
                                     }
                                 }
                             }
@@ -3154,7 +3287,7 @@ impl<'a> TurnRounds<'a> {
                     } else {
                     tokio::select! {
                         _ = cancellation.changed() => None,
-                        result = tokio::time::timeout(tool.call_deadline(Duration::from_secs(timeout_secs), true), async {
+                        result = tokio::time::timeout(tool.call_deadline(execution_budget, true), async {
                             if tool.is_harness() {
                                 let emit_run = run.id.clone();
                                 let emit_step = step_id.clone();
@@ -3197,7 +3330,7 @@ impl<'a> TurnRounds<'a> {
                                     }
                                     Ok(value)
                                 } else {
-                                    match crate::harness::execute(&ctx, &call.name, call.arguments.clone()).await {
+                                    match crate::harness::execute_for_call(&ctx, &call.name, dispatch_args, Some(&call.id)).await {
                                         Ok(outcome) => {
                                             pending_events.extend(outcome.events);
                                             Ok(outcome.value)
@@ -3212,7 +3345,7 @@ impl<'a> TurnRounds<'a> {
                                         progress_emit(channel, &run.id, &step_id, &assistant.id),
                                     )
                                 });
-                                tool.call_with_execution_budget(call.arguments.clone(), Some(tool_chunk_cb), mcp_ui, Duration::from_secs(timeout_secs)).await
+                                tool.call_with_execution_budget(call.arguments.clone(), Some(tool_chunk_cb), mcp_ui, execution_budget).await
                             }
                         }) => Some(result),
                     }
@@ -3254,6 +3387,7 @@ impl<'a> TurnRounds<'a> {
                         message_id: assistant.id.clone(),
                         content: String::new(),
                         reasoning: String::new(),
+                            replace_draft: None,
                         approval: None,
                         elapsed_secs: Some(tool_exec_start.elapsed().as_secs_f64()),
                         round_index: Some(round),
@@ -3269,9 +3403,26 @@ impl<'a> TurnRounds<'a> {
                     }
                     match outcome {
                         None => {
-                            let _ = run.transition_to(crate::agent_run::RunState::Cancelled);
-                            let _ = state.database()?.update_run_status(&run.id, run.status, Some("Cancelled; the action may already have changed data."), Some(&step_id));
-                            state.database()?.update_message(&row.id,&json!({"request":audit,"result":"Cancelled; the action may already have changed data."}).to_string(),"","interrupted")?;
+                            let processes = state.processes.settle_cancelled_shells(&run.id).await;
+                            let mut cancelled = crate::tool_envelope::normalize_error(
+                                "Cancelled; the action may already have changed data.",
+                                crate::tool_envelope::Cause { cancelled: true, ..Default::default() },
+                                tool.envelope_family(),
+                            );
+                            if let Some(process) = processes.first() {
+                                cancelled["data"] = process.clone();
+                                cancelled["data"]["processes"] = json!(processes);
+                            }
+                            let store = state.database()?;
+                            store.update_message(&row.id,&json!({"request":audit,"result":cancelled}).to_string(),"","interrupted")?;
+                            verification.observe(&call.name, &call.arguments, &cancelled, development_task);
+                            if let Some(task) = ledger.as_mut() {
+                                task.context.verification = verification.clone();
+                                persist_tool_outcome(&store, task, &call.name, Some(call.id.clone()), &cancelled, !tool.trusted_read())?;
+                            }
+                            emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id),
+                                "tool_result", json!({"messageId":row.id,"name":tool.tool.name,"result":cancelled}), false);
+                            drop(store);
                             settle_unconsumed_reads(state, plan, &conversation_id, run, &step_id, &mut ledger, &calls, &mut prefetched, messages, &mut self.seq);
                             return Ok(false);
                         },
@@ -3282,12 +3433,32 @@ impl<'a> TurnRounds<'a> {
                         // explicitly unknown-side-effect outcomes.
                         Some(Ok(Ok(value))) => crate::tool_envelope::normalize(value, tool.envelope_family()),
                         Some(Ok(Err(error))) => crate::tool_envelope::normalize_error(&error, crate::tool_envelope::Cause::default(), tool.envelope_family()),
-                        Some(Err(_)) => crate::tool_envelope::normalize_error("Tool request timed out. Its remote outcome may be unknown; do not automatically retry.", crate::tool_envelope::Cause { timeout: true, ..Default::default() }, tool.envelope_family()),
+                        Some(Err(_)) => {
+                            let processes = state.processes.settle_cancelled_shells(&run.id).await;
+                            let mut timed_out = crate::tool_envelope::normalize_error("Tool request timed out. Its outcome may be unknown.", crate::tool_envelope::Cause { timeout: true, ..Default::default() }, tool.envelope_family());
+                            if let Some(process) = processes.first() {
+                                timed_out["data"] = process.clone();
+                                timed_out["data"]["processes"] = json!(processes);
+                            }
+                            timed_out
+                        },
                     }
                 }
             };
 
+            let web_calls = research_progress.calls;
+            let evidence_count = research_progress.evidence.len();
             research_progress.observe(&tool.tool.name, &result);
+            if research_progress.calls != web_calls {
+                segment_made_progress |= research_progress.evidence.len() > evidence_count;
+            } else if dispatched_or_ready && !crate::tool_envelope::failed(&result)
+                && !matches!(result["responseStatus"].as_str(), Some("declined" | "withdrawn" | "unanswered"))
+            {
+                let new_call = completed_calls.insert(signature);
+                let waited_for_process = matches!(call.name.as_str(), "process_poll" | "check_report" | "verification_report")
+                    && tool_exec_start.elapsed() >= Duration::from_secs(1);
+                segment_made_progress |= new_call || waited_for_process;
+            }
             // The taste profile learns from DECISIONS the user made, not
             // from calls the access mode approved on their own. An
             // auto-approved call carries no signal about the user's
@@ -3317,16 +3488,14 @@ impl<'a> TurnRounds<'a> {
             {
                 plan_approved = true;
                 let submitted = call.arguments["plan"].as_str().unwrap_or_default().trim().to_string();
-                let _ = begin_plan_implementation(messages, &submitted);
                 if let Ok(store) = state.database() {
                     if store.todos(&conversation_id).unwrap_or_default().is_empty() {
                         let seeded = crate::plans::parse_plan_steps(&submitted);
                         if !seeded.is_empty() { let _ = store.save_todos(&conversation_id, &seeded); }
                     }
-                    if let Ok(todos) = store.todos(&conversation_id) { refresh_plan_focus(messages, &todos); }
                 }
             }
-            verification.observe(&call.name, &call.arguments, &result, development_task);
+            verification.observe(&tool.verification_name(), &call.arguments, &result, development_task);
             if matches!(call.name.as_str(), "worktree_enter" | "worktree_exit")
                 && !crate::tool_envelope::failed(&result)
             {
@@ -3340,8 +3509,7 @@ impl<'a> TurnRounds<'a> {
             let deliverable_missing = matches!(call.name.as_str(), "file_write" | "create_file" | "run_code")
                 && result["isError"] == Value::Bool(true);
             let mut follow_up: Option<String> = None;
-            let budget_snapshot = budgets.lock().map(|b| b.clone()).unwrap_or_default();
-            match crate::continuation::continuation_after_tool(plan_mode, &call.name, &result, &budget_snapshot, corrections_used, deliverable_missing) {
+            match crate::continuation::continuation_after_tool(plan_mode, &call.name, &result, corrections_used, deliverable_missing) {
                 crate::continuation::Continuation::Proceed { evidence } => {
                     if evidence_note.is_none() {
                         evidence_note = evidence;
@@ -3349,9 +3517,10 @@ impl<'a> TurnRounds<'a> {
                 }
                 crate::continuation::Continuation::CorrectOnce { reason } => {
                     corrections_used = corrections_used.saturating_add(1);
-                    follow_up = Some(format!("{reason} Fix it once with the tools still available, then stop. Do not start an open-ended review."));
+                    follow_up = Some(format!("{reason} Correct the failed step using the tool result, then continue the remaining work."));
                 }
                 crate::continuation::Continuation::Partial { unresolved } => {
+                    self.partial_work = true;
                     let named = unresolved.join("; ");
                     self.research_fallback = Some(format!("Partial result. Unresolved: {named}"));
                     self.finalization_retried = false;
@@ -3389,6 +3558,9 @@ impl<'a> TurnRounds<'a> {
                 self.input_tokens,
                 round_preferences.max_tokens,
             );
+            if plan.goal.is_some() {
+                result["metadata"]["auditId"] = json!(row.id);
+            }
             let (bounded_val, artifact_id) = crate::artifacts::capture_tool_result(
                 result,
                 &tool.tool.name,
@@ -3399,6 +3571,12 @@ impl<'a> TurnRounds<'a> {
             );
             let mut bounded_val = bounded_val;
             if dispatched_or_ready {
+                if !*cancellation.borrow() && crate::hooks::has_post_use(state, &hook_workspace, &call.name) {
+                    // A post hook runs after check reporting and may rewrite
+                    // files even when it returns no note or is interrupted.
+                    crate::snapshots::capture_before_tool(state, &conversation_id, round, &hook_workspace, None);
+                    verification.invalidate();
+                }
                 let note = if *cancellation.borrow() {
                     None
                 } else {
@@ -3415,10 +3593,13 @@ impl<'a> TurnRounds<'a> {
             }
             state.database()?.update_message(&row.id,&json!({"request":audit,"result":bounded_val}).to_string(),"","complete")?;
             messages.push(json!({"role":"tool","tool_call_id":call.id,"content":bounded_val.to_string()}));
-            if !catalog_recorded {
-                if let Some(task) = ledger.as_mut() {
-                    let store = state.database()?;
-                    persist_completed_tool(&store, task, &call.name, Some(call.id.clone()))?;
+            if let Some(task) = ledger.as_mut() {
+                task.context.verification = verification.clone();
+                let store = state.database()?;
+                if catalog_recorded {
+                    store.save_research_task(task)?;
+                } else {
+                    persist_tool_outcome(&store, task, &call.name, Some(call.id.clone()), &bounded_val, !tool.trusted_read())?;
                 }
             }
             if let Some(follow_up) = follow_up {
@@ -3450,6 +3631,10 @@ impl<'a> TurnRounds<'a> {
                 );
             }
         }
+        if plan_mode && plan_approved && !paused_exit {
+            let todos = state.database()?.todos(&conversation_id)?;
+            refresh_plan_focus(messages, &todos);
+        }
         if plan.supports_images { crate::automation::add_model_images(messages, &*state.database()?, &conversation_id)?; }
         if let Some(final_answer) = explicit_finish {
             let finish_args = finish_args.take();
@@ -3460,11 +3645,12 @@ impl<'a> TurnRounds<'a> {
             return Ok(false);
         }
         if !tool_use_denied && research_progress.stopped() {
-            let unresolved = "Unresolved: the research budget is exhausted before every source was read.";
+            self.partial_work = true;
+            let unresolved = "Unresolved: repeated lookups provided no new evidence.";
             self.research_fallback = Some(format!("{RESEARCH_STALLED_FALLBACK}\n\n{unresolved}"));
             messages.push(json!({"role":"user","_continuation":true,"content":format!("{RESEARCH_STALLED}\n\n{unresolved}")}));
             let mut event = ChatEvent::progress(&run.id, &step_id, &assistant.id, "Research stopped · preparing answer…", None);
-            event.notice = Some("Research is no longer making progress or has reached its budget. Preparing an answer from the collected results.".into());
+            event.notice = Some("Recent lookups provided no new evidence. Preparing an answer from the collected results.".into());
             channel.send(event).map_err(|e| e.to_string())?;
         } else if !tool_use_denied && research_progress.calls > research_calls_before && research_progress.stagnant == 2 {
             messages.push(json!({"role":"user","_continuation":true,"content":"The last web calls added no new evidence. Do not rephrase the same search. Read an unvisited source, change the source or research approach, or answer from existing evidence and explain the gap."}));
@@ -3484,8 +3670,16 @@ impl<'a> TurnRounds<'a> {
             );
         }
     }
-    Err("Tool round limit reached.".into())
+    Err(EMPTY_FINAL_ANSWER_ERROR.into())
     }.await;
+    if let (Some(task_id), true) = (self.research_task_id.as_deref(), plan.goal.is_some()) {
+        let store = state.database()?;
+        verification.refresh_goal_evidence(&store, &conversation_id, &snapshot.workspace_path);
+        if let Some(mut task) = store.research_task(task_id)? {
+            task.context.verification = verification.clone();
+            store.save_research_task(&task)?;
+        }
+    }
     self.outcome = Some(verification.outcome());
     result
     }
@@ -3521,16 +3715,129 @@ fn save_ledger(state: &AppState, task: &crate::research_tasks::ResearchTask) {
     }
 }
 
-pub fn persist_completed_tool(
+fn start_turn_ledger(
+    store: &crate::store::Store,
+    conversation: &str,
+    content: &str,
+    run: &str,
+    plan: &TurnPlan,
+    resume_task_id: Option<&str>,
+) -> Result<(crate::research_tasks::ResearchTask, std::collections::HashSet<String>), String> {
+    use crate::research_tasks::{ResearchTask, TaskBudgets};
+    let mut blocked = std::collections::HashSet::new();
+    let mut task = if let Some(id) = resume_task_id {
+        let mut task = store.research_task(id)?.filter(|task| task.conversation_id == conversation)
+            .ok_or("The saved research checkpoint is unavailable.")?;
+        task.resume()?;
+        if let Some(workspace) = &task.context.workspace {
+            workspace.verify(std::path::Path::new(&plan.workspace_path))?;
+        }
+        restore_resume_guard(store, &mut task, &plan.tools, &mut blocked)?;
+        task
+    } else {
+        let mut question = content.chars().take(4000).collect::<String>();
+        while question.len() > 8000 { question.pop(); }
+        let mut task = ResearchTask::new(conversation, if question.trim().is_empty() { "continue" } else { &question }, TaskBudgets::for_parent())?;
+        task.context.goal = plan.goal.clone();
+        task
+    };
+    if task.context.workspace.is_none() && !plan.workspace_path.is_empty() {
+        task.context.workspace = crate::snapshots::WorkspacePin::open(std::path::Path::new(&plan.workspace_path))
+            .map(|(pin, _)| pin).ok();
+    }
+    if task.context.goal.is_some() && task.context.workspace.is_none() {
+        return Err("The goal needs a workspace whose identity can be recorded.".into());
+    }
+    // Reuse the checkpoint and transfer ownership to the new run. Creating a
+    // second ledger here would strand the resumed task in its old state.
+    store.start_research_task(&task, run)?;
+    Ok((task, blocked))
+}
+
+fn restore_resume_guard(
+    store: &crate::store::Store,
+    task: &mut crate::research_tasks::ResearchTask,
+    tools: &[crate::connectors::AgentTool],
+    blocked: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    use crate::research_tasks::{OperationStatus, TaskOperation};
+    store.visit_research_resume_audits(&task.conversation_id, &task.id, |id, content| {
+        let audit: Value = serde_json::from_str(content)
+            .map_err(|_| "The saved checkpoint contains an invalid tool audit.")?;
+        let request = audit.get("request").unwrap_or(&audit);
+        if request["decision"] != "allowed" {
+            return Ok(());
+        }
+        let saved = &audit["result"];
+        // Recover the outcome from an older excerpt's complete artifact.
+        let original = if saved["status"] == "partial" && saved["metadata"]["outcomeStatus"].is_null() {
+            if let Some(id) = saved["_artifactId"].as_str() {
+                store.artifact(id)?.filter(|record| record.conversation_id == task.conversation_id)
+                    .and_then(|record| serde_json::from_str::<Value>(&record.content).ok())
+            } else { None }
+        } else { None };
+        let result = original.as_ref().unwrap_or(saved);
+        if request["name"] == "verification_run"
+            && request["arguments"]["command"].as_str().is_some_and(|command| {
+                task.context.goal.as_ref().is_some_and(|goal| goal.requires_command(command))
+                    && task.context.verification.settled_gate(command)
+            })
+        {
+            // A named acceptance gate with a collected terminal outcome can
+            // run again under the current policy, for example after a patch.
+            return Ok(());
+        }
+        if request["connector"] == "Harness" && (
+            matches!(request["name"].as_str(), Some("research_pause" | "research_resume" | "research_progress" | "ask_user" | "plan_submit"))
+            || (request["name"] == "ptc_run" && result["data"]["workspaceEffects"] == "none")
+        ) {
+            return Ok(());
+        }
+        let effects = result.pointer("/error/sideEffects").or_else(|| result.pointer("/metadata/sideEffects"));
+        if effects.and_then(Value::as_str).is_some_and(|value| {
+            matches!(value, crate::tool_envelope::SIDE_NONE | crate::tool_envelope::SIDE_ROLLED_BACK)
+        }) {
+            return Ok(());
+        }
+        let tool = tools.iter().find(|tool| request["connector"] == tool.connector && request["name"] == tool.tool.name);
+        if tool.is_some_and(|tool| tool.trusted_read()) {
+            return Ok(());
+        }
+        if let Some(tool) = tool {
+            blocked.insert(crate::continuation::tool_signature(tool, &request["arguments"]));
+        }
+        if result.is_null() || crate::tool_envelope::failed(result)
+            || crate::tool_envelope::operation_status(result) == Some("partial") {
+            let id = format!("resume-audit-{id}");
+            if !task.operations.iter().any(|operation| operation.id == id) {
+                task.operations.push(TaskOperation {
+                    id,
+                    kind: request["name"].as_str().unwrap_or("tool").into(),
+                    status: OperationStatus::Unknown,
+                    attempts: 1,
+                    result_summary: None,
+                    error: Some("A previous segment did not confirm this action's outcome.".into()),
+                    updated_at: crate::store::now(),
+                });
+            }
+        }
+        Ok(())
+    })
+}
+
+pub fn persist_tool_outcome(
     store: &crate::store::Store,
     task: &mut crate::research_tasks::ResearchTask,
     name: &str,
     summary: Option<String>,
+    result: &Value,
+    may_mutate: bool,
 ) -> Result<(), String> {
     // Lifecycle tools persist their transition inside dispatch, while this
     // loop still owns an older ledger copy. Preserve the authoritative state
     // and uncertain operations instead of overwriting it with cached Running.
     if let Some(durable) = store.research_task(&task.id)? {
+        task.context.goal = durable.context.goal;
         if matches!(
             name,
             "research_pause" | "research_resume" | "research_cancel"
@@ -3562,11 +3869,10 @@ pub fn persist_completed_tool(
             }
         }
     }
-    task.checkpoint_operation(
-        name,
-        crate::research_tasks::OperationStatus::Completed,
-        summary,
-    );
+    task.checkpoint_operation(name, operation_outcome(result, may_mutate), summary);
+    if let Some(operation) = task.operations.last_mut() {
+        operation.error = result.pointer("/error/message").and_then(Value::as_str).map(str::to_owned);
+    }
     store.save_research_task(task)
 }
 
@@ -3599,23 +3905,54 @@ fn settle_catalog_op(
     result: &Value,
 ) {
     let id = format!("op-{call_id}");
-    let failed = result.get("isError").and_then(Value::as_bool) == Some(true);
-    if !failed {
-        if let Some(op) = task.operations.iter_mut().find(|op| op.id == id) {
-            op.status = crate::research_tasks::OperationStatus::Completed;
-            op.result_summary = result
-                .pointer("/data/result")
-                .map(|value| value.to_string())
-                .or_else(|| {
-                    result
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .map(|text| text.to_string())
-                });
-            op.updated_at = crate::store::now();
-        }
+    if let Some(op) = task.operations.iter_mut().find(|op| op.id == id) {
+        op.status = operation_outcome(result, op.kind != "file_read");
+        op.error = result.pointer("/error/message").and_then(Value::as_str)
+            .or_else(|| result["message"].as_str()).map(str::to_owned);
+        op.result_summary = result.pointer("/data/result").map(Value::to_string)
+            .or_else(|| result["content"].as_str().map(str::to_owned));
+        op.updated_at = crate::store::now();
     }
     let _ = store.save_research_task(task);
+}
+
+fn settle_interrupted_catalog_read(
+    store: &crate::store::Store, task: &mut crate::research_tasks::ResearchTask, call_id: &str,
+    outcome: &Option<Result<Result<Value, String>, tokio::time::error::Elapsed>>,
+) {
+    let message = match outcome {
+        Some(Ok(Err(error))) => error.as_str(),
+        Some(Err(_)) => "Catalog read timed out.",
+        _ => "Catalog read interrupted before its result was collected.",
+    };
+    settle_catalog_op(store, task, call_id, &json!({"status":"failure","message":message}));
+}
+
+fn operation_outcome(result: &Value, may_mutate: bool) -> crate::research_tasks::OperationStatus {
+    use crate::research_tasks::OperationStatus;
+    if result["denied"] == true || result["paused"] == true {
+        return OperationStatus::Skipped;
+    }
+    // A cancelled or missing outcome may have started. A definite failure
+    // (validation, nonzero exit, harness-killed tree) is Failed, so the next
+    // segment is not told the outcome is missing.
+    if may_mutate && matches!(crate::tool_envelope::operation_status(result), Some("unknown" | "cancelled")) {
+        return OperationStatus::Unknown;
+    }
+    if crate::tool_envelope::failed(result) {
+        OperationStatus::Failed
+    } else {
+        OperationStatus::Completed
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_known_tool_failure_is_not_an_unknown_outcome() {
+    let killed = json!({"status":"failure","isError":true,"error":{"code":"timeout","message":"Configured process timeout exceeded; process tree stopped.","sideEffects":"unknown"}});
+    assert_eq!(operation_outcome(&killed, true), crate::research_tasks::OperationStatus::Failed);
+    let lost = json!({"status":"unknown","error":{"sideEffects":"unknown","message":"interrupted"}});
+    assert_eq!(operation_outcome(&lost, true), crate::research_tasks::OperationStatus::Unknown);
 }
 
 /// Catalog dispatch without the ledger settle — shared by the sequential
@@ -3657,7 +3994,7 @@ async fn catalog_dispatch(
 }
 
 /// Execute one catalog tool. The running row from [`begin_catalog_op`] becomes
-/// completed on success and stays running when execution fails.
+/// settled using the actual dispatch result.
 pub async fn run_catalog_and_record(
     db_path: &std::path::Path,
     task_id: &str,
@@ -3672,9 +4009,8 @@ pub async fn run_catalog_and_record(
         if let Ok(Some(mut task)) = store.research_task(task_id) {
             match &executed {
                 Ok(value) => settle_catalog_op(&store, &mut task, call_id, value),
-                Err(_) => {
-                    let _ = store.save_research_task(&task);
-                }
+                Err(error) => settle_catalog_op(&store, &mut task, call_id,
+                    &json!({"isError":true,"status":if name == "file_read" { "failure" } else { "unknown" },"message":error})),
             }
         }
     }
@@ -3840,6 +4176,7 @@ fn tool_chunk_callback(
             message_id: message_id.clone(),
             content: String::new(),
             reasoning: String::new(),
+            replace_draft: None,
             approval: None,
             elapsed_secs: Some(started.elapsed().as_secs_f64()),
             round_index: Some(round),
@@ -4018,8 +4355,7 @@ fn settle_unconsumed_reads(
         let Some(tool) = plan.tools.iter().find(|tool| tool.alias == call.name) else {
             continue;
         };
-        // Catalog ledger settle mirrors the consumed path exactly: real
-        // outcomes complete the Running op, anything else leaves it Running.
+        // Grouped catalog operations are read-only and have no uncertain write effects.
         if pre.catalog {
             if let Some(task) = ledger.as_mut() {
                 if let Ok(store) = state.database() {
@@ -4028,9 +4364,7 @@ fn settle_unconsumed_reads(
                     }
                     match &pre.outcome {
                         Some(Ok(Ok(value))) => settle_catalog_op(&store, task, &call.id, value),
-                        _ => {
-                            let _ = store.save_research_task(task);
-                        }
+                        outcome => settle_interrupted_catalog_read(&store, task, &call.id, outcome),
                     }
                 }
             }
@@ -4063,7 +4397,7 @@ fn settle_unconsumed_reads(
             crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
             |artifact| state.database()?.save_artifact(artifact),
         );
-        let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":"allowed","accessMode":plan.access_mode,"authorization":"auto-approved read group (settled at turn interrupt)","callId":call.id,"stepId":step_id});
+        let audit = json!({"connector":tool.connector,"localServerName":tool.local_server_name(),"name":tool.tool.name,"arguments":call.arguments,"decision":"allowed","accessMode":plan.access_mode,"authorization":"auto-approved read group (settled at turn interrupt)","callId":call.id,"runId":run.id,"stepId":step_id});
         if let Ok(store) = state.database() {
             let content = json!({"request":audit,"result":bounded}).to_string();
             let message_id = if let Some(row) = &pre.audit_row {
@@ -4086,83 +4420,61 @@ fn settle_unconsumed_reads(
     }
 }
 
-fn append_checkpoint(messages: &mut [Value], note: &str) {
+pub(crate) fn append_checkpoint(messages: &mut [Value], note: &str) -> bool {
     let Some(message) = messages
         .iter_mut()
         .rev()
         .find(|message| message["role"] == "user")
     else {
-        return;
+        return false;
     };
-    if let Some(Value::String(text)) = message.get_mut("content") {
-        if !text.contains("Paused checkpoint.") {
+    match message.get_mut("content") {
+        Some(Value::String(text)) => {
             text.push_str("\n\n");
             text.push_str(note);
+            true
         }
+        Some(Value::Array(parts)) => {
+            parts.push(json!({"type":"text","text":note}));
+            true
+        }
+        _ => false,
     }
 }
 
 pub struct StagedResume {
+    pub task_id: String,
     pub question: String,
     pub pending: Vec<String>,
     pub completed: Vec<String>,
     pub checkpoint: String,
 }
 
-/// Load the paused ledger, mark it running again, and persist the checkpoint
-/// the next user turn must include.
-pub fn stage_paused_resume(
+/// Prepare the checkpoint for a particular task. Only an accepted request
+/// carrying that task ID can adopt it.
+pub fn prepare_task_resume(
     store: &crate::store::Store,
     conversation_id: &str,
+    task_id: Option<&str>,
 ) -> Result<StagedResume, String> {
-    let mut task = store
-        .recoverable_research_tasks(conversation_id)?
+    let task = store.recoverable_research_tasks(conversation_id)?
         .into_iter()
-        .find(|task| task.status == crate::research_tasks::TaskStatus::Paused)
-        .ok_or("No paused checkpoint to resume.")?;
-    task.resume()?;
-    let completed: Vec<String> = task
-        .operations
-        .iter()
+        .find(|task| task_id.is_none_or(|id| task.id == id)
+            && matches!(task.status, crate::research_tasks::TaskStatus::Paused | crate::research_tasks::TaskStatus::BudgetExhausted))
+        .ok_or("No matching task checkpoint to resume.")?;
+    let completed: Vec<String> = task.operations.iter()
         .filter(|op| op.status == crate::research_tasks::OperationStatus::Completed)
-        .map(|op| op.id.clone())
-        .collect();
-    let pending = task.pending_work.clone();
-    let question = task.question.clone();
-    store.save_research_task(&task)?;
+        .map(|op| op.id.clone()).collect();
     let checkpoint = format!(
-        "Paused checkpoint. Original request: {question}. Completed operation ids: {}. Do not repeat them. Pending: {}.",
-        completed.join(", "),
-        pending.join(", ")
+        "Paused checkpoint. Original request: {}. Completed operation ids: {}. Do not repeat them. For goal verification, inspect goal_status for saved handles and rerun settled gates when fresh evidence is needed. Pending: {}.",
+        task.question, completed.join(", "), task.pending_work.join(", ")
     );
-    store.save_setting(&format!("pending_resume:{conversation_id}"), &checkpoint)?;
     Ok(StagedResume {
-        question,
-        pending,
+        task_id: task.id,
+        question: task.question,
+        pending: task.pending_work,
         completed,
         checkpoint,
-    })
-}
-
-/// Move a staged checkpoint onto the latest user message once, then clear it.
-pub fn take_staged_checkpoint(
-    store: &crate::store::Store,
-    conversation_id: &str,
-    messages: &mut [Value],
-) -> bool {
-    let key = format!("pending_resume:{conversation_id}");
-    let staged: String = store.setting(&key).unwrap_or_default();
-    if staged.trim().is_empty() {
-        return false;
-    }
-    let _ = store.save_setting(&key, &String::new());
-    append_checkpoint(messages, &staged);
-    messages.iter().rev().any(|message| {
-        message["role"] == "user"
-            && message["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("Paused checkpoint.")
     })
 }
 
@@ -4170,25 +4482,12 @@ pub fn take_staged_checkpoint(
 pub fn resume_generation(
     state: State<'_, AppState>,
     conversation_id: String,
+    task_id: Option<String>,
 ) -> Result<Value, String> {
-    let _operation = state
-        .operation
-        .try_shared()
-        .map_err(|_| "Wait for the active operation before resuming.")?;
     let _turn = state.turns.acquire(&conversation_id)?;
-    let store = state.database()?;
-    let staged = stage_paused_resume(&store, &conversation_id)?;
-    drop(store);
-    let generation = {
-        let mut control = state
-            .run_control
-            .lock()
-            .map_err(|_| "Run control is unavailable.")?;
-        crate::agent_run::resume_run(&mut control)
-    };
-    state.cancel_signal().send_replace(false);
+    let staged = prepare_task_resume(&*state.database()?, &conversation_id, task_id.as_deref())?;
     Ok(json!({
-        "generation": generation,
+        "taskId": staged.task_id,
         "question": staged.question,
         "pending": staged.pending,
         "completed": staged.completed,
@@ -4200,6 +4499,7 @@ pub fn resume_generation(
 pub fn restart_generation(
     state: State<'_, AppState>,
 ) -> Result<crate::agent_run::RestartReport, String> {
+    let _lease = state.operation.try_lock().map_err(|_| "Wait for active responses to finish before recovering interrupted tasks.")?;
     let store = state.database()?;
     crate::research_tasks::recover_interrupted(&store)
 }
@@ -4226,7 +4526,6 @@ async fn prepare_context(
         preferences,
         denied,
         finalizing,
-        false,
         plan.id_slot,
         plan.local_arex(),
     ))?;
@@ -4273,7 +4572,6 @@ async fn prepare_context(
                 preferences,
                 denied,
                 finalizing,
-                false,
                 plan.id_slot,
                 plan.local_arex(),
             ))?;
@@ -4322,7 +4620,7 @@ fn failed_round_key(conversation_id: &str) -> String {
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)] // Preserve the public IPC argument contract.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message(
     state: State<'_, AppState>,
     conversation_id: String,
@@ -4332,12 +4630,11 @@ pub async fn send_message(
     plan_mode: Option<bool>,
     reasoning_mode: Option<crate::store::ReasoningMode>,
     channel: Channel<Value>,
-    presentation_mode: Option<crate::presentation::Mode>,
     recovery_id: Option<String>,
     resume_failed_message_id: Option<String>,
+    resume_task_id: Option<String>,
 ) -> Result<(), String> {
-    if let Some(mode) = presentation_mode { state.database()?.set_presentation_mode(Some(&conversation_id), Some(mode))?; }
-    send_registered_turn(&state, conversation_id, content, connector_ids, connector_tools, plan_mode, reasoning_mode, channel, recovery_id, resume_failed_message_id).await
+    send_registered_turn(&state, conversation_id, content, connector_ids, connector_tools, plan_mode, reasoning_mode, channel, recovery_id, resume_failed_message_id, resume_task_id).await
 }
 
 fn recoverable_chat_channel(signals: std::sync::Arc<crate::session_runs::Signals>, channel: Channel<Value>) -> Channel<ChatEvent> {
@@ -4368,7 +4665,7 @@ pub(crate) async fn send_registered_message(
     channel: Channel<Value>,
     recovery_id: Option<String>,
 ) -> Result<(), String> {
-    send_registered_turn(state, conversation_id, content, connector_ids, connector_tools, plan_mode, reasoning_mode, channel, recovery_id, None).await
+    send_registered_turn(state, conversation_id, content, connector_ids, connector_tools, plan_mode, reasoning_mode, channel, recovery_id, None, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4383,6 +4680,7 @@ async fn send_registered_turn(
     channel: Channel<Value>,
     recovery_id: Option<String>,
     resume_failed_message_id: Option<String>,
+    resume_task_id: Option<String>,
 ) -> Result<(), String> {
     let registration = state.session_runs.register(&conversation_id)?;
     let channel = recoverable_chat_channel(registration.signals.clone(), channel);
@@ -4392,7 +4690,7 @@ async fn send_registered_turn(
     let (pending, resume) = {
         let store = state.database()?;
         if let Some(message_id) = resume_failed_message_id.as_deref() {
-            if recovery_id.is_some() || store.pending_turn(&conversation_id)?.is_some() {
+            if resume_task_id.is_some() || recovery_id.is_some() || store.pending_turn(&conversation_id)?.is_some() {
                 return Err("Resolve the saved unsent request before continuing this response.".into());
             }
             let saved = store.setting::<Option<FailedModelRound>>(&failed_round_key(&conversation_id))?
@@ -4408,7 +4706,10 @@ async fn send_registered_turn(
             }
             (None, Some(saved))
         } else {
-            (Some(store.stage_pending_turn(&conversation_id, &content, recovery_id.as_deref())?.id), None)
+            if let Some(task_id) = resume_task_id.as_deref() {
+                prepare_task_resume(&store, &conversation_id, Some(task_id))?;
+            }
+            (Some(store.stage_pending_turn_with_resume(&conversation_id, &content, recovery_id.as_deref(), resume_task_id.as_deref())?), None)
         }
     };
     let _slot = registration.wait_for_slot(|| {
@@ -4459,7 +4760,7 @@ async fn send_message_with_pending(
     plan_mode: Option<bool>,
     reasoning_mode: Option<crate::store::ReasoningMode>,
     channel: Channel<ChatEvent>,
-    pending_id: Option<String>,
+    pending: Option<crate::store::PendingTurn>,
     resume: Option<FailedModelRound>,
 ) -> Result<(), String> {
     let recovery_only = resume.is_some();
@@ -4476,7 +4777,7 @@ async fn send_message_with_pending(
         .map_err(|_| "Another operation is in progress. Try again when it finishes.")?;
     // Registered turns already hold this lock while queued. Direct test
     // callers still acquire it here, as before.
-    let _turn = if pending_id.is_none() && !recovery_only { Some(state.turns.acquire(&conversation_id)?) } else { None };
+    let _turn = if pending.is_none() && !recovery_only { Some(state.turns.acquire(&conversation_id)?) } else { None };
     // Establish the run and its interrupt subscription before any preparation
     // awaits. A Stop/Pause during assembly belongs to this generation.
     let (run_generation, mut cancellation) = state.with_run_control(|control| {
@@ -4496,10 +4797,17 @@ async fn send_message_with_pending(
             crate::workspace::Workspace::open(&path)?;
         }
     }
+    let resumed_task = if let Some(id) = pending.as_ref().and_then(|request| request.resume_task_id.as_deref()) {
+        Some(state.database()?.research_task(id)?
+            .filter(|task| task.conversation_id == conversation_id)
+            .ok_or("The saved task is unavailable.")?)
+    } else {
+        None
+    };
     let mut plan = tokio::select! {
         biased;
         _ = cancellation.changed() => return Err("Message cancelled before generation; it was not saved.".into()),
-        result = assemble_turn(
+        result = assemble_turn_for_task(
         state,
         &conversation_id,
         &content,
@@ -4507,6 +4815,7 @@ async fn send_message_with_pending(
         connector_tools,
         None,
         reasoning_mode,
+        resumed_task.as_ref(),
         ) => result?,
     };
     let presentation_mode = state.database()?.presentation_mode(Some(&conversation_id))?.effective_mode;
@@ -4533,8 +4842,9 @@ async fn send_message_with_pending(
             "role":"user", "_continuation":true,
             "content":"Finish the original request using the recorded tool outcomes. Report unresolved or uncertain work explicitly. This recovery round has no tools."
         }));
-    } else if let Ok(store) = state.database() {
-        take_staged_checkpoint(&store, &conversation_id, &mut messages);
+    } else if let Some(task_id) = pending.as_ref().and_then(|request| request.resume_task_id.as_deref()) {
+        let staged = prepare_task_resume(&*state.database()?, &conversation_id, Some(task_id))?;
+        append_checkpoint(&mut messages, &staged.checkpoint);
     }
     let (input_tokens, compacted_once) = tokio::select! {
         biased;
@@ -4542,18 +4852,13 @@ async fn send_message_with_pending(
         result = prepare_context(state, &plan, &plan.preferences, &conversation_id, &mut messages, false, recovery_only, recovery_only) => result?,
     };
     let model_content = &messages.last().ok_or("Missing current user message.")?["content"];
-    let assistant = if recovery_only {
-        let store = state.database()?;
-        let tx = store.connection.unchecked_transaction().map_err(|e| e.to_string())?;
-        store.save_setting(&failed_round_key(&conversation_id), &Option::<FailedModelRound>::None)?;
-        let assistant = store.insert_message_row(&conversation_id, "assistant", "", "streaming", store.next_message_time(&conversation_id)?)?;
-        tx.commit().map_err(|e| e.to_string())?;
-        assistant
-    } else if let Some(id) = pending_id.as_deref() {
-        state.database()?.begin_pending_turn(&conversation_id, &content, model_content, id)?
-    } else {
-        state.database()?.begin_turn_with_model_content(&conversation_id, &content, model_content)?
+    let mut snapshot = tokio::select! {
+        biased;
+        _ = cancellation.changed() => return Err("Message cancelled before generation; it was not saved.".into()),
+        result = crate::subagents::snapshot_for_conversation(state, &conversation_id) => result?,
     };
+    snapshot.workspace_path.clone_from(&plan.workspace_path);
+    snapshot.allowed_tool_aliases = plan.tools.iter().map(|tool| tool.alias.clone()).collect();
     let run_id = format!("run-{}", uuid::Uuid::new_v4());
     let now = crate::store::now();
     let mut run = crate::agent_run::RunRecord {
@@ -4567,74 +4872,54 @@ async fn send_message_with_pending(
         created_at: now,
         updated_at: now,
     };
-    state.database()?.save_run(&run)?;
-    if let Ok(store) = state.database() {
+    let (assistant, initial_task, start_seq) = {
+        let store = state.database()?;
+        let tx = rusqlite::Transaction::new_unchecked(&store.connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+    let assistant = if recovery_only {
+        store.save_setting(&failed_round_key(&conversation_id), &Option::<FailedModelRound>::None)?;
+        let assistant = store.insert_message_row(&conversation_id, "assistant", "", "streaming", store.next_message_time(&conversation_id)?)?;
+        assistant
+    } else if let Some(request) = &pending {
+        store.begin_pending_turn(&conversation_id, &content, model_content, &request.id)?
+    } else {
+        store.begin_turn_with_model_content(&conversation_id, &content, model_content)?
+    };
+        store.save_run(&run)?;
+        let initial_task = start_turn_ledger(&store, &conversation_id, &content, &run.id, &plan,
+            pending.as_ref().and_then(|request| request.resume_task_id.as_deref()))?;
+        let record_start = |event_type: &str, payload: Value| {
+            store.append_session_event(&crate::sessions::SessionEvent {
+                id: uuid::Uuid::new_v4().to_string(), conversation_id: conversation_id.clone(),
+                run_id: Some(run.id.clone()), seq: 0, step_id: Some("turn_start".into()), tool_call_id: None,
+                event_type: event_type.into(), payload, ignorable: false, created_at: crate::store::now(),
+            })
+        };
         if let Some(saved) = &resume {
-            emit_session_event(&store, &conversation_id, Some(&run.id), Some("turn_start"), None,
-                "model_round_resumed", json!({"failedMessageId":saved.assistant_id}), false);
+            record_start("model_round_resumed", json!({"failedMessageId":saved.assistant_id}))?;
         } else {
-            emit_session_event(
-                &store,
-                &conversation_id,
-                Some(&run.id),
-                Some("turn_start"),
-                None,
-                "user_msg",
-                json!({"role": "user", "content": content.trim(), "messageId":store.turn_user_message_id(&assistant.id)?}),
-                false,
-            );
+            record_start("user_msg", json!({"role":"user","content":content.trim(),"messageId":store.turn_user_message_id(&assistant.id)?}))?;
         }
-        emit_session_event(
-            &store,
-            &conversation_id,
-            Some(&run.id),
-            Some("turn_start"),
-            None,
-            "system_prompt",
-            json!({"role": "system", "content": frozen_system_for(&plan)}),
-            false,
-        );
+        record_start("system_prompt", json!({"role":"system","content":frozen_system_for(&plan)}))?;
         for (kind, text) in &plan.injections {
-            emit_session_event(
-                &store,
-                &conversation_id,
-                Some(&run.id),
-                Some("turn_start"),
-                None,
-                "context_injection",
-                json!({"kind": kind, "chars": text.len(), "content": text}),
-                false,
-            );
+            record_start("context_injection", json!({"kind":kind,"chars":text.len(),"content":text}))?;
         }
         if let Some(checkpoint) = &compacted_once {
-            emit_session_event(
-                &store,
-                &conversation_id,
-                Some(&run.id),
-                Some("turn_start"),
-                None,
-                "compaction",
-                json!({"artifact": checkpoint, "cutoff":store.compaction(&conversation_id)?.map(|c| c.cutoff), "thresholdPercent": 80, "auto": true}),
-                false,
-            );
+            record_start("compaction", json!({"artifact":checkpoint,"cutoff":store.compaction(&conversation_id)?.map(|c|c.cutoff),"thresholdPercent":80,"auto":true}))?;
         }
-        emit_session_event(
-            &store,
-            &conversation_id,
-            Some(&run.id),
-            Some("turn_start"),
-            None,
-            "turn_start",
-            json!({
+        let start_seq = record_start("turn_start", json!({
                 "runId": run.id,
+                "messageId": assistant.id,
+                "taskId": initial_task.0.id,
                 "modelProvider": plan.selection.provider_id,
                 "modelId": plan.selection.model_id,
                 "contextLength": plan.context_length,
                 "inputTokens": input_tokens,
-            }),
-            false,
-        );
-    }
+        }))?;
+        tx.commit().map_err(|error| error.to_string())?;
+        (assistant, initial_task, start_seq)
+    };
+    crate::sessions::notify_activity(&conversation_id, start_seq);
     let mut seq: u32 = 0;
     // Model-visible ⟺ logged: every injected context block lands in the log.
     for (kind, text) in &plan.injections {
@@ -4665,10 +4950,6 @@ async fn send_message_with_pending(
                 created_at: crate::store::now(),
             });
     }
-    // Snapshot once for harness children (subagents, workflows).
-    let mut snapshot =
-        crate::subagents::snapshot_for_conversation(state, &conversation_id).await?;
-    snapshot.allowed_tool_aliases = plan.tools.iter().map(|tool| tool.alias.clone()).collect();
     let preset_id = plan.preset.id.clone();
     let mut answer = String::new();
     let mut reasoning = String::new();
@@ -4724,25 +5005,26 @@ async fn send_message_with_pending(
         failed_model_round: false,
         outcome: None,
         partial_work: false,
+        budget_exhausted: false,
+        research_task_id: None,
+        initial_task: Some(initial_task),
     };
-    let result: Result<bool,String> = rounds.run().await;
+    // The tool loop contains large dispatch state machines. Keep its storage
+    // off the caller's stack, including on ordinary 2 MiB runtime workers.
+    let result: Result<bool,String> = Box::pin(rounds.run()).await;
     // The round loop owns these while it runs; take them back for the
     // post-turn bookkeeping.
     replay_answer = rounds.replay_answer;
     last_model_message_id = rounds.last_model_message_id;
     let failed_model_round = rounds.failed_model_round;
     let partial_work = rounds.partial_work;
+    let budget_exhausted = rounds.budget_exhausted;
+    let research_task_id = rounds.research_task_id;
     let verification_outcome = resume.as_ref().map(|saved| saved.verification.clone())
         .or(rounds.outcome).unwrap_or_else(|| json!({"status":"unverified"}));
     if let Some((start, mut measurement)) = active_measurement.take() {
         measurement.duration_ms = start.elapsed().as_secs_f64() * 1000.0;
         response_metrics.rounds.push(measurement);
-    }
-    response_metrics.total_ms = response_started.elapsed().as_secs_f64() * 1000.0;
-    if !response_metrics.rounds.is_empty() {
-        state
-            .database()?
-            .save_message_metrics(&assistant.id, &response_metrics)?;
     }
     let final_run_state = crate::agent_run::settled_state(
         result.as_ref().ok().copied(),
@@ -4761,7 +5043,11 @@ async fn send_message_with_pending(
             Err(_) => "error",
         }
     };
-    state.database()?.finish_message(
+    let (end_payload, end_seq) = {
+    let store = state.database()?;
+    let tx = rusqlite::Transaction::new_unchecked(&store.connection, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    store.finish_message(
         &assistant.id,
         &answer,
         &reasoning,
@@ -4769,21 +5055,20 @@ async fn send_message_with_pending(
         result.as_ref().err().map(String::as_str),
     )?;
     let mut recovery_available = false;
-    if status == "error" && failed_model_round && !recovery_only {
+    if status == "error" && failed_model_round && !recovery_only && plan.goal.is_none() {
         let saved = FailedModelRound {
             assistant_id: assistant.id.clone(), request: content.clone(),
             selection: plan.selection.clone(), history: messages.clone(),
             verification: verification_outcome.clone(),
         };
         if serde_json::to_vec(&saved).is_ok_and(|value| value.len() <= 2 * crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES) {
-            recovery_available = state.database()?.save_setting(&failed_round_key(&conversation_id), &Some(saved)).is_ok();
+            store.save_setting(&failed_round_key(&conversation_id), &Some(saved))?;
+            recovery_available = true;
         }
     }
     if status == "complete" {
         if let Some(content) = &replay_answer {
-            state
-                .database()?
-                .save_model_content(&assistant.id, content)?;
+            store.save_model_content(&assistant.id, content)?;
             if !content.is_null() && content.as_str() != Some("") {
                 messages.push(crate::history::assistant_from_saved(content)?);
             }
@@ -4792,50 +5077,60 @@ async fn send_message_with_pending(
         }
         // The system is rebuilt from current settings; every historical message
         // is replayed byte-for-byte until an explicit compaction or history edit.
-        state.database()?.save_model_history(
+        store.save_model_history(
             &conversation_id,
             &last_model_message_id,
             &messages[1..],
         )?;
     }
-    if status == "complete" && !recovery_only {
-        match crate::presentation::generate(state, &plan, crate::presentation::FinalAnswer{conversation:&conversation_id,message:&assistant.id,question:&content,answer:&answer,mode:presentation_mode,run_id:&run.id}, &channel, &mut cancellation).await {
-            Ok(Some(measurement)) => response_metrics.rounds.push(measurement),
-            Ok(None) => {},
-            Err(error) => {
-                let mut event = ChatEvent::progress(&run.id, "presentation", &assistant.id, "Text answer preserved", None);
-                event.notice = Some(format!("Visual presentation unavailable: {error}"));
-                let _ = channel.send(event);
-            }
-        }
-    }
     response_metrics.total_ms = response_started.elapsed().as_secs_f64() * 1000.0;
-    if !response_metrics.rounds.is_empty() { state.database()?.save_message_metrics(&assistant.id, &response_metrics)?; }
-    let _ = run.transition_to(final_run_state);
-    let _ = state.database()?.update_run_status(
-        &run.id,
-        run.status,
-        if paused {
-            Some(crate::agent_run::pause_notice(false))
-        } else {
-            result.as_ref().err().map(String::as_str)
-        },
-        None,
-    );
-    if let Ok(store) = state.database() {
-        let unfinished = store.todos(&conversation_id).unwrap_or_default().into_iter()
+    response_metrics.children = crate::subagents::usage_for_parent(&store, &conversation_id, &run.id)?;
+    if !response_metrics.rounds.is_empty() { store.save_message_metrics(&assistant.id, &response_metrics)?; }
+        let unfinished = store.todos(&conversation_id)?.into_iter()
             .filter(|todo| todo.status != crate::plans::COMPLETED).collect::<Vec<_>>();
-        let partial = partial_work || !unfinished.is_empty() || verification_outcome["status"] == "unverified";
+        let unfinished_tasks = store.tasks(&conversation_id)?.into_iter()
+            .filter(|task| !matches!(task.state.as_str(), crate::tasks::COMPLETED | crate::tasks::CANCELLED)).collect::<Vec<_>>();
+        let unresolved_operations = match research_task_id.as_deref() {
+            Some(id) => store.research_task(id)?.map(|task| task.operations.into_iter()
+                .filter(|operation| matches!(operation.status, crate::research_tasks::OperationStatus::Running | crate::research_tasks::OperationStatus::Unknown))
+                .collect::<Vec<_>>()).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let goal_task = research_task_id.as_deref().map(|id| store.research_task(id)).transpose()?.flatten();
+        let pending_goal = goal_task.as_ref().and_then(|task| task.context.goal.as_ref()
+            .map(|goal| goal.pending(&task.context.verification))).unwrap_or_default();
+        let partial = partial_work || !unfinished.is_empty() || !unfinished_tasks.is_empty()
+            || !unresolved_operations.is_empty() || !pending_goal.is_empty()
+            || verification_outcome["status"] == "unverified";
+        let task_state = if partial && final_run_state == crate::agent_run::RunState::Completed && !recovery_only {
+            crate::agent_run::RunState::Paused
+        } else { final_run_state };
+        run.transition_to(task_state)?;
+        store.update_run_status(&run.id, run.status,
+            if paused { Some(crate::agent_run::pause_notice(false)) } else { result.as_ref().err().map(String::as_str) }, None)?;
+        let task = if let Some(task_id) = research_task_id.as_deref() {
+            let mut pending = unfinished.iter().map(|todo| todo.text.clone())
+                .chain(unfinished_tasks.iter().map(|task| task.title.clone()))
+                .chain(pending_goal).collect::<Vec<_>>();
+            if partial && pending.is_empty() && unresolved_operations.is_empty() {
+                pending.push("Continue unfinished work from the recorded outcomes; resolve uncertain operations and collect fresh verification before claiming completion.".into());
+            }
+            crate::research_tasks::settle_turn(&store, task_id, run.status, budget_exhausted, pending)?;
+            store.research_task(task_id)?
+        } else { None };
         let audit_ids = store.latest_turn_audit_ids(&conversation_id)?;
-        emit_session_event(
-            &store,
-            &conversation_id,
-            Some(&run.id),
-            None,
-            None,
-            "turn_end",
-            json!({
+        let stop_reason = match task.as_ref().map(|task| &task.status) {
+            Some(crate::research_tasks::TaskStatus::BudgetExhausted) => "budget_exhausted",
+            Some(crate::research_tasks::TaskStatus::Paused) if status == "complete" => "pending_work",
+            _ => run.status.as_str(),
+        };
+        let end_payload = json!({
                 "status": status,
+                "stopReason": stop_reason,
+                "taskId": task.as_ref().map(|task| &task.id),
+                "taskStatus": task.as_ref().map(|task| task.status.as_str()),
+                "resumeTaskId": task.as_ref().filter(|task| matches!(task.status, crate::research_tasks::TaskStatus::Paused | crate::research_tasks::TaskStatus::BudgetExhausted)).map(|task| &task.id),
+                "pendingWork": task.as_ref().map(|task| task.pending_work.as_slice()).unwrap_or_default(),
                 "error": result.as_ref().err().map(String::as_str),
                 "messageId": assistant.id,
                 "delivered":status == "complete",
@@ -4843,15 +5138,51 @@ async fn send_message_with_pending(
                 "toolAuditIds":audit_ids,
                 "partial":partial || status != "complete",
                 "unfinishedTodos":unfinished,
+                "unfinishedTasks":unfinished_tasks,
+                "unresolvedOperations":unresolved_operations,
                 "verification":verification_outcome,
                 "answerLength": answer.len(),
                 "reasoningLength": reasoning.len(),
-            }),
-            false,
-        );
+            });
+        let end_seq = store.append_session_event(&crate::sessions::SessionEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conversation_id.clone(),
+            run_id: Some(run.id.clone()),
+            seq: 0,
+            step_id: None,
+            tool_call_id: None,
+            event_type: "turn_end".into(),
+            payload: end_payload.clone(),
+            ignorable: false,
+            created_at: crate::store::now(),
+        })?;
+        tx.commit().map_err(|error| error.to_string())?;
+        (end_payload, end_seq)
+    };
+    crate::sessions::notify_activity(&conversation_id, end_seq);
+    if status == "complete" && !recovery_only {
+        crate::hooks::run_finished(state, &conversation_id, &snapshot.workspace_path, json!({
+            "status": if end_payload["partial"] == true { "partial" } else { "completed" },
+            "stopReason": end_payload["stopReason"],
+            "pendingWork": end_payload["pendingWork"],
+        }));
     }
     if status == "complete" && !recovery_only {
-        crate::hooks::run_finished(state, &conversation_id, &snapshot.workspace_path, json!({"status":"completed"}));
+        match crate::presentation::generate(state, &plan, crate::presentation::FinalAnswer{conversation:&conversation_id,message:&assistant.id,question:&content,answer:&answer,mode:presentation_mode,run_id:&run.id}, &channel, &mut cancellation).await {
+            Ok(Some(measurement)) => {
+                response_metrics.rounds.push(measurement);
+                response_metrics.total_ms = response_started.elapsed().as_secs_f64() * 1000.0;
+                let store = state.database()?;
+                response_metrics.children = crate::subagents::usage_for_parent(&store, &conversation_id, &run.id)?;
+                store.save_message_metrics(&assistant.id, &response_metrics)?;
+            }
+            Ok(None) => {},
+            Err(error) => {
+                let mut event = ChatEvent::progress(&run.id, "presentation", &assistant.id, "Text answer preserved", None);
+                event.notice = Some(format!("Visual presentation unavailable: {error}"));
+                let _ = channel.send(event);
+            }
+        }
     }
     result.map(|_| ())
 }
@@ -4978,7 +5309,6 @@ pub async fn context_preflight(
                 &messages,
                 tools,
                 &plan.preferences,
-                false,
                 false,
                 false,
                 None,
@@ -5171,7 +5501,6 @@ fn request_payload(
     preferences: &crate::store::Preferences,
     denied: bool,
     finalizing: bool,
-    planning: bool,
     id_slot: Option<i64>,
     arex: bool,
 ) -> Value {
@@ -5179,10 +5508,12 @@ fn request_payload(
     for message in payload["messages"].as_array_mut().into_iter().flatten() {
         if let Some(message) = message.as_object_mut() {
             message.remove("_continuation");
+            message.remove("_plan_focus");
+            message.remove(crate::compaction::HANDOFF_FIELD);
         }
     }
-    // Keep the tools array identical on every round — including finalizing and
-    // planning rounds. Strict templates (AREX) render <tools> at the very top of
+    // Keep the tools array identical on every round — including finalizing rounds.
+    // Strict templates (AREX) render <tools> at the very top of
     // the prompt, so omitting it shifts the token stream at position ~3 and
     // forces a full reprocess. tool_choice:none still prevents actual calls.
     if !tools.is_empty() {
@@ -5191,14 +5522,15 @@ fn request_payload(
     // …except local AREX: its trained answer path is the finish tool, so the
     // finalizing round leaves tool_choice at auto. A structured finish is then
     // executed like any finish call; stray markup is stripped by the loop.
-    if !tools.is_empty() && (denied || planning || (finalizing && !arex)) {
+    if !tools.is_empty() && (denied || (finalizing && !arex)) {
         payload["tool_choice"] = json!("none");
+        payload["locallm_allow_omit_tools"] = json!(true);
     }
     // Small local models fall into verbatim re-emission loops on prose
     // rounds. llama.cpp honors repeat_penalty; remote backends strip it in
     // Backend::payload the same way cache_prompt is stripped. Tool-calling
     // rounds keep clean sampling so structured arguments are never penalized.
-    if denied || planning || finalizing {
+    if denied || finalizing {
         payload["repeat_penalty"] = json!(1.1);
     }
     // On a finalizing round thinking only competes with the answer for the
@@ -5269,6 +5601,53 @@ mod finish_tests {
     }
 
     #[tokio::test]
+    async fn native_output_limit_retries_without_dispatching_a_complete_sibling_write() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(dir.path());
+        crate::test_support::select_fixture_model(&state, dir.path());
+        std::fs::write(dir.path().join("evidence.txt"), "read after the retry").unwrap();
+        let complete = fixture_call("sibling", "workspace_create_file", r#"{"path":"unexpected.txt","content":"never dispatch"}"#);
+        let mut draft = fixture_call("unfinished", "workspace_create_file", "{");
+        draft["status"] = json!("incomplete");
+        let mut start = draft.clone();
+        start["status"] = json!("in_progress");
+        start["arguments"] = json!("");
+        let cutoff = [
+            json!({"type":"response.output_item.done","output_index":0,"item":complete}),
+            json!({"type":"response.output_item.added","output_index":1,"item":start}),
+            json!({"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc-unfinished","delta":"{"}),
+            json!({"type":"response.output_item.done","output_index":1,"item":draft}),
+            json!({"type":"response.incomplete","response":{"status":"incomplete",
+                "incomplete_details":{"reason":"max_output_tokens"},"output":[complete,draft]}}),
+        ].into_iter().map(sse_event).collect();
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![
+            cutoff,
+            sse_completed(vec![fixture_call("read", "workspace_read_file", r#"{"path":"evidence.txt"}"#)]),
+            sse_completed(vec![fixture_answer("Done")]),
+        ]).await;
+        let owner = scripted_conversation(&state, base).await;
+        super::send_registered_message(
+            &state, owner.clone(), "Inspect evidence.txt.".into(), Some(vec!["__workspace".into()]),
+            Some(vec![]), None, None, tauri::ipc::Channel::new(|_| Ok(())), None,
+        ).await.unwrap();
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let retry = requests[1].body["input"].to_string();
+        assert!(!retry.contains("call-sibling") && !retry.contains("call-unfinished"));
+        let result = requests[2].body["input"].as_array().unwrap().iter()
+            .find(|item| item["type"] == "function_call_output").unwrap();
+        assert_eq!(result["call_id"], "call-read");
+        assert!(result["output"].as_str().unwrap().contains("read after the retry"));
+        assert!(!dir.path().join("unexpected.txt").exists());
+        let store = state.database().unwrap();
+        assert_eq!(store.messages(&owner).unwrap().iter().filter(|message| message.role == "tool").count(), 1);
+        let events = store.session_events(&owner, None, None).unwrap();
+        assert_eq!(events.iter().find(|event| event.event_type == "turn_end").unwrap().payload["partial"], false);
+    }
+
+    #[tokio::test]
     async fn plan_mode_refuses_writes_until_plan_submit_approval() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::test_support::app_state(dir.path());
@@ -5288,6 +5667,12 @@ mod finish_tests {
                 "3",
                 "workspace_create_file",
                 "{\"path\":\"made.txt\",\"content\":\"hi\"}",
+            )]),
+            sse_completed(vec![fixture_answer("The file was created.")]),
+            sse_completed(vec![fixture_call(
+                "4",
+                "todo_write",
+                "{\"todos\":[{\"text\":\"Write made.txt\",\"status\":\"completed\"}]}",
             )]),
             sse_completed(vec![fixture_answer("Done implementing.")]),
         ])
@@ -5348,6 +5733,12 @@ mod finish_tests {
                 "workspace_create_file",
                 "{\"path\":\"made.txt\",\"content\":\"hi\"}",
             )]),
+            sse_completed(vec![fixture_answer("The file was created.")]),
+            sse_completed(vec![fixture_call(
+                "4",
+                "todo_write",
+                "{\"todos\":[{\"text\":\"Write made.txt\",\"status\":\"completed\"}]}",
+            )]),
             sse_completed(vec![fixture_answer("Done implementing.")]),
             sse_completed(vec![fixture_answer("root = Response([Text(\"Done implementing.\")])")]),
         ])
@@ -5393,8 +5784,9 @@ mod finish_tests {
         assert_eq!(records[0].source_text,"Done implementing.");
         assert_eq!(records[0].ui_program,"root = Response([Text(\"Done implementing.\")])");
         let request_list=requests.lock().unwrap();
-        assert_eq!(request_list.len(),5);
-        assert!(request_list[4].body.get("tools").is_none());
+        assert_eq!(request_list.len(),7);
+        assert!(request_list[4].body.to_string().contains("active checklist has unfinished work"));
+        assert!(request_list[6].body.get("tools").is_none());
         let history:String=store.connection.query_row("SELECT messages_json FROM conversation_model_history WHERE conversation_id=?1",[&conversation],|r|r.get(0)).unwrap();
         assert!(!history.contains("root = Response"));
         assert!(history.contains("Done implementing."));
@@ -5479,15 +5871,14 @@ mod finish_tests {
             ..Default::default()
         };
         budgets.note_round();
-        let finalizing = budgets.reserve_final_response();
         budgets.note_round();
+        let finalizing = budgets.exhausted();
         let payload = super::request_payload(
             &[],
             &[serde_json::json!({"type":"function"})],
             &crate::store::Preferences::default(),
             false,
             finalizing,
-            false,
             None,
             false,
         );
@@ -5507,14 +5898,13 @@ mod finish_tests {
             &crate::store::Preferences::default(),
             false,
             false,
-            true,
             None,
             false,
         );
         assert!(plain.get("tools").is_none() && plain.get("tool_choice").is_none());
     }
     #[test]
-    fn schema_changes_refresh_frozen_tools_while_description_noise_does_not() {
+    fn contract_changes_refresh_frozen_tools_while_unchanged_contracts_are_stable() {
         let store = crate::store::Store::open_memory().unwrap();
         let conversation = store.create_conversation().unwrap();
         let mut tools = vec![crate::connectors::AgentTool::system_time()];
@@ -5526,7 +5916,6 @@ mod finish_tests {
             &mut tools,
         )
         .unwrap();
-        tools[0].tool.description = "Discovery text changed".into();
         let stable = super::freeze_tool_catalog(
             &store,
             &conversation.id,
@@ -5536,6 +5925,9 @@ mod finish_tests {
         )
         .unwrap();
         assert_eq!(first, stable);
+        tools[0].tool.description = "Discovery text changed".into();
+        let new_description = super::freeze_tool_catalog(&store, &conversation.id, true, "same-selection".into(), &mut tools).unwrap();
+        assert_ne!(stable, new_description);
         tools[0].tool.input_schema = serde_json::json!({"type":"object","required":["timezone"],"properties":{"timezone":{"type":"string"}}});
         let changed = super::freeze_tool_catalog(
             &store,
@@ -5627,7 +6019,6 @@ mod finish_tests {
             &prefs,
             false,
             true,
-            false,
             None,
             false,
         );
@@ -5677,7 +6068,6 @@ mod finish_tests {
             &crate::store::Preferences::default(),
             false,
             true,
-            false,
             None,
             false,
         );
@@ -5686,14 +6076,12 @@ mod finish_tests {
     }
 
     #[test]
-    fn research_progress_has_a_budget_even_when_results_keep_changing() {
+    fn new_research_evidence_is_progress_across_segments() {
         let mut progress = super::ResearchProgress::default();
-        for i in 0..16 {
-            // Each hit on a genuinely new domain is progress; the call budget
-            // is the only brake left once domains keep changing.
+        for i in 0..32 {
             let result = serde_json::json!({"results":[{"url":format!("https://site{i}.example.com/page"),"text":format!("result {i}")}]});
             progress.observe("web_search", &result);
-            assert_eq!(progress.stopped(), i == 15);
+            assert!(!progress.stopped());
         }
     }
 
@@ -5755,7 +6143,6 @@ mod finish_tests {
             &messages,
             &[],
             &regular,
-            false,
             false,
             false,
             Some(0),
@@ -5850,16 +6237,17 @@ mod finish_tests {
         block.push('\n');
         let mut text = String::from("Intro. ");
         text.push_str(&block);
-        text.push_str("Let me restate. ");
+        text.push_str(&block);
         text.push_str(&block);
         // The cut drops the second emission and keeps the first copy intact.
         let cut = super::repetition_cut(&text).expect("verbatim re-emission");
         let kept = &text[..cut];
         assert_eq!(kept.matches("## Findings").count(), 1, "{kept}");
-        assert!(kept.contains("restate"), "{kept}");
+        assert!(kept.starts_with("Intro."), "{kept}");
         // Whitespace differences still count as the same emission.
         let mut noisy = String::from(&block[..]);
         noisy.push_str(&block.replace("\n\n", "\n"));
+        noisy.push_str(&block);
         assert!(super::repetition_cut(&noisy).is_some());
         // Short text, small echoes, and non-repeating answers are left alone.
         assert!(super::repetition_cut("short").is_none());
@@ -6005,28 +6393,15 @@ mod finish_tests {
             &preferences,
             false,
             true,
-            false,
             None,
             true,
         );
         assert_eq!(finalizing["repeat_penalty"], 1.1);
-        let planning = super::request_payload(
-            &messages,
-            &tools,
-            &preferences,
-            false,
-            false,
-            true,
-            None,
-            false,
-        );
-        assert_eq!(planning["repeat_penalty"], 1.1);
         // Tool-calling rounds keep clean sampling.
         let normal = super::request_payload(
             &messages,
             &tools,
             &preferences,
-            false,
             false,
             false,
             None,
@@ -6049,7 +6424,6 @@ mod finish_tests {
             &preferences,
             false,
             true,
-            false,
             None,
             false,
         );
@@ -6077,7 +6451,6 @@ mod finish_tests {
             &preferences,
             false,
             true,
-            false,
             None,
             true,
         );
@@ -6085,12 +6458,11 @@ mod finish_tests {
         assert!(payload.get("tool_choice").is_none());
         assert_eq!(payload["chat_template_kwargs"]["enable_thinking"], false);
         // Only the finalizing round opens the channel — normal rounds and
-        // denied/planning rounds are unchanged.
+        // denied rounds still disable calls.
         let normal = super::request_payload(
             &messages,
             &tools,
             &preferences,
-            false,
             false,
             false,
             None,
@@ -6104,22 +6476,10 @@ mod finish_tests {
             &preferences,
             true,
             true,
-            false,
             None,
             true,
         );
         assert_eq!(denied["tool_choice"], "none");
-        let planning = super::request_payload(
-            &messages,
-            &tools,
-            &preferences,
-            false,
-            false,
-            true,
-            None,
-            true,
-        );
-        assert_eq!(planning["tool_choice"], "none");
     }
 
     #[test]
@@ -6140,11 +6500,11 @@ mod finish_tests {
         );
         // Unterminated markup (finish_reason=length mid-call) truncates too.
         assert_eq!(
-            super::strip_call_markup("prose <tool_call>{\"name\":"),
+            super::strip_call_markup("prose\n<tool_call>{\"name\":"),
             "prose"
         );
         assert_eq!(
-            super::strip_call_markup("prose <function=search>{\"q\":"),
+            super::strip_call_markup("prose\n<function=search>{\"q\":"),
             "prose"
         );
         assert_eq!(super::strip_call_markup("clean answer"), "clean answer");
@@ -6154,14 +6514,13 @@ mod finish_tests {
     fn text_form_tool_markup_is_not_treated_as_an_answer() {
         assert!(super::is_text_tool_call("<function=web_search>"));
         assert!(super::is_text_tool_call("  <tool_call>{}"));
-        // Calls embedded after commentary count too — the model's intent is
-        // unambiguous once a block exists or `<tool_call>` markup appears.
+        // Standalone template controls may follow commentary on a prior line.
         assert!(super::is_text_tool_call(
             "Let me search first.\n<tool_call>{}</tool_call>"
         ));
-        assert!(super::is_text_tool_call("Checking: <tool_call>{\"name\":"));
+        assert!(super::is_text_tool_call("Checking:\n<tool_call>{\"name\":"));
         assert!(super::is_text_tool_call(
-            "prose <function=search>{}</function>"
+            "prose\n<function=search>{}</function>"
         ));
         // A stray `<function=` mention without a closing tag stays prose.
         assert!(!super::is_text_tool_call(
@@ -6240,12 +6599,26 @@ mod finish_tests {
         assert_eq!(t2, "");
 
         let (a3, t3) = filter.feed("<think>in progress");
-        assert_eq!(a3, "");
-        assert_eq!(t3, "in progress");
+        assert_eq!(a3, "<think>in progress");
+        assert_eq!(t3, "");
 
         let (flush_a, flush_t) = filter.flush();
         assert_eq!(flush_a, "");
         assert_eq!(flush_t, "");
+    }
+
+    #[test]
+    fn think_filter_preserves_literal_tags_after_the_answer_begins() {
+        let text = "Example:\n```xml\n<think>literal</think>\n```";
+        let mut filter = super::ThinkFilter::new();
+        let mut answer = String::new();
+        for ch in text.chars() {
+            let (visible, reasoning) = filter.feed(&ch.to_string());
+            assert!(reasoning.is_empty());
+            answer.push_str(&visible);
+        }
+        answer.push_str(&filter.flush().0);
+        assert_eq!(answer, text);
     }
 
     #[test]
@@ -6256,6 +6629,7 @@ mod finish_tests {
             command: Some("npm test".into()),
             language: None,
             cwd: Some("c:/workspace".into()),
+            arguments: serde_json::json!({}),
         };
         let started_val = serde_json::to_value(&started).unwrap();
         assert_eq!(started_val["type"], "started");
@@ -6290,35 +6664,30 @@ mod finish_tests {
     }
 
     #[test]
-    fn planning_payload_keeps_tools_and_forces_tool_choice_none() {
+    fn finalizing_payload_preserves_the_tool_catalog_and_disables_calls() {
         let messages = vec![serde_json::json!({"role":"user","content":"Build a thing"})];
         let preferences = crate::store::Preferences::default();
         let tools = vec![serde_json::json!({"type":"function","function":{"name":"web_search"}})];
-        let planning = super::request_payload(
+        let finalizing = super::request_payload(
             &messages,
             &tools,
             &preferences,
-            false,
             false,
             true,
             None,
             false,
         );
-        // Same rendered prefix as tool-call rounds — cache survives the
-        // plan→implement transition; tool_choice:none blocks calls.
-        assert!(planning.get("tools").is_some());
-        assert_eq!(planning["tool_choice"], "none");
+        assert_eq!(finalizing["tool_choice"], "none");
         let implementing = super::request_payload(
             &messages,
             &tools,
             &preferences,
             false,
             false,
-            false,
             None,
             false,
         );
-        assert!(implementing.get("tools").is_some());
+        assert_eq!(finalizing["tools"], implementing["tools"]);
         assert!(implementing.get("tool_choice").is_none());
         let slotted = super::request_payload(
             &messages,
@@ -6326,7 +6695,6 @@ mod finish_tests {
             &preferences,
             false,
             false,
-            true,
             Some(0),
             false,
         );
@@ -6344,13 +6712,11 @@ mod finish_tests {
         assert!(super::arm_research_finalization(false, "web_search", &result).is_none());
         assert!(!crate::continuation::search_disables_tools(true, false));
         assert!(!crate::continuation::search_disables_tools(true, true));
-        let budgets = crate::continuation::Budgets::default();
         assert!(matches!(
             crate::continuation::continuation_after_tool(
                 false,
                 "web_search",
                 &result,
-                &budgets,
                 0,
                 false
             ),
@@ -6359,64 +6725,11 @@ mod finish_tests {
     }
 
     #[test]
-    fn begin_plan_implementation_rewrites_the_draft_and_appends_phase_two() {
-        let prefix = crate::prompt::volatile_scratchpad(&[(
-            "plan_mode".into(),
-            super::PLAN_MODE_INSTRUCTION.into(),
-        )])
-        .unwrap();
-        let mut messages = vec![
-            serde_json::json!({"role":"system","content":"sys"}),
-            serde_json::json!({"role":"user","content":format!("{prefix}\n\nInvestigate fusion yield")}),
-        ];
-        super::begin_plan_implementation(&mut messages, "1. Search\n2. Calculate\n3. Verify")
-            .unwrap();
-        assert_eq!(messages.len(), 4);
-        let draft = messages[1]["content"].as_str().unwrap();
-        assert!(draft.contains(super::PLAN_MODE_ACTIVE));
-        assert!(!draft.contains("Do not call tools and do not implement yet"));
-        assert!(draft.ends_with("Investigate fusion yield"));
-        assert_eq!(messages[2]["role"], "assistant");
-        assert_eq!(messages[2]["content"], "1. Search\n2. Calculate\n3. Verify");
-        assert_eq!(messages[3]["role"], "user");
-        assert!(messages[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Continue through the plan while making progress"));
-        assert!(messages[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("report the unresolved steps honestly"));
-        assert!(super::begin_plan_implementation(&mut messages, "   ").is_err());
-    }
-
-    #[test]
-    fn begin_plan_implementation_rewrites_multimodal_draft_prefix() {
-        let prefix = crate::prompt::volatile_scratchpad(&[(
-            "plan_mode".into(),
-            super::PLAN_MODE_INSTRUCTION.into(),
-        )])
-        .unwrap();
-        let mut messages = vec![serde_json::json!({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": format!("{prefix}\n")},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}
-            ]
-        })];
-        super::begin_plan_implementation(&mut messages, "1. Look").unwrap();
-        let text = messages[0]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains(super::PLAN_MODE_ACTIVE));
-        assert!(!text.contains("Do not call tools and do not implement yet"));
-        assert_eq!(messages[1]["role"], "assistant");
-    }
-
-    #[test]
     fn refresh_plan_focus_keeps_the_model_on_the_current_task() {
         let mut messages = vec![
             serde_json::json!({"role":"user","content":"Investigate"}),
             serde_json::json!({"role":"assistant","content":"1. Search\n2. Open"}),
-            serde_json::json!({"role":"user","content":super::PLAN_IMPLEMENT_INSTRUCTION}),
+            serde_json::json!({"role":"user","content":"Quote this text: The plan above is ready."}),
         ];
         let todos = vec![
             crate::plans::Todo {
@@ -6431,14 +6744,15 @@ mod finish_tests {
             },
         ];
         super::refresh_plan_focus(&mut messages, &todos);
-        let focus = messages[2]["content"].as_str().unwrap();
+        assert_eq!(messages[2]["content"], "Quote this text: The plan above is ready.");
+        let focus = messages[3]["content"].as_str().unwrap();
         assert!(focus.contains("The plan above is ready"));
         assert!(focus.contains("one task at a time"));
         assert!(focus.contains("1/2 complete"));
         assert!(focus.contains("Open the source"));
         assert!(focus.contains("index 1"));
         super::refresh_plan_focus(&mut messages, &todos);
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
     }
 }
 
@@ -6452,7 +6766,7 @@ mod reasoning_preference_tests {
             reasoning_mode: crate::store::ReasoningMode::Quick,
             ..Default::default()
         };
-        let payload = request_payload(&[], &[], &preferences, false, false, false, None, false);
+        let payload = request_payload(&[], &[], &preferences, false, false, None, false);
         assert_eq!(payload["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(payload["max_tokens"], preferences.max_tokens);
         let thinking = crate::store::Preferences {
@@ -6460,7 +6774,7 @@ mod reasoning_preference_tests {
             ..preferences
         };
         assert_eq!(
-            request_payload(&[], &[], &thinking, false, false, false, None, false)
+            request_payload(&[], &[], &thinking, false, false, None, false)
                 ["chat_template_kwargs"]["enable_thinking"],
             true
         );
@@ -7387,7 +7701,7 @@ mod read_group_tests {
                 json!({"id": ids[1], "wait_ms": 1000, "max_bytes": 8192}),
             ),
             ("tc-x2", "workspace_list_files", json!({"path": "."}))];
-        let (base_url, served) = scripted_model_server(vec![
+        let (base_url, _served) = scripted_model_server(vec![
             tool_calls_wire(
                 &calls
                     .iter()
@@ -7409,30 +7723,26 @@ mod read_group_tests {
             None,
             channel,
         );
+        let cancel_at = std::cell::Cell::new(None);
         let cancel = async {
-            // Bounded wait: if the turn errors before reaching the model this
-            // still cancels instead of spinning forever.
-            for _ in 0..500 {
-                if served.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
-                    break;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while state.processes.polls_started.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                    state.processes.poll_started.notified().await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            // The group dispatched (polls block ~1s); cancel lands mid-flight.
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            }).await.expect("both grouped polls must enter dispatch");
+            cancel_at.set(Some(Instant::now()));
             {
                 let mut control = state.run_control.lock().unwrap();
                 crate::agent_run::request_cancel(&mut control);
             }
             state.cancel.send_replace(true);
         };
-        let cancel_at = Instant::now();
         let (result, ()) = tokio::join!(send, cancel);
         result.unwrap();
         // Real mid-flight interruption: waiting out both 1s polls would blow
         // this bound; cancelled members must resolve early.
         assert!(
-            cancel_at.elapsed() < Duration::from_millis(900),
+            cancel_at.get().expect("cancellation observed").elapsed() < Duration::from_millis(900),
             "cancel did not interrupt in-flight reads"
         );
         let rows = {
@@ -7847,7 +8157,7 @@ mod output_recovery_tests {
         let wire = format!("data: {delta}\r\n\r\ndata: [DONE]\r\n\r\n");
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let server = tokio::spawn(async move {
-            for body in [wire, text_wire("Finished.", "stop")] {
+            for body in [wire, text_wire("Finished.", "stop"), text_wire("Finished; no relevant source checks were performed.", "stop")] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -8109,7 +8419,7 @@ mod output_recovery_tests {
             Channel::new(|_| Ok(())), None).await.is_err());
         let saved = state.database().unwrap().setting::<Option<FailedModelRound>>(&failed_round_key(&id)).unwrap().unwrap();
         send_registered_turn(&state, id.clone(), String::new(), None, None, None, None,
-            Channel::new(|_| Ok(())), None, Some(saved.assistant_id.clone())).await.unwrap();
+            Channel::new(|_| Ok(())), None, Some(saved.assistant_id.clone()), None).await.unwrap();
         server.await.unwrap();
         let rows = state.database().unwrap().messages(&id).unwrap();
         assert_eq!(rows.iter().filter(|m| m.role == "user").count(), 1);
@@ -8331,3 +8641,24 @@ mod output_recovery_tests {
         assert_eq!(store.messages(&ids[4]).unwrap().iter().filter(|message| message.role == "user").count(), 1);
     }
 }
+
+#[cfg(test)]
+mod audit_fixes_repetition {
+    #[test]
+    fn legitimate_shared_html_boilerplate_triggers_early_stream_stop() {
+        let mut shared = String::from("<header><h1>Project dashboard</h1></header>\n<table>\n");
+        for n in 0..12 {
+            shared.push_str(&format!("<tr><td>Required field {n}</td><td>Enter the value for field {n}</td><td>Pending</td></tr>\n"));
+        }
+        let text = format!("Here are the requested two standalone templates with the same header and fields.\n## First page\n```html\n{shared}</table>\n```\n## Second page\n```html\n{shared}");
+        assert!(super::repetition_cut(&text).is_none());
+        let row = "| Item | Expected value | Pending confirmation |\n";
+        assert!(super::repetition_cut(&row.repeat(80)).is_none());
+        let json = format!("{{\"items\":[{}]}}", "{\"same\":true},".repeat(100));
+        assert!(super::repetition_cut(&json).is_none());
+    }
+}
+
+#[cfg(test)]
+#[path = "chat_reliability_tests.rs"]
+mod reliability_regressions;

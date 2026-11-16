@@ -3,15 +3,37 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::borrow::Cow;
 
-/// Display programs are data, including literal tool markup in code samples.
-/// Blank their bytes (preserving offsets) before text-call detection/parsing.
-/// Conservative recognition also covers nested Markdown/list/blockquote fences
-/// and an interrupted fence: ambiguity must never turn presentation into work.
+/// Markdown examples are data. Only standalone control output from an opted-in
+/// local template is eligible. Preserve genuine argument bytes exactly: code
+/// fences and backticks inside a file-write argument are not Markdown here.
 pub(crate) fn without_presentation_fences(text: &str) -> Cow<'_, str> {
     let mut masked: Option<Vec<u8>> = None;
     let mut fence: Option<(u8, usize)> = None;
+    let mut controls = Vec::new();
+    let mut control_until = 0usize;
     let mut offset = 0;
+    let blank = |masked: &mut Option<Vec<u8>>, start: usize, end: usize| {
+        let bytes = masked.get_or_insert_with(|| text.as_bytes().to_vec());
+        for byte in &mut bytes[start..end] {
+            if *byte != b'\n' && *byte != b'\r' { *byte = b' '; }
+        }
+    };
     for line in text.split_inclusive('\n') {
+        if controls.len() >= 9 && offset >= control_until { blank(&mut masked, offset, text.len()); break; }
+        if offset < control_until { offset += line.len(); continue; }
+        let trimmed = line.trim_start();
+        let indented = line.starts_with("    ") || line.starts_with('\t');
+        if fence.is_none() && !indented {
+            let closing = if trimmed.starts_with("<tool_call>") { Some("</tool_call>") }
+                else if trimmed.starts_with("<function=") { Some("</function>") } else { None };
+            if let Some(closing) = closing {
+                let start = offset + line.len() - trimmed.len();
+                control_until = text[start..].find(closing).map(|end| start + end + closing.len()).unwrap_or(text.len());
+                controls.push((start, control_until));
+                offset += line.len();
+                continue;
+            }
+        }
         let mut closing = false;
         if let Some((marker, count)) = fence {
             let trimmed = line.trim_start_matches(|c: char| c.is_whitespace() || c == '>');
@@ -20,30 +42,46 @@ pub(crate) fn without_presentation_fences(text: &str) -> Cow<'_, str> {
         } else {
             for (index, marker) in line.bytes().enumerate() {
                 if marker != b'`' && marker != b'~' { continue; }
-                // Inspect each marker run once; long backtick lines must not
-                // turn fence recognition into quadratic work.
                 if index > 0 && line.as_bytes()[index - 1] == marker { continue; }
-                let rest = &line[index..];
-                let count = rest.bytes().take_while(|byte| *byte == marker).count();
-                if count < 3 { continue; }
-                let language = rest[count..].split_whitespace().next().unwrap_or_default();
-                if matches!(language, "openui" | "openui-lang") {
-                    fence = Some((marker, count));
-                    break;
-                }
+                let prefix = &line.as_bytes()[..index];
+                if !prefix.iter().all(|b| b.is_ascii_whitespace() || b.is_ascii_digit() || matches!(b, b'>' | b'-' | b'+' | b'*' | b'.' | b')')) { break; }
+                let count = line[index..].bytes().take_while(|byte| *byte == marker).count();
+                if count >= 3 { fence = Some((marker, count)); break; }
             }
         }
-        if fence.is_some() {
-            let bytes = masked.get_or_insert_with(|| text.as_bytes().to_vec());
-            for byte in &mut bytes[offset..offset + line.len()] {
-                if *byte != b'\n' && *byte != b'\r' { *byte = b' '; }
-            }
-        }
+        if fence.is_some() || indented || trimmed.starts_with('>') { blank(&mut masked, offset, offset + line.len()); }
         if closing { fence = None; }
         offset += line.len();
     }
+    let protected = |index: usize| controls.iter().any(|(start, end)| *start <= index && index < *end);
+    // Inline code outside genuine control output is inert as well.
+    let mut i = 0;
+    while i < text.len() {
+        if let Some((_, end)) = controls.iter().find(|(start, end)| *start <= i && i < *end) { i = *end; continue; }
+        let source = masked.as_deref().unwrap_or(text.as_bytes());
+        if source[i] != b'`' { i += 1; continue; }
+        let start = i;
+        while i < source.len() && source[i] == b'`' { i += 1; }
+        let count = i - start;
+        let mut end = i;
+        while end < source.len() && !protected(end) {
+            if source[end] == b'`' {
+                let closing = end;
+                while end < source.len() && source[end] == b'`' { end += 1; }
+                if end - closing == count { break; }
+            } else { end += 1; }
+        }
+        blank(&mut masked, start, end);
+        i = end;
+    }
+    // Quoted/inline tag mentions never constitute a template control record.
+    for marker in ["<tool_call>", "<function="] {
+        for (index, _) in text.match_indices(marker) {
+            if !protected(index) { blank(&mut masked, index, index + marker.len()); }
+        }
+    }
     match masked {
-        Some(bytes) => Cow::Owned(String::from_utf8(bytes).expect("masked complete UTF-8 lines")),
+        Some(bytes) => Cow::Owned(String::from_utf8(bytes).expect("mask preserves UTF-8")),
         None => Cow::Borrowed(text),
     }
 }
@@ -756,7 +794,7 @@ mod tests {
 
         // Prose between two call blocks is skipped as well.
         let calls = parse_text_tool_calls(
-            "first <tool_call>{\"name\":\"search\",\"arguments\":{\"query\":[\"a\"]}}</tool_call> then <tool_call>{\"name\":\"visit\",\"arguments\":{\"url\":\"https://example.org\",\"goal\":\"g\"}}</tool_call>",
+            "first\n<tool_call>{\"name\":\"search\",\"arguments\":{\"query\":[\"a\"]}}</tool_call>\nthen\n<tool_call>{\"name\":\"visit\",\"arguments\":{\"url\":\"https://example.org\",\"goal\":\"g\"}}</tool_call>",
         )
         .unwrap();
         assert_eq!(calls.len(), 2);
@@ -804,4 +842,21 @@ mod tests {
         assert!(ToolCalls::from_openai_message(&invalid).is_err());
     }
 
+}
+
+#[cfg(test)]
+mod quoted_control_regressions {
+    use super::*;
+    #[test]
+    fn markdown_examples_are_inert_but_bare_template_control_still_works() {
+        let call = "<tool_call>{\"name\":\"clock\",\"arguments\":{}}</tool_call>";
+        for example in [format!("```xml\n{call}\n```"), format!("~~~~json\n{call}\n~~~~"), format!("Example `{call}`"), format!("> {call}"), format!("Example \"{call}\""), format!("    {call}"), format!("- ```xml\n{call}")] {
+            assert!(parse_text_tool_calls(&example).is_none(), "{example}");
+            assert_eq!(strip_text_tool_calls(&example), example.trim());
+        }
+        assert_eq!(parse_text_tool_calls(&format!("Checking the clock.\n{call}")).unwrap()[0].name, "clock");
+        let args = json!({"path":"example.md","content":"```rust\nlet x = `literal`;\n```\n<function=not_a_call>"});
+        let control = format!("<tool_call>{{\"name\":\"file_write\",\"arguments\":{args}}}</tool_call>");
+        assert_eq!(parse_text_tool_calls(&control).unwrap()[0].arguments, args);
+    }
 }

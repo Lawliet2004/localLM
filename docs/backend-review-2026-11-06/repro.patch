@@ -1,0 +1,258 @@
+--- a/src-tauri/src/compaction.rs
++++ b/src-tauri/src/compaction.rs
+@@ -984,3 +984,28 @@
+         assert_eq!(big.pending_work.len(), 20);
+     }
+ }
++
++#[cfg(test)]
++mod audit_review_compaction_probes {
++    use super::*;
++    #[test]
++    fn audit_review_retention_drops_history_even_when_keep_exceeds_its_size() {
++        let messages=vec![json!({"role":"system","content":"rules"}),json!({"role":"user","content":"PRESERVE this requirement"}),json!({"role":"assistant","content":"Earlier answer"}),json!({"role":"user","content":"Continue"})];
++        let plan=plan_compaction(&messages,10).expect("probe expects the observed defect");
++        println!("AUDIT keep=10, history_turns=1, dropped={:?}",plan.dropped.iter().map(|m|m["content"].clone()).collect::<Vec<_>>());
++        assert!(plan.dropped.iter().any(|m|m["content"]=="PRESERVE this requirement"));
++    }
++    #[test]
++    fn audit_review_send_compaction_sequence_never_saves_original_archive() {
++        let dir=tempfile::tempdir().unwrap();let store=crate::store::Store::open(&dir.path().join("test.sqlite")).unwrap();let c=store.create_conversation().unwrap().id;
++        let mut messages=vec![json!({"role":"system","content":"rules"})];
++        for i in 0..5 { messages.push(json!({"role":"user","content":format!("{} OLD_MARKER_{i} {}","a".repeat(1000),"a".repeat(4000))}));messages.push(json!({"role":"assistant","content":"answered"})); }
++        messages.push(json!({"role":"user","content":"continue"}));
++        let candidate=plan_compaction(&messages,2).unwrap();let original_id=candidate.id.clone();let mut accepted=candidate.kept;
++        let recorded=compact_model_messages(&store,&c,&mut accepted,2).unwrap();
++        let original=store.artifact(&original_id).unwrap();
++        let recorded_text=recorded.as_ref().and_then(|id|store.artifact(id).unwrap()).map(|a|a.content).unwrap_or_default();
++        println!("AUDIT original archive exists={}, replacement archive exists={}, original dropped text preserved in replacement={}",original.is_some(),recorded.is_some(),recorded_text.contains("OLD_MARKER_0"));
++        assert!(original.is_none());assert!(!recorded_text.contains("OLD_MARKER_0"));
++    }
++}
+--- a/src-tauri/src/formatter.rs
++++ b/src-tauri/src/formatter.rs
+@@ -975,3 +975,24 @@
+         assert!(execute(&ctx, json!({"paths":[]})).await.is_err());
+     }
+ }
++
++#[cfg(test)]
++mod audit_review_formatter_probes {
++    use super::*;
++    #[test]
++    #[cfg(unix)]
++    fn audit_review_formatter_pipe_join_exceeds_its_deadline() {
++        let formatter=Formatter{name:"review",extensions:&[],command:"/bin/sh",args:&["-c","sleep 2 & exit 0","--"]};
++        let dir=tempfile::tempdir().unwrap();let target=dir.path().join("unused.txt");
++        let start=Instant::now();let _=run_formatter(&formatter,dir.path(),&target,Duration::from_millis(100));
++        println!("AUDIT formatter deadline=100ms, elapsed_ms={}",start.elapsed().as_millis());
++        assert!(start.elapsed()>=Duration::from_millis(1500));
++    }
++    #[test]
++    fn audit_review_failed_format_result_normalizes_as_success() {
++        let raw=json!({"formatted":[],"skipped":[],"failed":[{"path":"broken.rs","formatter":"rustfmt","changed":false,"detail":"syntax error"}]});
++        let normalized=crate::tool_envelope::normalize(raw,crate::tool_envelope::Family::Harness);
++        println!("AUDIT formatter failure envelope status={}, error={}",normalized["status"],normalized["error"]);
++        assert_eq!(normalized["status"],"success");assert!(normalized["error"].is_null());
++    }
++}
+--- a/src-tauri/src/hooks.rs
++++ b/src-tauri/src/hooks.rs
+@@ -474,3 +474,49 @@
+         assert!(validate(&[hook]).is_err());
+     }
+ }
++
++#[cfg(test)]
++mod audit_review_hook_probes {
++    use super::*;
++    #[tokio::test]
++    #[cfg(unix)]
++    async fn audit_review_hook_uses_global_workspace_instead_of_conversations_project() {
++        let global=tempfile::tempdir().unwrap();let other=tempfile::tempdir().unwrap();let state=crate::test_support::app_state(global.path());
++        let c={let store=state.database().unwrap();store.save_workspace_path(global.path().to_str().unwrap()).unwrap();
++            let c=store.create_conversation().unwrap().id;
++            store.save_setting("workspace_index_v1",&json!({"projects":[{"id":"other","name":"Other","path":other.path().to_str().unwrap()}],"tasks":{c.clone():{"projectId":"other","archived":false,"pinned":false}}})).unwrap();
++            let mut config=crate::execution::ExecutionConfig::default();config.bash_path="/bin/sh".into();store.save_execution_config(&config).unwrap();
++            save(&store,&[Hook{id:"review".into(),event:EVENT_PRE_TOOL.into(),matcher:"*".into(),command:"pwd > audit-hook-cwd.txt".into(),timeout_secs:2,enabled:true}]).unwrap();
++            assert_eq!(crate::workspace_ui::task_workspace(&store,&c).unwrap().as_deref(),other.path().to_str());c};
++        let _=pre_use(&state,&c,"workspace_create_file",&json!({})).await;
++        println!("AUDIT hook in global project={}, hook in task project={}",global.path().join("audit-hook-cwd.txt").exists(),other.path().join("audit-hook-cwd.txt").exists());
++        assert!(global.path().join("audit-hook-cwd.txt").exists());assert!(!other.path().join("audit-hook-cwd.txt").exists());
++    }
++    #[tokio::test]
++    #[cfg(unix)]
++    async fn audit_review_timed_out_hook_keeps_running_and_changes_files() {
++        let dir=tempfile::tempdir().unwrap();let mut config=crate::execution::ExecutionConfig::default();config.bash_path="/bin/sh".into();
++        let result=run_hook(dir.path().to_str().unwrap(),&config,"sleep 2; printf late > hook-after-timeout.txt",&json!({}),1).await;
++        assert!(result.is_err());tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
++        println!("AUDIT hook timed out at 1s, later side effect={}",dir.path().join("hook-after-timeout.txt").exists());
++        assert!(dir.path().join("hook-after-timeout.txt").exists());
++    }
++}
++
++#[cfg(test)]
++mod audit_review_hook_stdin_probe {
++    use super::*;
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn audit_review_hook_stdin_blocks_before_its_deadline_starts() {
++        let root = tempfile::tempdir().unwrap();
++        let mut config = crate::execution::ExecutionConfig::default();
++        config.bash_path = "/bin/sh".into();
++        let start = std::time::Instant::now();
++        let result = run_hook(root.path().to_str().unwrap(), &config, "sleep 2", &json!({"payload":"a".repeat(262144)}), 1).await;
++        let elapsed = start.elapsed();
++        eprintln!("AUDIT hook stdin deadline=1000ms, elapsed_ms={}, result={:?}", elapsed.as_millis(), result);
++        assert!(elapsed >= std::time::Duration::from_millis(1800));
++        assert!(result.is_ok(), "the advertised timeout did not cover stdin transmission");
++    }
++}
+--- a/src-tauri/src/process_tools.rs
++++ b/src-tauri/src/process_tools.rs
+@@ -1680,3 +1680,59 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod audit_review_process_probes {
++    use super::*;
++    #[test]
++    fn audit_review_small_output_page_cannot_advance_over_a_decoded_frame() {
++        let decoded=crate::terminal_ui::decode(&mut Vec::new(),&vec![0xff;4096],true);
++        let mut output=Output::default();output.push("stdout",decoded);
++        let page=output.poll("proc-review",0,8192).unwrap();
++        println!("AUDIT process page: retained_decoded_bytes={}, returned_frames={}, next_cursor={}, has_more={}",output.bytes,page["output"].as_array().unwrap().len(),page["nextCursor"],page["hasMore"]);
++        assert_eq!(page["output"].as_array().unwrap().len(),0);assert_eq!(page["nextCursor"],0);assert_eq!(page["hasMore"],true);
++    }
++}
++
++#[cfg(test)]
++mod audit_review_shell_output_probe {
++    use super::*;
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn audit_review_shell_run_returns_only_one_final_page_without_marking_truncation() {
++        let root = tempfile::tempdir().unwrap();
++        let registry = ProcessRegistry::default();
++        let mut config = crate::execution::ExecutionConfig::default();
++        config.bash_path = "/bin/sh".into();
++        let result = registry.shell_run("owner", root.path().to_str().unwrap(), config,
++            json!({"command":"head -c 150000 /dev/zero | tr '\\000' 'x'", "timeout_secs":5})).await.unwrap();
++        let id = result["processId"].as_str().unwrap();
++        let retained = registry.retained_output("owner", root.path().to_str().unwrap(), id).unwrap();
++        let retained_bytes: usize = retained["output"].as_array().unwrap().iter().map(|f|f["text"].as_str().unwrap().len()).sum();
++        let returned_bytes = result["stdout"].as_str().unwrap().len();
++        eprintln!("AUDIT shell_run retained_bytes={retained_bytes}, returned_bytes={returned_bytes}, truncated={}, state={}", result["truncated"], result["status"]);
++        assert_eq!(retained_bytes, 150000);
++        assert!(returned_bytes < retained_bytes);
++        assert_eq!(result["truncated"], false);
++    }
++}
++
++#[cfg(test)]
++mod audit_review_shell_latency_probe {
++    use super::*;
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn audit_review_shell_run_sleeps_a_second_even_for_true() {
++        let root = tempfile::tempdir().unwrap();
++        let registry = ProcessRegistry::default();
++        let mut config = crate::execution::ExecutionConfig::default();
++        config.bash_path = "/bin/sh".into();
++        let start = std::time::Instant::now();
++        let result = registry.shell_run("owner", root.path().to_str().unwrap(), config,
++            json!({"command":"true", "timeout_secs":5})).await.unwrap();
++        let elapsed = start.elapsed();
++        eprintln!("AUDIT shell_run true elapsed_ms={}, status={}", elapsed.as_millis(), result["status"]);
++        assert_eq!(result["status"], "exited");
++        assert!(elapsed >= std::time::Duration::from_millis(900));
++    }
++}
+--- a/src-tauri/src/snapshots.rs
++++ b/src-tauri/src/snapshots.rs
+@@ -1504,3 +1504,30 @@
+         assert_eq!(listed[2].id, ids[0]);
+     }
+ }
++
++#[cfg(test)]
++mod audit_review_snapshot_probe {
++    use super::*;
++    #[cfg(unix)]
++    #[test]
++    fn audit_review_snapshot_restore_follows_a_replaced_parent_outside_the_workspace() {
++        let dir = tempfile::tempdir().unwrap();
++        let outside = tempfile::tempdir().unwrap();
++        let db = tempfile::tempdir().unwrap();
++        let store = crate::store::Store::open(&db.path().join("test.sqlite")).unwrap();
++        let owner = store.create_conversation().unwrap().id;
++        std::fs::create_dir(dir.path().join("nested")).unwrap();
++        std::fs::write(dir.path().join("nested/file.txt"), "captured workspace file").unwrap();
++        let captured = capture(&store, &owner, 1, dir.path(), &["nested/file.txt".into()]).unwrap();
++        let staged = stage(&store, &owner, &captured.id).unwrap();
++        std::fs::remove_file(dir.path().join("nested/file.txt")).unwrap();
++        std::fs::remove_dir(dir.path().join("nested")).unwrap();
++        std::fs::write(outside.path().join("file.txt"), "outside file must remain untouched").unwrap();
++        std::os::unix::fs::symlink(outside.path(), dir.path().join("nested")).unwrap();
++        let report = commit(&store, dir.path(), &staged.id).unwrap();
++        let actual = std::fs::read_to_string(outside.path().join("file.txt")).unwrap();
++        eprintln!("AUDIT snapshot restore: outside file overwritten={}, failed_paths={}", actual == "captured workspace file", report.failed.len());
++        assert_eq!(actual, "captured workspace file");
++        assert!(report.failed.is_empty());
++    }
++}
+--- a/src-tauri/src/store.rs
++++ b/src-tauri/src/store.rs
+@@ -4438,3 +4438,50 @@
+         assert!(no_hits.is_empty());
+     }
+ }
++
++#[cfg(test)]
++mod audit_review_probes {
++    use super::*;
++    use serde_json::json;
++    fn event(c: &str, seq: u64, kind: &str, payload: serde_json::Value) -> crate::sessions::SessionEvent {
++        crate::sessions::SessionEvent { id:uuid::Uuid::new_v4().to_string(), conversation_id:c.into(), run_id:None,
++            seq, step_id:None, tool_call_id:None, event_type:kind.into(), payload, ignorable:false, created_at:seq as i64 }
++    }
++    #[test]
++    fn audit_review_fork_includes_messages_after_the_selected_event() {
++        let dir=tempfile::tempdir().unwrap(); let store=Store::open(&dir.path().join("test.sqlite")).unwrap();
++        let c=store.create_conversation().unwrap().id;
++        for (role,text) in [("user","original request"),("assistant","first answer"),("user","FUTURE request"),("assistant","FUTURE answer")] {
++            store.append_message(&c,role,text,"complete").unwrap();
++        }
++        for seq in 1..=7 { store.append_session_event(&event(&c,seq,if seq==6 {"user_msg"} else {"step_start"},json!({"marker":seq}))).unwrap(); }
++        let (fork,n)=store.fork_session_events(&c,4).unwrap(); let rows=store.messages(&fork.id).unwrap();
++        println!("AUDIT fork at event 4: copied_events={n}, copied_messages={:?}",rows.iter().map(|m|&m.content).collect::<Vec<_>>());
++        assert!(rows.iter().any(|m|m.content=="FUTURE request"),"probe expects the observed defect");
++    }
++    #[test]
++    fn audit_review_replay_and_fork_silently_stop_at_5000_events() {
++        let dir=tempfile::tempdir().unwrap(); let store=Store::open(&dir.path().join("test.sqlite")).unwrap();
++        let c=store.create_conversation().unwrap().id;
++        let tx=store.connection.unchecked_transaction().unwrap();
++        for seq in 1..=5005 { store.append_session_event(&event(&c,seq,"step_start",json!({"n":seq}))).unwrap(); }
++        tx.commit().unwrap();
++        let replay=store.session_events(&c,Some(0),Some(10000)).unwrap();
++        let (_fork,n)=store.fork_session_events(&c,5005).unwrap();
++        println!("AUDIT existing_events=5005, replay_events={}, fork_events={n}",replay.len());
++        assert_eq!(replay.len(),5000);assert_eq!(n,5000);
++    }
++    #[test]
++    fn audit_review_fork_retains_artifact_id_owned_by_original_conversation() {
++        let dir=tempfile::tempdir().unwrap(); let store=Store::open(&dir.path().join("test.sqlite")).unwrap();
++        let c=store.create_conversation().unwrap().id;
++        let artifact=crate::artifacts::ArtifactRecord{id:"art_review".into(),conversation_id:c.clone(),run_id:None,tool_name:"read_file".into(),mime_type:"text/plain".into(),size_bytes:4,sha256:"abcd".into(),content:"text".into(),created_at:1};
++        store.save_artifact(&artifact).unwrap();
++        store.append_session_event(&event(&c,1,"tool_result",json!({"result":{"_artifactId":artifact.id}}))).unwrap();
++        let (fork,_)=store.fork_session_events(&c,1).unwrap();
++        let events=store.session_events(&fork.id,Some(0),None).unwrap();let id=events[0].payload["result"]["_artifactId"].as_str().unwrap();
++        let saved=store.artifact(id).unwrap().unwrap();
++        println!("AUDIT fork artifact still owned by original={}, readable_under_fork={}",saved.conversation_id==c,saved.conversation_id==fork.id);
++        assert_ne!(saved.conversation_id,fork.id);
++    }
++}

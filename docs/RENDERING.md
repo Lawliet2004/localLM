@@ -292,3 +292,24 @@ detector again returned `[]`. Screenshots and native interaction approval remain
 unavailable. Exact measurements, test failures and build outcomes are recorded
 separately in the implementation report; earlier pinned source references remain
 evidence for their initial-pass scope.
+
+
+## November 8 response follow-up
+
+`lib/toolActivity.ts` owns immutable tool record parsing, operation IDs, native
+alias categories and changed-file normalization. A live operation is identified
+by conversation, run, step and call, rather than call ID alone. Timeline replay
+merges journal operations with unmatched durable messages. Process polling pages
+join the launch's row and use owned native process commands; returning a process
+handle is not completion of that process.
+
+`useAnswerEvidence` supplies the same hydrated sources to inline Markdown
+citations, research context and the source list. Ambiguous citation IDs are
+excluded from the inline map. Full source links remain available.
+
+Completed successful command rows default to collapsed unless opened deliberately.
+Failures/approval requests expand. Reasoning Markdown and file diffs mount on
+inspection; inspected disclosure state survives later updates. Response colors
+continue to use `tokens.css`; activity color and outcome remain separate axes.
+
+See [implementation and acceptance evidence](INFERENCE_AND_RESPONSE_FIX_RESULTS_2026-11-08.md).

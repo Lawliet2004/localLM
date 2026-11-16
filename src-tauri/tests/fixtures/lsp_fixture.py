@@ -3,6 +3,7 @@ import json, os, pathlib, re, subprocess, sys, time, urllib.parse
 mode, log_path = sys.argv[1:3]
 documents = {}
 root = None
+rejections = 0
 
 def log(method, **values):
     with open(log_path, 'a', encoding='utf-8') as out:
@@ -54,6 +55,14 @@ while True:
     method = message.get('method')
     params = message.get('params') or {}
     log(method or 'client_response', id=message.get('id'))
+    if ((mode in ('content_modified', 'source_changed', 'always_modified') and method == 'textDocument/references')
+            or (mode == 'command_modified' and method == 'workspace/executeCommand')):
+        if rejections == 0 or mode in ('always_modified', 'command_modified'):
+            rejections += 1
+            if mode == 'source_changed':
+                path(params['textDocument']['uri']).write_text('user changed this\n', encoding='utf-8')
+            send({'jsonrpc': '2.0', 'id': message['id'], 'error': {'code': -32801, 'message': 'ContentModified'}})
+            continue
     if method == 'exit':
         break
     if method == 'initialize':
@@ -80,7 +89,16 @@ while True:
             capabilities['positionEncoding'] = 'utf-8'
         if mode == 'unsupported':
             capabilities = {}
-        send({'jsonrpc': '2.0', 'id': message['id'], 'result': {'capabilities': capabilities}})
+        result = {'capabilities': capabilities}
+        if mode == 'indexing':
+            log('readiness_capability', enabled=params.get('capabilities', {}).get('experimental', {}).get('serverStatusNotification'))
+            result['serverInfo'] = {'name': 'rust-analyzer'}
+        send({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
+    elif method == 'initialized' and mode == 'indexing':
+        send({'jsonrpc': '2.0', 'method': 'experimental/serverStatus', 'params': {'health': 'warning', 'quiescent': False}})
+        time.sleep(.1)
+        send({'jsonrpc': '2.0', 'method': 'experimental/serverStatus', 'params': {'health': 'warning', 'quiescent': True}})
+        log('index_ready')
     elif method == 'workspace/executeCommand':
         uri = next(iter(documents))
         send({'jsonrpc':'2.0','id':'command-edit','method':'workspace/applyEdit','params':{'edit':{'changes':{uri:edits(documents[uri]['text'],'command_name')}}}})

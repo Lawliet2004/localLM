@@ -1003,7 +1003,7 @@ pub fn check_repetition(
 ) -> Option<String> {
     // Repeated polls are how a model follows a quiet long-running process.
     // The owned process lifetime, output and turn budgets remain bounded.
-    if matches!(alias, "process_poll" | "check_report") {
+    if matches!(alias, "process_poll" | "check_report" | "verification_report") {
         return None;
     }
     if history.len() >= 2

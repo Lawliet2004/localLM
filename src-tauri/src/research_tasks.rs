@@ -122,12 +122,25 @@ impl Default for TaskBudgets {
 }
 
 impl TaskBudgets {
+    /// Parent runs persist the same limits that their dispatch loop enforces.
+    pub(crate) fn for_parent() -> Self {
+        let turn = crate::continuation::Budgets::default();
+        Self {
+            max_rounds: turn.max_rounds as usize,
+            max_searches: turn.max_searches as usize,
+            max_documents: turn.max_fetches as usize,
+            max_retries: turn.max_retries as usize,
+            operation_timeout_secs: 300,
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !(60..=7200).contains(&self.task_timeout_secs) {
             return Err("task_timeout_secs must be 60-7200.".into());
         }
-        if !(1..=16).contains(&self.max_rounds) {
-            return Err("max_rounds must be 1-16.".into());
+        if !(1..=64).contains(&self.max_rounds) {
+            return Err("max_rounds must be 1-64.".into());
         }
         if !(1..=50).contains(&self.max_searches) {
             return Err("max_searches must be 1-50.".into());
@@ -172,6 +185,16 @@ pub struct ResearchTask {
     pub pending_work: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(skip)]
+    pub(crate) context: TaskContext,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TaskContext {
+    pub workspace: Option<crate::snapshots::WorkspacePin>,
+    pub goal: Option<crate::task_goal::Goal>,
+    pub verification: crate::verification_progress::Progress,
 }
 
 impl ResearchTask {
@@ -204,6 +227,7 @@ impl ResearchTask {
             ],
             created_at: now,
             updated_at: now,
+            context: TaskContext::default(),
         })
     }
 
@@ -220,6 +244,7 @@ impl ResearchTask {
         status: OperationStatus,
         summary: Option<String>,
     ) -> bool {
+        let completed = status == OperationStatus::Completed;
         self.operations.push(TaskOperation {
             id: format!("op_{}", uuid::Uuid::new_v4().simple()),
             kind: kind.to_string(),
@@ -229,23 +254,26 @@ impl ResearchTask {
             error: None,
             updated_at: crate::store::now(),
         });
-        if let Some(summary) = summary {
+        if let Some(summary) = summary.filter(|_| completed) {
             self.completed_results
                 .push(json!({"kind": kind, "summary": summary}));
         }
-        self.pending_work.retain(|work| work != kind);
+        if completed {
+            self.pending_work.retain(|work| work != kind);
+        }
         self.updated_at = crate::store::now();
         !self.budget_exhausted()
     }
 
+    /// Search budget only. Model rounds are the turn loop's `Budgets`, not the
+    /// operation count — counting every tool call as a round exhausted the
+    /// ledger while the loop was still running.
     pub fn budget_exhausted(&self) -> bool {
-        let searches = self
-            .operations
+        self.operations
             .iter()
             .filter(|op| op.kind == "search")
-            .count();
-        let rounds = self.operations.len();
-        searches >= self.budgets.max_searches || rounds >= self.budgets.max_rounds
+            .count()
+            >= self.budgets.max_searches
     }
 
     pub fn elapsed_exhausted(&self) -> bool {
@@ -262,26 +290,18 @@ impl ResearchTask {
         Ok(())
     }
 
-    /// Pause at a tool boundary. The call is recorded and not started, so a
-    /// later restart can mark that in-flight row outcome-unknown.
-    pub fn pause_before_new_tool(&mut self, call_id: &str, call_name: &str) -> Result<(), String> {
-        self.operations.push(TaskOperation {
-            id: format!("op-{call_id}"),
-            kind: call_name.to_string(),
-            status: OperationStatus::Running,
-            attempts: 1,
-            result_summary: None,
-            error: None,
-            updated_at: crate::store::now(),
-        });
-        if !self.pending_work.iter().any(|item| item == call_name) {
-            self.pending_work.push(call_name.to_string());
+    /// Pause before dispatch. The next segment can propose this work again.
+    pub fn pause_before_new_tool(&mut self, call_name: &str) -> Result<(), String> {
+        self.pause()?;
+        let pending = format!("Review {call_name}, which was paused before dispatch.");
+        if !self.pending_work.contains(&pending) {
+            self.pending_work.push(pending);
         }
-        self.pause()
+        Ok(())
     }
 
     pub fn resume(&mut self) -> Result<(), String> {
-        if self.status != TaskStatus::Paused {
+        if !matches!(self.status, TaskStatus::Paused | TaskStatus::BudgetExhausted) {
             return Err("Only a paused task can be resumed.".into());
         }
         self.status = TaskStatus::Running;
@@ -375,23 +395,96 @@ impl ResearchTask {
     }
 }
 
+/// Settle the ledger from the authoritative run outcome, not answer delivery.
+pub(crate) fn settle_turn(
+    store: &crate::store::Store,
+    id: &str,
+    state: crate::agent_run::RunState,
+    budget_exhausted: bool,
+    mut pending: Vec<String>,
+) -> Result<(), String> {
+    use crate::agent_run::RunState;
+    let Some(mut task) = store.research_task(id)? else { return Ok(()); };
+    if task.status == TaskStatus::Cancelled { return Ok(()); }
+    if state == RunState::Paused && task.status == TaskStatus::Paused {
+        for item in &task.pending_work {
+            if !pending.contains(item) {
+                pending.push(item.clone());
+            }
+        }
+    }
+    for operation in &task.operations {
+        if matches!(operation.status, OperationStatus::Running | OperationStatus::Unknown) {
+            pending.push(format!("Review operation {} ({}) before retrying; its outcome may be unknown.", operation.id, operation.kind));
+        }
+    }
+    task.status = match state {
+        RunState::Completed | RunState::Paused if budget_exhausted => TaskStatus::BudgetExhausted,
+        RunState::Completed if pending.is_empty() => TaskStatus::Completed,
+        RunState::Completed | RunState::Paused => TaskStatus::Paused,
+        RunState::Cancelled => TaskStatus::Cancelled,
+        RunState::Failed | RunState::OutcomeUnknown if task.context.goal.is_some() => TaskStatus::Paused,
+        RunState::Failed | RunState::OutcomeUnknown => TaskStatus::Failed,
+        _ => return Err("Cannot settle research from a live run.".into()),
+    };
+    task.pending_work = pending;
+    task.updated_at = crate::store::now();
+    store.save_research_task(&task)
+}
+
 #[allow(dead_code)]
 /// Called from application startup and from `restart_generation`.
 pub fn recover_interrupted(
     store: &crate::store::Store,
 ) -> Result<crate::agent_run::RestartReport, String> {
     let mut replayed = Vec::new();
-    let mut any_unknown = false;
     for id in store.running_research_task_ids()? {
         let Some(mut task) = store.research_task(&id)? else {
             continue;
         };
+        let run = store.research_task_run(&task)?;
+        let start = run.as_ref().map(|run| store.run_session_event_payload(&run.id, "turn_start")).transpose()?.flatten();
+        let end = run.as_ref().map(|run| store.run_session_event_payload(&run.id, "turn_end")).transpose()?.flatten();
+        if let Some(run) = &run {
+            use crate::agent_run::RunState;
+            if matches!(run.status, RunState::Completed | RunState::Failed) && (start.is_none() || end.is_some()) {
+                let mut pending = Vec::new();
+                if run.status == RunState::Completed {
+                    pending.extend(store.todos(&task.conversation_id)?.into_iter().filter(|todo| todo.status != crate::plans::COMPLETED).map(|todo| todo.text));
+                    pending.extend(store.tasks(&task.conversation_id)?.into_iter().filter(|task| !matches!(task.state.as_str(), crate::tasks::COMPLETED | crate::tasks::CANCELLED)).map(|task| task.title));
+                    if let Some(items) = end.as_ref().and_then(|event| event["pendingWork"].as_array()) {
+                        pending.extend(items.iter().filter_map(Value::as_str).map(str::to_owned));
+                    }
+                    if end.as_ref().is_some_and(|event| event["partial"] == true) && pending.is_empty() {
+                        pending.push("Review the partial result and finish the remaining work.".into());
+                    }
+                }
+                settle_turn(store, &id, run.status, false, pending)?;
+                continue;
+            }
+        }
         let report = task.restart_from_ledger();
         replayed.extend(report.replayed_write_ids);
-        any_unknown = true;
+        let tx = store.connection.unchecked_transaction().map_err(|error| error.to_string())?;
+        if let (Some(run), Some(start), None) = (run, start, end) {
+            if task.pending_work.is_empty() {
+                task.pending_work.push("Review the recorded work and resume from the saved checkpoint.".into());
+            }
+            let unresolved: Vec<_> = task.operations.iter().filter(|op| op.status == OperationStatus::Unknown).collect();
+            let error = "The previous run was interrupted. Review recorded outcomes before continuing.";
+            store.update_run_status(&run.id, crate::agent_run::RunState::Paused, Some(error), None)?;
+            store.append_session_event(&crate::sessions::SessionEvent {
+                id: uuid::Uuid::new_v4().to_string(), conversation_id: task.conversation_id.clone(),
+                run_id: Some(run.id), seq: 0, step_id: None, tool_call_id: None,
+                event_type: "turn_end".into(), ignorable: false, created_at: crate::store::now(),
+                payload: json!({"status":"interrupted","stopReason":"restart","messageId":start["messageId"],"partial":true,
+                    "delivered":false,"taskId":task.id,"taskStatus":"paused","resumeTaskId":task.id,"pendingWork":task.pending_work,
+                    "unresolvedOperations":unresolved,"error":error}),
+            })?;
+        }
         store.save_research_task(&task)?;
+        tx.commit().map_err(|error| error.to_string())?;
     }
-    let _ = any_unknown;
     Ok(crate::agent_run::RestartReport {
         replayed_write_ids: replayed,
         unconditional_success: false,
@@ -403,6 +496,34 @@ pub fn recover_interrupted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_recovers_a_legacy_run_marked_complete_without_its_terminal_journal() {
+        use crate::agent_run::{RunRecord, RunState};
+        let store = crate::store::Store::open_memory().unwrap();
+        let owner = store.create_conversation().unwrap().id;
+        let assistant = store.begin_turn(&owner, "Ship the feature").unwrap();
+        let run = RunRecord { id:"legacy-early-finish".into(), conversation_id:owner.clone(),
+            status:RunState::Completed, model_provider:None, model_id:None, checkpoint:None,
+            error:None, created_at:1, updated_at:2 };
+        store.save_run(&run).unwrap();
+        let task = ResearchTask::new(&owner, "Ship the feature", TaskBudgets::default()).unwrap();
+        store.start_research_task(&task, &run.id).unwrap();
+        store.append_session_event(&crate::sessions::SessionEvent {
+            id:"start".into(), conversation_id:owner.clone(), run_id:Some(run.id.clone()), seq:0,
+            step_id:None, tool_call_id:None, event_type:"turn_start".into(),
+            payload:json!({"messageId":assistant.id}), ignorable:false, created_at:1,
+        }).unwrap();
+        store.recover_interrupted().unwrap();
+        recover_interrupted(&store).unwrap();
+        recover_interrupted(&store).unwrap();
+        assert_eq!(store.latest_run(&owner).unwrap().unwrap().status, RunState::Paused);
+        assert_eq!(store.research_task(&task.id).unwrap().unwrap().status, TaskStatus::Paused);
+        let events = store.session_events(&owner, None, None).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].payload["resumeTaskId"], task.id);
+        assert_eq!(events[1].payload["stopReason"], "restart");
+    }
 
     #[test]
     fn checkpoint_pause_resume_cancel_flow() {
@@ -421,6 +542,21 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Cancelled);
         assert!(task.is_terminal());
         assert!(task.resume().is_err());
+    }
+
+    #[test]
+    fn pause_before_dispatch_keeps_pending_work_without_an_uncertain_operation() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let owner = store.create_conversation().unwrap().id;
+        let mut task = ResearchTask::new(&owner, "Save a file", TaskBudgets::default()).unwrap();
+        task.pause_before_new_tool("workspace_create_file").unwrap();
+        store.save_research_task(&task).unwrap();
+        settle_turn(&store, &task.id, crate::agent_run::RunState::Paused, false, vec![]).unwrap();
+        recover_interrupted(&store).unwrap();
+        let task = store.research_task(&task.id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert!(task.operations.is_empty());
+        assert!(task.pending_work.iter().any(|work| work.contains("workspace_create_file") && work.contains("before dispatch")));
     }
 
     #[test]
@@ -464,6 +600,10 @@ mod tests {
             Some("partial".into())
         ));
         assert!(task.budget_exhausted());
+        let mut reads = ResearchTask::new("conv", "Q", TaskBudgets { max_rounds: 2, ..TaskBudgets::default() }).unwrap();
+        assert!(reads.checkpoint_operation("workspace_read_file", OperationStatus::Completed, None));
+        assert!(reads.checkpoint_operation("shell_run", OperationStatus::Completed, None));
+        assert!(!reads.budget_exhausted(), "tool operations are not model rounds");
         assert_eq!(task.completed_results.len(), 1);
         let summary = task.progress_summary();
         assert_eq!(summary["partialResults"], 1);

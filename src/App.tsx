@@ -1,3 +1,4 @@
+import { toolOperationId } from './lib/toolActivity';
 import { toolOutput } from './lib/toolOutput';
 import { publishTurnItem } from './lib/turnItems';
 import { CommandPalette } from './components/CommandPalette';
@@ -207,7 +208,8 @@ export default function App() {
   const contextUsage = session.context ? { conversationId: activeId, usage: session.context } : null;
   const approvalOrder = useRef<string[]>([]);
   const approvalEntries = Object.entries(sessions.runs).flatMap(([id, run]) => run.approvals.map(request => ({ id, request })));
-  const approvalEntry = approvalEntries.find(entry => entry.request.id === approvalOrder.current[0]) ?? approvalEntries[0];
+  const visibleApprovals = approvalEntries.filter(entry => entry.id === (activeId ?? 'new'));
+  const approvalEntry = visibleApprovals.find(entry => entry.request.id === approvalOrder.current[0]) ?? visibleApprovals[0];
   const approval = approvalEntry?.request;
   const [reviewRequest, setReviewRequest] = useState(0);
 
@@ -738,7 +740,7 @@ export default function App() {
 
   }
 
-  async function send(content: string, recoveryId?: string, resumeFailedMessageId?: string) {
+  async function send(content: string, recoveryId?: string, resumeFailedMessageId?: string, resumeTaskId?: string) {
 
     if (busy || toolSave.current || pendingSends.current.has(activeId ?? 'new')) throw new Error('Wait for the active operation before sending a message.');
 
@@ -865,7 +867,7 @@ export default function App() {
 
           const stream = event.toolStream;
 
-          const toolMsgId = `tool-${stream.toolCallId}`;
+          const toolMsgId = toolOperationId(stream.toolCallId, event.runId, event.stepId);
           streamedTools.add(toolMsgId);
 
           if (stream.type === 'started') {
@@ -889,11 +891,13 @@ export default function App() {
                   content: JSON.stringify({
 
                     request: {
-
+                      callId: stream.toolCallId,
+                      runId: event.runId,
+                      stepId: event.stepId,
                       name: stream.toolName,
 
                       arguments: {
-
+                        ...stream.arguments,
                         command: stream.command,
 
                         language: stream.language,
@@ -982,18 +986,23 @@ export default function App() {
 
         }
 
-        if (!event.messageId || (!event.content && !event.reasoning)) return;
+        if (!event.messageId || (!event.replaceDraft && !event.content && !event.reasoning)) return;
         setMessages(current => {
 
           const existing = current.find(message => message.id === event.messageId);
 
-          if (existing) return current.map(message => message.id === event.messageId ? { ...message, content: message.content + event.content, reasoning: message.reasoning + event.reasoning } : message);
+          if (existing) return current.map(message => message.id === event.messageId ? {
+            ...message,
+            content: event.replaceDraft ? event.content : message.content + event.content,
+            reasoning: event.replaceDraft ? event.reasoning : message.reasoning + event.reasoning,
+          } : message);
 
+          if (!event.content && !event.reasoning) return current;
           return [...current, { id: event.messageId, conversationId, role: 'assistant', content: event.content, reasoning: event.reasoning, status: 'streaming', createdAt: Date.now() }];
 
         });
 
-      }, selectedConnectors, selectedTools, planMode, reasoningOverride, undefined, recoveryId, resumeFailedMessageId);
+      }, selectedConnectors, selectedTools, planMode, reasoningOverride, recoveryId, resumeFailedMessageId, resumeTaskId);
       setChatNotice('');
 
     } catch (e) {
@@ -1355,12 +1364,13 @@ export default function App() {
           if (request?.backendStarted || (!request && activeId && recoveredRuns.current.has(activeId))) void api.cancelGeneration(activeId ?? undefined).catch(e => setChatError(errorMessage(e)));
         }}
         paused={!generating && pausedConversationId === activeId && activeId !== null}
-        onResume={() => {
+        onResume={taskId => {
           if (!activeId || busy) return;
-          void api.resumeGeneration(activeId).then(checkpoint => {
+          const owner = activeId;
+          void api.resumeGeneration(owner, taskId).then(checkpoint => {
+            if (activeIdRef.current !== owner) return;
             setPausedConversationId(null);
-            const pending = (checkpoint.pending ?? []).join(', ');
-            return send(`Continue from the paused checkpoint. Do not repeat completed work. Pending: ${pending}.`);
+            return send('Continue the saved task.', undefined, undefined, checkpoint.taskId);
           }).catch(e => setChatError(errorMessage(e)));
         }}
 

@@ -193,9 +193,24 @@ try:
             ('review-read', {'request': {'name': 'read_file', 'arguments': {'path': 'src/App.tsx'}, 'decision': 'allowed'}, 'result': {'content': 'export function App() {}', 'path': 'src/App.tsx'}}),
             ('review-edit', {'request': {'name': 'edit_file', 'arguments': {'path': 'src/App.tsx'}, 'decision': 'allowed'}, 'result': {'diff': '--- a/src/App.tsx\n+++ b/src/App.tsx\n@@ -1 +1 @@\n-old\n+new\n'}}),
         ]
+        if os.environ.get('LOCALLM_REVIEW_RICH') == '1':
+            tools.extend([
+                ('review-command', {'request': {'connector': 'Harness', 'name': 'shell_run', 'arguments': {'command': 'npm test', 'cwd': str(workspace)}, 'decision': 'allowed'}, 'result': {'exitCode': 0, 'stdout': '✓ Header.test.tsx (8 tests)\n✓ Navigation.test.tsx (12 tests)\n\n20 tests passed', 'durationMs': 842}}),
+                ('review-web', {'request': {'connector': 'Harness', 'name': 'search', 'arguments': {'query': ['accessible responsive navigation']}, 'decision': 'allowed'}, 'result': {'answer': 'Keep navigation usable with keyboard and narrow windows.', 'sources': {'S1': {'url': 'https://developer.mozilla.org/en-US/docs/Web/Accessibility', 'title': 'Accessibility on the web', 'snippet': 'Semantic elements and keyboard access support a usable navigation experience.'}}}}),
+            ])
         rows = [('review-user', 'user', 'Improve the project header and explain what changed.', '')]
         rows.extend((ident, 'tool', json.dumps(record), '') for ident, record in tools)
         rows.append(('review-answer', 'assistant', 'I will inspect the header.Updated the header layout and kept the existing navigation.\n\nThe revised spacing works at narrow widths.\n\n```tsx\nexport function Header() { return <header>Project</header>; }\n```', 'Inspect the existing header.Decide how to preserve navigation.'))
+        if os.environ.get('LOCALLM_REVIEW_RICH') == '1':
+            message_id, role, content, reasoning = rows[-1]
+            rows[-1] = (message_id, role, content + '\n\nKeyboard access follows the documented guidance. [S1]', reasoning)
+        history_count = int(os.environ.get('LOCALLM_REVIEW_HISTORY', '0'))
+        for index in range(history_count):
+            timestamp = now - (history_count - index) * 1000
+            archived = [('user', f'Earlier request {index + 1}'), ('assistant', 'A completed earlier response.\n\n' + 'Context retained for the next task. ' * 16)]
+            for offset, (role, text) in enumerate(archived):
+                db.execute('INSERT INTO messages(id,conversation_id,role,content,reasoning,status,created_at) VALUES(?,?,?,?,?,?,?)',
+                    (f'history-{index}-{role}', 'native-conversation-review', role, text, 'Earlier reasoning. ' * 200 if role == 'assistant' else '', 'complete', timestamp + offset))
         for offset, (message_id, role, content, reasoning) in enumerate(rows):
             db.execute('INSERT INTO messages(id,conversation_id,role,content,reasoning,status,created_at) VALUES(?,?,?,?,?,?,?)',
                        (message_id, 'native-conversation-review', role, content, reasoning, 'complete', now + offset))
@@ -241,9 +256,37 @@ try:
     app = start()
     window = wait_for(lambda: window_for(app.pid), 'fixture native window')
     wait_for(lambda: app_accessible(app.pid), 'application accessibility tree')
-    click(app, 'localLM home')
+    width = int(os.environ.get('LOCALLM_REVIEW_WIDTH', '1280'))
+    height = int(os.environ.get('LOCALLM_REVIEW_HEIGHT', '840'))
+    if os.environ.get('LOCALLM_REVIEW_THEME') == 'dark':
+        click(app, 'Use dark theme')
+    click(app, 'LocalLM home')
     capture(window, 'home')
+    opened_at = time.monotonic()
     click(app, 'Conversation review fixture')
+    x11 = ctypes.CDLL('libX11.so.6')
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]; x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XResizeWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint]
+    x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    display = x11.XOpenDisplay(None)
+    x11.XResizeWindow(display, int(window, 16), width, height); x11.XSync(display, 0); x11.XCloseDisplay(display)
+    time.sleep(1)
+    thought = find_node(app, 'Reasoning · 1.2s')
+    opened_ms = (time.monotonic() - opened_at) * 1000
+    action = thought.get_action_iface()
+    if not action or not action.get_n_actions(): raise RuntimeError('Reasoning disclosure is not actionable.')
+    action_at = time.monotonic()
+    if not action.do_action(0): raise RuntimeError('Reasoning disclosure rejected expansion.')
+    time.sleep(.1)
+    state_set = thought.get_state_set()
+    expanded = state_set.contains(Atspi.StateType.EXPANDED)
+    if not expanded: raise RuntimeError('Reasoning disclosure did not expand.')
+    states = [str(state) for state in state_set.get_states()]
+    (output / 'interaction.json').write_text(json.dumps({'historyTurns': int(os.environ.get('LOCALLM_REVIEW_HISTORY', '0')), 'openedConversationMsIncludingFixedWaitAndAccessibility': round(opened_ms, 1), 'reasoningActionAndStateReadMs': round((time.monotonic() - action_at) * 1000, 1), 'reasoningExpanded': expanded, 'reasoningStatesAfterExpansion': states, 'frameTimingMeasured': False}, indent=2))
+    capture(window, 'reasoning-expanded')
+    action.do_action(0)
+    time.sleep(.2)
     if approval_fixture:
         capture(window, 'approval-before-send')
         click(app, 'Send saved request')
@@ -278,9 +321,31 @@ try:
         raise RuntimeError('Could not scroll to the fixture answer.')
     time.sleep(1)
     capture(window, 'conversation-answer')
-    click(app, 'Conversation work')
-    click(app, 'Worktree')
-    capture(window, 'worktree')
+    if os.environ.get('LOCALLM_REVIEW_RICH') == '1':
+        root = app_accessible(app.pid)
+        for node in walk(root):
+            try:
+                name = node.get_name()
+                if name.startswith('Ran') and 'npm test' in name:
+                    node.get_component_iface().scroll_to(Atspi.ScrollType.TOP_EDGE)
+                    action = node.get_action_iface()
+                    if action and action.get_n_actions(): action.do_action(0)
+                    time.sleep(1); capture(window, 'command-expanded'); break
+            except Exception: pass
+        find_node(app, 'assistant message', last=True).get_component_iface().scroll_to(Atspi.ScrollType.TOP_EDGE)
+        time.sleep(1)
+        # Accessibility names are captured only from this isolated fixture.
+        (output / 'accessible-names.txt').write_text('\n'.join(node.get_name() for node in walk(app_accessible(app.pid)) if node.get_name()))
+    if os.environ.get('LOCALLM_REVIEW_RICH') == '1':
+        node = find_node(app, 'File changes')
+        node.get_component_iface().scroll_to(Atspi.ScrollType.TOP_EDGE)
+        time.sleep(1); click(app, 'View changes'); capture(window, 'file-review')
+        node = find_node(app, 'Answer sources')
+        node.get_component_iface().scroll_to(Atspi.ScrollType.TOP_EDGE)
+        time.sleep(1); capture(window, 'sources')
+    else:
+        click(app, 'Toggle workspace panel')
+        capture(window, 'workspace')
     print('Captured native fixture windows:', output)
 finally:
     stop(app)

@@ -17,6 +17,8 @@ const MIN_PAGE_BYTES: usize = 8192;
 const OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_PROCESSES: usize = 64;
 const MAX_ACTIVE_PER_OWNER: usize = 8;
+const MAX_POLL_WAIT_MS: u64 = 30_000;
+const DEFAULT_SHELL_WAIT_SECS: u64 = 120;
 
 pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     let schema = |properties, required: &[&str]| json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
@@ -25,23 +27,25 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
         ("process_start".into(), "Start an approved long-running shell command when you need incremental output or later stdin input. Returns a conversation-owned process ID, state and output cursor promptly. Use process_poll to follow output and process_stop to terminate the process tree. The configured shell permissions, environment, memory limit and timeout apply; this is not OS isolation.".into(), schema(json!({
             "command":{"type":"string","minLength":1,"maxLength":32768},
             "cwd":{"type":"string","maxLength":4096,"description":"Directory inside the authorized workspace; defaults to the configured shell directory."},
-            "timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"description":"Lifetime bounded by the configured shell timeout."},
-            "yield_ms":{"type":"integer","minimum":0,"maximum":1000,"default":100},
+            "timeout_seconds":{"type":"integer","minimum":1,"maximum":crate::execution::MAX_MANAGED_SHELL_SECONDS,"description":"Process lifetime in seconds. Reduced to the configured shell timeout when larger. timeout_secs is an alias."},
+            "timeout_secs":{"type":"integer","minimum":1,"maximum":crate::execution::MAX_MANAGED_SHELL_SECONDS,"description":"Alias of timeout_seconds."},
+            "yield_ms":{"type":"integer","minimum":0,"maximum":1000,"default":100,"description":"Initial wait in milliseconds. Larger values are reduced to 1000."},
             "stdin":{"type":"string","maxLength":65536},"close_stdin":{"type":"boolean","default":false}
         }), &["command"])),
-        ("process_poll".into(), "Read incremental stdout/stderr and the current state of an owned process. Pass the previous nextCursor to avoid repeated output. hasMore means another page is available; truncated and firstAvailableCursor explicitly report output lost from the bounded buffer. Polling does not execute a command.".into(), schema(json!({
+        ("process_poll".into(), "Read incremental stdout/stderr and the current state of an owned process. While waiting for a long command, pass wait_ms=30000 and the previous nextCursor to wait for output or exit. Keep following the same process ID until you have its terminal status. hasMore means another page is available; truncated and firstAvailableCursor report output lost from the bounded buffer.".into(), schema(json!({
             "id":id,"cursor":{"type":"integer","minimum":0,"default":0},
             "max_bytes":{"type":"integer","minimum":8192,"maximum":65536,"default":65536},
-            "wait_ms":{"type":"integer","minimum":0,"maximum":1000,"default":0}
+            "wait_ms":{"type":"integer","minimum":0,"maximum":MAX_POLL_WAIT_MS,"default":0,"description":"Wait for output or exit for up to 30 seconds."}
         }), &["id"])),
         ("process_write".into(), "Write stdin to an owned running process, for example a line ending in newline. Set close_stdin to deliver EOF. Input can cause side effects and follows shell approval settings. A timeout can mean bytes were partially written; do not blindly retry.".into(), schema(json!({
             "id":id,"input":{"type":"string","maxLength":65536},"close_stdin":{"type":"boolean","default":false}
         }), &["id","input"])),
         ("process_stop".into(), "Stop an owned process and its descendants, then return its final state and bounded output. Already completed processes return their stored result. Stopping cannot undo side effects that already occurred.".into(), schema(json!({"id":id}), &["id"])),
-        ("shell_run".into(), "Run a shell command to completion and return exit code, bounded stdout/stderr and duration. On timeout the process keeps running and the returned processId continues the lifecycle through process_poll and process_stop. The configured shell permissions, environment, memory limit and timeout apply; this is not OS isolation.".into(), schema(json!({
+        ("shell_run".into(), "Run an approved shell command and wait for exit. Returns a processId and its state. If only the wait elapsed and the process is running, use process_poll or process_stop. When the configured shell lifetime expires the process tree is stopped and the result is timed_out. The configured shell permissions, environment and memory limit apply.".into(), schema(json!({
             "command":{"type":"string","minLength":1,"maxLength":32768},
             "cwd":{"type":"string","maxLength":4096,"description":"Directory inside the authorized workspace; defaults to the configured shell directory."},
-            "timeout_secs":{"type":"integer","minimum":1,"maximum":600,"default":120,"description":"How long to wait for exit before returning the live processId."}
+            "timeout_secs":{"type":"integer","minimum":1,"maximum":600,"default":DEFAULT_SHELL_WAIT_SECS,"description":"Seconds to wait for exit before returning the live processId. The tool can return sooner to fit the current tool budget. Does not extend the configured shell lifetime. timeout_seconds is an alias."},
+            "timeout_seconds":{"type":"integer","minimum":1,"maximum":600,"description":"Alias of timeout_secs."}
         }), &["command"])),
     ].into_iter().map(crate::tool_spec::ToolSpec::from).collect()
 }
@@ -89,6 +93,62 @@ struct ShellRunArgs {
     command: String,
     cwd: Option<String>,
     timeout_secs: Option<u64>,
+    timeout_seconds: Option<u64>,
+}
+
+/// Models mix the timeout and wait field names. Rewrite to the field the tool
+/// accepts, and reduce an over-limit wait to the ceiling, before schema checks.
+pub fn align_arguments(name: &str, args: &mut Value) {
+    let Some(obj) = args.as_object_mut() else { return };
+    match name {
+        "process_start" | "check_run" | "verification_run" => {
+            copy_field(obj, "timeout_seconds", "timeout_secs");
+            clamp_int(obj, "yield_ms", 0, 1000);
+        }
+        "shell_run" => {
+            copy_field(obj, "timeout_secs", "timeout_seconds");
+            clamp_int(obj, "timeout_secs", 1, 600);
+        }
+        "process_poll" => clamp_int(obj, "wait_ms", 0, MAX_POLL_WAIT_MS),
+        "check_report" | "verification_report" => clamp_int(obj, "wait_ms", 0, 30_000),
+        _ => {}
+    }
+}
+
+/// Leave time for the waiting tool to return its process handle or report.
+/// The policy enforced by the supervisor still owns the process lifetime.
+pub(crate) fn limit_wait(name: &str, args: &mut Value, tool_timeout: Duration) {
+    let remaining = tool_timeout.saturating_sub(Duration::from_secs(1));
+    match name {
+        "shell_run" => {
+            let wait = args["timeout_secs"].as_u64().unwrap_or(DEFAULT_SHELL_WAIT_SECS);
+            args["timeout_secs"] = json!(wait.min(remaining.as_secs().max(1)));
+        }
+        "process_poll" | "check_report" | "verification_report" => {
+            if let Some(wait) = args["wait_ms"].as_u64() {
+                args["wait_ms"] = json!(wait.min(remaining.as_millis() as u64));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn copy_field(obj: &mut serde_json::Map<String, Value>, canonical: &str, alias: &str) {
+    if !obj.contains_key(canonical) {
+        if let Some(value) = obj.remove(alias) {
+            obj.insert(canonical.to_string(), value);
+        }
+    } else {
+        obj.remove(alias);
+    }
+}
+
+fn clamp_int(obj: &mut serde_json::Map<String, Value>, key: &str, min: u64, max: u64) {
+    let Some(value) = obj.get(key).and_then(Value::as_u64) else { return };
+    let clamped = value.clamp(min, max);
+    if clamped != value {
+        obj.insert(key.into(), json!(clamped));
+    }
 }
 
 struct Frame {
@@ -104,6 +164,7 @@ struct Output {
     next: u64,
     bytes: usize,
     incomplete: bool,
+    observation_pending: bool,
     started_at: std::time::Instant,
     duration_ms: Option<f64>,
 }
@@ -118,6 +179,7 @@ impl Default for Output {
             next: 0,
             bytes: 0,
             incomplete: false,
+            observation_pending: false,
             started_at: std::time::Instant::now(),
             duration_ms: None,
         }
@@ -177,12 +239,17 @@ impl Output {
             self.error.as_deref()
         };
         let message = self.error.as_deref();
-        Ok(
-            json!({"id":id,"state":self.phase,"durationMs":self.duration_ms,"exitCode":self.exit_code,"error":error,"message":message,
+        let mut result = json!({"id":id,"state":self.phase,"durationMs":self.duration_ms,"exitCode":self.exit_code,"error":error,"message":message,
             "output":frames,"nextCursor":next,"hasMore":next < self.next,
             "truncated":cursor < base || self.incomplete,"firstAvailableCursor":base,"sideEffects":"possible",
-            "isError":self.incomplete || matches!(self.phase, "failed" | "timed_out" | "unknown") || (self.phase == "exited" && self.exit_code.is_some_and(|code| code != 0))}),
-        )
+            "isError":self.incomplete || matches!(self.phase, "failed" | "timed_out" | "unknown") || (self.phase == "exited" && self.exit_code.is_some_and(|code| code != 0))});
+        if self.phase == "timed_out" {
+            result["code"] = json!("timeout");
+        }
+        if self.observation_pending {
+            result["observationPending"] = json!(true);
+        }
+        Ok(result)
     }
 }
 
@@ -204,11 +271,18 @@ struct Process {
     output: Arc<Mutex<Output>>,
     changed: Arc<Notify>,
     control: mpsc::Sender<Control>,
+    stop: tokio::sync::watch::Sender<bool>,
+    terminated: tokio::sync::watch::Receiver<bool>,
+    waiting_run: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
 pub struct ProcessRegistry {
     processes: Mutex<HashMap<String, Arc<Process>>>,
+    #[cfg(test)]
+    pub(crate) polls_started: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) poll_started: Notify,
 }
 
 /// A cancelled start must not leave a process whose ID was never delivered.
@@ -227,6 +301,25 @@ impl Drop for PendingStart<'_> {
     }
 }
 
+/// Cancelling the wait also cancels the command. A successful return of a
+/// running process explicitly transfers control to the returned handle.
+struct ShellWait {
+    process: Arc<Process>,
+    returned: bool,
+}
+
+impl Drop for ShellWait {
+    fn drop(&mut self) {
+        if self.returned {
+            if let Ok(mut run) = self.process.waiting_run.lock() {
+                *run = None;
+            }
+        } else {
+            self.process.stop.send_replace(true);
+        }
+    }
+}
+
 impl ProcessRegistry {
     /// Terminate every process this registry owns.
     ///
@@ -236,8 +329,24 @@ impl ProcessRegistry {
     /// terminate the child and reap it.
     pub fn stop_all(&self) {
         if let Ok(mut processes) = self.processes.lock() {
+            for process in processes.values() { process.stop.send_replace(true); }
             processes.clear();
         }
+    }
+    /// Await process-tree termination separately from output/verification sealing.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let terminated = self.processes.lock().map_err(|_| "Process registry is unavailable.".to_string())?
+            .values().map(|process| process.terminated.clone()).collect::<Vec<_>>();
+        self.stop_all();
+        tokio::time::timeout(Duration::from_secs(5), futures_util::future::try_join_all(
+            terminated.into_iter().map(|mut watch| async move {
+                while !*watch.borrow() {
+                    watch.changed().await.map_err(|_| "Process termination was not acknowledged.".to_string())?;
+                }
+                Ok::<_, String>(())
+            }),
+        )).await.map_err(|_| "Process shutdown exceeded five seconds; some outcomes are unknown.".to_string())??;
+        Ok(())
     }
     /// Terminate every process owned by one conversation.
     ///
@@ -252,9 +361,31 @@ impl ProcessRegistry {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in owned {
-                processes.remove(&id);
+                if let Some(process) = processes.remove(&id) { process.stop.send_replace(true); }
             }
         }
+    }
+
+    /// Settle waits abandoned by this run, without touching deliberately
+    /// detached commands or another turn's process.
+    pub(crate) async fn settle_cancelled_shells(&self, run_id: &str) -> Vec<Value> {
+        let waiting = self.processes.lock().map(|processes| {
+            processes.iter().filter(|(_, process)| {
+                process.waiting_run.lock().is_ok_and(|run| run.as_deref() == Some(run_id))
+            }).map(|(id, process)| (id.clone(), process.clone())).collect::<Vec<_>>()
+        }).unwrap_or_default();
+        futures_util::future::join_all(waiting.into_iter().map(|(id, process)| async move {
+            process.stop.send_replace(true);
+            let mut terminated = process.terminated.clone();
+            let confirmed = tokio::time::timeout(Duration::from_secs(5), async {
+                while !*terminated.borrow() {
+                    if terminated.changed().await.is_err() { return false; }
+                }
+                true
+            }).await.unwrap_or(false);
+            if let Ok(mut run) = process.waiting_run.lock() { *run = None; }
+            json!({"processId":id,"processState":if confirmed { "stopped" } else { "unknown" }})
+        })).await
     }
     pub fn has_owned(&self, owner: &str, workspace: &str) -> Result<bool, String> {
         let processes = self
@@ -272,8 +403,9 @@ impl ProcessRegistry {
         workspace: &str,
         config: crate::execution::ExecutionConfig,
         alias: &str,
-        args: Value,
+        mut args: Value,
     ) -> Result<Value, String> {
+        align_arguments(alias, &mut args);
         match alias {
             "process_start" => self.start(owner, workspace, config, args).await,
             "process_poll" => self.poll(owner, workspace, args).await,
@@ -318,12 +450,15 @@ impl ProcessRegistry {
         owner: &str,
         workspace: &str,
         mut config: crate::execution::ExecutionConfig,
-        args: Value,
+        mut args: Value,
         completion: Option<crate::verification_observer::Completion>,
     ) -> Result<Value, String> {
+        align_arguments("process_start", &mut args);
         let args: StartArgs = serde_json::from_value(args).map_err(|error| error.to_string())?;
-        let yield_ms = args.yield_ms.unwrap_or(100);
-        let timeout = args.timeout_seconds.unwrap_or(config.bash.timeout_seconds);
+        let yield_ms = args.yield_ms.unwrap_or(100).min(1000);
+        let lifetime = config.bash.timeout_seconds.min(crate::execution::MAX_MANAGED_SHELL_SECONDS).max(1);
+        let requested = args.timeout_seconds.unwrap_or(lifetime);
+        let timeout = requested.clamp(1, lifetime);
         if owner.is_empty() || workspace.is_empty() {
             return Err("Process start needs a conversation and workspace.".into());
         }
@@ -332,10 +467,6 @@ impl ProcessRegistry {
             return Err(
                 "Process command must contain 1–32768 bytes and stdin at most 64 KiB.".into(),
             );
-        }
-        if yield_ms > 1000 || !(1..=300).contains(&timeout) || timeout > config.bash.timeout_seconds
-        {
-            return Err("Process yield must be 0–1000 ms; timeout must be 1–300 seconds within the configured shell limit.".into());
         }
         if let Some(cwd) = args.cwd {
             config.bash.working_directory = cwd;
@@ -403,7 +534,7 @@ impl ProcessRegistry {
                     if process.owner == owner {
                         active += 1;
                     }
-                } else {
+                } else if !output.observation_pending {
                     completed.push((id.clone(), process.created));
                 }
             }
@@ -433,12 +564,15 @@ impl ProcessRegistry {
             let stderr = child.stderr().take().ok_or("Missing process error pipe.")?;
             let output = Arc::new(Mutex::new(Output {
                 started_at,
+                observation_pending: completion.is_some(),
                 ..Output::default()
             }));
             let changed = Arc::new(Notify::new());
             let out_reader = tokio::spawn(read_output(stdout, "stdout", output.clone(), changed.clone()));
             let err_reader = tokio::spawn(read_output(stderr, "stderr", output.clone(), changed.clone()));
             let (control, receiver) = mpsc::channel(8);
+            let (stop, stop_requested) = tokio::sync::watch::channel(false);
+            let (terminated, termination) = tokio::sync::watch::channel(false);
             processes.insert(
                 id.clone(),
                 Arc::new(Process {
@@ -448,10 +582,13 @@ impl ProcessRegistry {
                     output: output.clone(),
                     changed: changed.clone(),
                     control,
+                    stop,
+                    terminated: termination,
+                    waiting_run: Mutex::new(None),
                 }),
             );
             tokio::spawn(supervise(
-                child, stdin, receiver, output, changed, out_reader, err_reader, timeout, completion,
+                child, stdin, receiver, stop_requested, terminated, output, changed, out_reader, err_reader, timeout, completion,
             ));
         }
         let mut pending = PendingStart {
@@ -474,7 +611,11 @@ impl ProcessRegistry {
         if yield_ms > 0 {
             tokio::time::sleep(Duration::from_millis(yield_ms)).await;
         }
-        let value = self.snapshot(owner, workspace, &id, 0, 65536)?;
+        let mut value = self.snapshot(owner, workspace, &id, 0, 65536)?;
+        value["appliedTimeoutSeconds"] = json!(timeout);
+        if requested != timeout {
+            value["timeoutClamped"] = json!(true);
+        }
         pending.armed = false;
         Ok(value)
     }
@@ -508,10 +649,12 @@ impl ProcessRegistry {
             let (reply, _) = oneshot::channel();
             if process.control.try_send(Control::Stop { reply }).is_err() {
                 if let Ok(mut state) = process.output.lock() {
-                    state.phase = "unknown";
-                    state.error = Some(
-                        "Process control queue is unavailable; stop was not acknowledged.".into(),
-                    );
+                    if state.phase == "running" {
+                        state.phase = "unknown";
+                        state.error = Some(
+                            "Process control queue is unavailable; stop was not acknowledged.".into(),
+                        );
+                    }
                 }
                 process.changed.notify_waiters();
             }
@@ -526,14 +669,40 @@ impl ProcessRegistry {
         self.snapshot(owner, workspace, id, 0, OUTPUT_BYTES)
     }
 
+    pub(crate) async fn wait_for_terminal(
+        &self, owner: &str, workspace: &str, id: &str, wait: Duration,
+    ) -> Result<(), String> {
+        let process = self.owned(owner, workspace, id)?;
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let notified = process.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if {
+                let output = process.output.lock().map_err(|_| "Process output is unavailable.")?;
+                output.phase != "running" && !output.observation_pending
+            } {
+                return Ok(());
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+
     pub async fn poll(&self, owner: &str, workspace: &str, args: Value) -> Result<Value, String> {
         let args: PollArgs = serde_json::from_value(args).map_err(|error| error.to_string())?;
         let limit = args.max_bytes.unwrap_or(65536);
-        let wait = args.wait_ms.unwrap_or(0);
-        if !(8192..=65536).contains(&limit) || wait > 1000 {
-            return Err("Process max_bytes must be 8192–65536 and wait_ms 0–1000.".into());
+        let wait = args.wait_ms.unwrap_or(0).min(MAX_POLL_WAIT_MS);
+        if !(8192..=65536).contains(&limit) {
+            return Err("Process max_bytes must be 8192–65536.".into());
         }
         let process = self.owned(owner, workspace, &args.id)?;
+        #[cfg(test)]
+        {
+            self.polls_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.poll_started.notify_one();
+        }
         let cursor = args.cursor.unwrap_or(0);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(wait);
         loop {
@@ -584,11 +753,21 @@ impl ProcessRegistry {
         config: crate::execution::ExecutionConfig,
         args: Value,
     ) -> Result<Value, String> {
+        self.shell_run_tracked(owner, workspace, config, args, None, |_| Ok(())).await
+    }
+
+    pub(crate) async fn shell_run_tracked(
+        &self,
+        owner: &str,
+        workspace: &str,
+        config: crate::execution::ExecutionConfig,
+        mut args: Value,
+        run_id: Option<&str>,
+        on_launch: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<Value, String> {
+        align_arguments("shell_run", &mut args);
         let args: ShellRunArgs = serde_json::from_value(args).map_err(|error| error.to_string())?;
-        let wait_secs = args.timeout_secs.unwrap_or(120);
-        if !(1..=600).contains(&wait_secs) {
-            return Err("shell_run timeout_secs must be 1–600.".into());
-        }
+        let wait_secs = args.timeout_secs.or(args.timeout_seconds).unwrap_or(DEFAULT_SHELL_WAIT_SECS).clamp(1, 600);
         let mut start_args = json!({"command":args.command,"yield_ms":0,"timeout_seconds":config.bash.timeout_seconds,"close_stdin":true});
         if let Some(cwd) = args.cwd {
             start_args["cwd"] = json!(cwd);
@@ -599,6 +778,10 @@ impl ProcessRegistry {
             .as_str()
             .ok_or("Process start did not return an id.")?
             .to_string();
+        let process = self.owned(owner, workspace, &id)?;
+        let mut wait = ShellWait { process, returned: false };
+        *wait.process.waiting_run.lock().map_err(|_| "Process ownership is unavailable.")? = run_id.map(str::to_owned);
+        on_launch(&id)?;
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut truncated = false;
@@ -644,17 +827,19 @@ impl ProcessRegistry {
         let state = page["state"].as_str().unwrap_or("unknown");
         let has_more = capped || page["hasMore"] == true;
         let mut result = json!({
-            "status":state, "processId":id,
+            "status":state, "processState":state, "processId":id,
             "stdout":stdout, "stderr":stderr, "truncated":truncated || has_more,
             "nextCursor":next_cursor, "hasMore":has_more,
             "durationMs":started.elapsed().as_millis() as u64,
         });
         if state == "running" {
-            result["message"] = json!("Still running; continue with process_poll or stop it with process_stop.");
+            result["message"] = json!("Still running. Use process_poll with this processId and wait_ms=30000 to follow it, or process_stop to stop it.");
         } else {
             result["exitCode"] = page["exitCode"].clone();
-            result["isError"] = json!(page["isError"] == true || state != "exited");
+            result["isError"] = json!(page["isError"] == true || state != "exited" || page["exitCode"] != 0);
+            result["error"] = page["message"].clone();
         }
+        wait.returned = true;
         Ok(result)
     }
 
@@ -670,10 +855,15 @@ impl ProcessRegistry {
         if running {
             let (reply, received) = oneshot::channel();
             if process.control.try_send(Control::Stop { reply }).is_ok() {
-                tokio::time::timeout(Duration::from_secs(5), received)
-                    .await
-                    .map_err(|_| "Process stop timed out; its outcome is unknown.")?
-                    .map_err(|_| "Process supervisor stopped without a final acknowledgement.")?;
+                let acknowledgement = tokio::time::timeout(Duration::from_secs(5), received).await;
+                if !matches!(acknowledgement, Ok(Ok(()))) && process.output.lock()
+                    .map_err(|_| "Process output is unavailable.")?.phase == "running"
+                {
+                    return Err(match acknowledgement {
+                        Err(_) => "Process stop timed out; its outcome is unknown.",
+                        _ => "Process supervisor stopped without a final acknowledgement.",
+                    }.into());
+                }
             } else if process
                 .output
                 .lock()
@@ -744,6 +934,8 @@ async fn supervise(
     mut child: crate::execution::ExecutionChild,
     stdin: tokio::process::ChildStdin,
     mut receiver: mpsc::Receiver<Control>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    terminated: tokio::sync::watch::Sender<bool>,
     output: Arc<Mutex<Output>>,
     changed: Arc<Notify>,
     out_reader: tokio::task::JoinHandle<()>,
@@ -752,6 +944,7 @@ async fn supervise(
     completion: Option<crate::verification_observer::Completion>,
 ) {
     let mut stdin = Some(stdin);
+    let mut stop_reply = None;
     let deadline = tokio::time::sleep(Duration::from_secs(timeout));
     tokio::pin!(deadline);
     let (phase, exit_code, error) = loop {
@@ -766,12 +959,16 @@ async fn supervise(
             };
         }
         tokio::select! {
+            _ = stop.changed() => break match terminate(&mut child).await {
+                Ok(code) => ("stopped", code, Some("Process owner closed; process tree stopped.".into())),
+                Err(error) => ("unknown", None, Some(error)),
+            },
             status = child.wait() => break match status {
                 Ok(status) => ("exited", status.code(), if status.success() { None } else { Some(format!("Process exited with status {status}.")) }),
                 Err(error) => ("failed", None, Some(format!("Process wait failed: {error}"))),
             },
             _ = &mut deadline => break match terminate(&mut child).await {
-                Ok(code) => ("timed_out", code, Some("Configured process timeout exceeded; process tree stopped.".into())),
+                Ok(code) => ("timed_out", code, Some(format!("The process reached its {timeout}-second shell lifetime and was stopped."))),
                 Err(error) => ("unknown", None, Some(error)),
             },
             control = receiver.recv() => match control {
@@ -785,14 +982,8 @@ async fn supervise(
                     let _ = reply.send(result);
                 },
                 Some(Control::Stop { reply }) => {
-                    // The stop is acknowledged as soon as the process tree is
-                    // terminated. Sealing the observation (a full recursive
-                    // workspace walk, a barrier poll and a database write)
-                    // happens afterwards and must not delay the caller: the
-                    // stop budget is five seconds.
-                    let outcome = terminate(&mut child).await;
-                    let _ = reply.send(());
-                    break match outcome {
+                    stop_reply = Some(reply);
+                    break match terminate(&mut child).await {
                         Ok(code) => ("stopped", code, Some("Process tree stopped by request; side effects may already have occurred.".into())),
                         Err(error) => ("unknown", None, Some(error)),
                     };
@@ -809,8 +1000,12 @@ async fn supervise(
     }
     drop(stdin);
     drop(child); // Stop any surviving descendants before sealing observation.
-    if let Some(completion) = completion {
-        completion.finish(phase).await;
+    terminated.send_replace(matches!(phase, "exited" | "stopped" | "timed_out"));
+    let mut completion = completion;
+    if stop_reply.is_none() {
+        if let Some(observation) = completion.take() {
+            observation.finish(phase).await;
+        }
     }
     let mut out_reader = out_reader;
     let mut err_reader = err_reader;
@@ -831,16 +1026,53 @@ async fn supervise(
     if let Ok(mut state) = output.lock() {
         state.phase = phase;
         state.exit_code = exit_code;
-        if error.is_some() {
-            state.error = error;
+        state.observation_pending = completion.is_some();
+        if let Some(error) = error {
+            state.error = Some(match state.error.take() {
+                Some(output_error) => format!("{error} {output_error}"),
+                None => error,
+            });
         }
     }
     changed.notify_waiters();
+    // An explicit stop returns the terminal snapshot, including drained
+    // output. A workspace scan for verification can finish afterwards.
+    drop(receiver);
+    if let Some(reply) = stop_reply {
+        let _ = reply.send(());
+    }
+    if let Some(observation) = completion {
+        observation.finish(phase).await;
+        if let Ok(mut state) = output.lock() {
+            state.observation_pending = false;
+        }
+        changed.notify_waiters();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_timeout_fields_are_rewritten_before_dispatch() {
+        let mut args = json!({"command":"cargo test","timeout_secs":3600,"yield_ms":30000});
+        align_arguments("process_start", &mut args);
+        assert_eq!(args["timeout_seconds"], 3600);
+        assert!(args.get("timeout_secs").is_none());
+        assert_eq!(args["yield_ms"], 1000);
+        let mut wait = json!({"command":"echo hi","timeout_seconds":900});
+        align_arguments("shell_run", &mut wait);
+        assert_eq!(wait["timeout_secs"], 600);
+        assert!(wait.get("timeout_seconds").is_none());
+        limit_wait("shell_run", &mut wait, Duration::from_secs(300));
+        assert_eq!(wait["timeout_secs"], 299);
+        let mut poll = json!({"id":"fixture","wait_ms":30_000});
+        align_arguments("process_poll", &mut poll);
+        assert_eq!(poll["wait_ms"], 30_000);
+        limit_wait("process_poll", &mut poll, Duration::from_secs(5));
+        assert_eq!(poll["wait_ms"], 4_000);
+    }
 
     #[tokio::test]
     async fn a_stop_is_acknowledged_before_the_observation_is_sealed() {
@@ -896,11 +1128,15 @@ mod tests {
             .await
             .expect("the stop is acknowledged")
             .expect("the supervisor acknowledges the stop");
+        assert_eq!(process.output.lock().unwrap().phase, "stopped");
         assert!(
             acknowledged.elapsed() < Duration::from_millis(900),
             "the stop must be acknowledged before the observation is sealed: {:?}",
             acknowledged.elapsed()
         );
+        assert!(process.output.lock().unwrap().observation_pending);
+        registry.wait_for_terminal("owner", directory.path().to_str().unwrap(), &id, Duration::from_secs(5)).await.unwrap();
+        assert!(!process.output.lock().unwrap().observation_pending);
     }
 
     #[tokio::test]
@@ -923,6 +1159,9 @@ mod tests {
             output: output.clone(),
             changed: Arc::new(Notify::new()),
             control,
+            stop: tokio::sync::watch::channel(false).0,
+            terminated: tokio::sync::watch::channel(false).1,
+            waiting_run: Mutex::new(None),
         });
         let registry = ProcessRegistry::default();
         registry
@@ -1315,17 +1554,17 @@ mod tests {
             .unwrap();
         for args in [
             json!({"command":"echo hi","timeout_secs":0}),
-            json!({"command":"echo hi","timeout_secs":601}),
-            json!({"command":"echo hi","unexpected":1}),
+            json!({"command":"echo hi","timeout_seconds":601}),
         ] {
             assert!(
                 registry
                     .execute("owner", root, config.clone(), "shell_run", args.clone())
                     .await
-                    .is_err(),
+                    .is_ok(),
                 "{args}"
             );
         }
+        assert!(registry.execute("owner", root, config.clone(), "shell_run", json!({"command":"echo hi","unexpected":1})).await.is_err());
         // Same approval family as process_start: never a trusted read.
         assert!(!crate::harness::is_trusted_read("shell_run"));
         assert_eq!(
@@ -1421,6 +1660,7 @@ mod tests {
             .unwrap();
         let result = finished(&registry, root, started["id"].as_str().unwrap()).await;
         assert_eq!(result["state"], "timed_out");
+        assert_eq!(result["code"], "timeout");
         let started = registry
             .start(
                 "owner",
@@ -1437,12 +1677,17 @@ mod tests {
         assert_eq!(stopped["state"], "stopped");
         assert_eq!(stopped["isError"], false, "{stopped}");
         assert!(stopped["error"].is_null(), "{stopped}");
+        let oversized = registry
+            .start("owner", root, config.clone(), json!({"command":command,"yield_ms":1001,"timeout_seconds":config.bash.timeout_seconds + 1}))
+            .await
+            .unwrap();
+        assert_eq!(oversized["appliedTimeoutSeconds"], config.bash.timeout_seconds);
+        assert_eq!(oversized["timeoutClamped"], true);
+        registry.stop("owner", root, json!({"id":oversized["id"]})).await.unwrap();
         for args in [
             json!({"command":""}),
-            json!({"command":command,"yield_ms":1001}),
             json!({"command":command,"cwd":"../"}),
             json!({"command":command,"unexpected":true}),
-            json!({"command":command,"timeout_seconds":301}),
         ] {
             assert!(
                 registry
@@ -1561,6 +1806,30 @@ mod tests {
         let _ = task.await;
         assert!(registry.processes.lock().unwrap().is_empty());
         assert_terminated(pid).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_an_attached_shell_settles_its_handle_and_prevents_a_late_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap().to_string();
+        let registry = Arc::new(ProcessRegistry::default());
+        let (started, id) = oneshot::channel();
+        let task_registry = registry.clone();
+        let task_root = root.clone();
+        let task = tokio::spawn(async move {
+            task_registry.shell_run_tracked("owner", &task_root, crate::execution::ExecutionConfig::default(),
+                json!({"command":"(sleep 1; printf changed > late.txt) & printf '%s\\n' \"$!\" > descendant.pid; wait"}),
+                Some("run"), |id| { let _ = started.send(id.to_string()); Ok(()) }).await
+        });
+        let handle = id.await.unwrap();
+        let pid = descendant_pid(&directory.path().join("descendant.pid")).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let settled = registry.settle_cancelled_shells("run").await;
+        assert_eq!(settled, vec![json!({"processId":handle,"processState":"stopped"})]);
+        assert_terminated(pid).await;
+        assert!(!directory.path().join("late.txt").exists());
     }
 
     #[tokio::test]
@@ -1759,4 +2028,43 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(800));
     }
 
+}
+
+// Transcript controls operate only on a process already owned by this chat.
+// They neither launch commands nor widen execution permissions. Use the
+// registry's original workspace so a later project selection cannot strand it.
+fn ui_process_workspace(state: &crate::AppState, conversation_id: &str, id: &str) -> Result<String, String> {
+    let processes = state.processes.processes.lock().map_err(|_| "Process registry is unavailable.")?;
+    let process = processes.get(id).ok_or("This process is no longer available; its saved state is historical.")?;
+    if process.owner != conversation_id { return Err("Process belongs to another conversation.".into()); }
+    Ok(process.workspace.clone())
+}
+#[tauri::command]
+pub async fn get_owned_process(state: tauri::State<'_, crate::AppState>, conversation_id: String, id: String, cursor: u64) -> Result<Value, String> {
+    let workspace = ui_process_workspace(&state, &conversation_id, &id)?;
+    state.processes.poll(&conversation_id, &workspace, json!({"id":id,"cursor":cursor,"max_bytes":65536,"wait_ms":0})).await
+}
+#[tauri::command]
+pub async fn stop_owned_process(state: tauri::State<'_, crate::AppState>, conversation_id: String, id: String) -> Result<Value, String> {
+    let workspace = ui_process_workspace(&state, &conversation_id, &id)?;
+    state.processes.stop(&conversation_id, &workspace, json!({"id":id})).await
+}
+
+#[cfg(test)]
+mod transcript_control_tests {
+    use super::*;
+    #[tokio::test]
+    async fn transcript_lookup_cannot_read_or_stop_another_chats_process() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::test_support::app_state(root.path());
+        let workspace = root.path().to_string_lossy().into_owned();
+        let config = state.database().unwrap().execution_config().unwrap();
+        let command = if cfg!(windows) { "Start-Sleep -Seconds 30" } else { "sleep 30" };
+        let launch = state.processes.start("owner", &workspace, config, json!({"command":command,"yield_ms":0})).await.unwrap();
+        let id = launch["id"].as_str().unwrap();
+        assert!(ui_process_workspace(&state, "other", id).is_err());
+        assert_eq!(ui_process_workspace(&state, "owner", id).unwrap(), workspace);
+        let stopped = state.processes.stop("owner", &workspace, json!({"id":id})).await.unwrap();
+        assert_eq!(stopped["state"], "stopped");
+    }
 }

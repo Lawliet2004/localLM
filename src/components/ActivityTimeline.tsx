@@ -1,3 +1,4 @@
+import { toolRecord, toolOperationId, toolFailed } from '../lib/toolActivity';
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ChevronRight } from 'lucide-react';
 import { api, nativeAvailable } from '../lib/api';
@@ -9,28 +10,66 @@ import { reduceTurnItems, subscribeTurnItems, type TurnItem } from '../lib/turnI
 
 export function useSessionActivity(conversationId: string, generating: boolean) {
   const [events, setEvents] = useState<SessionEvent[]>([]);
+  const [hasEarlier, setHasEarlier] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [historyError, setHistoryError] = useState('');
   const generatingRef = useRef(generating);
   generatingRef.current = generating;
+  const previousGenerating = useRef(generating);
   const reload = useRef<(() => void) | null>(null);
+  const loadEarlier = useRef<(() => void) | null>(null);
   useEffect(() => {
     let disposed = false, loading = false, queued = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let cursor = 0;
+    let initial = true;
+    let earlier: number | undefined;
+    let readingEarlier = false;
     setEvents([]);
+    setHasEarlier(false);
+    setLoadingEarlier(false);
+    setHistoryError('');
     if (!nativeAvailable || conversationId === 'new' || !api.getSessionEvents) return;
+    const pageSize = 500;
+    const merge = (batch: SessionEvent[]) => setEvents(current => [...new Map([...current, ...batch].map(event => [event.seq, event])).values()].sort((a, b) => a.seq - b.seq));
+    const receiveEarlier = (batch: SessionEvent[]) => {
+      const first = batch[0]?.seq;
+      earlier = batch.length === pageSize && first > 1 ? first : undefined;
+      setHasEarlier(earlier !== undefined);
+    };
+    loadEarlier.current = async () => {
+      if (disposed || readingEarlier || earlier === undefined) return;
+      readingEarlier = true;
+      setLoadingEarlier(true);
+      setHistoryError('');
+      try {
+        const batch = await api.getSessionEvents(conversationId, null, pageSize, { beforeSeq: earlier });
+        if (disposed) return;
+        receiveEarlier(batch);
+        if (batch.length) merge(batch);
+      } catch {
+        if (!disposed) setHistoryError('Earlier activity could not be loaded.');
+      } finally {
+        readingEarlier = false;
+        if (!disposed) setLoadingEarlier(false);
+      }
+    };
     async function load() {
       if (disposed) return;
       if (loading) { queued = true; return; }
       loading = true; clearTimeout(timer);
       let full = false, failed = false;
       try {
-        const batch = await api.getSessionEvents(conversationId, cursor, 500);
+        const batch = initial ? await api.getSessionEvents(conversationId, null, pageSize, { latest: true })
+          : await api.getSessionEvents(conversationId, cursor, pageSize);
         if (disposed) return;
+        if (initial) receiveEarlier(batch);
+        full = !initial && batch.length === pageSize;
+        initial = false;
         if (batch.length) {
-          cursor = Math.max(...batch.map(event => event.seq)) + 1;
-          setEvents(current => [...new Map([...current, ...batch].map(event => [event.seq, event])).values()].sort((a, b) => a.seq - b.seq));
+          cursor = Math.max(cursor, batch[batch.length - 1].seq + 1);
+          merge(batch);
         }
-        full = batch.length === 500;
       } catch { failed = true; }
       finally {
         loading = false;
@@ -54,10 +93,14 @@ export function useSessionActivity(conversationId: string, generating: boolean) 
       if (!disposed && seq >= cursor) void load();
     }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(() => { /* Polling remains available. */ });
     void load();
-    return () => { disposed = true; stopItems(); unlisten?.(); clearTimeout(timer); reload.current = null; };
+    return () => { disposed = true; stopItems(); unlisten?.(); clearTimeout(timer); reload.current = null; loadEarlier.current = null; };
   }, [conversationId]);
-  useEffect(() => { reload.current?.(); }, [generating]);
-  return events;
+  useEffect(() => {
+    if (previousGenerating.current === generating) return;
+    previousGenerating.current = generating;
+    reload.current?.();
+  }, [generating]);
+  return { events, hasEarlier, loadingEarlier, historyError, loadEarlier: () => loadEarlier.current?.() };
 }
 
 /** Duplicate delivery must not duplicate an operation or move it in the log. */
@@ -71,15 +114,7 @@ function toolCalls(events: SessionEvent[]) {
   });
 }
 
-const records = new WeakMap<Message, Record<string, any>>();
-function toolRecord(message: Message): Record<string, any> {
-  const cached = records.get(message);
-  if (cached) return cached;
-  let record: Record<string, any> = {};
-  try { const value = JSON.parse(message.content); if (value && typeof value === 'object' && !Array.isArray(value)) record = value; } catch { /* Legacy tool text. */ }
-  records.set(message, record); return record;
-}
-const replay = new WeakMap<SessionEvent, { result?: SessionEvent; ended: boolean; awaiting: boolean; interruptedApproval: boolean; message: Message }>();
+const replay = new WeakMap<SessionEvent, { result?: SessionEvent; processId?: string; ended: boolean; awaiting: boolean; interruptedApproval: boolean; message: Message }>();
 
 /** Run identity and call intervals prevent reused provider IDs crossing runs.
  * Immutable event objects also let completed replay rows retain their identity. */
@@ -88,52 +123,109 @@ export function activityTools(events: SessionEvent[], messages: Message[], items
   if (!calls.length) return messages.filter(message => message.role === 'tool' && !isPlanMessage(message));
   const resultEvents = [...events].sort((a, b) => a.seq - b.seq).filter(event => event.eventType === 'tool_result');
   const results = new Map(resultEvents.map(event => [JSON.stringify([event.runId, event.stepId ?? null, event.toolCallId]), event]));
+  const processes = new Map(events.filter(event => event.eventType === 'process_started' && event.toolCallId)
+    .map(event => [JSON.stringify([event.runId, event.stepId ?? null, event.toolCallId]), (event.payload as { processId?: string })?.processId]));
   const pending = new Set(items.filter(item => item.kind === 'approval' && item.status === 'awaiting' && typeof item.payload.callId === 'string')
     .map(item => JSON.stringify([item.runId, item.payload.stepId ?? null, item.payload.callId])));
   const interruptedApprovals = new Set(items.filter(item => item.kind === 'approval' && item.status === 'interrupted' && typeof item.payload.callId === 'string')
     .map(item => JSON.stringify([item.runId, item.payload.stepId ?? null, item.payload.callId])));
   const ended = new Set(events.filter(event => event.eventType === 'turn_end').map(event => event.runId));
+  const byMessageId = new Map<string, Message>();
   const candidates = new Map<string, Message[]>();
+  const legacy = new Map<string, Message[]>();
   for (const message of messages) if (message.role === 'tool') {
+    byMessageId.set(message.id, message);
     const request = toolRecord(message).request;
     for (const key of new Set([message.id, typeof request?.callId === 'string' ? `tool-${request.callId}` : message.id])) {
       const list = candidates.get(key) ?? []; list.push(message); candidates.set(key, list);
     }
+    if (request && !request.callId) {
+      const key = JSON.stringify([request.name, request.arguments ?? {}]);
+      const list = legacy.get(key) ?? []; list.push(message); legacy.set(key, list);
+    }
   }
-  const callsById = new Map<string | null | undefined, SessionEvent[]>();
-  for (const call of calls) { const list = callsById.get(call.toolCallId) ?? []; list.push(call); callsById.set(call.toolCallId, list); }
-  return calls.map(event => {
-    const siblings = callsById.get(event.toolCallId)!;
-    const next = siblings[siblings.indexOf(event) + 1];
-    const persisted = candidates.get(`tool-${event.toolCallId}`)?.find(message => {
-      const runId = toolRecord(message).request?.runId;
-      if (runId) return runId === event.runId;
-      return siblings.length === 1 || message.createdAt >= event.createdAt && (!next || message.createdAt < next.createdAt);
-    });
+  const lastCallById = new Map<string | null | undefined, SessionEvent>();
+  const nextCalls = new Map<SessionEvent, SessionEvent>();
+  const reused = new Set<string | null | undefined>();
+  for (const call of calls) {
+    const previous = lastCallById.get(call.toolCallId);
+    if (previous) { nextCalls.set(previous, call); reused.add(call.toolCallId); }
+    lastCallById.set(call.toolCallId, call);
+  }
+  const matched = new Set<Message>();
+  const projected = calls.map((event): Message => {
+    const next = nextCalls.get(event);
     const resultEvent = results.get(JSON.stringify([event.runId, event.stepId ?? null, event.toolCallId]));
+    const resultMessageId = (resultEvent?.payload as { messageId?: string } | undefined)?.messageId;
+    const call = event.payload as Record<string, any>;
+    const persisted = (resultMessageId ? byMessageId.get(resultMessageId) : undefined) ?? candidates.get(`tool-${event.toolCallId}`)?.find(message => {
+      if (matched.has(message)) return false;
+      const request = toolRecord(message).request;
+      const runId = request?.runId;
+      if (request?.stepId) return (!runId || runId === event.runId) && request.stepId === event.stepId;
+      if (runId && runId !== event.runId) return false;
+      return !reused.has(event.toolCallId) || message.createdAt >= event.createdAt && (!next || message.createdAt < next.createdAt);
+    }) ?? legacy.get(JSON.stringify([call.name, call.arguments ?? {}]))?.find(message => {
+      const runId = toolRecord(message).request?.runId;
+      return !matched.has(message) && (!runId || runId === event.runId);
+    });
+    if (persisted) matched.add(persisted);
     const finished = ended.has(event.runId);
     const approvalKey = JSON.stringify([event.runId, event.stepId ?? null, event.toolCallId]);
     const hasPendingApproval = !resultEvent && pending.has(approvalKey);
     const awaiting = !finished && active && hasPendingApproval;
     const interruptedApproval = !resultEvent && (interruptedApprovals.has(approvalKey) || hasPendingApproval && (finished || !active));
+    const processId = !resultEvent && !finished && active ? processes.get(approvalKey) : undefined;
+    const runningProcess = processId ? { data: { processId, processState: 'running' }, metadata: { family: 'harness' } } : undefined;
     if (persisted && (persisted.status !== 'streaming' || !resultEvent)) {
-      if ((!awaiting && !interruptedApproval) || persisted.status !== 'streaming') return persisted;
+      if ((!awaiting && !interruptedApproval && !runningProcess) || persisted.status !== 'streaming') return persisted;
       const record = toolRecord(persisted);
       return { ...persisted, status: interruptedApproval ? 'interrupted' : persisted.status,
-        content: JSON.stringify({ ...record, request: { ...(record.request ?? {}), decision: awaiting ? 'pending' : undefined } }) };
+        content: JSON.stringify({ ...record, request: { ...(record.request ?? {}), decision: awaiting ? 'pending' : record.request?.decision },
+          result: runningProcess ?? record.result }) };
     }
     const cached = replay.get(event);
-    if (cached && cached.result === resultEvent && cached.ended === finished && cached.awaiting === awaiting && cached.interruptedApproval === interruptedApproval) return cached.message;
-    const call = event.payload as Record<string, any>;
+    if (cached && cached.result === resultEvent && cached.processId === processId && cached.ended === finished && cached.awaiting === awaiting && cached.interruptedApproval === interruptedApproval) return cached.message;
     const result = resultEvent?.payload as Record<string, any> | undefined;
     const message: Message = {
-      id: event.id, conversationId: event.conversationId, role: 'tool', reasoning: '', createdAt: event.createdAt,
+      id: toolOperationId(event.toolCallId ?? event.id, event.runId, event.stepId), conversationId: event.conversationId, role: 'tool', reasoning: '', createdAt: event.createdAt,
       status: result ? 'complete' : finished || interruptedApproval ? 'interrupted' : 'streaming',
-      content: JSON.stringify({ request: { ...call, callId: event.toolCallId, runId: event.runId, name: result?.name ?? call.name, arguments: call.arguments, decision: result?.decision ?? (awaiting ? 'pending' : finished ? undefined : call.decision) }, result: result ? result.result ?? result : {} }),
+      content: JSON.stringify({ request: { ...call, callId: event.toolCallId, runId: event.runId, stepId: event.stepId, name: result?.name ?? call.name, arguments: call.arguments, decision: result?.decision ?? (awaiting ? 'pending' : finished ? undefined : call.decision) }, result: result ? result.result ?? result : runningProcess ?? {} }),
     };
-    replay.set(event, { result: resultEvent, ended: finished, awaiting, interruptedApproval, message });
+    replay.set(event, { result: resultEvent, processId, ended: finished, awaiting, interruptedApproval, message });
     return message;
   });
+  return [...projected, ...messages.filter(message => message.role === 'tool' && !matched.has(message) && !isPlanMessage(message))];
+}
+
+/** Unjournaled settlements retain a place in the same chronological feed. */
+function sequencedTools(events: SessionEvent[], tools: Message[]): Map<number, Message> {
+  const calls = toolCalls(events);
+  const entries = new Map(calls.map((event, index) => [event.seq, tools[index]]));
+  for (const message of tools.slice(calls.length)) {
+    const next = events.find(event => event.createdAt > message.createdAt);
+    let seq = next ? next.seq - 0.5 : (events[events.length - 1]?.seq ?? 0) + 0.5;
+    while (entries.has(seq)) seq += 0.0001;
+    entries.set(seq, message);
+  }
+  const owned = new Map<string, { seq: number; message: Message; frames: Map<number, unknown> }>();
+  for (const [seq, message] of entries) {
+    const record = toolRecord(message), request = record.request ?? {}, result = record.result ?? {}, data = result.data ?? result;
+    if (!['process_start', 'shell_run', 'process_poll', 'process_write', 'process_stop'].includes(request.name)) continue;
+    const id = typeof data.id === 'string' ? data.id : typeof data.processId === 'string' ? data.processId : undefined;
+    if (!id) continue;
+    const key = JSON.stringify([message.conversationId, id]);
+    let prior = owned.get(key);
+    if (!prior) { prior = { seq, message, frames: new Map() }; owned.set(key, prior); }
+    for (const frame of Array.isArray(data.output) ? data.output : []) if (typeof frame.cursor === 'number') prior.frames.set(frame.cursor, frame);
+    if (prior.message === message) continue;
+    const first = toolRecord(prior.message), firstData = first.result?.data ?? first.result ?? {};
+    const mergedData = { ...firstData, ...data, output: [...prior.frames.values()] };
+    const merged = { ...prior.message, status: message.status, content: JSON.stringify({ ...first, result: result.data ? { ...result, data: mergedData } : mergedData }) };
+    entries.set(prior.seq, merged);
+    entries.delete(seq);
+  }
+  return entries;
 }
 function isPlanMessage(message: Message) {
   const value = toolRecord(message); return isPlanStateTool(value.request?.name ?? value.name ?? '');
@@ -141,7 +233,7 @@ function isPlanMessage(message: Message) {
 function needsAttention(message: Message) {
   if (['streaming', 'error', 'interrupted'].includes(message.status)) return true;
   const value = toolRecord(message);
-  return Boolean(value.result?.error || value.result?.isError || ['error', 'failed', 'failure', 'denied', 'interrupted', 'cancelled', 'unknown', 'partial'].includes(value.result?.status) || ['denied', 'pending'].includes(value.request?.decision));
+  return toolFailed(value) || value.request?.decision === 'pending';
 }
 function toolMeta(message: Message): { name: string; args: Record<string, unknown> } {
   const value = toolRecord(message), request = value.request ?? value;
@@ -162,7 +254,7 @@ export function activityLabel(tools: Message[]): string {
 
 /** Only adjacent successful exploration can fold. Consequential work and
  * attention states form hard boundaries, so chronology survives collapsing. */
-function ActivityGroup({ tools, renderTool }: { tools: Message[]; renderTool: (message: Message) => ReactNode; live: boolean }) {
+function ActivityGroup({ tools, renderTool }: { tools: Message[]; renderTool: (message: Message) => ReactNode }) {
   const rows: ReactNode[] = [];
   let exploration: Message[] = [];
   const flush = () => {
@@ -177,7 +269,7 @@ function ActivityGroup({ tools, renderTool }: { tools: Message[]; renderTool: (m
       ? `Read ${fileCount} ${fileCount === 1 ? 'file' : 'files'}`
       : `${activityLabel(group)} · ${group.length} actions`;
     rows.push(<details className="activity-summary" key={group[0].id}>
-      <summary className="card-header"><TraceIcon kind={groupKindOf(kinds)} size={14} /><span className="activity-summary-label">{label}</span><ChevronRight size={14} className="trace-chevron" aria-hidden="true" /><span className="sr-only">{group.length} tools used</span></summary>
+      <summary className="card-header"><TraceIcon kind={groupKindOf(kinds)} size={14} /><span className="activity-summary-label">{label}</span><ChevronRight size={14} className="trace-chevron" aria-hidden="true" /></summary>
       <div className="activity-summary-rows">{group.map(tool => <Fragment key={tool.id}>{renderTool(tool)}</Fragment>)}</div>
     </details>);
   };
@@ -243,7 +335,6 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
   const thinking = live && !hasAnswer;
   const segments = assistant && assistants.length === 1 && assistant.presentation?.format !== 'openui' ? activitySegments(events, assistant.content) : [];
   let remaining = assistant?.content ?? '';
-  const toolEvents = toolCalls(events);
 
   // Only use per-round ordering when the journal is an exact prefix of the
   // persisted/live text. Older or partial journals otherwise risk omitting or
@@ -276,13 +367,13 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
       if (appendLive) pendingThought = '';
       return [thought.seq, { ...thought, text: thought.text + appendLive, index }];
     }));
-    const toolBySeq = new Map(toolEvents.map((event, index) => [event.seq, tools[index]]));
+    const toolBySeq = sequencedTools(events, tools);
     const draftBySeq = new Map(drafts.map(item => [item.seq, item]));
     const orderedSeqs = [...new Set([...commentary.keys(), ...thoughtBySeq.keys(), ...toolBySeq.keys(), ...draftBySeq.keys()])].sort((a, b) => a - b);
     let pendingTools: Message[] = [];
     const flushTools = () => {
       if (!pendingTools.length) return;
-      feed.push(<ActivityGroup key={`tools-${pendingTools[0].id}`} tools={pendingTools} renderTool={renderTool} live={generating} />);
+      feed.push(<ActivityGroup key={`tools-${pendingTools[0].id}`} tools={pendingTools} renderTool={renderTool} />);
       pendingTools = [];
     };
     for (const seq of orderedSeqs) {
@@ -301,18 +392,18 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
     }
     flushTools();
     // Message-only legacy tools have no sequence and remain visible.
-    if (!toolEvents.length && tools.length) feed.push(<ActivityGroup key="legacy-tools" tools={tools} renderTool={renderTool} live={generating} />);
+
     if (pendingThought) feed.push(<ReasoningDisclosure key={`thought-${orderedThoughts.length}`} text={pendingThought} active={generating} />);
   } else {
     if (reasoning) feed.push(<ReasoningDisclosure key="thought-0" text={reasoning} durationMs={reasoningMs} active={thinking} />);
     const commentary = new Map(segments.map(segment => [segment.seq, segment]));
-    const toolBySeq = new Map(toolEvents.map((event, index) => [event.seq, tools[index]]));
+    const toolBySeq = sequencedTools(events, tools);
     const draftBySeq = new Map(drafts.map(item => [item.seq, item]));
     const orderedSeqs = [...new Set([...commentary.keys(), ...toolBySeq.keys(), ...draftBySeq.keys()])].sort((a, b) => a - b);
     let pendingTools: Message[] = [];
     const flushTools = () => {
       if (!pendingTools.length) return;
-      feed.push(<ActivityGroup key={`tools-${pendingTools[0].id}`} tools={pendingTools} renderTool={renderTool} live={generating} />);
+      feed.push(<ActivityGroup key={`tools-${pendingTools[0].id}`} tools={pendingTools} renderTool={renderTool} />);
       pendingTools = [];
     };
     for (const seq of orderedSeqs) {
@@ -328,7 +419,7 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
       }
     }
     flushTools();
-    if (!toolEvents.length && tools.length) feed.push(<ActivityGroup key="legacy-tools" tools={tools} renderTool={renderTool} live={generating} />);
+
   }
   return <div className="activity-feed">
     {feed}

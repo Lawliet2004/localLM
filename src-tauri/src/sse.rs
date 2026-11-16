@@ -69,10 +69,17 @@ pub struct ModelStream {
     claude: bool,
     responses: Option<crate::responses_adapter::Stream>,
     pub done: bool,
-    finish_seen: bool,
-    tool_indices: std::collections::BTreeMap<u64, u64>,
-    tool_has_input: std::collections::HashSet<u64>,
+    finish: Option<String>,
+    saw_tools: bool,
+    saw_refusal: bool,
+    claude_tools: std::collections::BTreeMap<u64, ClaudeToolBlock>,
     native_content: crate::claude_adapter::StreamContent,
+    compatible_reasoning: std::collections::BTreeMap<String, String>,
+}
+
+struct ClaudeToolBlock {
+    index: u64,
+    has_input: bool,
 }
 
 impl ModelStream {
@@ -81,10 +88,12 @@ impl ModelStream {
             claude,
             responses: None,
             done: false,
-            finish_seen: false,
-            tool_indices: Default::default(),
-            tool_has_input: Default::default(),
+            finish: None,
+            saw_tools: false,
+            saw_refusal: false,
+            claude_tools: Default::default(),
             native_content: Default::default(),
+            compatible_reasoning: Default::default(),
         }
     }
 
@@ -102,6 +111,9 @@ impl ModelStream {
             return Err("Model sent data after stream completion.".into());
         }
         if data.trim() == "[DONE]" {
+            if self.claude {
+                return Err("Claude stream ended without message_stop.".into());
+            }
             return self.complete();
         }
         let mut value: Value =
@@ -114,12 +126,19 @@ impl ModelStream {
             let normalized = responses.push(&value)?;
             if responses.completed {
                 self.done = true;
-                self.finish_seen = true;
             }
             normalized
         } else if self.claude {
+            let kind = value["type"].as_str().unwrap_or("");
+            if self.finish.is_some()
+                && matches!(
+                    kind,
+                    "content_block_start" | "content_block_delta" | "content_block_stop"
+                )
+            {
+                return Err("Claude changed content after the finish reason; no tool was executed.".into());
+            }
             self.native_content.observe(&value)?;
-            let kind = value["type"].as_str().unwrap_or("").to_owned();
             if kind == "message_stop" {
                 return self.complete();
             }
@@ -127,17 +146,17 @@ impl ModelStream {
                 let block = value["index"]
                     .as_u64()
                     .ok_or("Claude tool block has no index.")?;
-                if self.tool_indices.len() >= 8 || self.tool_indices.contains_key(&block) {
-                    return Err("Claude returned too many or duplicate tool blocks.".into());
+                if self.claude_tools.len() >= 8 {
+                    return Err("Claude returned too many tool blocks.".into());
                 }
-                let index = self.tool_indices.len() as u64;
-                self.tool_indices.insert(block, index);
+                let index = self.claude_tools.len() as u64;
                 let input = &value["content_block"]["input"];
                 let input_object = input
                     .as_object()
                     .ok_or("Claude tool input must be a JSON object.")?;
-                let arguments = if !input_object.is_empty() {
-                    self.tool_has_input.insert(block);
+                let has_input = !input_object.is_empty();
+                self.claude_tools.insert(block, ClaudeToolBlock { index, has_input });
+                let arguments = if has_input {
                     input.to_string()
                 } else {
                     String::new()
@@ -149,42 +168,84 @@ impl ModelStream {
                 let block = value["index"]
                     .as_u64()
                     .ok_or("Claude content block has no index.")?;
-                if let Some(index) = self.tool_indices.get(&block) {
-                    if self.tool_has_input.insert(block) {
-                        return Ok(Some(
-                            json!({"choices":[{"delta":{"tool_calls":[{"index":index,"function":{"arguments":"{}"}}]}}]}),
-                        ));
-                    }
+                if let Some(tool) = self.claude_tools.get(&block) {
+                    (!tool.has_input).then(|| json!({"choices":[{"delta":{"tool_calls":[
+                            {"index":tool.index,"function":{"arguments":"{}"}}
+                        ]}}]}))
+                } else {
+                    None
                 }
-                None
             } else {
                 if kind == "content_block_delta" && value["delta"]["type"] == "input_json_delta" {
                     let block = value["index"]
                         .as_u64()
                         .ok_or("Claude tool delta has no index.")?;
-                    let index = self
-                        .tool_indices
-                        .get(&block)
+                    let tool = self.claude_tools.get_mut(&block)
                         .ok_or("Claude tool delta arrived before its tool block.")?;
                     let fragment = value["delta"]["partial_json"]
                         .as_str()
                         .ok_or("Claude tool arguments fragment must be a string.")?;
                     if !fragment.is_empty() {
-                        self.tool_has_input.insert(block);
+                        tool.has_input = true;
                     }
-                    value["index"] = json!(index);
+                    value["index"] = json!(tool.index);
                 }
                 crate::claude_adapter::normalize_sse_event(&value.to_string())?
             }
         } else {
+            // We request one choice. Tool indices are local to that choice,
+            // so combining deltas from two choices can fabricate a valid call.
+            if let Some(choices) = value.get("choices") {
+                let choices = choices.as_array().ok_or("Invalid model choices array.")?;
+                if choices.len() > 1
+                    || choices
+                        .first()
+                        .and_then(|choice| choice.get("index"))
+                        .is_some_and(|index| index.as_u64() != Some(0))
+                {
+                    return Err("Expected a single model choice at index zero; no tool was executed.".into());
+                }
+            }
+            if let Some(refusal) = value["choices"][0]["delta"]["refusal"].as_str().filter(|text| !text.is_empty()) {
+                self.saw_refusal = true;
+                let content = value["choices"][0]["delta"]["content"].as_str().unwrap_or("");
+                value["choices"][0]["delta"]["content"] = json!(format!("{content}{refusal}"));
+            }
+            if self.saw_refusal && matches!(value["choices"][0]["finish_reason"].as_str(), Some("stop" | "tool_calls")) {
+                value["choices"][0]["finish_reason"] = json!("refusal");
+            }
+            // Replay only the compatible protocol fields actually supplied by
+            // this endpoint. UI reasoning is never substituted for this data.
+            for key in ["reasoning_content", "reasoning"] {
+                if let Some(chunk) = value["choices"][0]["delta"][key].as_str() {
+                    let received = self.compatible_reasoning.entry(key.into()).or_default();
+                    if received.len().saturating_add(chunk.len()) > 4 * 1024 * 1024 {
+                        return Err("Model reasoning exceeded the replay limit.".into());
+                    }
+                    received.push_str(chunk);
+                }
+            }
             Some(value)
         };
         if let Some(value) = &normalized {
-            if value["choices"][0]["finish_reason"]
-                .as_str()
-                .is_some_and(|reason| !reason.is_empty())
-            {
-                self.finish_seen = true;
+            let choice = &value["choices"][0];
+            let delta = &choice["delta"];
+            let has_tools = delta["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty());
+            let finish = choice["finish_reason"].as_str().filter(|reason| !reason.is_empty());
+            if let Some(previous) = &self.finish {
+                let has_text = ["content", "reasoning_content", "reasoning"].iter()
+                    .any(|key| delta[*key].as_str().is_some_and(|text| !text.is_empty()));
+                if has_tools || has_text || finish.is_some_and(|reason| reason != previous) {
+                    return Err("Model changed its response after the finish reason; no tool was executed.".into());
+                }
+            }
+            self.saw_tools |= has_tools;
+            if let Some(reason) = finish {
+                self.saw_refusal |= reason == "refusal";
+                self.finish = Some(reason.into());
+            }
+            if self.saw_refusal && self.saw_tools {
+                return Err("Model returned a refusal with tool calls; no tool was executed.".into());
             }
         }
         Ok(normalized)
@@ -198,8 +259,16 @@ impl ModelStream {
         {
             return Err("Responses stream ended before its native terminal event; no unfinished tool was executed.".into());
         }
-        if !self.finish_seen {
+        if self.finish.is_none() {
             return Err("Model stream completed without a finish reason; unfinished tools were not executed.".into());
+        }
+        self.native_content.ensure_closed()?;
+        if self.claude && match self.finish.as_deref() {
+            Some("tool_calls") => self.claude_tools.is_empty(),
+            Some("stop") => !self.claude_tools.is_empty(),
+            _ => false,
+        } {
+            return Err("Claude stop reason does not match its tool blocks; no tool was executed.".into());
         }
         self.done = true;
         Ok(None)
@@ -212,6 +281,9 @@ impl ModelStream {
     ) -> serde_json::Value {
         let mut message = serde_json::json!({"role":"assistant","content":text,
             "tool_calls":calls.iter().map(|call| call.model_value()).collect::<Vec<_>>()});
+        for (key, reasoning) in &self.compatible_reasoning {
+            message[key] = serde_json::json!(reasoning);
+        }
         if let Some(content) = self
             .responses
             .as_ref()
@@ -250,8 +322,10 @@ mod tests {
         let events = [
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"café "}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"日本"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
             r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"reason"}}"#,
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"ing"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
             r#"{"type":"message_stop"}"#,
         ];
@@ -423,6 +497,30 @@ mod tests {
     }
 
     #[test]
+    fn compatible_stream_cannot_add_a_call_or_replace_its_finish_reason_after_stop() {
+        for tail in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"late","function":{"name":"clock","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ] {
+            let mut stream = ModelStream::new(false);
+            stream.push(r#"{"choices":[{"delta":{"content":"Finished."},"finish_reason":"stop"}]}"#).unwrap();
+            assert!(stream.push(tail).unwrap_err().contains("after the finish reason"));
+        }
+    }
+
+    #[test]
+    fn a_native_refusal_cannot_authorize_a_sibling_function_call() {
+        let mut stream = ModelStream { responses: Some(Default::default()), ..ModelStream::new(false) };
+        let event = serde_json::json!({"type":"response.completed","response":{
+            "status":"completed","output":[
+                {"type":"message","id":"refusal","role":"assistant","content":[{"type":"refusal","refusal":"I cannot do that."}]},
+                {"type":"function_call","id":"item","call_id":"write","name":"workspace_create_file","arguments":"{}"}
+            ]
+        }});
+        assert!(stream.push(&event.to_string()).unwrap_err().contains("refusal with tool calls"));
+    }
+
+    #[test]
     fn premature_completion_and_orphan_tool_deltas_fail_closed() {
         assert!(ModelStream::new(false).push("[DONE]").is_err());
         assert!(ModelStream::new(true)
@@ -564,5 +662,13 @@ mod responses_tests {
             .get("error")
             .is_some());
         assert!(!stream.done);
+    }
+}
+
+/// Literal fallback calls are absent from the provider's native channel.
+pub fn canonicalize_text_calls(message: &mut serde_json::Value) {
+    if let Some(object) = message.as_object_mut() {
+        object.remove("locallm_responses_output");
+        object.remove("locallm_claude_content");
     }
 }

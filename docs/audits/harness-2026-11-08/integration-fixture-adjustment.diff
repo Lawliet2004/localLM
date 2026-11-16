@@ -1,0 +1,11 @@
+--- original-chat.rs
++++ disposable-chat.rs
+@@ -7874,7 +7874,7 @@
+         let wire = format!("data: {delta}\r\n\r\ndata: [DONE]\r\n\r\n");
+         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+         let server = tokio::spawn(async move {
+-            for body in [wire, text_wire("Finished.", "stop")] {
++            for body in [wire, text_wire("Finished.", "stop"), text_wire("Finished; no relevant source checks were performed.", "stop")] {
+                 let (mut stream, _) = listener.accept().await.unwrap();
+                 let mut bytes = Vec::new();
+                 loop {

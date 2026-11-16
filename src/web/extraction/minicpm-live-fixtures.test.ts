@@ -159,14 +159,17 @@ async function abortThenPong(): Promise<{ aborted: boolean; later: string; first
 
 beforeAll(async () => {
   if (!live) return;
+  if (!scratch) throw new Error('Set LOCALLM_LIVE_SCRATCH to an owned acceptance output directory.');
+  mkdirSync(scratch, { recursive: true });
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (!/127\.0\.0\.1|localhost/i.test(url)) external.push(url);
     return originalFetch(input, init);
   };
   server = spawn(serverBin, [
-    '-m', model, '--jinja', '-c', '2048', '-ngl', '99',
+    '-m', model, '--jinja', '-c', '4096', '-ngl', '99', '--parallel', '1', '--no-agent',
     '--host', '127.0.0.1', '--port', String(port), '--no-webui',
+    ...(process.env.LOCALLM_LIVE_DEVICE ? ['--device', process.env.LOCALLM_LIVE_DEVICE] : []),
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   server.stdout?.on('data', (chunk) => { serverLog += chunk; });
   server.stderr?.on('data', (chunk) => { serverLog += chunk; });
@@ -174,11 +177,18 @@ beforeAll(async () => {
 }, 200000);
 
 afterAll(async () => {
-  server?.kill();
+  if (server && server.exitCode === null && server.signalCode === null) {
+    const child = server;
+    await new Promise<void>((resolve) => {
+      const force = setTimeout(() => child.kill('SIGKILL'), 3000);
+      child.once('exit', () => { clearTimeout(force); resolve(); });
+      child.kill();
+    });
+  }
   globalThis.fetch = originalFetch;
   if (!live || !scratch) return;
   const lines = [
-    'step7 remaining families on managed llama-server + MiniCPM5-2B.Q6_K',
+    'remaining fixture families on a managed local runtime; model and quantization are identified by the actual path below',
     `runtime=${serverBin}`,
     `model=${model}`,
     ...rows.map((row) => `pass=${row.pass} task=${row.task} same=${row.sameAsOtherPass} ${row.detail}`),
@@ -186,6 +196,7 @@ afterAll(async () => {
     external.length ? `external=${external.join(' ')}` : 'external=none',
   ];
   writeFileSync(join(scratch, 'real-model-suite.log'), lines.join('\n') + '\n');
+  writeFileSync(join(scratch, 'runtime.log'), serverLog);
 });
 
 it.skipIf(!live)('runs the remaining fixture families twice on MiniCPM', async () => {

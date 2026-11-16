@@ -113,12 +113,7 @@ async fn owned_resources(
             .map_err(|_| "Cannot verify remote MySQL ownership.")?;
             let role_row = sqlx_core::query::query::<sqlx_mysql::MySql>("SELECT JSON_UNQUOTE(JSON_EXTRACT(ATTRIBUTE,'$.locallmOwner')) AS marker FROM information_schema.USER_ATTRIBUTES WHERE USER=? AND HOST='%'").bind(role).fetch_optional(&mut c).await.map_err(|_| "MySQL 8.0.21+ user ownership metadata is required for cleanup.")?;
             if let Some(row) = &role_row {
-                if row
-                    .try_get::<Option<String>, _>("marker")
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    != Some(marker)
+                if crate::remote_database::mysql_metadata_named(row, "marker").as_str() != Some(marker)
                 {
                     return Err(
                         "Remote MySQL role ownership marker mismatch; resource preserved.".into(),
@@ -215,9 +210,8 @@ async fn cleanup(ctx: &crate::harness::HarnessCtx<'_>, id: &str) -> Result<Value
         ledger["roleMayExist"] = json!(false);
         persist(ctx.state, id, &ledger)?;
     }
-    if database_exists && ledger["databaseCreated"] != false && ledger["databaseMayExist"] != false
-    {
-        return Err("Scratch database cleanup is not confirmed.".into());
+    if owned_resources(ctx.state, &p, &ledger).await? != (false, false) {
+        return Err("Scratch database or role cleanup is not confirmed.".into());
     }
     ledger["databaseCreated"] = json!(false);
     ledger["databaseMayExist"] = json!(false);
@@ -258,6 +252,7 @@ async fn cli(
             cmd.env(k, v);
         }
     }
+    let mysql_login_dir;
     if p.engine == "postgres" {
         cmd.env("PGPASSWORD", &password).env(
             "PGSSLMODE",
@@ -293,8 +288,14 @@ async fn cli(
             cmd.args(["--no-psqlrc", "--set=ON_ERROR_STOP=1"]);
         }
     } else {
-        cmd.env("MYSQL_PWD", &password);
+        mysql_login_dir = tempfile::tempdir().map_err(|_| "Cannot isolate MySQL client options.")?;
+        // --no-defaults skips option files. Older clients still consult a
+        // login path, so point them at an absent file in our private directory.
+        cmd.env("MYSQL_TEST_LOGIN_FILE", mysql_login_dir.path().join("login.cnf"))
+            .env("MYSQL_PWD", &password)
+            .arg("--no-defaults");
         cmd.args([
+            "--protocol=TCP".into(),
             format!("--host={}", p.host),
             format!("--port={}", p.port),
             format!("--user={}", p.username),
@@ -309,6 +310,11 @@ async fn cli(
                 }
             ),
         ]);
+        if p.tls == "disable" {
+            // The profile explicitly opted out of TLS. A fresh caching_sha2
+            // scratch account needs RSA password exchange before it is cached.
+            cmd.arg("--get-server-public-key");
+        }
         if dump {
             cmd.args([
                 "--single-transaction",
@@ -317,7 +323,7 @@ async fn cli(
                 "--no-tablespaces",
                 "--set-gtid-purged=OFF",
             ]);
-            cmd.arg(&p.database);
+            cmd.arg("--").arg(&p.database);
         } else {
             cmd.arg(format!("--database={}", p.database));
         }
@@ -445,9 +451,9 @@ async fn mysql_schema(connection: &mut sqlx_mysql::MySqlConnection) -> Result<Va
     if constraints.len() > 4096 {
         return Err("MySQL schema exceeds 4096 constraints.".into());
     }
-    let constraints = constraints.iter().map(|r| json!({"table":r.try_get::<String,_>("table_name").ok(),"name":r.try_get::<String,_>("constraint_name").ok(),"type":r.try_get::<String,_>("constraint_type").ok(),"enforced":r.try_get::<String,_>("enforced").ok()})).collect::<Vec<_>>();
+    let constraints = constraints.iter().map(|r| json!({"table":crate::remote_database::mysql_metadata_named(r,"table_name"),"name":crate::remote_database::mysql_metadata_named(r,"constraint_name"),"type":crate::remote_database::mysql_metadata_named(r,"constraint_type"),"enforced":crate::remote_database::mysql_metadata_named(r,"enforced")})).collect::<Vec<_>>();
     let enforcement=sqlx_core::query::query::<sqlx_mysql::MySql>("SELECT @@SESSION.foreign_key_checks AS foreign_key_checks,@@SESSION.unique_checks AS unique_checks,@@SESSION.sql_mode AS sql_mode").fetch_one(&mut *connection).await.map_err(|_| "Cannot inspect MySQL session constraint enforcement.")?;
-    let enforcement = json!({"foreignKeyChecks":enforcement.try_get::<u64,_>("foreign_key_checks").ok(),"uniqueChecks":enforcement.try_get::<u64,_>("unique_checks").ok(),"sqlMode":enforcement.try_get::<String,_>("sql_mode").ok()});
+    let enforcement = json!({"foreignKeyChecks":enforcement.try_get::<u64,_>("foreign_key_checks").ok(),"uniqueChecks":enforcement.try_get::<u64,_>("unique_checks").ok(),"sqlMode":crate::remote_database::mysql_metadata_named(&enforcement,"sql_mode")});
     async fn metadata(
         connection: &mut sqlx_mysql::MySqlConnection,
         sql: &str,
@@ -469,12 +475,8 @@ async fn mysql_schema(connection: &mut sqlx_mysql::MySqlConnection) -> Result<Va
                         .enumerate()
                         .map(|(i, c)| {
                             (
-                                c.name().to_string(),
-                                row.try_get::<Option<String>, _>(i)
-                                    .ok()
-                                    .flatten()
-                                    .map(Value::String)
-                                    .unwrap_or(Value::Null),
+                                c.name().to_ascii_lowercase(),
+                                crate::remote_database::mysql_metadata_cell(row, i),
                             )
                         })
                         .collect(),
@@ -487,25 +489,36 @@ async fn mysql_schema(connection: &mut sqlx_mysql::MySqlConnection) -> Result<Va
     let checks=metadata(connection,"SELECT constraint_name,check_clause FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() ORDER BY constraint_name LIMIT 4097").await?;
     let engines=metadata(connection,"SELECT table_name,engine FROM information_schema.tables WHERE table_schema=DATABASE() AND table_type='BASE TABLE' ORDER BY table_name LIMIT 4097").await?;
     let mut integrity = Vec::new();
+    let mut integrity_complete = engines.len() <= 16;
     for table in engines.iter().take(16) {
         let table = table["table_name"]
             .as_str()
-            .or_else(|| table["TABLE_NAME"].as_str())
             .ok_or("MySQL table name metadata unavailable.")?;
         let sql = format!("CHECK TABLE `{}` QUICK", table.replace('`', "``"));
-        let rows = sqlx_core::query::query::<sqlx_mysql::MySql>(&sql)
-            .fetch_all(&mut *connection)
+        // CHECK TABLE is a MySQL text-protocol statement. COM_STMT_PREPARE
+        // rejects it, even for a table the scratch role can read and check.
+        let rows = connection
+            .fetch_all(sql.as_str())
             .await
             .map_err(|_| "Bounded MySQL QUICK integrity check failed.")?;
         if rows.len() > 16 {
             return Err("MySQL QUICK check exceeds result bound.".into());
         }
+        let mut confirmed = false;
         for row in rows {
-            integrity.push(json!({"table":table,"operation":row.try_get::<String,_>(1).ok(),"messageType":row.try_get::<String,_>(2).ok(),"message":row.try_get::<String,_>(3).ok().map(|s|s.chars().take(1000).collect::<String>())}));
+            let operation = crate::remote_database::mysql_metadata_cell(&row, 1);
+            let kind = crate::remote_database::mysql_metadata_cell(&row, 2);
+            let message = crate::remote_database::mysql_metadata_cell(&row, 3);
+            if kind.as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("error")) {
+                return Err("MySQL QUICK integrity check reported an error in the disposable database.".into());
+            }
+            confirmed |= operation == "check" && kind == "status" && message == "OK";
+            integrity.push(json!({"table":table,"operation":operation,"messageType":kind,"message":message.as_str().map(|s|s.chars().take(1000).collect::<String>())}));
         }
+        integrity_complete &= confirmed;
     }
     Ok(
-        json!({"sessionEnforcement":enforcement,"constraints":constraints,"keyColumns":keys,"foreignKeys":foreign_keys,"checks":checks,"tableEngines":engines,"quickIntegrity":integrity,"quickIntegrityCoverageComplete":engines.len()<=16,"integrityScope":"constraint metadata and engine QUICK checks on at most 16 scratch tables; not exhaustive physical corruption scanning or complete row validation","columns":columns.iter().map(|row|{let mut value=serde_json::Map::new();for key in ["table_name","column_name","column_type","is_nullable","column_default"]{value.insert(key.into(),row.try_get::<Option<String>,_>(key).ok().flatten().map(Value::String).unwrap_or(Value::Null));}Value::Object(value)}).collect::<Vec<_>>()}),
+        json!({"sessionEnforcement":enforcement,"constraints":constraints,"keyColumns":keys,"foreignKeys":foreign_keys,"checks":checks,"tableEngines":engines,"quickIntegrity":integrity,"quickIntegrityCoverageComplete":integrity_complete,"integrityScope":"constraint metadata and engine QUICK checks on at most 16 scratch tables; not exhaustive physical corruption scanning or complete row validation","columns":columns.iter().map(|row|{let mut value=serde_json::Map::new();for key in ["table_name","column_name","column_type","is_nullable","column_default"]{value.insert(key.into(),crate::remote_database::mysql_metadata_named(row,key));}Value::Object(value)}).collect::<Vec<_>>()}),
     )
 }
 async fn source_evidence(state: &crate::AppState, source: &Profile) -> Result<Value, String> {

@@ -16,6 +16,8 @@ pub const CONTINUE_INSTRUCTION: &str = "Continue the interrupted response withou
 
 pub const WORKSPACE_GUIDANCE: &str = "When asked to create or update a file, perform the workspace tool calls in this turn. A promise or code pasted in chat does not save a file. Prefer small complete writes followed by patches; read back the result and perform relevant checks before claiming success. Use tool_search for deferred editing tools. If workspace_open_preview is offered, it can open a saved HTML project in a visible browser using Workspace and Local execution; Browser/Computer automation is separate. Do not ask for another go or confirmation when the user already requested the work and tool policy permits it.";
 
+const VERIFICATION_GUIDANCE: &str = "For multi-step work, identify the acceptance checks early, batch independent reads, then make and verify the change. Run each required check separately and collect its terminal result on the current source. An active process, a clipped result, and an uncertain write need different follow-up. Use the returned handle or artifact cursor to inspect the result. Review uncertain writes before attempting them again. When a prerequisite is blocked, finish independent work and report the pending gate and recorded evidence.";
+
 /// Frozen when `local_run_code` is in the tool catalog. Short on purpose: small
 /// local models need a nudge to actually call the tool instead of guessing.
 pub const CODE_EXECUTION_GUIDANCE: &str = "When the question needs exact arithmetic, dates, conversions, parsing, or data work, call local_run_code with Python. Do not compute by hand and do not guess. Write plain Python — no markdown fences. The last expression, last assignment, or printed output is the answer; locallm_result(value) is optional. math, json, datetime, decimal, fractions, statistics, and re are already available.";
@@ -33,7 +35,7 @@ pub const GENUI_GUIDANCE: &str = include_str!("genui_prompt.txt");
 /// Injection kinds that ride on the current user draft. Anything pushed into
 /// `TurnPlan.injections` under a kind absent from this list is logged as a
 /// context_injection but silently never reaches the model.
-pub const VOLATILE_KINDS: [&str; 11] = [
+pub const VOLATILE_KINDS: [&str; 13] = [
     "model_capabilities",
     "project_documents",
     "unavailable_tools",
@@ -45,6 +47,8 @@ pub const VOLATILE_KINDS: [&str; 11] = [
     "system_time",
     "tool_discovery",
     "development_task",
+    "workspace_context",
+    "goal_file",
 ];
 
 /// Called after availability, offline policy and model compatibility filtering.
@@ -60,6 +64,9 @@ pub fn frozen_system_for_project(
     let mut guidance = Vec::new();
     if aliases.contains(&"workspace_create_file") || aliases.contains(&"file_write") {
         guidance.push(WORKSPACE_GUIDANCE);
+    }
+    if aliases.contains(&"verification_run") {
+        guidance.push(VERIFICATION_GUIDANCE);
     }
     if aliases.contains(&"local_run_code") {
         guidance.push(CODE_EXECUTION_GUIDANCE);

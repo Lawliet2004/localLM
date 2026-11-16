@@ -70,10 +70,11 @@ pub fn extract(
     for index in 0..archive.len() {
         check_cancel()?;
         let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
+        let entry_name = entry.name().map_err(|_| "Invalid runtime archive entry name.")?.into_owned();
         let expected = asset
             .files
             .iter()
-            .find(|item| item.name == entry.name())
+            .find(|item| item.name == entry_name)
             .ok_or("Unexpected runtime archive entry.")?;
         if entry.is_dir()
             || entry.is_symlink()
@@ -147,7 +148,7 @@ mod tests {
     }
     #[test]
     fn extraction_checks_hash_manifest_and_existing_files() {
-        for case in ["valid", "hash", "unexpected", "size", "existing", "cancel"] {
+        for case in ["valid", "hash", "unexpected", "size", "existing", "cancel", "invalid_utf8"] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("archive.zip");
             let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
@@ -156,7 +157,17 @@ mod tests {
                 .unwrap();
             writer.write_all(b"fixture").unwrap();
             writer.finish().unwrap();
-            let bytes = std::fs::read(&path).unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            if case == "invalid_utf8" {
+                let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+                for (header, flags, name) in [(0, 6, 30), (central, 8, 46)] {
+                    let offset = header + flags;
+                    let value = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) | 0x800;
+                    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+                    bytes[header + name] = 0xff;
+                }
+                std::fs::write(&path, &bytes).unwrap();
+            }
             let asset = RuntimeAsset {
                 name: "archive.zip".into(),
                 url: "unused".into(),

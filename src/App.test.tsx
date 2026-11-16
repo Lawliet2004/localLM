@@ -120,6 +120,7 @@ describe('recovering active responses', () => {
     mocks.listActiveRuns.mockImplementation(async () => snapshots);
     mocks.messages.mockImplementation(async () => saved);
     render(<App />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Saved chat' }));
     const dialog = await screen.findByRole('dialog', { name: 'Allow Workspace to run this tool?' });
     expect(dialog).toHaveTextContent('Workspace');
     expect(await screen.findByText('Input needed')).toBeInTheDocument();
@@ -127,9 +128,7 @@ describe('recovering active responses', () => {
     expect(mocks.resolveToolApproval).toHaveBeenCalledWith('approval-1', true);
     snapshots = [{ ...snapshots[0], state: 'generating', approvals: [] }];
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Allow Workspace to run this tool?' })).not.toBeInTheDocument(), { timeout: 2500 });
-    await userEvent.click(screen.getByRole('button', { name: 'Saved chat' }));
     expect(await screen.findByText('Partial response')).toBeInTheDocument();
-    expect(screen.getByText(/Reconnected to a running response/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Stop response' }));
     expect(mocks.cancelGeneration).toHaveBeenCalledWith('chat');
     saved = [saved[0], { ...saved[1], content: 'Final saved response', status: 'complete' }];
@@ -550,6 +549,30 @@ it('restores focus to the opener when the settings modal closes', async () => {
 });
 
 
+it('replaces the interrupted draft when a model round retries', async () => {
+  mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, runtime: { phase: 'ready', message: '', modelPath: 'fixture.gguf' }, rememberedTools: { sources: [], tools: [] } });
+  let receive!: (event: ChatEvent) => void;
+  let finish!: () => void;
+  mocks.sendMessage.mockImplementation((_id: string, _content: string, callback: (event: ChatEvent) => void) => {
+    receive = callback;
+    return new Promise<void>(resolve => { finish = resolve; });
+  });
+  await openChat();
+  fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Run checks' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+  await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledOnce());
+  await act(async () => receive({ messageId: 'reply', content: 'Stale draft', reasoning: '' }));
+  expect(await screen.findByText('Stale draft')).toBeInTheDocument();
+  await act(async () => {
+    receive({ messageId: 'reply', content: '', reasoning: '', replaceDraft: true, activity: 'Model connection interrupted · retrying…' });
+    receive({ messageId: 'reply', content: 'Finished checks.', reasoning: '' });
+  });
+  expect(screen.queryByText(/Stale draft/)).not.toBeInTheDocument();
+  expect(screen.getByText('Finished checks.')).toBeInTheDocument();
+  mocks.messages.mockResolvedValue([{ id: 'reply', conversationId: 'chat', role: 'assistant', content: 'Finished checks.', status: 'complete', reasoning: '', createdAt: 1 }]);
+  await act(async () => { finish(); });
+});
+
 it('streams tool-local channels and reconciles completion to persisted history', async () => {
   mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, runtime: { phase: 'ready', message: '', modelPath: 'fixture.gguf' }, rememberedTools: { sources: [], tools: [] } });
   let receive!: (event: ChatEvent) => void;
@@ -753,7 +776,7 @@ describe('independent running conversations', () => {
     await waitFor(() => expect(f.channels.has('one')).toBe(true));
     const call = mocks.sendMessage.mock.calls[mocks.sendMessage.mock.calls.length - 1];
     expect(call[1]).toBe('Saved queued request');
-    expect(call[8]).toBe('pending-one');
+    expect(call[7]).toBe('pending-one');
     await act(async () => f.finish.get('one')!());
     await waitFor(() => expect(screen.queryByRole('region', { name: 'Saved unsent request' })).not.toBeInTheDocument());
   });
@@ -787,7 +810,7 @@ describe('independent running conversations', () => {
     await waitFor(() => expect(f.channels.has('one')).toBe(true));
     const call = mocks.sendMessage.mock.calls[mocks.sendMessage.mock.calls.length - 1];
     expect(call[1]).toBe(content);
-    expect(call[8]).toBe('image-request');
+    expect(call[7]).toBe('image-request');
     await act(async () => f.finish.get('one')!());
   });
 
@@ -860,11 +883,15 @@ describe('independent running conversations', () => {
       await act(async () => f.channels.get('one')!({ messageId: '', content: '', reasoning: '', approval: approval('approve-one') }));
       expect(screen.getByText('Conversation: Draft document')).toBeInTheDocument();
       await act(async () => f.channels.get('two')!({ messageId: '', content: '', reasoning: '', approval: { ...approval('approve-two'), closed: true } }));
+      expect(screen.queryByRole('dialog', { name: 'Allow Workspace to run this tool?' })).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Research notes' }));
       expect(screen.getByText('Conversation: Research notes')).toBeInTheDocument();
       await act(async () => f.channels.get('two')!({ messageId: '', content: '', reasoning: '', approval: approval('approve-two-next') }));
       fireEvent.click(screen.getByRole('button', { name: 'Allow once' }));
       await waitFor(() => expect(mocks.resolveToolApproval).toHaveBeenCalledWith('approve-one', true));
       await act(async () => f.channels.get('one')!({ messageId: '', content: '', reasoning: '', approval: { ...approval('approve-one'), closed: true } }));
+      expect(screen.queryByRole('dialog', { name: 'Allow Workspace to run this tool?' })).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Draft document' }));
       expect(screen.getByText('Conversation: Draft document')).toBeInTheDocument();
       // A delayed close for the previous session cannot dismiss this dialog.
       await act(async () => f.channels.get('one')!({ messageId: '', content: '', reasoning: '', approval: { ...approval('approve-one'), closed: true } }));
@@ -895,4 +922,39 @@ it('serializes workspace navigation and ignores a superseded project selection',
   expect(mocks.setWorkspace).toHaveBeenLastCalledWith('C:/second');
   expect(mocks.messages).not.toHaveBeenCalledWith('one');
   expect(screen.queryByText('Content for one')).not.toBeInTheDocument();
+});
+
+it('keeps reused call ids in distinct rounds and separates their output', async () => {
+  mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, runtime: { phase: 'ready', message: '', modelPath: 'fixture.gguf' }, rememberedTools: { sources: [], tools: [] } });
+  let receive!: (event: ChatEvent) => void;
+  let finish!: () => void;
+  mocks.sendMessage.mockImplementation((_id: string, _content: string, callback: (event: ChatEvent) => void) => {
+    receive = callback;
+    return new Promise<void>(resolve => { finish = resolve; });
+  });
+  await openChat();
+  fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Run two independent commands' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+  await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledOnce());
+  const emit = (stepId: string, toolStream: NonNullable<ChatEvent['toolStream']>) => receive({ runId: 'audit-run', stepId, messageId: '', content: '', reasoning: '', toolStream });
+  await act(async () => {
+    emit('step-0', { type: 'started', toolCallId: 'textcall_0', toolName: 'execute_command', command: 'printf first-command' });
+    emit('step-0', { type: 'outputChunk', toolCallId: 'textcall_0', stream: 'stdout', chunk: 'first-result\n' });
+    emit('step-0', { type: 'finished', toolCallId: 'textcall_0', exitCode: 0, durationMs: 1 });
+  });
+  await act(async () => {
+    emit('step-1', { type: 'started', toolCallId: 'textcall_0', toolName: 'execute_command', command: 'printf second-command' });
+    emit('step-1', { type: 'outputChunk', toolCallId: 'textcall_0', stream: 'stdout', chunk: 'second-result\n' });
+  });
+  const cards = screen.getAllByTestId('command-run-card');
+  expect(cards).toHaveLength(2);
+  expect(cards[0]).toHaveTextContent('printf first-command');
+  expect(cards[1]).toHaveTextContent('printf second-command');
+  if (!cards[0].hasAttribute('open')) fireEvent.click(cards[0].querySelector('summary')!);
+  expect(cards[0]).toHaveTextContent('first-result');
+  expect(cards[0]).not.toHaveTextContent('second-result');
+  expect(cards[1]).toHaveTextContent('second-result');
+  expect(cards[1]).not.toHaveTextContent('first-result');
+  await act(async () => emit('step-1', { type: 'finished', toolCallId: 'textcall_0', exitCode: 0, durationMs: 2 }));
+  await act(async () => finish());
 });

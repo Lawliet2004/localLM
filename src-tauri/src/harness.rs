@@ -64,6 +64,24 @@ impl<'a> HarnessCtx<'a> {
     }
 }
 
+async fn wait_for_choice(
+    ctx: &HarnessCtx<'_>, name: &str, kind: &str, activity: &str, arguments: Value,
+) -> Result<(Option<String>, &'static str), String> {
+    let (id, decision) = ctx.state.ask_user.request_choice()?;
+    let _pending = ctx.state.ask_user.guard(&id);
+    (ctx.emit)(activity.into(), Some(json!({
+        "kind":kind,"id":id,"connector":"Interaction","name":name,"arguments":arguments
+    })));
+    let (answer, status, activity) = match tokio::time::timeout(crate::approval::CHOICE_WAIT, decision).await {
+        Ok(Ok(Some(choice))) if !choice.trim().is_empty() => (Some(choice), "answered", "Decision recorded"),
+        Ok(Ok(_)) => (None, "declined", "Request dismissed"),
+        Ok(Err(_)) => (None, "withdrawn", "Request withdrawn"),
+        Err(_) => (None, "unanswered", "No reply received"),
+    };
+    (ctx.emit)(activity.into(), Some(json!({"id":id,"closed":true})));
+    Ok((answer, status))
+}
+
 fn schema(properties: Value, required: &[&str]) -> Value {
     json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false})
 }
@@ -236,9 +254,9 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
             schema(json!({"scope": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}), &[])),
         ("plan_submit".into(), "Submit a plan for explicit user approval and wait for the decision. Shows the plan text; the user approves or requests changes. Returns {approved, feedback}. Required in plan mode before any file or command mutation; optional elsewhere.".into(),
             schema(json!({"plan":{"type":"string","minLength":1,"maxLength":16000},"summary":{"type":"string","maxLength":200}}), &["plan"])),
-        ("ask_user".into(), "Ask the user a question; they pick one option or type a freeform answer. Never assume the first option.".into(),
+        ("ask_user".into(), "Ask the user only when their answer is necessary. They can pick an option or type a freeform answer. If unanswered, continue independent work and leave the dependent step blocked.".into(),
             schema(json!({"question": str_prop("the question"), "options": {"type": "array", "maxItems": 4, "items": {"type": "string"}}}), &["question"])),
-        ("artifact_read".into(), "Read a page of a truncated tool-output artifact (see _artifactId). If hasMore, continue with the same id at offset + limit. Trusted read.".into(),
+        ("artifact_read".into(), "Read a page of a truncated tool-output artifact (see _artifactId). If hasMore, continue with the same id and nextOffset. Trusted read.".into(),
             schema(json!({"id": str_prop("artifact id (art_...)"),
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 10000}}), &["id"])),
@@ -287,6 +305,7 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
     tools.extend(crate::session_tools::registry());
     tools.extend(crate::findings::registry());
     tools.extend(crate::tasks::registry());
+    tools.extend(crate::task_goal::registry());
     tools.extend(crate::taste::registry());
     attach_output_contracts(tools)
 }
@@ -325,6 +344,7 @@ pub fn is_trusted_read(alias: &str) -> bool {
                 | "file_read"
                 | "preset_guide"
                 | "artifact_read"
+                | "goal_status"
                 | "process_poll"
                 | "check_report"
                 | "update_context"
@@ -452,25 +472,6 @@ async fn open_saved_passage(
 /// Workspace catalog tools shared by the chat loop and the live fixture.
 /// The instruction files that apply to one file but not to the workspace root.
 ///
-/// The workspace chain already covers the root and its ancestors. A file
-/// deeper in the tree can have its own `AGENTS.md`; reading the file is what
-/// surfaces it, the same way OpenCode discovers instructions on demand.
-fn nested_instructions(workspace_path: &str, args: &Value) -> Option<String> {
-    let relative = args.get("path").and_then(Value::as_str)?;
-    if relative.is_empty() {
-        return None;
-    }
-    let root = std::path::Path::new(workspace_path);
-    let target = root.join(relative);
-    let chain = crate::instructions::discover(root, &target);
-    let rendered = chain.render();
-    if rendered.trim().is_empty() {
-        None
-    } else {
-        Some(rendered)
-    }
-}
-
 pub async fn execute_workspace_tool(
     workspace_path: &str,
     config: crate::execution::ExecutionConfig,
@@ -492,15 +493,7 @@ pub async fn execute_workspace_tool(
             })
             .await
             .map_err(|_| "Workspace operation failed unexpectedly.")?;
-            // A file that is read may sit under its own instruction file.
-            // The workspace chain only covers the root, so the directory
-            // rules that apply to THIS file are discovered here and travel
-            // with the read.
-            let mut result = result?;
-            if let Some(chain) = nested_instructions(workspace_path, &args) {
-                result["instructions"] = json!(chain);
-            }
-            Ok(result)
+            result
         }
         "file_write" => {
             let path = arg_str(&args, "path", 1, 4096, "file_write")?;
@@ -530,6 +523,12 @@ pub async fn execute(
     alias: &str,
     args: Value,
 ) -> Result<HarnessOutcome, String> {
+    execute_for_call(ctx, alias, args, None).await
+}
+
+pub(crate) async fn execute_for_call(
+    ctx: &HarnessCtx<'_>, alias: &str, args: Value, call_id: Option<&str>,
+) -> Result<HarnessOutcome, String> {
     // `tool_invoke` is a discovery wrapper: it names the real tool in its
     // arguments. Resolve it to that tool first, so the documented "search
     // then invoke" pairing works from every dispatch path — not only from
@@ -541,7 +540,9 @@ pub async fn execute(
     } else {
         (alias.to_string(), args)
     };
-    let outcome = execute_inner(ctx, &alias, args).await?;
+    // Nested programs and child workflows share this dispatch boundary. Heap
+    // allocation here bounds the state accumulated by each calling future.
+    let outcome = Box::pin(execute_inner(ctx, &alias, args, call_id)).await?;
     enforce_output_contract(&alias, &outcome.value)?;
     Ok(outcome)
 }
@@ -565,6 +566,7 @@ async fn execute_inner(
     ctx: &HarnessCtx<'_>,
     alias: &str,
     args: Value,
+    call_id: Option<&str>,
 ) -> Result<HarnessOutcome, String> {
     if !ctx.preset_offered(alias) {
         return Err(format!(
@@ -721,7 +723,31 @@ async fn execute_inner(
             let config = crate::automation::load(&*ctx.state.database()?)?;
             Ok(HarnessOutcome::value(ctx.state.previews.open(&ctx.conversation_id, &ctx.snapshot.workspace_path, &config, args).await?))
         }
-        "process_start" | "process_poll" | "process_write" | "process_stop" | "shell_run" => {
+        "shell_run" => {
+            let config = ctx.state.database()?.execution_config()?;
+            let result = ctx.state.processes.shell_run_tracked(
+                &ctx.conversation_id, &ctx.snapshot.workspace_path, config, args, Some(&ctx.run_id),
+                |id| {
+                    let store = ctx.state.database()?;
+                    let seq = store.append_session_event(&crate::sessions::SessionEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        conversation_id: ctx.conversation_id.clone(),
+                        run_id: Some(ctx.run_id.clone()),
+                        seq: 0,
+                        step_id: Some(ctx.step_id.clone()),
+                        tool_call_id: call_id.map(str::to_owned),
+                        event_type: "process_started".into(),
+                        payload: json!({"processId": id}),
+                        ignorable: false,
+                        created_at: crate::store::now(),
+                    })?;
+                    crate::sessions::notify_activity(&ctx.conversation_id, seq);
+                    Ok(())
+                },
+            ).await?;
+            Ok(HarnessOutcome::value(result))
+        }
+        "process_start" | "process_poll" | "process_write" | "process_stop" => {
             let config = ctx.state.database()?.execution_config()?;
             Ok(HarnessOutcome::value(ctx.state.processes.execute(&ctx.conversation_id, &ctx.snapshot.workspace_path, config, alias, args).await?))
         }
@@ -890,6 +916,7 @@ async fn execute_inner(
             }
             Ok(HarnessOutcome::value(crate::artifacts::read_window(&record, offset, limit.min(20000))))
         }
+        "goal_status" | "goal_update" => Ok(HarnessOutcome::value(crate::task_goal::execute(ctx, alias, &args)?)),
         "goal_set" => {
             let objective = arg_str(&args, "objective", 1, 4000, "goal_set")?;
             let store = ctx.state.database()?;
@@ -1059,24 +1086,13 @@ async fn execute_inner(
                     return Err("Each ask_user option must be 1-200 characters.".into());
                 }
             }
-            let (approval_id, decision) = ctx.state.ask_user.request_choice()?;
-            (ctx.emit)(
-                "Awaiting answer".into(),
-                Some(json!({"kind": "ask_user", "id": approval_id, "connector": "Interaction", "name": "ask_user",
-                    "arguments": {"question": question, "options": options}})),
-            );
-            let answer = tokio::time::timeout(std::time::Duration::from_secs(600), decision)
-                .await
-                .map_err(|_| "The question timed out unanswered.".to_string())?
-                .map_err(|_| "The question was withdrawn.".to_string())?;
-            ctx.state.ask_user.remove(&approval_id);
-            (ctx.emit)("Answer recorded".into(), Some(Value::Null));
-            match answer {
-                Some(choice) if !choice.trim().is_empty() => {
-                    Ok(HarnessOutcome::value(json!({"answer": choice})))
-                }
-                _ => Ok(HarnessOutcome::value(json!({"answer": "declined"}))),
+            let (answer, status) = wait_for_choice(ctx, "ask_user", "ask_user", "Awaiting answer",
+                json!({"question":question,"options":options})).await?;
+            let mut value = json!({"answer":answer,"responseStatus":status});
+            if answer.is_none() {
+                value["message"] = json!("No answer was provided. Continue work that can proceed independently and report any step that needs this answer.");
             }
+            Ok(HarnessOutcome::value(value))
         }
         "plan_submit" => {
             let plan = arg_str(&args, "plan", 1, 16000, "plan_submit")?;
@@ -1084,29 +1100,11 @@ async fn execute_inner(
             if summary.len() > 200 {
                 return Err("plan_submit summary must be at most 200 characters.".into());
             }
-            // Same pause/resolve channel as ask_user; the dialog carries a
-            // distinct kind so the UI renders the plan, not a question form.
-            let (approval_id, decision) = ctx.state.ask_user.request_choice()?;
-            (ctx.emit)(
-                "Awaiting plan approval".into(),
-                Some(json!({"kind": "plan_approval", "id": approval_id, "connector": "Interaction", "name": "plan_submit",
-                    "arguments": {"plan": plan, "summary": summary}})),
-            );
-            let answer = tokio::time::timeout(std::time::Duration::from_secs(600), decision)
-                .await
-                .map_err(|_| "The plan approval timed out unanswered.".to_string())?
-                .map_err(|_| "The plan approval was withdrawn.".to_string())?;
-            ctx.state.ask_user.remove(&approval_id);
-            (ctx.emit)("Plan decision recorded".into(), Some(Value::Null));
-            match answer {
-                Some(choice) if choice == "approved" => {
-                    Ok(HarnessOutcome::value(json!({"approved": true, "feedback": null})))
-                }
-                Some(choice) if !choice.trim().is_empty() => {
-                    Ok(HarnessOutcome::value(json!({"approved": false, "feedback": choice})))
-                }
-                _ => Ok(HarnessOutcome::value(json!({"approved": false, "feedback": null}))),
-            }
+            let (answer, status) = wait_for_choice(ctx, "plan_submit", "plan_approval", "Awaiting plan approval",
+                json!({"plan":plan,"summary":summary})).await?;
+            let approved = answer.as_deref() == Some("approved");
+            let feedback = answer.filter(|_| !approved);
+            Ok(HarnessOutcome::value(json!({"approved":approved,"feedback":feedback,"responseStatus":status})))
         }
         "ptc_run" => execute_ptc(ctx, args).await,
         "docker_exec" => {
@@ -1441,6 +1439,7 @@ async fn execute_ptc(ctx: &HarnessCtx<'_>, args: Value) -> Result<HarnessOutcome
         }
     }
     let mut results = Vec::new();
+    let mut may_mutate = false;
     for (index, step) in steps.iter().enumerate() {
         let tool_name = step
             .get("tool")
@@ -1517,6 +1516,7 @@ async fn execute_ptc(ctx: &HarnessCtx<'_>, args: Value) -> Result<HarnessOutcome
         } else { false };
         let mut hook_blocked = false;
         let allow = if allow {
+            may_mutate |= crate::verification_progress::step_may_mutate(ctx, tool);
             let verdict = crate::hooks::pre_use(ctx.state, &ctx.conversation_id, &ctx.snapshot.workspace_path, &tool.alias, &tool_args).await;
             for notice in verdict.notices { (ctx.emit)(notice, None); }
             if let Some(reason) = verdict.blocked {
@@ -1606,7 +1606,7 @@ async fn execute_ptc(ctx: &HarnessCtx<'_>, args: Value) -> Result<HarnessOutcome
         results.push(json!({"tool": tool_name, "status": if failed { "error" } else { "ok" }, "result": bounded,
             "callId": call_id}));
     }
-    Ok(HarnessOutcome::value(json!({"results": results}))
+    Ok(HarnessOutcome::value(json!({"results": results, "workspaceEffects":if may_mutate {"possible"} else {"none"}}))
         .event("ptc", json!({"steps": results.len()})))
 }
 

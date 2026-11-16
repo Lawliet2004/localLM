@@ -459,6 +459,16 @@ impl AgentTool {
             ToolBackend::Workspace(_) => crate::tool_envelope::Family::Workspace,
         }
     }
+    /// Bookkeeping follows the typed dispatch backend, not an advertised or
+    /// hashed connector alias. Cloud/local executable code is equally opaque.
+    pub fn verification_name(&self) -> String {
+        match &self.backend {
+            ToolBackend::Workspace(_) => format!("workspace_{}", self.tool.name),
+            ToolBackend::Execution(_) | ToolBackend::Daytona(_) => format!("local_{}", self.tool.name),
+            ToolBackend::Harness { name } => name.clone(),
+            _ => self.alias.clone(),
+        }
+    }
     pub fn trusted_read(&self) -> bool {
         matches!(&self.backend, ToolBackend::System)
             || matches!(&self.backend, ToolBackend::Harness { name } if crate::harness::is_trusted_read(name))
@@ -504,6 +514,9 @@ impl AgentTool {
             arguments
         };
         crate::tool_spec::check_argument_bytes(&self.alias, arguments.to_string().len())?;
+        let mut arguments = arguments;
+        crate::process_tools::align_arguments(&self.alias, &mut arguments);
+        crate::process_tools::align_arguments(&self.tool.name, &mut arguments);
         crate::tool_validation::validate(&self.tool.input_schema, &arguments)?;
         if let ToolBackend::Execution(execution) = &self.backend {
             return execution.prepare_arguments(&self.tool.name, arguments);
@@ -542,7 +555,9 @@ impl AgentTool {
     /// `None`: the call still serializes on the session gate, but any server
     /// question fails explicitly instead of hanging.
     pub(crate) fn call_deadline(&self, execution: Duration, interactive: bool) -> Duration {
-        if interactive && (self.is_mcp() || self.harness_name() == Some("ptc_run")) {
+        if interactive && matches!(self.harness_name(), Some("ask_user" | "plan_submit")) {
+            execution + crate::approval::CHOICE_WAIT
+        } else if interactive && (self.is_mcp() || self.harness_name() == Some("ptc_run")) {
             execution + crate::mcp_input::FORM_WAIT
         } else {
             execution

@@ -99,17 +99,20 @@ fn endpoint_fingerprint(format: &str, base: &str, model_id: &str) -> String {
     )
 }
 
-/// River documents required reasoning and these effort values for these two
-/// models: https://docs.river.ai/guides/inference-controls/. Match the exact
-/// hosted endpoint rather than guessing from a model name at another provider.
+/// Apply River's documented reasoning controls to the exact hosted endpoint.
+/// https://docs.river.ai/guides/inference-controls/
 pub fn documented_river_reasoning(base: &str, model: &str, mode: &str) -> Option<&'static str> {
-    if !matches!(model, "zai-org/GLM-5.3-Flash" | "GLM-5.3") { return None; }
+    let efforts = match model {
+        "zai-org/GLM-5.3-Flash" | "GLM-5.3" => ["low", "high", "max"],
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017" | "deepseek-ai/DeepSeek-V4.1-Flash" => ["low", "none", "high"],
+        _ => return None,
+    };
     let url = reqwest::Url::parse(base).ok()?;
     if url.scheme() != "https" || url.host_str() != Some("api.river.ai")
         || url.port_or_known_default() != Some(443) || !url.username().is_empty()
         || url.password().is_some() || url.query().is_some() || url.fragment().is_some()
         || !matches!(url.path().trim_end_matches('/'), "" | "/v1") { return None; }
-    match mode { "quick" => Some("low"), "auto" => Some("high"), "think" => Some("max"), _ => None }
+    match mode { "quick" => Some(efforts[0]), "auto" => Some(efforts[1]), "think" => Some(efforts[2]), _ => None }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1042,6 +1045,14 @@ mod tests {
                         *base_url = base;
                     }
                     let request = child_request(&conversation, schema());
+                    let child_id = if background { "child-background" } else { "child-foreground" };
+                    let now = crate::store::now();
+                    state.database().unwrap().save_run(&crate::agent_run::RunRecord {
+                        id: child_id.into(), conversation_id: conversation.clone(),
+                        status: crate::agent_run::RunState::Generating, model_provider: None,
+                        model_id: None, checkpoint: Some("subagent".into()), error: None,
+                        created_at: now, updated_at: now,
+                    }).unwrap();
                     let result = if background {
                         let store = Arc::new(Mutex::new(
                             crate::store::Store::open(&state.db_path).unwrap(),

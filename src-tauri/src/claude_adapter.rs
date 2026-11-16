@@ -24,8 +24,13 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// from the text shown in the UI.
 #[derive(Default)]
 pub struct StreamContent {
-    blocks: std::collections::BTreeMap<u64, Value>,
+    blocks: std::collections::BTreeMap<u64, StreamBlock>,
     bytes: usize,
+}
+
+struct StreamBlock {
+    content: Value,
+    closed: bool,
 }
 
 impl StreamContent {
@@ -49,20 +54,38 @@ impl StreamContent {
                 if self.bytes > 4_194_304 {
                     return Err("Claude content exceeded 4 MiB.".into());
                 }
-                self.blocks.insert(index, block.clone());
+                self.blocks.insert(
+                    index,
+                    StreamBlock {
+                        content: block.clone(),
+                        closed: false,
+                    },
+                );
+                return Ok(());
+            }
+            Some("content_block_stop") => {
+                let index = event["index"]
+                    .as_u64()
+                    .ok_or("Claude content block has no index.")?;
+                if let Some(block) = self.blocks.get_mut(&index) {
+                    if std::mem::replace(&mut block.closed, true) {
+                        return Err("Claude content block stopped twice.".into());
+                    }
+                }
                 return Ok(());
             }
             Some("content_block_delta") => match event["delta"]["type"].as_str() {
                 Some("text_delta") => ("text", &event["delta"]["text"]),
                 Some("thinking_delta") => ("thinking", &event["delta"]["thinking"]),
                 Some("signature_delta") => ("signature", &event["delta"]["signature"]),
+                Some("input_json_delta") => {
+                    self.open_block(event)?;
+                    return Ok(());
+                }
                 _ => return Ok(()),
             },
             _ => return Ok(()),
         };
-        let index = event["index"]
-            .as_u64()
-            .ok_or("Claude content delta has no index.")?;
         let fragment = fragment
             .as_str()
             .ok_or("Claude content fragment must be a string.")?;
@@ -70,10 +93,7 @@ impl StreamContent {
         if self.bytes > 4_194_304 {
             return Err("Claude content exceeded 4 MiB.".into());
         }
-        let block = self
-            .blocks
-            .get_mut(&index)
-            .ok_or("Claude content delta arrived before its block.")?;
+        let block = self.open_block(event)?;
         let Some(Value::String(text)) = block.get_mut(field) else {
             return Err("Claude content delta does not match its block.".into());
         };
@@ -81,16 +101,41 @@ impl StreamContent {
         Ok(())
     }
 
+    fn open_block(&mut self, event: &Value) -> Result<&mut Value, String> {
+        let index = event["index"]
+            .as_u64()
+            .ok_or("Claude content delta has no index.")?;
+        let block = self.blocks
+            .get_mut(&index)
+            .ok_or("Claude content delta arrived before its block.")?;
+        if block.closed {
+            return Err("Claude content delta arrived after its block stopped.".into());
+        }
+        Ok(&mut block.content)
+    }
+
+    pub fn ensure_closed(&self) -> Result<(), String> {
+        if let Some(block) = self.blocks.values().find(|block| !block.closed) {
+            let kind = if block.content["type"] == "tool_use" {
+                "tool"
+            } else {
+                "content"
+            };
+            return Err(format!("Claude completed before closing a {kind} block; no tool was executed."));
+        }
+        Ok(())
+    }
+
     pub fn replay(&self, calls: &[crate::tool_calls::ToolCall]) -> Option<Value> {
         if !self.blocks.values().any(|block| {
             matches!(
-                block["type"].as_str(),
+                block.content["type"].as_str(),
                 Some("thinking" | "redacted_thinking")
             )
         }) {
             return None;
         }
-        let mut blocks: Vec<Value> = self.blocks.values().cloned().collect();
+        let mut blocks: Vec<Value> = self.blocks.values().map(|block| block.content.clone()).collect();
         for call in calls {
             if let Some(block) = blocks
                 .iter_mut()

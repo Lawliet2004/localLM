@@ -22,6 +22,8 @@ pub fn reserve_native_read_round(
 pub fn saved_native_message(message: &Value) -> Option<Value> {
     if message.get("locallm_responses_output").is_some()
         || message.get("locallm_claude_content").is_some()
+        || message.get("reasoning_content").is_some()
+        || message.get("reasoning").is_some()
     {
         Some(json!({"kind":NATIVE_MESSAGE,"message":message}))
     } else {
@@ -117,7 +119,7 @@ pub fn model_history_with_contents(
             .filter(|message| message.created_at <= cutoff)
             .count();
         if dropped > 0 {
-            messages.push(json!({"role": "user", "content": format!(
+            messages.push(json!({"role": "user", "_continuation": true, "content": format!(
                 "Context checkpoint: the first {dropped} messages were compacted into artifact {artifact_id} to fit context. \
                  Audits and full history remain in the local database; ask before expanding anything back.")}));
         }
@@ -203,14 +205,25 @@ fn parse_pending(message: &Message) -> Result<PendingCall, String> {
         .unwrap_or("")
         .to_string();
     let alias = crate::connectors::tool_alias(connector, name);
+    let uncertain = |code, text, extra| {
+        let mut value = crate::tool_envelope::failure_notice(
+            code, text, false, crate::tool_envelope::SIDE_UNKNOWN, &extra,
+        );
+        value["status"] = json!(crate::tool_envelope::Status::Unknown.as_str());
+        value
+    };
     let result = if message.status == "interrupted" || message.status == "streaming" {
-        json!({"isError":true,"outcome":"unknown","message":"This previous tool action was interrupted. It may already have changed data. Do not automatically repeat it.","recordedResult":audit.get("result")})
+        uncertain("interrupted-tool", "This previous tool action was interrupted. It may already have changed data. Do not automatically repeat it.",
+            json!({"outcome":"unknown","recordedResult":audit.get("result")}))
     } else if let Some(result) = audit.get("result") {
         result.clone()
     } else if request["decision"] == "denied" {
-        json!({"isError":true,"message":"The user denied this previous tool request. Do not repeat it without a new instruction."})
+        crate::tool_envelope::failure_notice("denied",
+            "The user denied this previous tool request. Do not repeat it without a new instruction.",
+            false, crate::tool_envelope::SIDE_NONE, &json!({"denied":true}))
     } else {
-        json!({"isError":true,"outcome":"unknown","message":"No result was saved for this previous action. Do not automatically repeat it."})
+        uncertain("missing-tool-result", "No result was saved for this previous action. Do not automatically repeat it.",
+            json!({"outcome":"unknown"}))
     };
     Ok(PendingCall {
         call_id,

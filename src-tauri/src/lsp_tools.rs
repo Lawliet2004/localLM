@@ -1278,6 +1278,43 @@ mod tests {
         f.close().await;
     }
     #[tokio::test]
+    async fn transient_content_modified_retries_only_unchanged_read_queries() {
+        for (mode, expected_requests, succeeds) in [
+            ("content_modified", 2, true),
+            ("always_modified", 3, false),
+            ("source_changed", 1, false),
+        ] {
+            let f = Fixture::new(mode);
+            let result = f.call("lsp_references", json!({"server":"fixture","path":"main.rs","line":0,"character":3})).await;
+            assert_eq!(result.is_ok(), succeeds, "{mode}: {result:?}");
+            assert_eq!(f.events().iter().filter(|e| e["method"] == "textDocument/references").count(), expected_requests, "{mode}");
+            if mode == "source_changed" {
+                assert_eq!(std::fs::read_to_string(f.dir.path().join("main.rs")).unwrap(), "user changed this\n");
+            }
+            f.close().await;
+        }
+        let mut f = Fixture::new("command_modified");
+        f.config.servers[0].allowed_commands = vec!["fixture.refactor".into()];
+        f.state.database().unwrap().save_setting(crate::lsp_client::KEY, &f.config).unwrap();
+        let mut args = f.args();
+        args["command"] = json!("fixture.refactor");
+        args["expected_sha256"] = json!(hash(&std::fs::read(f.dir.path().join("main.rs")).unwrap()));
+        assert!(f.call("lsp_execute_command", args).await.is_err());
+        assert_eq!(f.events().iter().filter(|e| e["method"] == "workspace/executeCommand").count(), 1);
+        f.close().await;
+    }
+    #[tokio::test]
+    async fn rust_analyzer_readiness_uses_quiescence_even_with_warning_health() {
+        let f = Fixture::new("indexing");
+        assert_eq!(f.call("lsp_symbols", f.args()).await.unwrap()["items"][0]["name"], "old_name");
+        let events = f.events();
+        assert_eq!(events.iter().find(|e| e["method"] == "readiness_capability").unwrap()["enabled"], true);
+        let ready = events.iter().position(|e| e["method"] == "index_ready").unwrap();
+        let query = events.iter().position(|e| e["method"] == "textDocument/documentSymbol").unwrap();
+        assert!(ready < query);
+        f.close().await;
+    }
+    #[tokio::test]
     async fn resource_deletion_is_only_applied_after_review() {
         let f = Fixture::new("resource");
         let proposal = f.call("lsp_prepare_rename", f.rename_args()).await.unwrap();

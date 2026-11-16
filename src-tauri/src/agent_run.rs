@@ -647,12 +647,11 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(again["content"].as_str().unwrap().matches(&text).count(), 1);
-        let staged = crate::chat::stage_paused_resume(&store, &task.conversation_id).unwrap();
+        let staged = crate::chat::prepare_task_resume(&store, &task.conversation_id, Some(&task.id)).unwrap();
         let mut messages = vec![
             serde_json::json!({"role":"user","content":"Continue from the paused checkpoint."}),
         ];
-        let applied =
-            crate::chat::take_staged_checkpoint(&store, &task.conversation_id, &mut messages);
+        let applied = crate::chat::append_checkpoint(&mut messages, &staged.checkpoint);
         let continued = messages[0]["content"].as_str().unwrap().to_string();
         let resume_from_checkpoint = applied
             && staged.completed.iter().any(|id| id == "op-calc")
@@ -663,11 +662,13 @@ mod tests {
             && !staged.completed.iter().any(|id| id == "op-not-run")
             && continued.contains("Do not repeat them.");
         assert!(resume_from_checkpoint, "resume note was {continued}");
-        assert!(!crate::chat::take_staged_checkpoint(
-            &store,
-            &task.conversation_id,
-            &mut messages
-        ));
+        let mut retried = vec![serde_json::json!({"role":"user","content":[
+            {"type":"text","text":"Continue. Paused checkpoint. This is quoted text."},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
+        ]})];
+        assert!(crate::chat::append_checkpoint(&mut retried, &staged.checkpoint));
+        assert_eq!(retried[0]["content"][1]["type"], "image_url");
+        assert_eq!(retried[0]["content"][2]["text"], staged.checkpoint);
         let report = recovered;
         let request =
             "Compare the two sources. You must keep the tariff. Do not repeat a completed write.";

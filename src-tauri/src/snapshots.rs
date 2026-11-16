@@ -1,8 +1,8 @@
 //! Workspace snapshots: capture the files an agent changed, and restore them.
 //!
 //! A snapshot is the localLM answer to "the agent broke my file". The agent
-//! loop captures the workspace files it is about to touch before a model step
-//! and again when the step completes; `/undo` stages a rollback of the latest
+//! loop captures the workspace files it is about to touch before dispatch;
+//! `/undo` stages a rollback of the latest
 //! snapshot, committing it restores the captured bytes, and discarding it
 //! leaves the workspace exactly as it was.
 //!
@@ -16,8 +16,8 @@
 use cap_fs_ext::{DirExt, MetadataExt};
 use cap_std::fs::{Dir, File, OpenOptions, Permissions};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -30,6 +30,56 @@ pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_FILES: usize = 512;
 /// Largest number of paths a single capture request may name.
 const MAX_REQUESTED_PATHS: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePin {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl WorkspacePin {
+    pub(crate) fn open(path: &Path) -> Result<(Self, Dir), String> {
+        let path = std::fs::canonicalize(path).map_err(|error| format!("Cannot open the workspace: {error}"))?;
+        let directory = Dir::open_ambient_dir(&path, cap_std::ambient_authority())
+            .map_err(|error| format!("Cannot open the workspace: {error}"))?;
+        let metadata = directory.dir_metadata().map_err(|error| error.to_string())?;
+        Ok((Self { path, device: metadata.dev(), inode: metadata.ino() }, directory))
+    }
+
+    pub(crate) fn verify(&self, root: &Path) -> Result<Dir, String> {
+        let (current, dir) = Self::open(root)?;
+        if current != *self {
+            return Err("The workspace changed since this state was recorded.".into());
+        }
+        Ok(dir)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TargetVersion {
+    device: u64,
+    inode: u64,
+    sha256: String,
+}
+
+impl TargetVersion {
+    fn read(file: &File) -> Result<Self, String> {
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        let sha256 = current_digest(file)?;
+        if sha256.is_empty() {
+            return Err("The current file is too large to review for undo.".into());
+        }
+        Ok(Self { device: metadata.dev(), inode: metadata.ino(), sha256 })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum ReviewedTarget {
+    Unavailable,
+    Absent,
+    Present(TargetVersion),
+}
 
 /// One captured file.
 #[derive(Clone, Debug, Serialize)]
@@ -64,6 +114,8 @@ pub struct Snapshot {
     /// snapshot store refuses. Only a fresh capture reports these; a snapshot
     /// read back from the store has an empty list.
     pub skipped: Vec<String>,
+    #[serde(skip)]
+    workspace: Option<WorkspacePin>,
 }
 
 /// A staged revert: the files that would be restored, and their content.
@@ -80,6 +132,8 @@ pub struct StagedRevert {
     pub paths: Vec<String>,
     /// When it was staged.
     pub created_at: i64,
+    #[serde(skip)]
+    targets: Option<Vec<ReviewedTarget>>,
 }
 
 /// What a committed revert did.
@@ -357,6 +411,25 @@ pub fn tracked_paths(store: &crate::store::Store, conversation_id: &str) -> Vec<
     paths
 }
 
+/// Snapshot immediately before a mutation or executable hook. Known paths
+/// take precedence so a first edit is covered without a prior tool audit.
+pub(crate) fn capture_before_tool(
+    state: &crate::AppState, conversation_id: &str, round: usize, root: &str, args: Option<&Value>,
+) {
+    if root.is_empty() { return; }
+    let Ok(store) = state.database() else { return; };
+    let mut paths = Vec::new();
+    if let Some(args) = args {
+        collect_paths(&json!({"request":{"arguments":args}}), &mut paths, &mut Default::default());
+    }
+    if paths.is_empty() {
+        paths = tracked_paths(&store, conversation_id);
+    }
+    if !paths.is_empty() {
+        let _ = capture(&store, conversation_id, round as i64, Path::new(root), &paths);
+    }
+}
+
 /// Pull workspace-relative paths out of one tool audit row.
 fn collect_paths(audit: &Value, paths: &mut Vec<String>, seen: &mut std::collections::BTreeSet<String>) {
     let Some(arguments) = audit
@@ -391,6 +464,12 @@ fn collect_paths(audit: &Value, paths: &mut Vec<String>, seen: &mut std::collect
     if let Some(destination) = arguments.get("destination").and_then(Value::as_str) {
         push(destination);
     }
+    if let Some(source) = arguments.get("source").and_then(Value::as_str) {
+        push(source);
+    }
+    if let Some(items) = arguments.get("paths").and_then(Value::as_array) {
+        for path in items.iter().filter_map(Value::as_str) { push(path); }
+    }
 }
 
 /// Capture the given workspace-relative files into a snapshot.
@@ -416,8 +495,7 @@ pub fn capture(
     if !store.conversation_exists(conversation_id)? {
         return Err("That conversation no longer exists.".into());
     }
-    let directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
-        .map_err(|error| format!("Cannot open the workspace: {error}"))?;
+    let (workspace, directory) = WorkspacePin::open(root)?;
     let mut wanted: Vec<String> = Vec::new();
     for path in paths {
         let path = path.trim();
@@ -447,6 +525,7 @@ pub fn capture(
         files,
         created_at: now_seconds(),
         skipped,
+        workspace: Some(workspace),
     };
     persist(store, &snapshot)?;
     Ok(snapshot)
@@ -532,15 +611,18 @@ fn absent_file(path: &str) -> SnapshotFile {
 }
 
 fn persist(store: &crate::store::Store, snapshot: &Snapshot) -> Result<(), String> {
+    let workspace = snapshot.workspace.as_ref().map(serde_json::to_string)
+        .transpose().map_err(|error| error.to_string())?;
     with_transaction(store, |connection| {
         connection
             .execute(
-                "INSERT INTO snapshots(id,conversation_id,step,created_at) VALUES(?1,?2,?3,?4)",
+                "INSERT INTO snapshots(id,conversation_id,step,created_at,workspace_json) VALUES(?1,?2,?3,?4,?5)",
                 params![
                     snapshot.id,
                     snapshot.conversation_id,
                     snapshot.step,
-                    snapshot.created_at
+                    snapshot.created_at,
+                    workspace,
                 ],
             )
             .map_err(db_error)?;
@@ -590,7 +672,7 @@ fn load_snapshot(
     let row = store
         .connection
         .query_row(
-            "SELECT id,conversation_id,step,created_at FROM snapshots WHERE id=?1",
+            "SELECT id,conversation_id,step,created_at,workspace_json FROM snapshots WHERE id=?1",
             [id],
             |row| {
                 Ok((
@@ -598,12 +680,13 @@ fn load_snapshot(
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(db_error)?;
-    let Some((id, conversation_id, step, created_at)) = row else {
+    let Some((id, conversation_id, step, created_at, workspace)) = row else {
         return Ok(None);
     };
     let files = load_files(store, &id)?;
@@ -614,6 +697,8 @@ fn load_snapshot(
         files,
         created_at,
         skipped: Vec::new(),
+        workspace: workspace.as_deref().map(serde_json::from_str).transpose()
+            .map_err(|error| format!("Invalid snapshot workspace: {error}"))?,
     }))
 }
 
@@ -634,6 +719,19 @@ pub fn stage(
     if snapshot.conversation_id != conversation_id {
         return Err("That snapshot belongs to another conversation.".into());
     }
+    let workspace = snapshot.workspace.as_ref()
+        .ok_or("This older snapshot has no verified workspace identity and cannot be restored safely.")?;
+    let lock = crate::workspace::patch::root_lock(&workspace.path)?;
+    let _guard = lock.read().map_err(|_| "Workspace transaction lock unavailable.")?;
+    let directory = workspace.verify(&workspace.path)?;
+    let targets: Vec<ReviewedTarget> = snapshot.files.iter()
+        .map(|file| match review_target(&directory, &file.path) {
+            Ok(Some(version)) => ReviewedTarget::Present(version),
+            Ok(None) => ReviewedTarget::Absent,
+            Err(_) => ReviewedTarget::Unavailable,
+        })
+        .collect();
+    let target_json = serde_json::to_string(&targets).map_err(|error| error.to_string())?;
     let id = new_id("stg");
     let created_at = now_seconds();
     with_transaction(store, |connection| {
@@ -647,8 +745,8 @@ pub fn stage(
             .map_err(db_error)?;
         connection
             .execute(
-                "INSERT INTO staged_reverts(id,conversation_id,snapshot_id,created_at) VALUES(?1,?2,?3,?4)",
-                params![id, conversation_id, snapshot_id, created_at],
+                "INSERT INTO staged_reverts(id,conversation_id,snapshot_id,created_at,targets_json) VALUES(?1,?2,?3,?4,?5)",
+                params![id, conversation_id, snapshot_id, created_at, target_json],
             )
             .map_err(db_error)?;
         Ok(())
@@ -663,6 +761,7 @@ pub fn stage(
             .map(|file| file.path.clone())
             .collect(),
         created_at,
+        targets: Some(targets),
     })
 }
 
@@ -674,7 +773,7 @@ pub fn staged_revert(
     let row = store
         .connection
         .query_row(
-            "SELECT id,conversation_id,snapshot_id,created_at FROM staged_reverts WHERE id=?1",
+            "SELECT id,conversation_id,snapshot_id,created_at,targets_json FROM staged_reverts WHERE id=?1",
             [staged_id],
             |row| {
                 Ok((
@@ -682,12 +781,13 @@ pub fn staged_revert(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(db_error)?;
-    let Some((id, conversation_id, snapshot_id, created_at)) = row else {
+    let Some((id, conversation_id, snapshot_id, created_at, targets)) = row else {
         return Ok(None);
     };
     let paths = match load_snapshot(store, &snapshot_id)? {
@@ -704,6 +804,8 @@ pub fn staged_revert(
         snapshot_id,
         paths,
         created_at,
+        targets: targets.map(|json| serde_json::from_str(&json)
+            .map_err(|error| format!("Invalid staged targets: {error}"))).transpose()?,
     }))
 }
 
@@ -752,9 +854,8 @@ enum Restored {
 /// Commit a staged revert: restore every captured file.
 ///
 /// Files recorded as deleted are removed. Files whose current sha256 differs
-/// from the sha256 recorded when the snapshot was taken are RESTORED ANYWAY
-/// (the snapshot is the older truth) but the result reports which paths
-/// overwrote newer content, so the caller can tell the user.
+/// from the reviewed state are preserved. The report distinguishes restored,
+/// removed and changed targets so the user can review a new stage.
 pub fn commit(
     store: &crate::store::Store,
     root: &std::path::Path,
@@ -771,12 +872,20 @@ pub fn commit(
         .ok_or("No staged revert with that id.".to_string())?;
     let snapshot = load_snapshot(store, &staged.snapshot_id)?
         .ok_or("The snapshot for that revert is no longer available.".to_string())?;
-    let directory = Dir::open_ambient_dir(&root, cap_std::ambient_authority())
-        .map_err(|e| format!("Cannot open the workspace: {e}"))?;
+    let workspace = snapshot.workspace.as_ref()
+        .ok_or("This older snapshot has no verified workspace identity and cannot be restored safely.")?;
+    let directory = workspace.verify(&root)?;
+    let targets = staged.targets.as_ref().filter(|targets| targets.len() == snapshot.files.len())
+        .ok_or("The reviewed target versions are unavailable. Stage the revert again.")?;
     let blobs = content_root(store);
     let mut report = RevertReport::default();
-    for file in &snapshot.files {
-        match restore(&directory, &blobs, file) {
+    for (file, reviewed) in snapshot.files.iter().zip(targets) {
+        let outcome = match reviewed {
+            ReviewedTarget::Absent => restore(&directory, workspace, &blobs, file, None),
+            ReviewedTarget::Present(version) => restore(&directory, workspace, &blobs, file, Some(version)),
+            ReviewedTarget::Unavailable => Err("The target could not be reviewed. Stage the revert again after resolving it.".into()),
+        };
+        match outcome {
             Ok(Restored::Written { overwritten }) => {
                 report.restored.push(file.path.clone());
                 if overwritten {
@@ -800,9 +909,25 @@ pub fn commit(
 /// Restore one captured file. The target is never written through a symbolic
 /// link, and the content is published with a rename so a crash cannot leave a
 /// half-written file.
-fn restore(root: &Dir, blobs: &Path, file: &SnapshotFile) -> Result<Restored, String> {
+fn review_target(root: &Dir, path: &str) -> Result<Option<TargetVersion>, String> {
+    match crate::workspace::parent_no_links(root, path) {
+        Ok((parent, leaf)) => open_restore_target(&parent, &leaf)?
+            .as_ref().map(TargetVersion::read).transpose(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Cannot review '{path}': {error}")),
+    }
+}
+
+fn restore(root: &Dir, workspace: &WorkspacePin, blobs: &Path, file: &SnapshotFile, reviewed: Option<&TargetVersion>) -> Result<Restored, String> {
     validate_path(&file.path)?;
     crate::sandbox::check_fs_path("", &file.path, true)?;
+    let current = review_target(root, &file.path)?;
+    if current.as_ref().map(|target| target.sha256.as_str()) == (!file.deleted).then_some(file.sha256.as_str()) {
+        return Ok(Restored::Unchanged);
+    }
+    if current.as_ref() != reviewed {
+        return Err("The target changed after review. Stage the revert again to review its current content.".into());
+    }
     let (parent, leaf) = match crate::workspace::parent_no_links(root, &file.path) {
         Ok(target) => target,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && file.deleted => {
@@ -834,6 +959,7 @@ fn restore(root: &Dir, blobs: &Path, file: &SnapshotFile) -> Result<Restored, St
     };
     let target = open_restore_target(&parent, &leaf)?;
     let verify_target = || -> Result<(), String> {
+        workspace.verify(&workspace.path)?;
         let (current_parent, _) = crate::workspace::parent_no_links(root, &file.path)
             .map_err(|e| format!("Restore parent changed: {e}"))?;
         let expected = parent.dir_metadata().map_err(|e| e.to_string())?;
@@ -841,12 +967,8 @@ fn restore(root: &Dir, blobs: &Path, file: &SnapshotFile) -> Result<Restored, St
         if (expected.dev(), expected.ino()) != (current.dev(), current.ino()) {
             return Err("Restore parent changed; the target was preserved.".into());
         }
-        if let Some(original) = &target {
-            use crate::workspace::patch::file_identity::single_link_identity;
-            let current = open_restore_target(&parent, &leaf)?.ok_or("Restore target disappeared.")?;
-            if single_link_identity(original)? != single_link_identity(&current)? {
-                return Err("Restore target changed identity; it was preserved.".into());
-            }
+        if open_restore_target(&parent, &leaf)?.as_ref().map(TargetVersion::read).transpose()?.as_ref() != reviewed {
+            return Err("The restore target changed during commit; it was preserved.".into());
         }
         Ok(())
     };
@@ -860,8 +982,7 @@ fn restore(root: &Dir, blobs: &Path, file: &SnapshotFile) -> Result<Restored, St
     }
     let permissions = target.as_ref().map(|f| f.metadata().map(|m| m.permissions()))
         .transpose().map_err(|e| e.to_string())?;
-    let overwritten = target.as_ref().map(current_digest).transpose()?
-        .is_some_and(|digest| digest != file.sha256);
+    let overwritten = current.is_some();
     let bytes = read_blob(blobs, &file.sha256)?;
     write_atomic(&parent, &leaf, &bytes, permissions, verify_target)?;
     Ok(Restored::Written { overwritten })
@@ -1052,6 +1173,11 @@ pub fn stage_revert(
     snapshot_id: String,
 ) -> Result<StagedRevertView, String> {
     let store = state.database()?;
+    let root = workspace_root(&store, &conversation_id)?;
+    let snapshot = load_snapshot(&store, &snapshot_id)?.filter(|snapshot| snapshot.conversation_id == conversation_id)
+        .ok_or("That snapshot is unavailable in this conversation.")?;
+    snapshot.workspace.as_ref().ok_or("This older snapshot has no verified workspace identity and cannot be restored safely.")?
+        .verify(&root)?;
     Ok(StagedRevertView::from(stage(
         &store,
         &conversation_id,
@@ -1282,6 +1408,47 @@ mod tests {
         );
         // The revert is finished, so nothing is left staged.
         assert!(pending_revert(&store, &conversation).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_staged_revert_cannot_cross_workspaces_or_overwrite_a_later_edit() {
+        let store = store();
+        let conversation = conversation(&store);
+        let original = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let path = original.path().join("main.rs");
+        let other_path = other.path().join("main.rs");
+        std::fs::write(&path, "original").unwrap();
+        let snapshot = capture(&store, &conversation, 0, original.path(), &["main.rs".into()]).unwrap();
+        std::fs::write(&path, "agent change").unwrap();
+        std::fs::write(&other_path, "agent change").unwrap();
+        let staged = stage(&store, &conversation, &snapshot.id).unwrap();
+        assert!(commit(&store, other.path(), &staged.id).is_err());
+        assert_eq!(std::fs::read_to_string(other_path).unwrap(), "agent change");
+        std::fs::write(&path, "later user edit").unwrap();
+        let report = commit(&store, original.path(), &staged.id).unwrap();
+        assert!(report.failed[0].1.contains("changed after review"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "later user edit");
+        let reviewed = stage(&store, &conversation, &snapshot.id).unwrap();
+        assert!(commit(&store, original.path(), &reviewed.id).unwrap().failed.is_empty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    }
+
+    #[test]
+    fn a_replacement_directory_at_the_same_path_does_not_match_the_snapshot() {
+        let store = store();
+        let conversation = conversation(&store);
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "original").unwrap();
+        let snapshot = capture(&store, &conversation, 0, &root, &["main.rs".into()]).unwrap();
+        let staged = stage(&store, &conversation, &snapshot.id).unwrap();
+        std::fs::rename(&root, parent.path().join("moved")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "replacement").unwrap();
+        assert!(commit(&store, &root, &staged.id).is_err());
+        assert_eq!(std::fs::read_to_string(root.join("main.rs")).unwrap(), "replacement");
     }
 
     #[test]
