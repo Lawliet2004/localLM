@@ -1,0 +1,32 @@
+Disposable source: /home/papan/Desktop/Projects/localLM/.local/qa/audit-2026-11-08/probe-workspace-wo4zjmh2
+   Compiling locallm v0.1.0 (/home/papan/Desktop/Projects/localLM/.local/qa/audit-2026-11-08/probe-workspace-wo4zjmh2/src-tauri)
+    Finished `test` profile [unoptimized] target(s) in 40.79s
+     Running unittests src/lib.rs (/home/papan/Desktop/Projects/localLM/src-tauri/target/debug/deps/tauri_app_lib-1f9b5e0a6b72a6ac)
+
+running 11 tests
+test audit_20261108::chat_completion_reasoning_is_absent_from_tool_round_replay ... CONFIRMED: received reasoning_content is absent from the next tool-round assistant message
+ok
+test audit_20261108::compaction_keeps_an_archive_but_no_semantic_record_of_old_requirements ... CONFIRMED: old explicit requirement survives only in the archive, absent from the model-visible checkpoint
+ok
+test audit_20261108::discovered_write_rejects_input_accepted_by_the_direct_tool ... CONFIRMED: 40,000-byte valid direct write fails discovery wrapper: Discovered tool arguments exceed32KiB.
+ok
+test audit_20261108::local_execution_aliases_do_not_invalidate_passed_verification ... CONFIRMED: local_run_code after checks leaves prior changes marked verified
+CONFIRMED: local_execute_command after checks leaves prior changes marked verified
+ok
+test audit_20261108::native_catalog_file_read_still_loses_file_identity_when_bounded ... CONFIRMED: first-party file_read still loses file SHA-256 at the 2 KiB bound
+ok
+test audit_20261108::nested_project_rules_depend_on_which_file_read_alias_is_used ... CONFIRMED: file_read supplies applicable nested AGENTS.md; workspace_read_file omits it
+ok
+test audit_20261108::quoted_code_example_becomes_an_executable_call ... CONFIRMED: fenced explanatory XML becomes Execute and is removed from answer text
+ok
+test chat::audit_20261108_chat::legitimate_shared_html_boilerplate_triggers_early_stream_stop ... CONFIRMED: valid shared HTML boilerplate is cut from 2339 bytes to 1225; caller turns this into finish_reason=stop
+ok
+test subagents::audit_20261108_subagents::child_does_not_separate_inline_thinking_from_answer ... CONFIRMED: child output includes inline thinking as final answer content
+ok
+test subagents::audit_20261108_subagents::child_text_fallback_conflicts_with_native_responses_replay ... CONFIRMED: child's accepted text fallback makes its next native Responses request fail: Saved Responses function calls conflict with canonical history.
+ok
+test subagents::audit_20261108_subagents::child_valid_final_schema_is_polluted_by_earlier_tool_commentary ... CONFIRMED: valid final JSON fails child schema validation after preceding tool commentary
+ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1085 filtered out; finished in 0.06s
+

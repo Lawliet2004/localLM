@@ -849,6 +849,10 @@ pub struct ChildRequest {
     pub conversation_id: String,
 }
 
+/// Upper bound on rounds per subagent delegation so deep investigation or
+/// subsystem implementation can finish without forced early termination.
+pub const MAX_CHILD_ROUNDS: usize = 24;
+
 pub fn validate_child_request(request: &ChildRequest) -> Result<(), String> {
     if request.label.trim().is_empty() || request.label.len() > 80 {
         return Err("Subagent label must be 1-80 characters.".into());
@@ -856,8 +860,8 @@ pub fn validate_child_request(request: &ChildRequest) -> Result<(), String> {
     if request.prompt.trim().is_empty() || request.prompt.len() > 4000 {
         return Err("Subagent prompt must be 1-4000 characters.".into());
     }
-    if request.max_rounds == 0 || request.max_rounds > 8 {
-        return Err("Subagent max_rounds must be 1-8.".into());
+    if request.max_rounds == 0 || request.max_rounds > MAX_CHILD_ROUNDS {
+        return Err(format!("Subagent max_rounds must be 1-{MAX_CHILD_ROUNDS}."));
     }
     if let Some(persona) = &request.persona {
         if persona.len() > 500 {
@@ -913,7 +917,7 @@ pub fn tool_allowed(filter: &Option<Vec<String>>, tool: &crate::connectors::Agen
     })
 }
 
-fn child_system_prompt(snapshot: &BackendSnapshot, request: &ChildRequest) -> Result<String, String> {
+fn child_system_prompt(snapshot: &BackendSnapshot, request: &ChildRequest, tools: &[&crate::connectors::AgentTool]) -> Result<String, String> {
     let project = if snapshot.workspace_path.is_empty() { String::new() } else {
         crate::instructions::chain(std::path::Path::new(&snapshot.workspace_path)).render()
     };
@@ -926,7 +930,7 @@ fn child_system_prompt(snapshot: &BackendSnapshot, request: &ChildRequest) -> Re
     } else {
         crate::skills::Skills::new(snapshot.data_dir.join("skills")).instructions(&snapshot.active_skills)?
     };
-    let aliases = snapshot.allowed_tool_aliases.iter().map(String::as_str).collect::<Vec<_>>();
+    let aliases = tools.iter().map(|tool| tool.alias.as_str()).collect::<Vec<_>>();
     let mut prompt = crate::prompt::frozen_system_for_project(
         &snapshot.system_prompt, &skills, &project, None, &aliases, false,
     );
@@ -1028,6 +1032,7 @@ fn detached_tool_limits(
     snapshot: &BackendSnapshot,
     tools: &[&crate::connectors::AgentTool],
     policy: &crate::capabilities::ToolPolicy,
+    rules: Option<&crate::permission_rules::RuleSet>,
 ) -> Vec<serde_json::Value> {
     let offered: std::collections::HashSet<&str> =
         tools.iter().map(|tool| tool.alias.as_str()).collect();
@@ -1036,7 +1041,9 @@ fn detached_tool_limits(
         .iter()
         .filter(|alias| !offered.contains(alias.as_str()))
         .map(|alias| {
-            let reason = if detached_capability(alias)
+            let reason = if rules.is_some_and(|rules| !rules.may_offer_tool(alias)) {
+                "denied by a saved permission rule"
+            } else if detached_capability(alias)
                 .and_then(|capability| policy.denial(capability))
                 .is_some()
             {
@@ -1190,7 +1197,20 @@ fn merge_child_tools<'a>(
         .collect()
 }
 
-/// Drive the bounded child loop. Shared by foreground and background runs.
+/// Freeze the child's own filtered schemas once for both generation and lookup.
+fn child_catalog<'a>(
+    tools: impl IntoIterator<Item = &'a crate::connectors::AgentTool>,
+    rules: Option<&crate::permission_rules::RuleSet>,
+) -> (Vec<&'a crate::connectors::AgentTool>, Vec<serde_json::Value>) {
+    let tools: Vec<_> = tools.into_iter()
+        .filter(|tool| rules.is_none_or(|rules| rules.may_offer_tool(&tool.alias)))
+        .collect();
+    let schemas = crate::tool_discovery::advertised(tools.iter().copied())
+        .into_iter().map(|tool| tool.definition()).collect();
+    (tools, schemas)
+}
+
+/// Drive the bounded foreground child loop.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_child(
     state: &crate::AppState,
@@ -1208,8 +1228,9 @@ pub async fn drive_child(
     if cancel.is_set() {
         return Err("Subagent was interrupted before starting.".into());
     }
-    let tools: Vec<&crate::connectors::AgentTool> = tools.iter().map(|tool| tool.tool()).collect();
-    let mut system = child_system_prompt(snapshot, request)?;
+    let rules = crate::permission_rules::load_checked(&*state.database()?).ok();
+    let (tools, schemas) = child_catalog(tools.iter().map(ChildTool::tool), rules.as_ref());
+    let mut system = child_system_prompt(snapshot, request, &tools)?;
     system.push_str(&format!(
         "\nModel capability metadata (not independent verification): {}",
         backend.capability_report()
@@ -1227,7 +1248,9 @@ pub async fn drive_child(
     };
     backend.prepare_preferences(&mut preferences)?;
     let mut answer = String::new();
-    let max_rounds = request.max_rounds.min(8);
+    let mut file_tracker = crate::workspace::FileReadTracker::new();
+    let mut output_recoveries = 0u32;
+    let max_rounds = request.max_rounds.min(MAX_CHILD_ROUNDS);
     for round in 0..max_rounds {
         if cancel.is_set() {
             if let Ok(store) = state.database() {
@@ -1250,31 +1273,79 @@ pub async fn drive_child(
             "messages": messages, "temperature": preferences.temperature,
             "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
             "stream": true, "cache_prompt": true, "stream_options":{"include_usage":true},
+            "locallm_cache_key": crate::inference::prompt_cache_key(child_run_id),
         });
         if snapshot.inference_slots >= 2 {
             payload["id_slot"] = serde_json::json!(1);
         }
-        if backend.supports_tools() && !tools.is_empty() {
-            payload["tools"] =
-                serde_json::json!(crate::tool_discovery::advertised(tools.iter().copied())
-                    .into_iter()
-                    .map(|tool| tool.definition())
-                    .collect::<Vec<_>>());
+        if backend.supports_tools() && !schemas.is_empty() {
+            payload["tools"] = serde_json::Value::Array(schemas.clone());
         }
         if let Some(schema) = &request.output_schema {
             backend.constrain_output(&mut payload, schema)?;
         }
-        let payload = backend.payload(&payload)?;
+        let mut payload = backend.payload(&payload)?;
         // Every blocking await — token counting, request headers, the stream,
         // tool calls, approval — is selected against the child's cancel watch
         // so an interrupt lands promptly instead of after a deadman timeout.
-        let _tokens = match tokio::select! {
+        let mut tokens = match tokio::select! {
             _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
-            result = tokio::time::timeout(Duration::from_secs(45), backend.check_context(&payload, preferences.max_tokens)) => result,
+            result = tokio::time::timeout(Duration::from_secs(45), backend.count_tokens(&payload)) => result,
         } {
             Ok(result) => result?,
             Err(_) => return Err("Subagent context check timed out.".into()),
         };
+        if crate::compaction::should_compact(tokens, preferences.max_tokens, backend.context_capacity()) {
+            let mut compacted = false;
+            if let Some(prune) = crate::compaction::plan_stale_tool_prune(&messages, 4, 2048) {
+                if let Ok(store) = state.database() {
+                    if crate::compaction::commit_stale_tool_prune(&store, &request.conversation_id, &mut messages, prune).is_ok() {
+                        compacted = true;
+                    }
+                }
+            }
+            if !compacted {
+                if let Some(plan) = crate::compaction::plan_compaction(&messages, 1) {
+                    if let Ok(store) = state.database() {
+                        if crate::compaction::commit_plan(&store, &request.conversation_id, &mut messages, plan, 1, false).is_ok() {
+                            compacted = true;
+                        }
+                    }
+                }
+            }
+            if compacted {
+                let mut rebuilt = serde_json::json!({
+                    "messages": messages, "temperature": preferences.temperature,
+                    "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
+                    "stream": true, "cache_prompt": true, "stream_options":{"include_usage":true},
+                    "locallm_cache_key": crate::inference::prompt_cache_key(child_run_id),
+                });
+                if snapshot.inference_slots >= 2 {
+                    rebuilt["id_slot"] = serde_json::json!(1);
+                }
+                if backend.supports_tools() && !schemas.is_empty() {
+                    rebuilt["tools"] = serde_json::Value::Array(schemas.clone());
+                }
+                if let Some(schema) = &request.output_schema {
+                    backend.constrain_output(&mut rebuilt, schema)?;
+                }
+                payload = backend.payload(&rebuilt)?;
+                tokens = match tokio::select! {
+                    _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
+                    result = tokio::time::timeout(Duration::from_secs(45), backend.check_context(&payload, preferences.max_tokens)) => result,
+                } {
+                    Ok(result) => result?,
+                    Err(_) => return Err("Subagent context check timed out.".into()),
+                };
+            } else {
+                backend.validate_response_tokens(preferences.max_tokens)?;
+                crate::context::validate_budget(tokens, preferences.max_tokens, backend.context_capacity())?;
+            }
+        } else {
+            backend.validate_response_tokens(preferences.max_tokens)?;
+            crate::context::validate_budget(tokens, preferences.max_tokens, backend.context_capacity())?;
+        }
+        let answer_len_before = answer.len();
         let mut measurement = usage::ChildRound::new(snapshot, request, child_run_id, round);
         let response = match tokio::select! {
             _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
@@ -1287,6 +1358,31 @@ pub async fn drive_child(
         measurement.finish(outcome.is_ok())?;
         let outcome = outcome?;
         if outcome.finish == "length" {
+            if output_recoveries < 2 && round + 1 < max_rounds {
+                output_recoveries += 1;
+                let partial = answer[answer_len_before..].trim().to_string();
+                if !outcome.calls.is_empty() || partial.is_empty() {
+                    answer.truncate(answer_len_before);
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "_continuation": true,
+                        "content": "The previous response hit the output token limit before completing. Continue the task using concise complete tool calls without repeating finished work."
+                    }));
+                } else {
+                    messages.push(serde_json::json!({"role": "assistant", "content": partial}));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "_continuation": true,
+                        "content": crate::prompt::CONTINUE_INSTRUCTION
+                    }));
+                }
+                if let Some(limit) = backend.response_limit() {
+                    if preferences.max_tokens > 0 && preferences.max_tokens < limit {
+                        preferences.max_tokens = preferences.max_tokens.saturating_mul(2).min(limit);
+                    }
+                }
+                continue;
+            }
             return Err("Subagent hit the response token limit.".into());
         }
         let calls = outcome.calls;
@@ -1303,22 +1399,14 @@ pub async fn drive_child(
             if cancel.is_set() {
                 return Err(INTERRUPTED.into());
             }
-            let visible = crate::tool_discovery::advertised(tools.iter().copied())
-                .into_iter()
-                .any(|tool| tool.alias == call.name);
-            let resolved = if visible {
-                crate::tool_discovery::resolve(
-                    tools.iter().copied(),
-                    &call.name,
-                    call.arguments.clone(),
-                )
-            } else {
-                Err("Tool is deferred or unavailable. Use tool_search and tool_invoke for this child's authorized catalog.".into())
-            };
+            let resolved = crate::tool_discovery::resolve_advertised(
+                tools.iter().copied(), &schemas, &call.name, call.arguments.clone(),
+            );
             let (resolved_tool, arguments) = match resolved {
                 Ok(value) => value,
                 Err(error) => {
-                    messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":crate::tool_envelope::failure_notice("unavailable-tool",&error,false,crate::tool_envelope::SIDE_NONE,&serde_json::json!({})).to_string()}));
+                    let result = rejected_child_call(&*state.database()?, child_run_id, round, &call, &error)?;
+                    messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
                     continue;
                 }
             };
@@ -1333,6 +1421,7 @@ pub async fn drive_child(
                     "content":crate::tool_envelope::failure_notice("capability-disabled", &reason, false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({})).to_string()}));
                 continue;
             }
+            file_tracker.inject_expected_sha256(&tool.alias, &mut call.arguments);
             match tool.prepare_arguments(call.arguments.clone()) {
                 Ok(arguments) => call.arguments = arguments,
                 Err(error) => {
@@ -1376,6 +1465,7 @@ pub async fn drive_child(
                     result = call_child_tool(state, snapshot, request, &tools, child_run_id, round, tool, &call, emit.as_ref(), false) => result,
                 }
             };
+            file_tracker.observe_result(&result);
             let control = if tool.harness_name().is_some()
                 && matches!(call.name.as_str(), "finish" | "update_context")
             {
@@ -1388,7 +1478,11 @@ pub async fn drive_child(
                 &tool.tool.name,
                 &request.conversation_id,
                 Some(child_run_id),
-                crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
+                crate::artifacts::excerpt_budget(
+                    backend.context_capacity(),
+                    tokens,
+                    preferences.max_tokens,
+                ),
                 |artifact| state.database()?.save_artifact(artifact),
             );
             if let Ok(store) = state.database() {
@@ -1441,6 +1535,26 @@ fn record_tool_call(
         payload: serde_json::json!({"tool":call.name,"arguments":call.arguments}),
         created_at: crate::store::now(),
     })
+}
+
+fn rejected_child_call(
+    store: &crate::store::Store,
+    child_run_id: &str,
+    round: usize,
+    call: &crate::tool_calls::ToolCall,
+    error: &str,
+) -> Result<serde_json::Value, String> {
+    let rules = crate::permission_rules::load_checked(store).ok();
+    let (decision, result) = crate::tool_discovery::rejected_call(rules.as_ref(), call, error);
+    if decision == "denied" {
+        record_tool_call(store, child_run_id, round, call)?;
+        store.append_run_event(&crate::agent_run::RunEvent {
+            run_id: child_run_id.into(), seq: 0, step_id: format!("round-{round}"),
+            tool_call_id: Some(call.id.clone()), event_type: "tool_result".into(),
+            payload: serde_json::json!({"tool":call.name,"result":result}), created_at: crate::store::now(),
+        })?;
+    }
+    Ok(result)
 }
 
 fn cancelled_tool_call(
@@ -1506,9 +1620,8 @@ async fn call_child_tool(
     }
     if tool.harness_name() == Some(crate::tool_discovery::SEARCH) {
         if let Some(failure) = child_pre_use(state, &snapshot.workspace_path, request, tool, call, emit, approved).await { return failure; }
-        let policy = crate::capabilities::ToolPolicy::guard(state.database());
-        return match crate::tool_discovery::search(tools.iter().copied(), &call.arguments, &policy)
-        {
+        let policy = state.database().and_then(|store| crate::tool_discovery::SearchPolicy::load(&store));
+        return match policy.and_then(|policy| crate::tool_discovery::search(tools.iter().copied(), &call.arguments, &policy)) {
             Ok(value) => crate::tool_envelope::normalize(value, tool.envelope_family()),
             Err(error) => crate::tool_envelope::failure_notice(
                 "discovery-error",
@@ -1898,7 +2011,9 @@ pub async fn drive_detached(
     if cancel.is_set() {
         return Err("Subagent was interrupted before starting.".into());
     }
-    let mut system = child_system_prompt(snapshot, request)?;
+    let rules = store.lock().ok().and_then(|store| crate::permission_rules::load_checked(&store).ok());
+    let (tools, schemas) = child_catalog(tools, rules.as_ref());
+    let mut system = child_system_prompt(snapshot, request, &tools)?;
     system.push_str(&format!(
         "\nModel capability metadata (not independent verification): {}",
         backend.capability_report()
@@ -1915,7 +2030,7 @@ pub async fn drive_detached(
                 "Capability settings are unreachable.".into(),
             ),
         };
-        detached_tool_limits(snapshot, &tools, &policy)
+        detached_tool_limits(snapshot, &tools, &policy, rules.as_ref())
     };
     if !limits.is_empty() {
         let names: Vec<&str> = limits
@@ -1951,7 +2066,9 @@ pub async fn drive_detached(
     };
     backend.prepare_preferences(&mut preferences)?;
     let mut answer = String::new();
-    let max_rounds = request.max_rounds.min(8);
+    let mut file_tracker = crate::workspace::FileReadTracker::new();
+    let mut output_recoveries = 0u32;
+    let max_rounds = request.max_rounds.min(MAX_CHILD_ROUNDS);
     for round in 0..max_rounds {
         if cancel.is_set() {
             if let Ok(s) = store.lock() {
@@ -1973,30 +2090,78 @@ pub async fn drive_detached(
             "messages": messages, "temperature": preferences.temperature,
             "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
             "stream": true, "cache_prompt": true, "stream_options":{"include_usage":true},
+            "locallm_cache_key": crate::inference::prompt_cache_key(child_run_id),
         });
         if snapshot.inference_slots >= 2 {
             payload["id_slot"] = serde_json::json!(1);
         }
-        if backend.supports_tools() && !tools.is_empty() {
-            payload["tools"] =
-                serde_json::json!(crate::tool_discovery::advertised(tools.iter().copied())
-                    .into_iter()
-                    .map(|tool| tool.definition())
-                    .collect::<Vec<_>>());
+        if backend.supports_tools() && !schemas.is_empty() {
+            payload["tools"] = serde_json::Value::Array(schemas.clone());
         }
         if let Some(schema) = &request.output_schema {
             backend.constrain_output(&mut payload, schema)?;
         }
-        let payload = backend.payload(&payload)?;
+        let mut payload = backend.payload(&payload)?;
         // The interrupt watch is selected against every blocking await so a
         // detached child stops promptly instead of out its deadman timeout.
-        let _tokens = match tokio::select! {
+        let mut tokens = match tokio::select! {
             _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
-            result = tokio::time::timeout(Duration::from_secs(45), backend.check_context(&payload, preferences.max_tokens)) => result,
+            result = tokio::time::timeout(Duration::from_secs(45), backend.count_tokens(&payload)) => result,
         } {
             Ok(result) => result?,
             Err(_) => return Err("Subagent context check timed out.".into()),
         };
+        if crate::compaction::should_compact(tokens, preferences.max_tokens, backend.context_capacity()) {
+            let mut compacted = false;
+            if let Some(prune) = crate::compaction::plan_stale_tool_prune(&messages, 4, 2048) {
+                if let Ok(s) = store.lock() {
+                    if crate::compaction::commit_stale_tool_prune(&s, &request.conversation_id, &mut messages, prune).is_ok() {
+                        compacted = true;
+                    }
+                }
+            }
+            if !compacted {
+                if let Some(plan) = crate::compaction::plan_compaction(&messages, 1) {
+                    if let Ok(s) = store.lock() {
+                        if crate::compaction::commit_plan(&s, &request.conversation_id, &mut messages, plan, 1, false).is_ok() {
+                            compacted = true;
+                        }
+                    }
+                }
+            }
+            if compacted {
+                let mut rebuilt = serde_json::json!({
+                    "messages": messages, "temperature": preferences.temperature,
+                    "top_p": preferences.top_p, "max_tokens": preferences.max_tokens,
+                    "stream": true, "cache_prompt": true, "stream_options":{"include_usage":true},
+                    "locallm_cache_key": crate::inference::prompt_cache_key(child_run_id),
+                });
+                if snapshot.inference_slots >= 2 {
+                    rebuilt["id_slot"] = serde_json::json!(1);
+                }
+                if backend.supports_tools() && !schemas.is_empty() {
+                    rebuilt["tools"] = serde_json::Value::Array(schemas.clone());
+                }
+                if let Some(schema) = &request.output_schema {
+                    backend.constrain_output(&mut rebuilt, schema)?;
+                }
+                payload = backend.payload(&rebuilt)?;
+                tokens = match tokio::select! {
+                    _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
+                    result = tokio::time::timeout(Duration::from_secs(45), backend.check_context(&payload, preferences.max_tokens)) => result,
+                } {
+                    Ok(result) => result?,
+                    Err(_) => return Err("Subagent context check timed out.".into()),
+                };
+            } else {
+                backend.validate_response_tokens(preferences.max_tokens)?;
+                crate::context::validate_budget(tokens, preferences.max_tokens, backend.context_capacity())?;
+            }
+        } else {
+            backend.validate_response_tokens(preferences.max_tokens)?;
+            crate::context::validate_budget(tokens, preferences.max_tokens, backend.context_capacity())?;
+        }
+        let answer_len_before = answer.len();
         let mut measurement = usage::ChildRound::new(snapshot, request, child_run_id, round);
         let response = match tokio::select! {
             _ = cancel.cancelled() => return Err(INTERRUPTED.into()),
@@ -2010,6 +2175,31 @@ pub async fn drive_detached(
         let outcome = outcome?;
         crate::arex::validate_batch(&outcome.calls)?;
         if outcome.finish == "length" {
+            if output_recoveries < 2 && round + 1 < max_rounds {
+                output_recoveries += 1;
+                let partial = answer[answer_len_before..].trim().to_string();
+                if !outcome.calls.is_empty() || partial.is_empty() {
+                    answer.truncate(answer_len_before);
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "_continuation": true,
+                        "content": "The previous response hit the output token limit before completing. Continue the task using concise complete tool calls without repeating finished work."
+                    }));
+                } else {
+                    messages.push(serde_json::json!({"role": "assistant", "content": partial}));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "_continuation": true,
+                        "content": crate::prompt::CONTINUE_INSTRUCTION
+                    }));
+                }
+                if let Some(limit) = backend.response_limit() {
+                    if preferences.max_tokens > 0 && preferences.max_tokens < limit {
+                        preferences.max_tokens = preferences.max_tokens.saturating_mul(2).min(limit);
+                    }
+                }
+                continue;
+            }
             return Err("Subagent hit the response token limit.".into());
         }
         if outcome.calls.is_empty() {
@@ -2024,22 +2214,14 @@ pub async fn drive_detached(
             if cancel.is_set() {
                 return Err(INTERRUPTED.into());
             }
-            let visible = crate::tool_discovery::advertised(tools.iter().copied())
-                .into_iter()
-                .any(|tool| tool.alias == call.name);
-            let resolved = if visible {
-                crate::tool_discovery::resolve(
-                    tools.iter().copied(),
-                    &call.name,
-                    call.arguments.clone(),
-                )
-            } else {
-                Err("Tool is deferred or unavailable. Use tool_search and tool_invoke for this child's authorized catalog.".into())
-            };
+            let resolved = crate::tool_discovery::resolve_advertised(
+                tools.iter().copied(), &schemas, &call.name, call.arguments.clone(),
+            );
             let (resolved_tool, arguments) = match resolved {
                 Ok(value) => value,
                 Err(error) => {
-                    messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":crate::tool_envelope::failure_notice("unavailable-tool",&error,false,crate::tool_envelope::SIDE_NONE,&serde_json::json!({})).to_string()}));
+                    let result = rejected_child_call(&*store.lock().map_err(|_| "Child store is unreachable.")?, child_run_id, round, &call, &error)?;
+                    messages.push(serde_json::json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));
                     continue;
                 }
             };
@@ -2061,6 +2243,7 @@ pub async fn drive_detached(
                     "content":crate::tool_envelope::failure_notice("capability-disabled", &reason, false, crate::tool_envelope::SIDE_NONE, &serde_json::json!({})).to_string()}));
                 continue;
             }
+            file_tracker.inject_expected_sha256(&tool.alias, &mut call.arguments);
             match tool.prepare_arguments(call.arguments.clone()) {
                 Ok(arguments) => call.arguments = arguments,
                 Err(error) => {
@@ -2086,14 +2269,9 @@ pub async fn drive_detached(
                     &serde_json::json!({"denied":true}),
                 )
             } else if tool.harness_name() == Some(crate::tool_discovery::SEARCH) {
-                let policy = match store.lock() {
-                    Ok(store) => crate::capabilities::ToolPolicy::resolve(&store),
-                    Err(_) => crate::capabilities::ToolPolicy::closed(
-                        "Capability settings unreachable.".into(),
-                    ),
-                };
-                match crate::tool_discovery::search(tools.iter().copied(), &call.arguments, &policy)
-                {
+                let policy = store.lock().map_err(|_| "Tool settings are unreachable.".to_string())
+                    .and_then(|store| crate::tool_discovery::SearchPolicy::load(&store));
+                match policy.and_then(|policy| crate::tool_discovery::search(tools.iter().copied(), &call.arguments, &policy)) {
                     Ok(value) => crate::tool_envelope::normalize(value, tool.envelope_family()),
                     Err(error) => crate::tool_envelope::normalize_error(
                         &error,
@@ -2125,6 +2303,7 @@ pub async fn drive_detached(
                     },
                 }
             };
+            file_tracker.observe_result(&result);
             let control = if tool.harness_name().is_some()
                 && matches!(call.name.as_str(), "finish" | "update_context")
             {
@@ -2137,7 +2316,11 @@ pub async fn drive_detached(
                 &tool.tool.name,
                 &request.conversation_id,
                 Some(child_run_id),
-                crate::artifacts::DEFAULT_MAX_RESULT_CHARS,
+                crate::artifacts::excerpt_budget(
+                    backend.context_capacity(),
+                    tokens,
+                    preferences.max_tokens,
+                ),
                 |artifact| store.lock().map_err(|_| "Artifact store is unavailable.".to_string())?.save_artifact(artifact),
             );
             if let Ok(s) = store.lock() {
@@ -2806,6 +2989,36 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn child_catalog_applies_saved_denials_and_audits_a_stale_call() {
+        use crate::permission_rules::{self, Action, Effect, Rule, RuleSet};
+        let store = crate::store::Store::open_memory().unwrap();
+        let owner = store.create_conversation().unwrap().id;
+        fixture_run(&store, "child", &owner);
+        let selected = [
+            crate::connectors::AgentTool::harness("todo_add").unwrap(),
+            crate::connectors::AgentTool::harness("todo_update").unwrap(),
+        ];
+        let rules = RuleSet { rules: vec![Rule {
+            action: Action::Tool, resource: "todo_update".into(), effect: Effect::Deny,
+        }] };
+        permission_rules::save(&store, &rules).unwrap();
+        let (targets, schemas) = child_catalog(&selected, Some(&rules));
+        assert_eq!(targets.len(), 1);
+        assert!(crate::tool_discovery::visible(&schemas, "todo_add"));
+        assert!(!crate::tool_discovery::visible(&schemas, "todo_update"));
+
+        let call = crate::tool_calls::ToolCall {
+            id: "stale".into(), name: "todo_update".into(), arguments: serde_json::json!({}), extra_content: None,
+        };
+        let result = rejected_child_call(&store, "child", 1, &call, "Unavailable.").unwrap();
+        assert_eq!(result["error"]["code"], "permission-denied");
+        let events = store.run_events("child").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "tool_call");
+        assert_eq!(events[1].payload["result"], result);
+    }
     #[test]
     fn child_requests_validate_loudly() {
         let base = ChildRequest {
@@ -2827,7 +3040,12 @@ mod tests {
         })
         .is_err());
         assert!(validate_child_request(&ChildRequest {
-            max_rounds: 9,
+            max_rounds: MAX_CHILD_ROUNDS,
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(validate_child_request(&ChildRequest {
+            max_rounds: MAX_CHILD_ROUNDS + 1,
             ..base.clone()
         })
         .is_err());
@@ -3175,7 +3393,7 @@ mod tests {
             let tools: Vec<_> = owned.iter().collect();
             let tool = tools.iter().find(|tool| tool.alias == "workspace_read_file").unwrap();
             let request = fixture_request(ChildPolicy::Full, &conversation.id);
-            let call = crate::tool_calls::ToolCall { id: "call".into(), name: tool.alias.clone(), arguments: serde_json::json!({"path":"secret.txt"}) };
+            let call = crate::tool_calls::ToolCall { id: "call".into(), name: tool.alias.clone(), arguments: serde_json::json!({"path":"secret.txt"}), extra_content: None };
             let task = call_child_tool(&state, &snapshot, &request, &tools, "child", 0, tool, &call, None, false);
             let update = async {
                 if scenario == "changed" {
@@ -3747,7 +3965,7 @@ mod tests {
         // Structured limitation disclosure: session-bound tools report the
         // real reason, never a false "unavailable" claim.
         let refs: Vec<&crate::connectors::AgentTool> = tools.iter().collect();
-        let limits = detached_tool_limits(&snapshot, &refs, &policy);
+        let limits = detached_tool_limits(&snapshot, &refs, &policy, None);
         let reason = |alias: &str| {
             limits
                 .iter()
@@ -3777,7 +3995,7 @@ mod tests {
             tool.alias.as_str(),
             "file_read" | "file_write" | "file_search"
         )));
-        let limits = detached_tool_limits(&snapshot, &refs, &policy);
+        let limits = detached_tool_limits(&snapshot, &refs, &policy, None);
         let reason = |alias: &str| {
             limits
                 .iter()

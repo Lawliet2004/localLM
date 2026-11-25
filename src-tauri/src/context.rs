@@ -51,7 +51,7 @@ fn count_cache_key(endpoint: &str, key: &str, payload: &Value) -> Result<[u8; 32
 pub fn validate_budget(input: u64, response: u32, context: u32) -> Result<(), String> {
     let required = input.saturating_add(u64::from(response));
     if required > u64::from(context) {
-        return Err(format!("Context limit exceeded: the prompt uses {input} tokens and the response reserves {response}, but the loaded context holds {context}. Shorten the message, select fewer tools or skills, start a new conversation, or increase the context and reload the model."));
+        return Err(format!("Context limit exceeded: the prompt uses {input} tokens and reserves {response} for the reply, but the model has {context} context tokens. Shorten the message, select fewer tools or skills, or increase the context window."));
     }
     Ok(())
 }
@@ -85,7 +85,14 @@ const COUNT_TTL: Duration = Duration::from_secs(300);
 fn normalized_count_payload(payload: &Value) -> Value {
     let mut normalized = payload.clone();
     if let Some(object) = normalized.as_object_mut() {
-        for field in ["cache_prompt", "id_slot", "timings", "stream_options"] {
+        for field in [
+            "cache_prompt",
+            "id_slot",
+            "timings",
+            "stream_options",
+            "locallm_cache_key",
+            "prompt_cache_key",
+        ] {
             object.remove(field);
         }
     }
@@ -260,6 +267,10 @@ pub fn estimate_remote_tokens(payload: &serde_json::Value) -> u64 {
     fn strip(value: &mut serde_json::Value, images: &mut u64) {
         if value["type"] == "image_url"
             || value["type"] == "input_image"
+            || value["type"] == "video_url"
+            || (value["type"] == "file" && value["file"]["file_data"].is_string())
+            || (value["type"] == "input_file" && value["file_data"].is_string())
+            || (value["type"] == "document" && value["source"]["type"] == "base64")
             || (value["type"] == "image" && value["source"]["type"] == "base64")
         {
             *images += 1;

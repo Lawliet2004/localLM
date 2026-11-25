@@ -1,0 +1,372 @@
+{
+  "LocalLM": {
+    "all": {
+      "runs": 12,
+      "strictPasses": 0,
+      "factualPasses": 2,
+      "formatPasses": 0,
+      "completed": 12,
+      "filesUnchanged": 12,
+      "timedOut": 0,
+      "caps": 0,
+      "runsWithPermissionDenials": 10,
+      "unknownDenialRuns": 0,
+      "partialToolOperationRuns": 0,
+      "modelRequests": 34,
+      "tokenCountRequests": 0,
+      "modelIssuedToolCalls": 40,
+      "recognizedToolCalls": 40,
+      "underlyingToolOperations": 30,
+      "successfulToolOperations": 30,
+      "firstInputTokenRange": [
+        7059,
+        7080
+      ],
+      "inputTokens": 252950,
+      "cachedTokens": 204047,
+      "uncachedInputTokens": 48903,
+      "cacheShare": 0.806669302233643,
+      "requestsWithPositiveCache": 28,
+      "cacheMeasurements": 34,
+      "outputTokens": 2147,
+      "medianWallSeconds": 7.001952489008545,
+      "maximumWallSeconds": 31.328736925002886,
+      "coldStartsChecked": 6,
+      "toolSchemaCounts": [
+        36
+      ]
+    },
+    "cold": {
+      "runs": 6,
+      "strictPasses": 0,
+      "factualPasses": 1,
+      "formatPasses": 0,
+      "completed": 6,
+      "filesUnchanged": 6,
+      "timedOut": 0,
+      "caps": 0,
+      "runsWithPermissionDenials": 5,
+      "unknownDenialRuns": 0,
+      "partialToolOperationRuns": 0,
+      "modelRequests": 17,
+      "tokenCountRequests": 0,
+      "modelIssuedToolCalls": 20,
+      "recognizedToolCalls": 20,
+      "underlyingToolOperations": 15,
+      "successfulToolOperations": 15,
+      "firstInputTokenRange": [
+        7059,
+        7080
+      ],
+      "inputTokens": 126475,
+      "cachedTokens": 80818,
+      "uncachedInputTokens": 45657,
+      "cacheShare": 0.6390037556829413,
+      "requestsWithPositiveCache": 11,
+      "cacheMeasurements": 17,
+      "outputTokens": 1020,
+      "medianWallSeconds": 10.33699949849688,
+      "maximumWallSeconds": 31.328736925002886,
+      "coldStartsChecked": 6,
+      "toolSchemaCounts": [
+        36
+      ]
+    },
+    "warm": {
+      "runs": 6,
+      "strictPasses": 0,
+      "factualPasses": 1,
+      "formatPasses": 0,
+      "completed": 6,
+      "filesUnchanged": 6,
+      "timedOut": 0,
+      "caps": 0,
+      "runsWithPermissionDenials": 5,
+      "unknownDenialRuns": 0,
+      "partialToolOperationRuns": 0,
+      "modelRequests": 17,
+      "tokenCountRequests": 0,
+      "modelIssuedToolCalls": 20,
+      "recognizedToolCalls": 20,
+      "underlyingToolOperations": 15,
+      "successfulToolOperations": 15,
+      "firstInputTokenRange": [
+        7059,
+        7080
+      ],
+      "inputTokens": 126475,
+      "cachedTokens": 123229,
+      "uncachedInputTokens": 3246,
+      "cacheShare": 0.9743348487843447,
+      "requestsWithPositiveCache": 17,
+      "cacheMeasurements": 17,
+      "outputTokens": 1127,
+      "medianWallSeconds": 4.6726510125008645,
+      "maximumWallSeconds": 7.22685939699295,
+      "coldStartsChecked": 0,
+      "toolSchemaCounts": [
+        36
+      ]
+    }
+  },
+  "Claude Code": {
+    "all": {
+      "runs": 12,
+      "strictPasses": 0,
+      "factualPasses": 0,
+      "formatPasses": 0,
+      "completed": 7,
+      "filesUnchanged": 12,
+      "timedOut": 1,
+      "caps": 4,
+      "runsWithPermissionDenials": 0,
+      "unknownDenialRuns": 1,
+      "partialToolOperationRuns": 1,
+      "modelRequests": 333,
+      "tokenCountRequests": 0,
+      "modelIssuedToolCalls": 1286,
+      "recognizedToolCalls": 1285,
+      "underlyingToolOperations": 1282,
+      "successfulToolOperations": 1102,
+      "firstInputTokenRange": [
+        764,
+        786
+      ],
+      "inputTokens": 2060401,
+      "cachedTokens": 2008868,
+      "uncachedInputTokens": 51533,
+      "cacheShare": 0.9749888492579842,
+      "requestsWithPositiveCache": 327,
+      "cacheMeasurements": 333,
+      "outputTokens": 31377,
+      "medianWallSeconds": 4.3967581174802035,
+      "maximumWallSeconds": 240.0095866979973,
+      "coldStartsChecked": 6,
+      "toolSchemaCounts": [
+        2
+      ]
+    },
+    "cold": {
+      "runs": 6,
+      "strictPasses": 0,
+      "factualPasses": 0,
+      "formatPasses": 0,
+      "completed": 4,
+      "filesUnchanged": 6,
+      "timedOut": 0,
+      "caps": 2,
+      "runsWithPermissionDenials": 0,
+      "unknownDenialRuns": 0,
+      "partialToolOperationRuns": 0,
+      "modelRequests": 137,
+      "tokenCountRequests": 0,
+      "modelIssuedToolCalls": 523,
+      "recognizedToolCalls": 523,
+      "underlyingToolOperations": 523,
+      "successfulToolOperations": 491,
+      "firstInputTokenRange": [
+        764,
+        786
+      ],
+      "inputTokens": 794940,
+      "cachedTokens": 771771,
+      "uncachedInputTokens": 23169,
+      "cacheShare": 0.9708544041059702,
+      "requestsWithPositiveCache": 131,
+      "cacheMeasurements": 137,
+      "outputTokens": 11870,
+      "medianWallSeconds": 4.3967581174802035,
+      "maximumWallSeconds": 143.57734385799267,
+      "coldStartsChecked": 6,
+      "toolSchemaCounts": [
+        2
+      ]
+    },
+    "warm": {
+      "runs": 6,
+      "strictPasses": 0,
+      "factualPasses": 0,
+      "formatPasses": 0,
+      "completed": 3,
+      "filesUnchanged": 6,
+      "timedOut": 1,
+      "caps": 2,
+      "runsWithPermissionDenials": 0,
+      "unknownDenialRuns": 1,
+      "partialToolOperationRuns": 1,
+      "modelRequests": 196,
+      "tokenCountRequests": 0,
+      "modelIssuedToolCalls": 763,
+      "recognizedToolCalls": 762,
+      "underlyingToolOperations": 759,
+      "successfulToolOperations": 611,
+      "firstInputTokenRange": [
+        764,
+        786
+      ],
+      "inputTokens": 1265461,
+      "cachedTokens": 1237097,
+      "uncachedInputTokens": 28364,
+      "cacheShare": 0.9775860338643387,
+      "requestsWithPositiveCache": 196,
+      "cacheMeasurements": 196,
+      "outputTokens": 19507,
+      "medianWallSeconds": 56.789114294500905,
+      "maximumWallSeconds": 240.0095866979973,
+      "coldStartsChecked": 0,
+      "toolSchemaCounts": [
+        2
+      ]
+    }
+  },
+  "byTask": {
+    "LocalLM": {
+      "single_read": {
+        "runs": 6,
+        "strictPasses": 0,
+        "factualPasses": 2,
+        "formatPasses": 0,
+        "completed": 6,
+        "filesUnchanged": 6,
+        "timedOut": 0,
+        "caps": 0,
+        "runsWithPermissionDenials": 4,
+        "unknownDenialRuns": 0,
+        "partialToolOperationRuns": 0,
+        "modelRequests": 16,
+        "tokenCountRequests": 0,
+        "modelIssuedToolCalls": 10,
+        "recognizedToolCalls": 10,
+        "underlyingToolOperations": 6,
+        "successfulToolOperations": 6,
+        "firstInputTokenRange": [
+          7059,
+          7059
+        ],
+        "inputTokens": 115522,
+        "cachedTokens": 92760,
+        "uncachedInputTokens": 22762,
+        "cacheShare": 0.8029639376049583,
+        "requestsWithPositiveCache": 13,
+        "cacheMeasurements": 16,
+        "outputTokens": 563,
+        "medianWallSeconds": 5.30441493752005,
+        "maximumWallSeconds": 31.328736925002886,
+        "coldStartsChecked": 3,
+        "toolSchemaCounts": [
+          36
+        ]
+      },
+      "four_file_join": {
+        "runs": 6,
+        "strictPasses": 0,
+        "factualPasses": 0,
+        "formatPasses": 0,
+        "completed": 6,
+        "filesUnchanged": 6,
+        "timedOut": 0,
+        "caps": 0,
+        "runsWithPermissionDenials": 6,
+        "unknownDenialRuns": 0,
+        "partialToolOperationRuns": 0,
+        "modelRequests": 18,
+        "tokenCountRequests": 0,
+        "modelIssuedToolCalls": 30,
+        "recognizedToolCalls": 30,
+        "underlyingToolOperations": 24,
+        "successfulToolOperations": 24,
+        "firstInputTokenRange": [
+          7080,
+          7080
+        ],
+        "inputTokens": 137428,
+        "cachedTokens": 111287,
+        "uncachedInputTokens": 26141,
+        "cacheShare": 0.8097840323660389,
+        "requestsWithPositiveCache": 15,
+        "cacheMeasurements": 18,
+        "outputTokens": 1584,
+        "medianWallSeconds": 8.408334910491249,
+        "maximumWallSeconds": 12.236435633007204,
+        "coldStartsChecked": 3,
+        "toolSchemaCounts": [
+          36
+        ]
+      }
+    },
+    "Claude Code": {
+      "single_read": {
+        "runs": 6,
+        "strictPasses": 0,
+        "factualPasses": 0,
+        "formatPasses": 0,
+        "completed": 6,
+        "filesUnchanged": 6,
+        "timedOut": 0,
+        "caps": 0,
+        "runsWithPermissionDenials": 0,
+        "unknownDenialRuns": 0,
+        "partialToolOperationRuns": 0,
+        "modelRequests": 12,
+        "tokenCountRequests": 0,
+        "modelIssuedToolCalls": 6,
+        "recognizedToolCalls": 6,
+        "underlyingToolOperations": 6,
+        "successfulToolOperations": 6,
+        "firstInputTokenRange": [
+          764,
+          764
+        ],
+        "inputTokens": 9462,
+        "cachedTokens": 6963,
+        "uncachedInputTokens": 2499,
+        "cacheShare": 0.7358909321496513,
+        "requestsWithPositiveCache": 9,
+        "cacheMeasurements": 12,
+        "outputTokens": 224,
+        "medianWallSeconds": 1.341993066991563,
+        "maximumWallSeconds": 2.268088505981723,
+        "coldStartsChecked": 3,
+        "toolSchemaCounts": [
+          2
+        ]
+      },
+      "four_file_join": {
+        "runs": 6,
+        "strictPasses": 0,
+        "factualPasses": 0,
+        "formatPasses": 0,
+        "completed": 1,
+        "filesUnchanged": 6,
+        "timedOut": 1,
+        "caps": 4,
+        "runsWithPermissionDenials": 0,
+        "unknownDenialRuns": 1,
+        "partialToolOperationRuns": 1,
+        "modelRequests": 321,
+        "tokenCountRequests": 0,
+        "modelIssuedToolCalls": 1280,
+        "recognizedToolCalls": 1279,
+        "underlyingToolOperations": 1276,
+        "successfulToolOperations": 1096,
+        "firstInputTokenRange": [
+          786,
+          786
+        ],
+        "inputTokens": 2050939,
+        "cachedTokens": 2001905,
+        "uncachedInputTokens": 49034,
+        "cacheShare": 0.9760919266735871,
+        "requestsWithPositiveCache": 318,
+        "cacheMeasurements": 321,
+        "outputTokens": 31153,
+        "medianWallSeconds": 140.1158009464998,
+        "maximumWallSeconds": 240.0095866979973,
+        "coldStartsChecked": 3,
+        "toolSchemaCounts": [
+          2
+        ]
+      }
+    }
+  }
+}

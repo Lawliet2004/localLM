@@ -1,0 +1,40 @@
+Disposable source: /home/papan/Desktop/Projects/localLM/.local/qa/harness-audit-2026-11-08/probe-workspace-_6kjsidr
+   Compiling locallm v0.1.0 (/home/papan/Desktop/Projects/localLM/.local/qa/harness-audit-2026-11-08/probe-workspace-_6kjsidr/src-tauri)
+    Finished `test` profile [unoptimized] target(s) in 48.70s
+     Running unittests src/lib.rs (/home/papan/Desktop/Projects/localLM/src-tauri/target/debug/deps/tauri_app_lib-1f9b5e0a6b72a6ac)
+
+running 15 tests
+test audit_harness_20261108::control_acknowledged_stop_prevents_later_write ... AUDIT_EVIDENCE {"evidence":{"postStopMarkerWritten":false},"name":"acknowledged_process_stop"}
+ok
+test audit_harness_20261108::diag_literal_user_handoff_replaces_recorded_constraints ... AUDIT_EVIDENCE {"evidence":{"originalRequest":"Unrelated example","retainedConstraints":[]},"name":"literal_handoff"}
+ok
+test audit_harness_20261108::diag_managed_process_rejects_one_hour_lifetime ... AUDIT_EVIDENCE {"evidence":{"defaultSeconds":60,"error":"Process yield must be 0–1000 ms; timeout must be 1–300 seconds within the configured shell limit.","requestedSeconds":3600},"name":"managed_process_lifetime"}
+ok
+test audit_harness_20261108::diag_multimodal_compaction_drops_text_requirements ... AUDIT_EVIDENCE {"evidence":{"archiveRetainsOriginal":true,"handoff":{"archiveIds":["art_49acc8128abb47f2ac873f8d45c22757"],"completedOperationIds":[],"constraints":[],"findings":["Assistant note (unverified): I have inspected the request."],"nextAction":"Continue the latest user request under the retained constraints. Check unresolved outcomes and rerun checks after later edits; consult artifact_read for exact archived details.","originalRequest":"","sourceRefs":[],"unresolved":[],"version":1},"liveContextRetainsRequirement":false},"name":"multimodal_compaction"}
+ok
+test audit_harness_20261108::diag_restart_leaves_child_lineage_running ... AUDIT_EVIDENCE {"evidence":{"lineageStatus":"running","liveChild":false,"runStatus":"cancelled"},"name":"restart_child_lineage"}
+ok
+test audit_harness_20261108::diag_stop_all_does_not_acknowledge_process_termination_before_exit ... AUDIT_EVIDENCE {"evidence":{"postExitDescendantMarkerWritten":true,"scope":"stop_all followed by immediate process exit; full Tauri graceful exit timing not exercised"},"name":"shutdown_unacknowledged_stop_all"}
+ok
+test chat::audit_harness_20261108::diag_completed_turn_research_ledger_reopens_as_paused_work ... AUDIT_EVIDENCE {"evidence":{"answerCompleted":true,"ledgerAfterRestart":"paused","ledgerBeforeRestart":"running","pending":["plan","search","read","verify","answer"]},"name":"completed_turn_research_ledger"}
+ok
+test chat::audit_harness_20261108::diag_parent_stops_at_64_model_rounds_with_unfinished_work ... AUDIT_EVIDENCE {"evidence":{"finalToolChoice":"none","modelRequests":64,"partial":false,"stableToolSchemas":true,"toolCalls":63},"name":"parent_round_cap"}
+ok
+test chat::audit_harness_20261108::diag_read_only_ptc_uses_an_extra_verification_round ... AUDIT_EVIDENCE {"evidence":{"cases":[{"answer":"alpha beta","batched":false,"durableToolAuditRows":2,"modelRequests":3,"outerToolCalls":2,"parentRulesPresent":true,"partial":false,"underlyingReads":2,"verification":{"checks":[],"revision":0,"status":"not_required"},"verificationNudges":0},{"answer":"alpha beta","batched":true,"durableToolAuditRows":3,"modelRequests":3,"outerToolCalls":1,"parentRulesPresent":true,"partial":true,"underlyingReads":2,"verification":{"checks":[],"revision":1,"status":"unverified"},"verificationNudges":1}],"limitation":"Scripted model chooses the plan. This tests orchestration and result parity, not real-model task accuracy or comparative harness performance."},"name":"scripted_ptc_equivalence"}
+ok
+test chat::audit_harness_20261108::diag_task_graph_pending_work_is_missing_from_turn_partial_outcome ... AUDIT_EVIDENCE {"evidence":{"delivered":true,"pendingGraphTasks":1,"turnEndPartial":false,"unfinishedTodos":[]},"name":"task_graph_completion"}
+ok
+test subagents::audit_harness_20261108::diag_background_children_bypass_four_parent_run_slots ... AUDIT_EVIDENCE {"evidence":{"acceptedSimultaneousChildren":12,"fixtureChildrenInterrupted":true,"parentSlotsConsumed":0},"name":"background_admission"}
+ok
+test subagents::audit_harness_20261108::diag_background_setup_error_is_discarded_without_settling_run ... AUDIT_EVIDENCE {"evidence":{"error":null,"lineageStatus":"running","spawnReturnedSuccess":true,"workerRetired":true},"name":"background_setup_error"}
+ok
+test subagents::audit_harness_20261108::diag_child_request_omits_project_instruction_file ... AUDIT_EVIDENCE {"evidence":{"instructionFileExists":true,"instructionSentInChildRequest":false,"system":"\nYou are a subagent: solve ONLY the assigned subtask and report back concisely.\nModel capability metadata (not independent verification): {\"controlSource\":\"legacy-family-heuristic\",\"controls\":null,\"probedAt\":null,\"tools\":\"supported\",\"toolsSource\":\"saved-model-setting\",\"toolsVerified\":false,\"unknownToolsMayBeAttempted\":false}"},"name":"child_project_rules"}
+ok
+test subagents::audit_harness_20261108::diag_dropped_foreground_child_leaves_running_state_and_live_registry_entry ... AUDIT_EVIDENCE {"evidence":{"lineageStatus":"running","registryAcceptsMail":true,"workerAborted":true},"name":"dropped_foreground_child"}
+ok
+test subagents::audit_harness_20261108::diag_empty_child_answer_is_marked_completed_and_usage_disappears ... AUDIT_EVIDENCE {"evidence":{"answerLength":0,"reportedFixtureCacheTokens":80,"savedUsageEvents":0,"status":"completed","usageRequested":false},"name":"empty_child_and_unreported_usage"}
+ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 1101 filtered out; finished in 3.83s
+
+Disposable three-response fixture control: 0

@@ -1,0 +1,13 @@
+{
+  "capturedAt": "2026-11-08T11:52:24.110Z",
+  "sourceSha256": "74f73b78b5b676116b4567ca2ee1690911c46a043783facd2792b5921953b507",
+  "binarySha256": "cb68e90ef078bbdae92dbb331d2c1f9b15ec9a2a00d0588e6d1c20dcdda7d0c8",
+  "fixtureSha256": "9ce2292c2caea6153d144b964cc8e784b90152b7acbe6d8f854276d9ccf63542",
+  "width": 1280,
+  "height": 840,
+  "theme": "light",
+  "nativeEmbedded": true,
+  "browserPreview": false,
+  "paidInference": false,
+  "syntheticTranscript": true
+}

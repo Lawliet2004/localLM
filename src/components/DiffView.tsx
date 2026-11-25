@@ -25,8 +25,13 @@ function diffRows(diff: string): DiffRow[] {
 
 /** One diff surface, with real source coordinates and safe syntax highlighting.
  * The source +/- markers remain visible so meaning never depends on color. */
-export const DiffLines = memo(function DiffLines({ diff, path }: { diff: string; path?: string }) {
-  const rows = useMemo(() => diffRows(diff), [diff]);
+export const DiffLines = memo(function DiffLines({ diff, path, excerpt = false }: { diff: string; path?: string; excerpt?: boolean }) {
+  const rows = useMemo(() => {
+    const rows = diffRows(diff);
+    if (!excerpt) return rows;
+    return rows.filter(row => row.kind === 'add' || row.kind === 'del').slice(0, 12)
+      .map(row => row.text.length > 240 ? { ...row, text: `${row.text.slice(0, 240)}…` } : row);
+  }, [diff, excerpt]);
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
   const regions = useMemo(() => {
     const regions = new Map<number, number>();
@@ -42,7 +47,7 @@ export const DiffLines = memo(function DiffLines({ diff, path }: { diff: string;
   for (const [start, end] of regions) if (!expanded.has(start)) for (let index = start; index < end; index++) folded.add(index);
   const language = languageFromPath(path ?? /^\+\+\+ (?:b\/)?(.+)$/m.exec(diff)?.[1] ?? '');
   const highlight = diff.length <= 100_000;
-  return <pre className="tool-diff diff-lines" tabIndex={0} aria-label="File changes">
+  return <pre className="tool-diff diff-lines" tabIndex={excerpt ? undefined : 0} aria-label={excerpt ? 'File changes excerpt' : 'File changes'}>
     {rows.map((row, idx) => {
       const regionEnd = regions.get(idx);
       const isExpanded = expanded.has(idx);

@@ -1,0 +1,19 @@
+Working directory: /home/papan/Desktop/Projects/localLM
+npm run typecheck
+npm run build
+npx vitest run
+npm audit --json
+node --import ./scripts/register-test-loader.mjs --test scripts/web-transport.test.mjs scripts/web-render.test.mjs scripts/web-storage.test.mjs scripts/searxng-worker.test.mjs scripts/weather-worker.test.mjs
+python3 scripts/benchmark-response-latency.test.py
+git diff --check
+graphify update .
+
+Working directory: /home/papan/Desktop/Projects/localLM/src-tauri
+cargo test --lib
+cargo check --lib
+
+The selected normally ignored tests were run using the just-built library test executable:
+./target/debug/deps/tauri_app_lib-1f9b5e0a6b72a6ac --ignored api_tools::transport_tests chat::output_recovery_tests subagents::tests::child_permission_rules_block_or_allow_actual_workspace_reads subagents::tests::foreground_child_approval_does_not_override_a_new_deny_rule profile_tools::tests::real_node_inspector_capture --test-threads=2
+
+Equivalent rebuildable Cargo invocation:
+cargo test --lib -- --ignored api_tools::transport_tests chat::output_recovery_tests subagents::tests::child_permission_rules_block_or_allow_actual_workspace_reads subagents::tests::foreground_child_approval_does_not_override_a_new_deny_rule profile_tools::tests::real_node_inspector_capture --test-threads=2

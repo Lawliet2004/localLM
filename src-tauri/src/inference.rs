@@ -35,7 +35,8 @@ impl InferenceUsage {
                 &mut self.cached_tokens,
                 usage["prompt_tokens_details"]["cached_tokens"]
                     .as_u64()
-                    .or_else(|| usage["cache_read_input_tokens"].as_u64()),
+                    .or_else(|| usage["cache_read_input_tokens"].as_u64())
+                    .or_else(|| usage["prompt_cache_hit_tokens"].as_u64()),
             ),
             (
                 &mut self.cache_write_tokens,
@@ -182,9 +183,15 @@ pub(crate) fn openai_reasoning_effort_supported(model: &str) -> bool {
         "gpt-5",
         "gpt-5-mini",
         "gpt-5-nano",
+        "gpt-5-codex",
         "gpt-5.1",
+        "gpt-5.1-codex",
         "gpt-5.2",
+        "gpt-5.2-codex",
+        "gpt-5.3",
+        "gpt-5.3-codex",
         "gpt-5.4",
+        "gpt-5.4-codex",
         "gpt-5.5",
         "o1",
         "o3",
@@ -193,6 +200,59 @@ pub(crate) fn openai_reasoning_effort_supported(model: &str) -> bool {
     ]
     .iter()
     .any(|name| model == *name || model.starts_with(&format!("{name}-20")))
+}
+
+/// Deterministic, non-PII cache routing key derived from a conversation or
+/// child-run identifier. Translated to `prompt_cache_key` only on official
+/// OpenAI endpoints and stripped everywhere else.
+pub fn prompt_cache_key(scope: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(scope.as_bytes()));
+    format!("locallm-{}", &digest[..24])
+}
+
+fn is_openai_official_endpoint(base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some("api.openai.com")
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn is_gemini_openai_endpoint(base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some("generativelanguage.googleapis.com")
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn is_gemini_model(model: &str) -> bool {
+    let stripped = model.strip_prefix("models/").unwrap_or(model);
+    stripped.starts_with("gemini-")
+}
+
+fn strip_extra_content(payload: &mut Value) {
+    if let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(object) = message.as_object_mut() {
+                object.remove("extra_content");
+                if let Some(calls) = object.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    for call in calls {
+                        if let Some(call_object) = call.as_object_mut() {
+                            call_object.remove("extra_content");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub struct SubscriptionAuth {
@@ -521,6 +581,10 @@ impl InferenceProvider for Backend {
         }
         let capabilities = self.capabilities();
         let object = payload.as_object_mut().unwrap();
+        let cache_key = object
+            .remove("locallm_cache_key")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .filter(|key| !key.is_empty() && key.len() <= 128 && !key.chars().any(char::is_control));
         let may_omit_tools = object.remove("locallm_allow_omit_tools").is_some_and(|value| value == true);
         if may_omit_tools && object.get("tool_choice").is_some_and(|choice| choice == "none")
             && capabilities.controls.as_ref().is_some_and(|controls| controls.tool_choice == crate::providers::ToolSupport::Unsupported)
@@ -559,10 +623,16 @@ impl InferenceProvider for Backend {
         }
         if let Self::OpenAi {
             responses: true,
+            base_url,
             model_id,
             ..
         } = self
         {
+            if let Some(key) = cache_key.as_deref() {
+                if is_openai_official_endpoint(base_url) && payload["cache_prompt"] != false {
+                    payload["prompt_cache_key"] = json!(key);
+                }
+            }
             if !self.supports_tools() {
                 if let Some(object) = payload.as_object_mut() {
                     for key in ["tools", "tool_choice", "parallel_tool_calls"] {
@@ -619,6 +689,7 @@ impl InferenceProvider for Backend {
         }
         Ok(match self {
             Self::Local { .. } => {
+                strip_extra_content(&mut payload);
                 payload
                     .as_object_mut()
                     .map(|object| object.remove("locallm_reasoning_mode"));
@@ -631,6 +702,11 @@ impl InferenceProvider for Backend {
                 max_output_tokens,
                 ..
             } => {
+                if payload["messages"].as_array().into_iter().flatten().any(|message| {
+                    message["content"].as_array().into_iter().flatten().any(|part| part["type"] == "video_url")
+                }) {
+                    return Err("This Claude endpoint does not accept MP4 attachments. Choose a video-capable Chat Completions endpoint or attach screenshots from the video.".into());
+                }
                 if payload
                     .get("output_config")
                     .is_some_and(|value| !value.is_object())
@@ -655,7 +731,14 @@ impl InferenceProvider for Backend {
                 }
                 native
             }
-            Self::OpenAi { model_id, .. } | Self::Subscription { model_id, .. } => {
+            Self::OpenAi { model_id, base_url, .. } | Self::Subscription { model_id, base_url, .. } => {
+                let official_openai = matches!(self, Self::OpenAi { .. }) && is_openai_official_endpoint(base_url);
+                let official_gemini = matches!(self, Self::OpenAi { .. })
+                    && is_gemini_openai_endpoint(base_url)
+                    && is_gemini_model(model_id);
+                if official_openai {
+                    strip_extra_content(&mut payload);
+                }
                 if let Some(object) = payload.as_object_mut() {
                     let mode = object.remove("locallm_reasoning_mode");
                     // Unknown compatible endpoints keep their default protocol.
@@ -680,8 +763,28 @@ impl InferenceProvider for Backend {
                                 _ => {}
                             }
                         }
+                    } else if capabilities.controls.is_none()
+                        && official_gemini
+                        && !object.contains_key("reasoning_effort")
+                    {
+                        if let Some(mode) = mode.as_ref().and_then(Value::as_str) {
+                            match mode {
+                                "quick" => {
+                                    object.insert("reasoning_effort".into(), json!("low"));
+                                }
+                                "think" => {
+                                    object.insert("reasoning_effort".into(), json!("high"));
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                    object.remove("cache_prompt");
+                    let cache_enabled = object.remove("cache_prompt") != Some(json!(false));
+                    if official_openai && cache_enabled {
+                        if let Some(key) = cache_key {
+                            object.insert("prompt_cache_key".into(), json!(key));
+                        }
+                    }
                     object.remove("id_slot");
                     // repeat_penalty is a llama.cpp extension — some
                     // OpenAI-compatible endpoints reject unknown fields.
@@ -1879,6 +1982,72 @@ mod reasoning_payload_tests {
         assert_eq!(
             chat["messages"],
             json!([{"role":"assistant","content":"Safe"}])
+        );
+    }
+
+    #[test]
+    fn deepseek_cache_hit_openai_cache_key_encrypted_reasoning_and_gemini_controls() {
+        // DeepSeek prompt_cache_hit_tokens accounting
+        let mut usage = InferenceUsage::default();
+        usage.observe(&json!({"usage":{"prompt_tokens":1000,"completion_tokens":50,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}}));
+        assert_eq!(usage.input_tokens, Some(1000));
+        assert_eq!(usage.cached_tokens, Some(800));
+        assert_eq!(usage.context(1000, 64, 65536, true)["cacheHitRate"], 0.8);
+
+        let key = prompt_cache_key("conv-123");
+        assert!(key.starts_with("locallm-"));
+        assert_eq!(key, prompt_cache_key("conv-123"));
+        assert_ne!(key, prompt_cache_key("conv-456"));
+
+        let make = |base_url: &str, responses: bool, model: &str| Backend::OpenAi {
+            responses,
+            client: reqwest::Client::new(),
+            base_url: base_url.into(),
+            key: String::new(),
+            model_id: model.into(),
+            context_length: 128_000,
+            max_output_tokens: Some(16_384),
+            capabilities: crate::provider_capabilities::ModelCapabilities::legacy(true),
+        };
+
+        // Official OpenAI Responses gets prompt_cache_key and reasoning.encrypted_content include
+        let responses_req = make("https://api.openai.com/v1", true, "gpt-5.4")
+            .payload(&json!({"messages":[{"role":"user","content":"hi"}],"locallm_reasoning_mode":"think","locallm_cache_key":key,"cache_prompt":true}))
+            .unwrap();
+        assert_eq!(responses_req["prompt_cache_key"], key);
+        assert_eq!(responses_req["include"], json!(["reasoning.encrypted_content"]));
+        assert!(responses_req.get("locallm_cache_key").is_none());
+
+        // Official OpenAI Chat Completions gets prompt_cache_key and strips foreign extra_content
+        let chat_req = make("https://api.openai.com/v1", false, "gpt-4o")
+            .payload(&json!({
+                "messages":[{"role":"assistant","content":"","extra_content":{"google":{"thought_signature":"sig"}},"tool_calls":[{"id":"c1","type":"function","extra_content":{"google":{"thought_signature":"sig2"}},"function":{"name":"read","arguments":"{}"}}]}],
+                "locallm_cache_key":key,"cache_prompt":true
+            }))
+            .unwrap();
+        assert_eq!(chat_req["prompt_cache_key"], key);
+        assert!(chat_req["messages"][0].get("extra_content").is_none());
+        assert!(chat_req["messages"][0]["tool_calls"][0].get("extra_content").is_none());
+
+        // DeepSeek / arbitrary endpoint does NOT receive prompt_cache_key
+        let deepseek_req = make("https://api.deepseek.com/v1", false, "deepseek-reasoner")
+            .payload(&json!({"messages":[{"role":"user","content":"hi"}],"locallm_cache_key":key,"cache_prompt":true}))
+            .unwrap();
+        assert!(deepseek_req.get("prompt_cache_key").is_none());
+        assert!(deepseek_req.get("locallm_cache_key").is_none());
+
+        // Gemini official OpenAI-compat endpoint maps reasoning_effort and preserves extra_content
+        let gemini_req = make("https://generativelanguage.googleapis.com/v1beta/openai", false, "gemini-2.5-pro")
+            .payload(&json!({
+                "messages":[{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","extra_content":{"google":{"thought_signature":"sig"}},"function":{"name":"read","arguments":"{}"}}]}],
+                "locallm_reasoning_mode":"think","locallm_cache_key":key
+            }))
+            .unwrap();
+        assert_eq!(gemini_req["reasoning_effort"], "high");
+        assert!(gemini_req.get("prompt_cache_key").is_none());
+        assert_eq!(
+            gemini_req["messages"][0]["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+            "sig"
         );
     }
 }

@@ -12,7 +12,7 @@
 .session-new { align-self: center; flex-shrink: 0; margin-inline: 5px; }
 .session-status { color: var(--accent); display: inline-flex; align-items: center; }
 .session-status.attention { color: var(--warn); }
-.session-working { animation: session-working 1.4s linear infinite; }
+.session-working { animation: session-working calc(1.4s * var(--motion-scale)) linear infinite; }
 @keyframes session-working { to { transform: rotate(360deg); } }
 .session-strip :is(button, [role="tab"]):focus-visible, .answer-navigation :is(summary, button):focus-visible { outline: 2px solid var(--focus-border); outline-offset: -2px; }
 .session-strip button:disabled { opacity: .5; cursor: default; }

@@ -1,11 +1,10 @@
-import { toolRecord, toolOperationId, toolFailed } from '../lib/toolActivity';
+import { toolRecord, toolOperationId } from '../lib/toolActivity';
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { ChevronRight } from 'lucide-react';
 import { api, nativeAvailable } from '../lib/api';
 import type { Message, SessionEvent } from '../lib/types';
 import { isPlanStateTool } from './PlanChecklist';
 import { ReasoningDisclosure } from './ReasoningDisclosure';
-import { TraceIcon, groupKindOf, toolKindOf } from './TraceIcon';
+import { TraceIcon, toolKindOf } from './TraceIcon';
 import { reduceTurnItems, subscribeTurnItems, type TurnItem } from '../lib/turnItems';
 
 export function useSessionActivity(conversationId: string, generating: boolean) {
@@ -230,58 +229,6 @@ function sequencedTools(events: SessionEvent[], tools: Message[]): Map<number, M
 function isPlanMessage(message: Message) {
   const value = toolRecord(message); return isPlanStateTool(value.request?.name ?? value.name ?? '');
 }
-function needsAttention(message: Message) {
-  if (['streaming', 'error', 'interrupted'].includes(message.status)) return true;
-  const value = toolRecord(message);
-  return toolFailed(value) || value.request?.decision === 'pending';
-}
-function toolMeta(message: Message): { name: string; args: Record<string, unknown> } {
-  const value = toolRecord(message), request = value.request ?? value;
-  return { name: typeof request.name === 'string' ? request.name : '', args: request.arguments && typeof request.arguments === 'object' ? request.arguments : {} };
-}
-
-export function activityLabel(tools: Message[]): string {
-  const kinds = new Set(tools.map(tool => { const meta = toolMeta(tool); return toolKindOf(meta.name, meta.args); }));
-  const labels: string[] = [];
-  if (kinds.has('edit')) labels.push('Edited files');
-  if (kinds.has('read')) labels.push('Read files');
-  if (kinds.has('search') || kinds.has('folder') || kinds.has('explore')) labels.push('Searched files');
-  if (kinds.has('web')) labels.push('Browsed the web');
-  if (kinds.has('command')) labels.push(tools.filter(tool => { const meta = toolMeta(tool); return toolKindOf(meta.name, meta.args) === 'command'; }).length === 1 ? 'Ran a command' : 'Ran commands');
-  if (kinds.has('tool') || kinds.has('task')) labels.push('Used tools');
-  return labels.map((label, index) => index ? label.toLowerCase() : label).join(', ');
-}
-
-/** Only adjacent successful exploration can fold. Consequential work and
- * attention states form hard boundaries, so chronology survives collapsing. */
-function ActivityGroup({ tools, renderTool }: { tools: Message[]; renderTool: (message: Message) => ReactNode }) {
-  const rows: ReactNode[] = [];
-  let exploration: Message[] = [];
-  const flush = () => {
-    if (!exploration.length) return;
-    const group = exploration;
-    exploration = [];
-    if (group.length === 1) { rows.push(<Fragment key={group[0].id}>{renderTool(group[0])}</Fragment>); return; }
-    const kinds = group.map(tool => { const meta = toolMeta(tool); return toolKindOf(meta.name, meta.args); });
-    const paths = group.map(tool => toolMeta(tool).args.path);
-    const fileCount = new Set(paths).size;
-    const label = paths.every(path => typeof path === 'string') && kinds.every(kind => kind === 'read')
-      ? `Read ${fileCount} ${fileCount === 1 ? 'file' : 'files'}`
-      : `${activityLabel(group)} · ${group.length} actions`;
-    rows.push(<details className="activity-summary" key={group[0].id}>
-      <summary className="card-header"><TraceIcon kind={groupKindOf(kinds)} size={14} /><span className="activity-summary-label">{label}</span><ChevronRight size={14} className="trace-chevron" aria-hidden="true" /></summary>
-      <div className="activity-summary-rows">{group.map(tool => <Fragment key={tool.id}>{renderTool(tool)}</Fragment>)}</div>
-    </details>);
-  };
-  for (const tool of tools) {
-    const meta = toolMeta(tool);
-    if (!needsAttention(tool) && ['read', 'search', 'folder', 'explore'].includes(toolKindOf(meta.name, meta.args))) exploration.push(tool);
-    else { flush(); rows.push(<Fragment key={tool.id}>{renderTool(tool)}</Fragment>); }
-  }
-  flush();
-  return <>{rows}</>;
-}
-
 /** Only split journal commentary when it is an exact prefix of the saved answer.
  * This keeps old, partial, or mismatched journals from duplicating model output. */
 export function activitySegments(events: SessionEvent[], content: string): { seq: number; content: string }[] {
@@ -309,7 +256,12 @@ function ToolDraftRow({ item, generating }: { item: TurnItem; generating: boolea
   const label = item.status === 'interrupted' ? 'Tool request incomplete · not run'
     : !generating ? 'Tool request interrupted · check activity'
     : kind === 'edit' ? 'Preparing edit request' : kind === 'command' ? 'Preparing command' : kind === 'read' ? 'Preparing read' : kind === 'search' ? 'Preparing search' : 'Preparing tool request';
-  return <div className="activity-draft" aria-live="off"><TraceIcon kind={kind} size={14} /><span>{label}</span>{target && <code title={target}>{target.length > 160 ? `${target.slice(0, 160)}…` : target}</code>}</div>;
+  return <div className="activity-draft" aria-live="off">
+    <TraceIcon kind={kind} size={14} />
+    <div className={generating && item.status === 'running' ? 'activity-sweep' : undefined}>
+      <span>{label}</span>{target && <> <code title={target}>{target.length > 160 ? `${target.slice(0, 160)}…` : target}</code></>}
+    </div>
+  </div>;
 }
 
 export function ActivityTimeline({ events, messages, renderMessage, renderTool, generating = false }: {
@@ -370,16 +322,12 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
     const toolBySeq = sequencedTools(events, tools);
     const draftBySeq = new Map(drafts.map(item => [item.seq, item]));
     const orderedSeqs = [...new Set([...commentary.keys(), ...thoughtBySeq.keys(), ...toolBySeq.keys(), ...draftBySeq.keys()])].sort((a, b) => a - b);
-    let pendingTools: Message[] = [];
-    const flushTools = () => {
-      if (!pendingTools.length) return;
-      feed.push(<ActivityGroup key={`tools-${pendingTools[0].id}`} tools={pendingTools} renderTool={renderTool} />);
-      pendingTools = [];
-    };
     for (const seq of orderedSeqs) {
       const tool = toolBySeq.get(seq);
-      if (tool) { pendingTools.push(tool); continue; }
-      flushTools();
+      if (tool) {
+        feed.push(<Fragment key={`tool-${tool.id}`}>{renderTool(tool)}</Fragment>);
+        continue;
+      }
       const thought = thoughtBySeq.get(seq);
       if (thought) feed.push(<ReasoningDisclosure key={`thought-${thought.index}`} text={thought.text} durationMs={thought.durationMs} active={thought.thinking} />);
       const draft = draftBySeq.get(seq);
@@ -390,9 +338,6 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
         remaining = remaining.trimStart().slice(segment.content.length);
       }
     }
-    flushTools();
-    // Message-only legacy tools have no sequence and remain visible.
-
     if (pendingThought) feed.push(<ReasoningDisclosure key={`thought-${orderedThoughts.length}`} text={pendingThought} active={generating} />);
   } else {
     if (reasoning) feed.push(<ReasoningDisclosure key="thought-0" text={reasoning} durationMs={reasoningMs} active={thinking} />);
@@ -400,16 +345,12 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
     const toolBySeq = sequencedTools(events, tools);
     const draftBySeq = new Map(drafts.map(item => [item.seq, item]));
     const orderedSeqs = [...new Set([...commentary.keys(), ...toolBySeq.keys(), ...draftBySeq.keys()])].sort((a, b) => a - b);
-    let pendingTools: Message[] = [];
-    const flushTools = () => {
-      if (!pendingTools.length) return;
-      feed.push(<ActivityGroup key={`tools-${pendingTools[0].id}`} tools={pendingTools} renderTool={renderTool} />);
-      pendingTools = [];
-    };
     for (const seq of orderedSeqs) {
       const tool = toolBySeq.get(seq);
-      if (tool) { pendingTools.push(tool); continue; }
-      flushTools();
+      if (tool) {
+        feed.push(<Fragment key={`tool-${tool.id}`}>{renderTool(tool)}</Fragment>);
+        continue;
+      }
       const draft = draftBySeq.get(seq);
       if (draft) feed.push(<ToolDraftRow key={draft.id} item={draft} generating={generating} />);
       const segment = commentary.get(seq);
@@ -418,7 +359,6 @@ export function ActivityTimeline({ events, messages, renderMessage, renderTool, 
         remaining = remaining.trimStart().slice(segment.content.length);
       }
     }
-    flushTools();
 
   }
   return <div className="activity-feed">

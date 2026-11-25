@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, errorMessage, nativeAvailable } from '../lib/api';
-import type { ContextUsage } from '../lib/types';
+import type { ContextUsage, PreflightBreakdown } from '../lib/types';
 
 /* Radius chosen so the circumference is ~100, letting stroke-dashoffset map
    directly onto percentages. */
@@ -31,6 +31,7 @@ function ContextRing({ percent, size, stroke }: { percent: number | null; size: 
 
 type ContextControlProps = {
   conversationId: string; usage?: ContextUsage; busy: boolean;
+  preview?: PreflightBreakdown;
   onCompact?: () => void; compacting?: boolean;
 };
 
@@ -39,7 +40,7 @@ export function ContextControl(props: ContextControlProps) {
   return <SessionContextControl key={props.conversationId} {...props} />;
 }
 
-function SessionContextControl({ conversationId, usage, busy, onCompact, compacting }: ContextControlProps) {
+function SessionContextControl({ conversationId, usage, preview, busy, onCompact, compacting }: ContextControlProps) {
   const [auto, setAuto] = useState(true);
   const [saving, setSaving] = useState(false);
   const [pinned, setPinned] = useState(false);
@@ -52,7 +53,9 @@ function SessionContextControl({ conversationId, usage, busy, onCompact, compact
     }
     return () => { disposed = true; };
   }, [conversationId]);
-  const percent = usage && usage.contextLength > 0 ? Math.min(100, Math.round(usage.inputTokens / usage.contextLength * 100)) : null;
+  const inputTokens = preview?.total ?? usage?.inputTokens;
+  const capacity = preview?.contextLength ?? usage?.contextLength;
+  const percent = inputTokens !== undefined && capacity ? Math.min(100, Math.round(inputTokens / capacity * 100)) : null;
   const level = percent === null ? 'idle' : percent >= 80 ? 'high' : percent >= 55 ? 'mid' : 'low';
   return (
     <div className={`context-control context-${level} ${pinned ? 'is-open' : ''}`}>
@@ -61,7 +64,7 @@ function SessionContextControl({ conversationId, usage, busy, onCompact, compact
         className="context-trigger"
         aria-expanded={pinned}
         aria-haspopup="dialog"
-        aria-label={percent === null ? 'Context usage details' : `Context ${percent}% used — hover or click for details`}
+        aria-label={preview ? 'Draft context details' : percent === null ? 'Context usage details' : `Context ${percent}% used — hover or click for details`}
         onClick={() => setPinned(p => !p)}
       >
         <ContextRing percent={percent} size={17} stroke={3.4} />
@@ -72,21 +75,31 @@ function SessionContextControl({ conversationId, usage, busy, onCompact, compact
           <div className="context-popover-title">
             <strong>Context window</strong>
             <small>
-              {usage
-                ? `${usage.inputTokens.toLocaleString()} / ${usage.contextLength.toLocaleString()} tokens`
+              {inputTokens !== undefined && capacity !== undefined
+                ? `${preview ? 'Draft · ' : ''}${inputTokens.toLocaleString()} / ${capacity.toLocaleString()} tokens`
                 : 'No usage measured yet'}
             </small>
           </div>
         </div>
-        {usage && (
+        {preview ? <>
+          <dl className="context-breakdown" aria-label={preview.exact ? 'Draft token breakdown' : 'Estimated draft token breakdown'}>
+            <dt>Chat history</dt><dd>{preview.history.toLocaleString()}</dd>
+            <dt>Instructions</dt><dd>{preview.instructions.toLocaleString()}</dd>
+            <dt>Tool definitions</dt><dd>{preview.tools.toLocaleString()}</dd>
+            {!!preview.scratchpad && <><dt>Additional context</dt><dd>{preview.scratchpad.toLocaleString()}</dd></>}
+            <dt>Your draft</dt><dd>{preview.draft.toLocaleString()}</dd>
+            <dt>Reserved for reply</dt><dd>{preview.responseReserve.toLocaleString()}</dd>
+          </dl>
+          {preview.notice && <p className="context-note">{preview.notice}</p>}
+        </> : usage && (
           <p className="context-detail">
             {usage.estimated ? 'Estimated: ' : ''}{usage.inputTokens.toLocaleString()} input + {usage.responseReserve.toLocaleString()} reserved / {usage.contextLength.toLocaleString()} tokens
           </p>
         )}
-        {usage && (
+        {!preview && usage && (
           <p className="context-detail">The response reserve is an output allowance, not stored conversation history. Auto-compaction checks input plus this allowance.</p>
         )}
-        {usage?.cachedTokens != null && (
+        {!preview && usage?.cachedTokens != null && (
           <p className="context-detail" aria-label="Prompt cache usage">
             {usage.cachedTokens.toLocaleString()} input tokens reused
             {usage.cacheHitRate != null ? ` (${Math.round(usage.cacheHitRate * 100)}% cache hit)` : ''}

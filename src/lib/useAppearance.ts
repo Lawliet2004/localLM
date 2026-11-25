@@ -31,6 +31,10 @@ export function useAppearance() {
 
   function update(patch: Partial<AppearancePreferences>) {
     const next = normalizeAppearance({ ...preferences, ...patch });
+    // Unchanged palette variants are already normalized. Keep their identity
+    // so editing layout or motion does not trigger a computed color read.
+    if (!patch.lightColors) next.lightColors = preferences.lightColors;
+    if (!patch.darkColors) next.darkColors = preferences.darkColors;
     setPreferences(next);
     try {
       localStorage.setItem(APPEARANCE_STORAGE_KEY, JSON.stringify(next));

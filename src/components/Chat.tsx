@@ -1,5 +1,7 @@
 import { useOwnedProcess } from '../lib/ownedProcess';
 import { useToolOutput } from '../lib/toolOutput';
+import { toolRecord } from '../lib/toolActivity';
+import { sumMetric } from '../lib/responseMetrics';
 import { FileResult } from './FileResult';
 import { partitionActivity } from '../lib/activity';
 import { WorkSummary } from './WorkSummary';
@@ -16,12 +18,12 @@ import type { Message, ContextUsage, ModelSelection, ProviderConnection, Preflig
 import { ResponseMetrics } from './ResponseMetrics';
 import { ToolResultExtras } from './ToolResultExtras';
 import type { InstalledModel } from '../lib/types';
-import { ActivityTimeline, useSessionActivity } from './ActivityTimeline';
+import { ActivityTimeline, activityTools, useSessionActivity } from './ActivityTimeline';
 import { ActivityIndicator } from './ActivityIndicator';
 import { ReasoningDisclosure } from './ReasoningDisclosure';
 import { ContextControl } from './ContextControl';
 import { CommandRunCard } from './CommandRunCard';
-import { PlanChecklist, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
+import { isPlanStateTool, PlanChecklist, todosFromPlanEvents, useConversationTodos } from './PlanChecklist';
 import { AnswerNavigation } from './AnswerNavigation';
 import { CanvasPanel } from './CanvasPanel';
 import { artifactVersions, extractArtifacts, findArtifact } from '../lib/canvas';
@@ -51,6 +53,8 @@ interface Props {
   composerPermissions?: ReactNode;
   reasoningMode?: 'auto' | 'quick' | 'think';
   conversationKey?: string;
+  draftOwner?: string;
+  draftProjectId?: string | null;
   pendingTurn?: PendingTurn | null;
   recoveryBusy?: boolean;
   onRecoverPending?: () => void;
@@ -91,13 +95,7 @@ interface Props {
 
 const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Message; onStop?: () => void }) {
   const output = useToolOutput(message.conversationId, message.id);
-  let record: Record<string, unknown> = {};
-  try {
-    const value: unknown = JSON.parse(message.content);
-    if (value && typeof value === 'object' && !Array.isArray(value)) record = value as Record<string, unknown>;
-  } catch {
-    /* Preserve legacy tool content below. */
-  }
+  const record: Record<string, unknown> = toolRecord(message);
   const request = record.request && typeof record.request === 'object' ? (record.request as Record<string, unknown>) : record;
   const name = typeof request.name === 'string' ? request.name : 'Tool';
   const connector = typeof request.connector === 'string' ? request.connector : 'Connector';
@@ -126,15 +124,20 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
   // read here so a result is never silently dropped from the transcript.
   const isStructured = (value: Record<string, unknown> | null) =>
     !!value && (typeof value.answer === 'string' || value.sources !== undefined || value.documents !== undefined);
-  const structuredResult = dataRecord && 'result' in dataRecord
+  const checkReport = payload?.report && typeof payload.report === 'object'
+    && ['check_run', 'check_report'].includes(name) ? payload.report : undefined;
+  const structuredResult = checkReport ?? (dataRecord && 'result' in dataRecord
     ? dataRecord.result
     : isStructured(dataRecord)
     ? dataRecord
     : isStructured(resultRecord)
     ? resultRecord
-    : undefined;
+    : undefined);
   const resultStatus = dataRecord && typeof dataRecord.resultStatus === 'string' ? dataRecord.resultStatus : undefined;
-  const diff = typeof dataRecord?.diff === 'string' ? dataRecord.diff : typeof resultRecord?.diff === 'string' ? resultRecord.diff : null;
+  const singleChange = Array.isArray(payload?.changes) && payload.changes.length === 1 ? payload.changes[0] : null;
+  const diff = typeof payload?.diff === 'string' ? payload.diff
+    : typeof resultRecord?.diff === 'string' ? resultRecord.diff
+    : typeof singleChange?.diff === 'string' ? singleChange.diff : null;
   const stdout = processStdout || (message.status === 'streaming' && output.stdout ? output.stdout : typeof logsRecord?.stdout === 'string' ? logsRecord.stdout : resultRecord && typeof resultRecord.stdout === 'string' ? resultRecord.stdout : typeof dataRecord?.stdout === 'string' ? dataRecord.stdout : '');
   const stderr = processStderr || (message.status === 'streaming' && output.stderr ? output.stderr : typeof logsRecord?.stderr === 'string' ? logsRecord.stderr : resultRecord && typeof resultRecord.stderr === 'string' ? resultRecord.stderr : typeof dataRecord?.stderr === 'string' ? dataRecord.stderr : '');
   const exitCode = typeof process?.exitCode === 'number' ? process.exitCode : dataRecord && typeof dataRecord.exitCode === 'number' ? dataRecord.exitCode : resultRecord && typeof resultRecord.exitCode === 'number' ? resultRecord.exitCode : null;
@@ -173,14 +176,26 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
   const originalBytes = resultRecord && typeof resultRecord._originalBytes === 'number' ? resultRecord._originalBytes : null;
   const authorization = typeof request.authorization === 'string' ? request.authorization : undefined;
 
-  const fallbackStdout = message.status === 'streaming' ? stdout : stdout || (!resultRecord && typeof result === 'string' ? result : (structuredResult ? '' : (processId ? '' : resultRecord ? JSON.stringify(resultRecord, null, 2) : message.content)));
-  const structuredJson = structuredResult !== undefined && structuredResult !== null
-    ? (() => { try { return JSON.stringify(structuredResult, null, 2); } catch { return String(structuredResult); } })()
-    : null;
+  const diagnosticResult = status === 'failed' && command && !stdout && !stderr && structuredResult == null ? resultRecord : null;
+  const hasRecord = Object.keys(record).length > 0;
+  const legacyOutput = message.status === 'streaming' ? '' : typeof result === 'string' ? result : hasRecord ? '' : message.content;
+  const displayOutput = stdout || legacyOutput;
+  // Keep structured records out of the terminal channel so log excerpts show
+  // actual output, including for shell tools that return without a log.
+  const rawResult = message.status !== 'streaming' && !displayOutput && !stderr && !diff && !diagnosticResult && !processId
+    ? resultRecord?.data ?? result ?? (hasRecord ? record : undefined) : undefined;
+  const resultValue = structuredResult ?? rawResult;
+  const structuredJson = resultValue == null ? null : JSON.stringify(resultValue, null, 2);
 
   if (/^(workspace_read_file|read_file|view_file|file_read)$/.test(name) && status === 'completed' && typeof resultRecord?._artifactId !== 'string' && typeof payload?.content === 'string') {
     const args = request.arguments as Record<string, unknown> | undefined;
-    return <article className="message message-tool" aria-label="tool message"><FileResult path={String(payload.path ?? args?.path ?? 'File')} content={payload.content} totalLines={typeof payload.totalLines === 'number' ? payload.totalLines : undefined} sha256={typeof payload.sha256 === 'string' ? payload.sha256 : undefined} raw={record} /></article>;
+    const totalLines = typeof payload.totalLines === 'number' ? payload.totalLines : undefined;
+    const start = args?.start_line ?? (args?.line_count !== undefined ? 1 : undefined);
+    const first = payload.content.match(/^(\d+): /)?.[1];
+    const last = payload.content.match(/(?:^|\n)(\d+): [^\n]*$/)?.[1];
+    const lineRange = typeof start === 'number' && Number(first) === start && last
+      ? first === last ? `line ${first}` : `lines ${first}–${last}` : undefined;
+    return <article className="message message-tool" aria-label="tool message"><FileResult path={String(payload.path ?? args?.path ?? 'File')} content={payload.content} totalLines={totalLines} lineRange={lineRange} sha256={typeof payload.sha256 === 'string' ? payload.sha256 : undefined} raw={record} /></article>;
   }
 
   return (
@@ -203,14 +218,17 @@ const ToolMessage = memo(function ToolMessage({ message, onStop }: { message: Me
         decision={decision}
         isError={isError}
         exitCode={exitCode}
-        stdout={fallbackStdout}
+        stdout={displayOutput}
         stderr={stderr}
         diff={diff}
         durationMs={durationMs}
-        error={errorCode ? `${errorCode}: ${error}` : error}
+        error={error}
+        errorCode={errorCode}
         resultStatus={resultStatus}
         envelopeStatus={envelopeStatus}
+        resultPath={typeof singleChange?.path === 'string' ? singleChange.path : typeof payload?.path === 'string' ? payload.path : undefined}
         structuredResult={structuredJson}
+        diagnosticResult={diagnosticResult}
         arguments={request.arguments as Record<string, unknown> | undefined}
         artifactId={artifactId}
         originalBytes={originalBytes}
@@ -234,9 +252,11 @@ const MessageBody = memo(function MessageBody({ message, suppressReasoning = fal
   useEffect(() => () => clearTimeout(timer.current), []);
 
   const streaming = message.status === 'streaming';
+  if (streaming && !displayContent.trim() && !message.presentation && !message.metrics && !attached.length && (suppressReasoning || !message.reasoning)) return null;
 
   return (
     <article ref={article} data-message-id={message.id} className={`message message-${message.role}${commentary ? ' message-commentary' : ''}`} aria-label={commentary ? 'Assistant update' : `${message.role} message`}>
+      {message.role === 'user' && <span className="transcript-prompt" aria-hidden="true">&gt;</span>}
       <div className="message-byline">{message.role === 'user' ? 'You' : <><span className="mini-mark">L</span>LocalLM</>}</div>
       {commentary && <div className="commentary-label">Update</div>}
       {message.role === 'assistant' && !commentary && <AnswerNavigation article={article} content={streaming ? '' : displayContent} />}
@@ -306,7 +326,7 @@ const ConversationTurn = memo(function ConversationTurn({ messages, events, run,
   return <div className="conversation-turn">
     {user && <MessageBody message={user} />}
     <ResearchContext.Provider value={research}>
-      <WorkSummary messages={messages} events={events} run={run} onResume={onResume}>
+      <WorkSummary messages={messages} events={events} run={run} onResume={onResume} showActivity={!generating}>
         <ActivityTimeline events={events} messages={messages} generating={generating} renderMessage={renderMessage} renderTool={renderTool} />
       </WorkSummary>
     </ResearchContext.Provider>
@@ -321,6 +341,8 @@ export function Chat({
   composerPermissions,
   reasoningMode,
   conversationKey = 'new',
+  draftOwner = conversationKey,
+  draftProjectId,
   contextUsage,
   modelLabel = 'Local model',
   modelIdentity = modelLabel,
@@ -371,9 +393,9 @@ export function Chat({
   }, [conversationKey, generating, messages.length]);
   const attachmentDrafts = controlledAttachments ?? localAttachments;
   const setAttachmentDrafts = onAttachmentDraftsChange ?? setLocalAttachments;
-  const latestConversation = useRef(conversationKey);
-  latestConversation.current = conversationKey;
-  const attachments = attachmentDrafts[conversationKey] ?? EMPTY_ATTACHMENTS;
+  const latestDraftOwner = useRef(draftOwner);
+  latestDraftOwner.current = draftOwner;
+  const attachments = attachmentDrafts[draftOwner] ?? EMPTY_ATTACHMENTS;
   const [attachmentError, setAttachmentError] = useState('');
   useEffect(() => {
     setAttachmentError('');
@@ -411,7 +433,7 @@ export function Chat({
   const reading = useRef(false);
 
   async function attach(files: File[]) {
-    if (reading.current || generating || loading || disabled || submitting.current.has(conversationKey)) return;
+    if (reading.current || generating || loading || disabled || submitting.current.has(draftOwner)) return;
     if (attachments.length + files.length > 8) {
       setAttachmentError('Attach up to 8 files per message.');
       return;
@@ -422,9 +444,9 @@ export function Chat({
     try {
       const added = await Promise.all(files.map(readAttachment));
       composeMessage(draft, [...attachments, ...added]);
-      setAttachmentDrafts(current => ({ ...current, [conversationKey]: [...attachments, ...added] }));
+      setAttachmentDrafts(current => ({ ...current, [draftOwner]: [...attachments, ...added] }));
     } catch (error) {
-      if (latestConversation.current === conversationKey) {
+      if (latestDraftOwner.current === draftOwner) {
         setAttachmentError(error instanceof Error ? error.message : 'Could not attach these files.');
       }
     } finally {
@@ -437,11 +459,11 @@ export function Chat({
   const draft = controlledDraft ?? localDraft;
   const setDraft = onDraftChange ?? setLocalDraft;
   const [preflightIssue, setPreflightIssue] = useState('');
-  const [preflight, setPreflight] = useState<{ breakdown: PreflightBreakdown; draft: string } | null>(null);
+  const [contextPreview, setContextPreview] = useState<{ owner: string; breakdown: PreflightBreakdown } | null>(null);
+  const preflight = contextPreview?.owner === draftOwner ? contextPreview.breakdown : undefined;
   const [compacting, setCompacting] = useState(false);
   const [compactionNotice, setCompactionNotice] = useState<string | null>(null);
   const [preflightRevision, setPreflightRevision] = useState(0);
-  const preflightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
   const input = useRef<HTMLTextAreaElement>(null);
@@ -510,9 +532,9 @@ export function Chat({
 
   // Buttons rendered by generated UI submit a follow-up like a typed message.
   const sendFromUi = useCallback((text: string) => {
-    if (!text.trim() || !ready || generating || loading || disabled || submitting.current.has(conversationKey)) return;
+    if (!text.trim() || !ready || generating || loading || disabled || submitting.current.has(draftOwner)) return;
     void onSend(text);
-  }, [ready, generating, loading, disabled, onSend]);
+  }, [ready, generating, loading, disabled, onSend, draftOwner]);
 
   // Canvas: every fenced artifact in the conversation, grouped so later
   // blocks with the same title supersede earlier versions.
@@ -537,14 +559,14 @@ export function Chat({
   const stopTranscriptResponse = useCallback(() => transcriptActions.current.onCancel(), []);
 
   async function retry() {
-    if (!lastPrompt || !ready || generating || loading || disabled || submitting.current.has(conversationKey)) return;
-    submitting.current.add(conversationKey);
+    if (!lastPrompt || !ready || generating || loading || disabled || submitting.current.has(draftOwner)) return;
+    submitting.current.add(draftOwner);
     try {
       await onSend(lastPrompt.content);
     } catch {
       /* App retains and displays the send error. */
     } finally {
-      submitting.current.delete(conversationKey);
+      submitting.current.delete(draftOwner);
     }
   }
 
@@ -578,20 +600,22 @@ export function Chat({
 
   useEffect(() => {
     let disposed = false;
-    setPreflight(null); setPreflightIssue('');
-    if ((!draft.trim() && !attachments.length) || !ready) return;
+    setContextPreview(null); setPreflightIssue('');
+    if ((!draft.trim() && !attachments.length) || !ready || loading || generating) return;
     let payload: string;
     try { payload = composeMessage(draft, attachments); } catch { return; }
-    preflightTimer.current = setTimeout(() => {
-      void api.contextPreflight(conversationKey === 'new' ? null : conversationKey, payload, preset, connectorIds, connectorTools, planMode, reasoningMode, presentation.effectiveMode).then(result => {
-        if (!disposed) { setPreflight(result.available ? { breakdown: result.breakdown!, draft: payload } : null); setPreflightIssue(!result.available && result.reason?.includes('at most 64 tools') ? result.reason : ''); }
-      }).catch(() => { if (!disposed) setPreflight(null); });
+    const timer = setTimeout(() => {
+      void api.contextPreflight(conversationKey === 'new' ? null : conversationKey, payload, preset, connectorIds, connectorTools, planMode, reasoningMode, presentation.effectiveMode, draftProjectId).then(result => {
+        if (disposed) return;
+        if (result.available && result.breakdown) setContextPreview({ owner: draftOwner, breakdown: result.breakdown });
+        setPreflightIssue(!result.available && result.reason?.includes('at most 64 tools') ? result.reason : '');
+      }).catch(() => { if (!disposed) setContextPreview(null); });
     }, 400);
-    return () => { disposed = true; if (preflightTimer.current) clearTimeout(preflightTimer.current); };
-  }, [draft, attachments, ready, conversationKey, connectorIds, connectorTools, preset, planMode, reasoningMode, modelIdentity, preflightRevision, presentation.effectiveMode]);
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [draft, attachments, ready, loading, generating, conversationKey, draftOwner, draftProjectId, connectorIds, connectorTools, preset, planMode, reasoningMode, modelIdentity, preflightRevision, presentation.effectiveMode]);
 
   async function submit() {
-    if ((!draft.trim() && !attachments.length) || !ready || generating || loading || disabled || preflightIssue || reading.current || submitting.current.has(conversationKey)) return;
+    if ((!draft.trim() && !attachments.length) || !ready || generating || loading || disabled || preflightIssue || reading.current || submitting.current.has(draftOwner)) return;
     let content: string;
     try {
       content = composeMessage(draft, attachments);
@@ -599,41 +623,69 @@ export function Chat({
       setAttachmentError((error as Error).message);
       return;
     }
-    submitting.current.add(conversationKey);
+    submitting.current.add(draftOwner);
     const originalDraft = draft;
     setAttachmentError('');
-    setAttachmentDrafts(current => ({ ...current, [conversationKey]: [] }));
+    setAttachmentDrafts(current => ({ ...current, [draftOwner]: [] }));
     setDraft('');
     try {
       await onSend(content);
     } catch (error) {
-      const owner = error && typeof error === 'object' && 'conversationId' in error && typeof error.conversationId === 'string' ? error.conversationId : conversationKey;
+      const owner = error && typeof error === 'object' && 'conversationId' in error && typeof error.conversationId === 'string' ? error.conversationId : draftOwner;
       if (onRestoreDraft) onRestoreDraft(owner, originalDraft);
-      else if (latestConversation.current === conversationKey) setDraft(current => current || originalDraft);
+      else if (latestDraftOwner.current === draftOwner) setDraft(current => current || originalDraft);
       setAttachmentDrafts(current => ({ ...current, [owner]: attachments }));
     } finally {
-      submitting.current.delete(conversationKey);
+      submitting.current.delete(draftOwner);
     }
-    if (latestConversation.current === conversationKey) input.current?.focus();
+    if (latestDraftOwner.current === draftOwner) input.current?.focus();
   }
 
   const isHome = !loading && !messages.length && !generating && !pendingTurn;
   const genericActivity = !liveActivity?.activity || /^(Thinking|Generating response|Streaming response)[….]*$/.test(liveActivity.activity);
-  const streamingAnswer = [...(turns[turns.length - 1] ?? [])].reverse().find(message => message.role === 'assistant' && message.status === 'streaming');
+  const currentTurn = turns[turns.length - 1] ?? [];
+  const streamingAnswer = [...currentTurn].reverse().find(message => message.role === 'assistant' && message.status === 'streaming');
   const answerHasText = Boolean(streamingAnswer?.content.trim());
-  const showLiveStatus = generating && !(genericActivity && answerHasText);
+  const reasoningIsVisible = /^Thinking[….]*$/.test(liveActivity?.activity ?? '') && Boolean(streamingAnswer?.reasoning.trim());
+  // Native chat can report the same action through its status and tool stream.
+  // Keep the status available until the corresponding transcript row arrives.
+  const toolStatus = /^(Executing|Running|Finished) (\S+)$/.exec(liveActivity?.activity ?? '');
+  const toolIsActive = toolStatus?.[1] !== 'Finished';
+  const toolStatusCovered = toolStatus && !isPlanStateTool(toolStatus[2]) && currentTurn.some(message => {
+    if (message.role !== 'tool' || (message.status === 'streaming') !== toolIsActive) return false;
+    const record = toolRecord(message);
+    return (record.request ?? record).name === toolStatus[2];
+  });
+  const showLiveStatus = generating && !toolStatusCovered && !(genericActivity && (answerHasText || reasoningIsVisible));
   const liveLabel = genericActivity ? 'Writing the answer' : (liveActivity?.activity || 'Working');
+  const currentEvents = turnActivity[turns.length - 1];
+  const toolCount = useMemo(() => activityTools(currentEvents ?? [], currentTurn, undefined, generating).length, [currentEvents, currentTurn, generating]);
+  const lastAnswer = [...currentTurn].reverse().find(message => message.role === 'assistant');
+  const outputTokens = generating ? contextUsage?.outputTokens : sumMetric(lastAnswer?.metrics?.rounds ?? [], 'outputTokens');
+  const transcriptPhase = loading ? 'loading' : paused ? 'paused' : generating
+    ? reasoningIsVisible ? 'thinking' : toolStatusCovered ? 'running tools' : answerHasText ? 'responding' : 'working'
+    : lastAnswer?.status === 'error' ? 'error' : lastAnswer?.status === 'interrupted' ? 'stopped' : lastAnswer?.status === 'complete' ? 'done' : 'idle';
 
   return (
     <div className="chat-shell" id="active-session-content" role="tabpanel" aria-label="Active conversation">
     <div className={`chat-layout ${isHome ? 'chat-home' : ''}`} style={{ position: 'relative' }}>
+      <div className={`chat-content${isHome ? '' : ' chat-transcript'}`}
+        onKeyDown={event => {
+          if (event.key !== 'Escape' || event.defaultPrevented || !generating || (event.target as Element).closest('dialog, [role="dialog"]')) return;
+          event.preventDefault();
+          onCancel();
+        }}
+      >
       <div
         className="chat-scroll"
         ref={scroll}
+        role={isHome ? undefined : 'region'}
+        aria-label={isHome ? undefined : 'Conversation transcript'}
+        tabIndex={isHome ? undefined : 0}
         onClickCapture={event => {
           const target = event.target as HTMLElement;
           const summary = target.closest('summary');
-          if (summary && !summary.closest('details')?.open) {
+          if (summary && !target.closest('button, a') && !summary.closest('details')?.open) {
             follow.current = false;
             setShowJumpToLatest(true);
           }
@@ -672,8 +724,8 @@ export function Chat({
             </section>}
             {showLiveStatus && (
               <div className="activity-live" role="status">
-                <ActivityIndicator />
-                <span className="activity-live-text">{liveLabel}</span>
+                <ActivityIndicator active={false} />
+                <span className="activity-live-text"><span className={liveActivity?.state === 'awaiting_approval' || liveActivity?.state === 'queued' ? undefined : 'activity-sweep'}>{liveLabel}</span></span>
                 {!genericActivity && liveActivity?.state && <span className="activity-badge">{activityStateLabel(liveActivity.state)}</span>}
               </div>
             )}
@@ -691,26 +743,23 @@ export function Chat({
           </>
         )}
       </div>
+      {!isHome && <footer className="transcript-status" aria-label="Transcript status">
+        <span>{transcriptPhase}</span>
+        <span>tokens {typeof outputTokens === 'number' && Number.isFinite(outputTokens) ? outputTokens.toLocaleString() : '—'}</span>
+        <span>tools {toolCount}</span>
+        <div className="transcript-actions">
+          {showJumpToLatest && <button type="button" onClick={() => {
+            if (!scroll.current) return;
+            scroll.current.scrollTo({ top: scroll.current.scrollHeight, behavior: prefersReducedMotion() ? 'instant' : 'smooth' });
+            follow.current = true;
+            setShowJumpToLatest(false);
+          }} aria-label="Jump to latest message"><ArrowDown size={12} aria-hidden="true" /> latest</button>}
+          {generating && <button type="button" aria-keyshortcuts="Escape" aria-label="Interrupt response" onClick={onCancel}>esc to interrupt</button>}
+        </div>
+      </footer>}
+      </div>
 
       <div className="composer-region">
-      {showJumpToLatest && (
-        <button
-          type="button"
-          className="jump-to-latest"
-          onClick={() => {
-            if (scroll.current) {
-              scroll.current.scrollTo({ top: scroll.current.scrollHeight, behavior: prefersReducedMotion() ? 'instant' : 'smooth' });
-              follow.current = true;
-              setShowJumpToLatest(false);
-            }
-          }}
-          aria-label="Jump to latest message"
-        >
-          <ArrowDown size={14} /> Latest
-        </button>
-      )}
-
-
         {chatNotice && <div className="setup-hint" role="status">{chatNotice}</div>}
         {chatError && (
           <div className="error-banner" role="alert" style={{ margin: '8px 0' }}>
@@ -791,7 +840,7 @@ export function Chat({
                     {file.imageUrl && <img src={file.imageUrl} alt="" width={32} height={32} />}
                     <span>
                       <strong>{file.name}</strong>
-                      <small>{Math.max(1, Math.ceil(file.size / 1024))} KB · {file.imageUrl ? 'Image' : 'Text'}</small>
+                      <small>{Math.max(1, Math.ceil(file.size / 1024))} KB · {file.imageUrl ? 'Image' : file.mediaUrl?.startsWith('data:video/') ? 'Video' : file.mediaUrl ? 'PDF' : 'Text'}</small>
                     </span>
                     <button
                       type="button"
@@ -801,7 +850,7 @@ export function Chat({
                       onClick={() =>
                         setAttachmentDrafts(current => ({
                           ...current,
-                          [conversationKey]: attachments.filter(item => item.id !== file.id),
+                          [draftOwner]: attachments.filter(item => item.id !== file.id),
                         }))
                       }
                     >
@@ -827,12 +876,17 @@ export function Chat({
               }
             }}
             onPaste={event => {
-              const items = event.clipboardData?.files;
-              if (!items?.length) return;
-              const images = Array.from(items).filter(f => f.type.startsWith('image/'));
-              if (!images.length) return;
+              const files = Array.from(event.clipboardData?.files ?? []);
+              if (!files.length) {
+                for (const item of Array.from(event.clipboardData?.items ?? [])) {
+                  if (item.kind !== 'file') continue;
+                  const file = item.getAsFile();
+                  if (file) files.push(file);
+                }
+              }
+              if (!files.length) return;
               event.preventDefault();
-              void attach(images);
+              void attach(files);
             }}
           />
           <div className="composer-bottom">
@@ -841,7 +895,7 @@ export function Chat({
                 type="button"
                 className="icon-button attach-button"
                 aria-label="Add files"
-                title="Attach images, text, code, or CSV files"
+                title="Attach images, PDFs, MP4 videos, or text files"
                 disabled={readingFiles || generating || loading || disabled}
                 onClick={() => fileInput.current?.click()}
               >
@@ -850,10 +904,11 @@ export function Chat({
               {composerPermissions}
             </div>
             <div className="composer-send" style={{ position: 'relative' }}>
-              {(!isHome || contextUsage) && <ContextControl
+              {(!isHome || ready || contextUsage) && <ContextControl
                 conversationId={conversationKey}
                 busy={generating || loading}
                 usage={contextUsage}
+                preview={preflight}
                 compacting={compacting}
                 onCompact={messages.length > 2 ? () => void handleCompact() : undefined}
               />}
@@ -962,10 +1017,10 @@ export function Chat({
           </p>
         )}
         {preflightIssue && <p className="composer-note" role="alert">{preflightIssue}</p>}
-        {preflight?.breakdown.presentation && <details className="composer-note"><summary>Visual response budget</summary><p>Separate formatting request: at least {preflight.breakdown.presentation.minimumInputTokens.toLocaleString()} input tokens plus the original answer, with {preflight.breakdown.presentation.responseReserve.toLocaleString()} output tokens reserved. The full request is checked before generation; text remains available if it does not fit.</p></details>}
-        {preflight?.breakdown.overflow && (
+        {preflight?.presentation && <details className="composer-note"><summary>Visual response budget</summary><p>Separate formatting request: at least {preflight.presentation.minimumInputTokens.toLocaleString()} input tokens plus the original answer, with {preflight.presentation.responseReserve.toLocaleString()} output tokens reserved. The full request is checked before generation; text remains available if it does not fit.</p></details>}
+        {preflight?.overflow && (
           <p className="composer-note" role="alert">
-            <span className="context-overflow">{preflight.breakdown.overflow}</span>
+            <span className="context-overflow">{preflight.overflow}</span>
           </p>
         )}
       </div>

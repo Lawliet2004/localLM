@@ -1,0 +1,99 @@
+Repository and run directory
+
+cd /home/papan/Desktop/Projects/localLM
+qa_root="$PWD/.local/qa/harness-acceptance-2026-11-08"
+qa_run="$qa_root/revalidation-2026-11-09.LcNYIf"
+test_bin="$qa_run/final-lib"
+
+Frozen binaries and default checks
+
+Use CARGO_BUILD_JOBS=2 for Rust compilation and separate fixture TMPDIRs outside the repository.
+Before and after the changes, use cargo test --lib --no-run --message-format=json
+from src-tauri, copy the test executable named by the tauri_app_lib compiler-artifact
+event to baseline-lib or final-lib, and record sha256sum.
+
+(cd src-tauri && cargo test --lib)
+(cd src-tauri && cargo check --lib)
+npx vitest run
+npm run typecheck
+npm run build
+npm audit --json
+python3 scripts/verify-glib-backport.py
+CARGO_TARGET_DIR="$qa_root/continuation-2026-11-09/glib-release-target" CARGO_BUILD_JOBS=2 cargo test --manifest-path src-tauri/vendor/glib/Cargo.toml --locked --offline --release --test variant_iter_backport
+GIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git clone --depth 1 https://github.com/RustSec/advisory-db.git "$qa_run/advisory-db"
+(cd src-tauri && "$qa_root/tools/cargo-audit" audit --no-fetch --db "$qa_run/advisory-db" --json)
+(cd src-tauri && cargo tree --locked -i rsa)
+node --import ./scripts/register-test-loader.mjs --test scripts/web-transport.test.mjs scripts/web-render.test.mjs scripts/web-storage.test.mjs scripts/searxng-worker.test.mjs scripts/weather-worker.test.mjs
+python3 scripts/benchmark-response-latency.test.py
+python3 scripts/run-harness-comparison.py --self-test
+git diff --check
+graphify update .
+
+Registered regression checks
+
+(cd src-tauri && cargo test --lib --jobs 2 registered_turn_rejects_ -- --nocapture --test-threads=2)
+(cd src-tauri && "$test_bin" registered_turn_rejects_ --nocapture --test-threads=2)
+(cd src-tauri && "$test_bin" chat::reliability_regressions:: --nocapture --test-threads=2)
+
+Ignored test inventory and loopback tests
+
+(cd src-tauri && "$test_bin" --ignored --list)
+(cd src-tauri && "$test_bin" --ignored --test-threads=2 --nocapture \
+  --skip automation::tests::real_browser --skip computer_use::tests::isolated_x11 \
+  --skip debug_tools::acceptance --skip harness_comparison_tests:: --skip harness_endurance_tests:: \
+  --skip lsp_tools::acceptance --skip model_library::tests::live_hub --skip profile_tools::tests::real_native \
+  --skip remote_database::acceptance --skip runtime::tests::recognizes_current_runtime_flags \
+  --skip runtime_archive::tests::extracts_cached_pinned_cuda --skip semantic_impact::acceptance)
+
+Development and local runtime
+
+export LOCALLM_RUST_ANALYZER="$(command -v rust-analyzer)"
+export LOCALLM_TYPESCRIPT_LANGUAGE_SERVER="$(command -v node)"
+export LOCALLM_TYPESCRIPT_LANGUAGE_SERVER_SCRIPT="$qa_root/tools/lsp/node_modules/typescript-language-server/lib/cli.mjs"
+export LOCALLM_DEBUGPY_PYTHON="$qa_root/tools/python/bin/python"
+export LOCALLM_CODELLDB="$qa_root/tools/codelldb/extension/adapter/codelldb"
+export LOCALLM_CC="$(command -v cc)"
+(cd src-tauri && "$test_bin" lsp_tools::acceptance --ignored --nocapture --test-threads=1)
+(cd src-tauri && "$test_bin" semantic_impact::acceptance --ignored --nocapture --test-threads=1)
+(cd src-tauri && "$test_bin" debug_tools::acceptance --ignored --nocapture --test-threads=1)
+(cd src-tauri && "$test_bin" model_library::tests::live_hub_search_catalog_and_verified_download --exact --ignored --nocapture)
+(cd src-tauri && LOCALLM_ACCEPTANCE_RUNTIME="$qa_root/tools/llama/llama-b10855/llama-server" "$test_bin" runtime::tests::recognizes_current_runtime_flags --exact --ignored --nocapture)
+perf record -o "$qa_run/perf-probe.data" -- sleep .05
+
+Disposable database fixtures
+
+Use a fresh output directory for each invocation. The starting run used baseline-lib
+and databases-baseline. The finished run used final-lib and databases-final.
+
+python3 scripts/run-database-acceptance.py --test-binary "$test_bin" --engine all \
+  --output "$qa_run/databases-final" --skip-pull \
+  --postgres-image postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 \
+  --mysql-image mirror.gcr.io/library/mysql@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+
+Endurance
+
+Run the following with a distinct mktemp -d /tmp/locallm-final-soak.XXXXXX
+TMPDIR for each process and verify the temporary directory can be removed
+with rmdir on exit. The start-of-task elapsed pair used baseline-lib. The
+finished-build pair and smoke used final-lib.
+
+(cd src-tauri && LOCALLM_SOAK_SECONDS=8 "$test_bin" --exact harness_endurance_tests::wall_clock_endurance --ignored --nocapture --test-threads=1)
+(cd src-tauri && LOCALLM_SOAK_SECONDS=3600 "$test_bin" --exact harness_endurance_tests::wall_clock_endurance --ignored --nocapture --test-threads=1)
+(cd src-tauri && LOCALLM_SOAK_SECONDS=7200 "$test_bin" --exact harness_endurance_tests::wall_clock_endurance --ignored --nocapture --test-threads=1)
+
+Same-model comparison and live MiniCPM
+
+The exact llama-server and comparison-runner argv are in comparison-runtime.json.
+Run the pinned local runtime and scripts/run-harness-comparison.py with a fresh
+slot directory and new output directory. Stop and reap the owned model before
+running the live MiniCPM fixture. The comparison runner saves all per-run
+argv, uses fresh isolated subprocess config and traces connect calls.
+
+Set qa_fixture to an owned /tmp output directory. The live fixture uses port
+8107 and launches and reaps its own runtime. The run started with an environment
+limited to PATH, LANG, scratch TMPDIR and npm cache, and the fixture variables below.
+
+LOCALLM_LIVE_MINICPM=1 LOCALLM_LIVE_DEVICE=Vulkan1 LOCALLM_LIVE_SCRATCH="$qa_fixture" \
+  LOCALLM_LLAMA_SERVER="$qa_root/tools/llama/llama-b10855/llama-server" \
+  LOCALLM_MODEL="$qa_root/models/MiniCPM5-2B-Q4_K_M.gguf" \
+  npx vitest run src/web/extraction/minicpm-live-fixtures.test.ts

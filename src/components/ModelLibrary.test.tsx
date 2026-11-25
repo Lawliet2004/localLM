@@ -184,6 +184,7 @@ it('resumes an ambiguous multimodal download with its persisted projector', asyn
   mock.downloadHuggingFaceModel.mockResolvedValue({ busy: false, phase: 'ready', received: 1024, total: 1024, path: model.path, error: null });
   render(<ModelLibrary {...props} models={[{ ...model, complete: false, received: 512, projectorFilename: 'mmproj-model-f16.gguf' }]} />);
   fireEvent.click(screen.getByRole('tab', { name: /My Models/ }));
+  fireEvent.click(screen.getByText('Model details'));
   expect(screen.getByText(/Vision: mmproj-model-f16\.gguf/)).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: 'Resume download' }));
   await waitFor(() => expect(mock.downloadHuggingFaceModel).toHaveBeenCalledWith(model.repo, model.revision, model.filename, undefined, 'mmproj-model-f16.gguf'));
@@ -242,9 +243,11 @@ it('shows live bytes for an active partial file and keeps completed models usabl
   render(<ModelLibrary {...props} models={[model, partial]} />);
   fireEvent.click(screen.getByRole('tab', { name: /My Models/ }));
   expect(await screen.findByText('Downloading')).toBeVisible();
+  expect(screen.getByText('75% · Measuring speed… · Time remaining: calculating…')).toBeVisible();
   expect(screen.queryByText('Interrupted')).not.toBeInTheDocument();
   expect(screen.getByRole('progressbar')).toHaveAttribute('value', '768');
   expect(screen.getAllByRole('button', { name: 'Use model' })[0]).toBeEnabled();
   expect(screen.getAllByRole('button', { name: 'Use model' })[1]).toBeDisabled();
-  expect(screen.getByRole('button', { name: 'Downloading…' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Pause download' }));
+  await waitFor(() => expect(mock.cancelModelInstall).toHaveBeenCalledOnce());
 });

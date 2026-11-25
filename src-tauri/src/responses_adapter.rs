@@ -63,7 +63,17 @@ fn content(message: &Value) -> Result<Value, String> {
                         if !["data:image/png;base64,","data:image/jpeg;base64,","data:image/webp;base64,"].iter().any(|prefix|url.starts_with(prefix)){return Err("Responses images must be embedded supported images; remote image fetches are not allowed.".into());}
                         let mut image=json!({"type":"input_image","image_url":url});
                         if let Some(detail)=part["image_url"].get("detail"){if !matches!(detail.as_str(),Some("auto"|"low"|"high")){return Err("Invalid Responses image detail.".into());}image["detail"]=detail.clone();}image
-                    },_=>return Err("Unsupported Responses input content part.".into()),
+                    },
+                    Some("file") if message["role"] == "user" => {
+                        let file = &part["file"];
+                        let data = string(file, "file_data")?;
+                        if !data.starts_with("data:application/pdf;base64,") {
+                            return Err("Responses PDF attachments must be embedded.".into());
+                        }
+                        json!({"type":"input_file","filename":string(file,"filename")?,"file_data":data})
+                    },
+                    Some("video_url") => return Err("This Responses endpoint does not accept MP4 attachments. Choose a video-capable Chat Completions endpoint or attach screenshots from the video.".into()),
+                    _=>return Err("Unsupported Responses input content part.".into()),
                 });
             }
             Ok(json!(result))
@@ -184,6 +194,19 @@ pub fn request(internal: &Value, model: &str) -> Result<Value, String> {
             return Err("Invalid Responses reasoning summary.".into());
         }
         out["reasoning"] = reasoning.clone();
+    }
+    if out.get("reasoning").is_some() || crate::inference::openai_reasoning_effort_supported(model) {
+        // Responses requests run statelessly (`store: false`), so reasoning
+        // models must request encrypted reasoning context to preserve thinking
+        // across multi-step tool rounds.
+        out["include"] = json!(["reasoning.encrypted_content"]);
+    }
+    if let Some(cache_key) = internal.get("prompt_cache_key") {
+        let key = cache_key
+            .as_str()
+            .filter(|value| valid_id(value))
+            .ok_or("Invalid Responses prompt_cache_key.")?;
+        out["prompt_cache_key"] = json!(key);
     }
     for (field, max) in [("temperature", 2.0), ("top_p", 1.0)] {
         if let Some(value) = internal.get(field) {
@@ -351,7 +374,7 @@ impl Stream {
             let name = string(item, "name")?;
             if !valid_id(call_id)
                 || !valid_id(name)
-                || self.calls >= 8
+                || self.calls >= crate::tool_calls::MAX_CALLS_PER_ROUND
                 || self.items.values().any(|i| i.call_id == call_id)
             {
                 return Err("Invalid, duplicate or excessive Responses function call.".into());

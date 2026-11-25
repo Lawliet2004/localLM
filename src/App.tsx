@@ -4,7 +4,7 @@ import { publishTurnItem } from './lib/turnItems';
 import { CommandPalette } from './components/CommandPalette';
 import { useEffect, useRef, useState, type SetStateAction } from 'react';
 import { useSessionRuns } from './hooks/useSessionRuns';
-import { Check, ChevronDown, Download, Pencil, Trash2, X, ArrowLeft, ArrowRight, Folder, MoreHorizontal } from 'lucide-react';
+import { Check, X, ArrowLeft, ArrowRight } from 'lucide-react';
 
 import { confirm, save } from '@tauri-apps/plugin-dialog';
 
@@ -20,7 +20,6 @@ import { Chat } from './components/Chat';
 
 import { Models } from './components/Models';
 
-import { DownloadActivity } from './components/DownloadActivity';
 
 import { Skills } from './components/Skills';
 import { PermissionRulesSettings } from './components/PermissionRulesSettings';
@@ -63,6 +62,7 @@ import './models.css';
 import './desktop.css';
 import './appearance.css';
 import './responses.css';
+import './transcript.css';
 import './sessions.css';
 
 import { loadDraft, saveDraft, moveNewDraft } from './lib/drafts';
@@ -194,21 +194,23 @@ export default function App() {
   const [requestedModel, setRequestedModel] = useState<string>();
 
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [newChatKey, setNewChatKey] = useState('new:0');
+  const newChatKeyRef = useRef(newChatKey);
+  const sessionKey = activeId ?? newChatKey;
 
   const [messages, setMessages] = useState<Message[]>([]);
   const displayMessages = setMessages;
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
   const sessions = useSessionRuns();
-  const session = sessions.get(activeId ?? 'new');
+  const session = sessions.get(sessionKey);
   const { generating, activity: liveActivity, error: chatError, notice: chatNotice, planMode } = session;
-  const setChatError = (error: string) => sessions.update(activeId ?? 'new', { error });
-  const setChatNotice = (notice: string) => sessions.update(activeId ?? 'new', { notice });
-  const setPlanMode = (planMode: boolean) => sessions.update(activeId ?? 'new', { planMode });
-  const contextUsage = session.context ? { conversationId: activeId, usage: session.context } : null;
+  const setChatError = (error: string) => sessions.update(sessionKey, { error });
+  const setChatNotice = (notice: string) => sessions.update(sessionKey, { notice });
+  const setPlanMode = (planMode: boolean) => sessions.update(sessionKey, { planMode });
   const approvalOrder = useRef<string[]>([]);
   const approvalEntries = Object.entries(sessions.runs).flatMap(([id, run]) => run.approvals.map(request => ({ id, request })));
-  const visibleApprovals = approvalEntries.filter(entry => entry.id === (activeId ?? 'new'));
+  const visibleApprovals = approvalEntries.filter(entry => entry.id === sessionKey);
   const approvalEntry = visibleApprovals.find(entry => entry.request.id === approvalOrder.current[0]) ?? visibleApprovals[0];
   const approval = approvalEntry?.request;
   const [reviewRequest, setReviewRequest] = useState(0);
@@ -387,6 +389,7 @@ export default function App() {
   }
 
   const active = data.conversations.find(item => item.id === activeId);
+  const draftProjectId = findProject(workspaceIndex, projectId)?.id ?? allProjects(workspaceIndex)[0]?.id ?? null;
 
   const busy = generating || modelBusy || loading || checkingSessions || savingTools || exporting;
   const anyGenerating = Object.values(sessions.runs).some(run => run.generating);
@@ -447,8 +450,6 @@ export default function App() {
 
     const version = ++selection.current;
     setLoading(false);
-    setChatNotice('');
-
     const index = nativeAvailable && api.workspaceIndex
       ? await api.workspaceIndex().catch(() => workspaceIndex)
       : workspaceIndex;
@@ -467,10 +468,20 @@ export default function App() {
     const resolvedFolder = findProject(index, resolvedProject);
 
     setWorkspaceIndex(index);
-
-    switchDraft(null);
-
     activeIdRef.current = null; setActiveId(null); setMessages([]); navigate('chat'); setError(''); setRenaming(false);
+    const oldDraftKey = newChatKeyRef.current;
+    // Several new chats may start while an earlier draft is acquiring its
+    // conversation ID. Their composer and run state need distinct owners.
+    newChatKeyRef.current = `new:${version}`;
+    setNewChatKey(newChatKeyRef.current);
+    sessions.forget(oldDraftKey);
+    setAttachmentDrafts(current => {
+      const next = { ...current };
+      delete next[oldDraftKey];
+      return next;
+    });
+    try { saveDraft(null, ''); } catch (e) { setError(errorMessage(e)); }
+    switchDraft(null);
 
     setAccessMode(rememberedTools.current.accessMode ?? 'ask');
 
@@ -742,17 +753,18 @@ export default function App() {
 
   async function send(content: string, recoveryId?: string, resumeFailedMessageId?: string, resumeTaskId?: string) {
 
-    if (busy || toolSave.current || pendingSends.current.has(activeId ?? 'new')) throw new Error('Wait for the active operation before sending a message.');
+    if (busy || toolSave.current || pendingSends.current.has(sessionKey)) throw new Error('Wait for the active operation before sending a message.');
 
     let id = activeId;
+    const draftOwner = sessionKey;
     const creationSelection = selection.current;
-    const updateRun = (patch: Parameters<typeof sessions.update>[1]) => sessions.update(id ?? 'new', patch);
+    const updateRun = (patch: Parameters<typeof sessions.update>[1]) => sessions.update(id ?? draftOwner, patch);
     const setChatError = (error: string) => updateRun({ error });
     const setChatNotice = (notice: string) => updateRun({ notice });
     const setGenerating = (generating: boolean) => updateRun({ generating });
     const setLiveActivity = (activity: typeof liveActivity) => updateRun({ activity });
     const setApproval = (change: ToolApproval | null | ((current: ToolApproval | null) => ToolApproval | null)) => {
-      const previous = sessions.get(id ?? 'new').approvals;
+      const previous = sessions.get(id ?? draftOwner).approvals;
       const approvals = typeof change === 'function'
         ? previous.flatMap(item => { const next = change(item); return next ? [next] : []; })
         : change ? [...previous.filter(item => item.id !== change.id), change] : [];
@@ -762,17 +774,16 @@ export default function App() {
       updateRun({ approvals });
     };
     const setMessages = (change: SetStateAction<Message[]>) => {
-      const next = typeof change === 'function' ? change(sessions.get(id ?? 'new').messages) : change;
+      const next = typeof change === 'function' ? change(sessions.get(id ?? draftOwner).messages) : change;
       updateRun({ messages: next });
-      if (activeIdRef.current === id) displayMessages(next);
+      if (activeIdRef.current === id && (id || draftOwner === newChatKeyRef.current)) displayMessages(next);
     };
     updateRun({ messages, notice: '', error: '' });
     const streamedTools = new Set<string>();
     let retriedEarlyStop = false;
 
     // Chats live under a folder: a brand-new conversation needs one up front.
-    const folderId = id ? projectId
-      : (projectId && findProject(workspaceIndex, projectId) ? projectId : allProjects(workspaceIndex)[0]?.id) ?? null;
+    const folderId = id ? projectId : draftProjectId;
 
     if (!id && !folderId) {
       const message = 'Add a project folder first, then send.';
@@ -781,7 +792,7 @@ export default function App() {
     }
 
     const request = { cancelled: false, backendStarted: false };
-    pendingSends.current.set(id ?? 'new', request);
+    pendingSends.current.set(draftOwner, request);
     const ensurePending = () => { if (request.cancelled) throw new Error('Message cancelled before generation; it was not saved.'); };
     setPausedConversationId(null);
     setGenerating(true); setChatError(''); setLiveActivity({ state: 'Preparing', activity: 'Preparing request…' });
@@ -795,8 +806,8 @@ export default function App() {
         completionRefresh.current++;
         const conversation = await api.createConversation(folderId); id = conversation.id;
         completionRefresh.current++;
-        sessions.move('new', id);
-        pendingSends.current.delete('new'); pendingSends.current.set(id, request);
+        sessions.move(draftOwner, id);
+        pendingSends.current.delete(draftOwner); pendingSends.current.set(id, request);
         // Creating a conversation may finish after the user has selected a
         // different one. The new run keeps its identity but must not seize the
         // visible session or move the new screen's draft in that case.
@@ -1013,7 +1024,7 @@ export default function App() {
 
       // An inference failure can happen after the user message has already been saved.
 
-      if (!id) throw Object.assign(new Error(errorMessage(e)), { conversationId: 'new' });
+      if (!id) throw Object.assign(new Error(errorMessage(e)), { conversationId: draftOwner });
 
       let saved: Message[];
 
@@ -1074,12 +1085,13 @@ export default function App() {
       });
 
       if (id) for (const toolId of streamedTools) toolOutput.clear(id, toolId);
-      if (pendingSends.current.get(id ?? 'new') === request) pendingSends.current.delete(id ?? 'new');
+      if (pendingSends.current.get(id ?? draftOwner) === request) pendingSends.current.delete(id ?? draftOwner);
       setApproval(null);
       setGenerating(false);
       updateRun({ unread: activeIdRef.current !== id });
 
       setLiveActivity(null);
+      if (!id && draftOwner !== newChatKeyRef.current) sessions.forget(draftOwner);
 
     }
 
@@ -1192,7 +1204,8 @@ export default function App() {
 
   }
 
-  const activeProject = allProjects(workspaceIndex).find(p => p.id === projectId);
+  const projects = allProjects(workspaceIndex);
+  const activeProject = projects.find(p => p.id === projectId);
   const activeProjectName = activeProject?.name ?? '';
 
   const settingsPage = page === 'general' ? <GeneralSettings accessMode={accessMode} onAccessMode={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} nativeAvailable={nativeAvailable} projectPath={activeProject?.path} modelLabel={modelLabel} scopeLabel={active?.title} onPage={navigate} /> : page === 'appearance' ? <AppearanceSettings preferences={appearance.preferences} theme={theme} onChange={appearance.update} onReset={appearance.reset} saveError={appearance.saveError} /> : page === 'tools' ? <ToolsSettings onChooseWorkspace={chooseTaskWorkspace} accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} preset={preset} onPresetChange={changePreset} selectedTools={selectedTools} onToolsChange={tools => void changeTools(selectedConnectors, tools)} selected={selectedConnectors} onChange={sources => void changeTools(sources, selectedTools)} scopeLabel={active?.title} onBack={() => navigate('chat')} busy={busy} loading={loading} saving={savingTools} onNavigate={target => navigate(target)} /> : ['models', 'inference', 'diagnostics'].includes(page) ? <Models runningConversations={runningConversations} key={page} initialTab={page === 'inference' ? 'generation' : page === 'diagnostics' ? 'diagnostics' : 'library'} onRefresh={async () => { setData(normalizeBootstrap(await api.bootstrap())); }} providers={data.providers} selection={modelSelection} requestedModel={requestedModel} onRequestedModelHandled={() => setRequestedModel(undefined)} config={data.config} preferences={data.preferences} runtime={data.runtime} busy={!nativeAvailable || globalBusy} onLoad={() => void modelAction(true)} onUnload={() => void modelAction(false)} onSaveSelection={saveModelSelection} onSaveConfig={async config => { try { await api.saveConfig(config); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} onSavePreferences={async preferences => { try { await api.savePreferences(preferences); setData(normalizeBootstrap(await api.bootstrap())); } catch (e) { setError(errorMessage(e)); throw e; } }} /> : page === 'security' ? <SecuritySettings accessMode={accessMode} onAccessMode={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} scope={active?.title} /> : page === 'git' ? <GitSettings root={activeProject?.path} onOpenReview={() => { navigate('chat'); setReviewRequest(value => value + 1); }} /> : page === 'weather' ? <WeatherSettings /> : page === 'web-search' ? <Execution key={page} section="web-search" /> : page === 'execution' ? <Execution key={page} /> : page === 'hooks' ? <HooksSettings /> : page === 'development-tools' ? <DevelopmentSettings /> : page === 'language-servers' ? <LanguageServerSettings root={activeProject?.path} /> : page === 'bash' || page === 'python' ? <NativeExecutionSettings key={page} kind={page} /> : page === 'browser-use' ? <AutomationSettings key={page} mode="browser" onConfigureExecution={() => navigate('execution')} /> : page === 'computer-use' ? <AutomationSettings key={page} mode="computer" /> : page === 'connectors' ? <Connectors /> : page === 'permission-rules' ? <PermissionRulesSettings /> : page === 'plugins' ? <PluginSettings /> : <Skills />;
@@ -1239,9 +1252,24 @@ export default function App() {
         </button>
       </div>
 
-      <details className="app-menu" name="application-menu"><summary>File</summary><div><button onClick={() => setPaletteOpen(true)}>Commands… <kbd>Ctrl+Shift+P</kbd></button><button disabled={navigationBusy} onClick={event => { newConversation(); event.currentTarget.closest('details')?.removeAttribute('open'); }}>New task <kbd>Ctrl+N</kbd></button><button disabled={!active || busy} onClick={() => void exportChat()}>Save a copy…</button></div></details>
+      <details className="app-menu" name="application-menu"><summary>File</summary><div><button onClick={() => setPaletteOpen(true)}>Commands… <kbd>Ctrl+Shift+P</kbd></button><button disabled={navigationBusy} onClick={event => { newConversation(); event.currentTarget.closest('details')?.removeAttribute('open'); }}>New task <kbd>Ctrl+N</kbd></button><button disabled={!active || busy} onClick={event => { event.currentTarget.closest('details')?.removeAttribute('open'); void exportChat(); }}>Save a copy…</button></div></details>
 
-      <details className="app-menu" name="application-menu"><summary>Edit</summary><div><button disabled={!active || busy} onClick={event => { if (active) { setTitle(active.title); setRenaming(true); } event.currentTarget.closest('details')?.removeAttribute('open'); }}>Rename task</button><button onClick={event => { searchConversations(); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Search tasks <kbd>Ctrl+K</kbd></button></div></details>
+      <details className="app-menu" name="application-menu">
+        <summary>Edit</summary>
+        <div>
+          <button disabled={!active || busy} onClick={event => { if (active) { setTitle(active.title); setRenaming(true); } event.currentTarget.closest('details')?.removeAttribute('open'); }}>Rename task</button>
+          {page === 'chat' && active && <button disabled={busy} onClick={event => { event.currentTarget.closest('details')?.removeAttribute('open'); void removeConversation(); }}>Delete task</button>}
+          <button onClick={event => { searchConversations(); event.currentTarget.closest('details')?.removeAttribute('open'); }}>Search tasks <kbd>Ctrl+K</kbd></button>
+          {page === 'chat' && projects.length > 0 && (
+            <label className="task-project-field">
+              Task project
+              <select value={projectId ?? projects[0]?.id} disabled={busy} onChange={event => void selectProject(event.target.value)}>
+                {projects.map(project => <option value={project.id} key={project.id}>{project.name}</option>)}
+              </select>
+            </label>
+          )}
+        </div>
+      </details>
 
 
 
@@ -1258,7 +1286,7 @@ export default function App() {
 
     {approval && <ApprovalDialog key={approval.id} sessionLabel={data.conversations.find(item => item.id === approvalEntry?.id)?.title} request={approval} onResolve={allow => api.resolveToolApproval(approval.id, allow)} onResolveAskUser={(choice) => api.resolveAskUser(approval.id, choice)} onResolveMcpInput={(action, content) => api.resolveMcpInput(approval.id, action, content)} />}
 
-    <main className="workspace" id="main-content"><DownloadActivity /><CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} commands={[
+    <main className="workspace" id="main-content"><CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} commands={[
       { id: 'plan', label: planMode ? 'Turn off plan before acting' : 'Plan before acting', disabled: busy, run: () => setPlanMode(!planMode) },
       { id: 'new', label: 'New conversation', disabled: navigationBusy, run: () => void newConversation() },
       { id: 'search', label: 'Search conversations', run: searchConversations },
@@ -1270,23 +1298,38 @@ export default function App() {
 
 
       <div className="workspace-split"><div className="workspace-conversation">
-      <header className={`workspace-header ${!messages.length && !renaming ? 'workspace-header-minimal' : ''}`}><div className="workspace-lead"><button className="icon-button" aria-label="Back" disabled={navigationBusy || navigation.cursor <= 0} onClick={() => { const cursor = navigation.cursor - 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowLeft size={17} /></button><button className="icon-button" aria-label="Forward" disabled={navigationBusy || navigation.cursor >= navigation.ids.length - 1} onClick={() => { const cursor = navigation.cursor + 1; setNavigation(n => ({ ...n, cursor })); void selectConversation(navigation.ids[cursor], true); }}><ArrowRight size={17} /></button><Folder className="task-folder-icon" size={18} />{renaming ? <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}><input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={e => setTitle(e.target.value)} /><button className="icon-button" aria-label="Save title"><Check size={16} /></button><button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button></form> : <span className="workspace-title">{active?.title || 'New conversation'}</span>}</div><div className="header-actions">{page === 'chat' && allProjects(workspaceIndex).length > 0 && <select aria-label="Task project" value={projectId ?? allProjects(workspaceIndex)[0]?.id} disabled={busy} onChange={e => void selectProject(e.target.value)}>{allProjects(workspaceIndex).map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select>}{page === 'chat' && active && <details className="app-menu task-menu" name="application-menu"><summary aria-label="Task actions"><MoreHorizontal size={19} /></summary><div><button className="icon-button" title="Rename conversation" aria-label="Rename conversation" disabled={busy} onClick={() => { setTitle(active.title); setRenaming(true); }}><Pencil size={15} /></button><button className="icon-button" title="Export conversation" aria-label="Export conversation" disabled={!messages.length || busy} onClick={() => void exportChat()}><Download size={15} /></button><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" disabled={busy} onClick={() => void removeConversation()}><Trash2 size={15} /></button></div></details>}<WorkspacePanel host={workspacePanelHost} reviewRequest={reviewRequest} onChooseWorkspace={chooseTaskWorkspace} busy={globalBusy} revision={`${projectId}:${activeId}`} visible={page === 'chat'} onReveal={() => navigate('chat')} /><button className="model-selector" disabled={busy} onClick={() => navigate('models')}><span className={`status-dot ${chatReady ? 'ready' : ''}`} />{modelLabel}<ChevronDown size={13} /></button></div></header>
+      <WorkspacePanel host={workspacePanelHost} reviewRequest={reviewRequest} onChooseWorkspace={chooseTaskWorkspace} busy={globalBusy} revision={`${projectId}:${activeId}`} visible={page === 'chat'} onReveal={() => navigate('chat')} />
+      {renaming && (
+        <form className="rename-form" onSubmit={event => { event.preventDefault(); void rename(); }}>
+          <input autoFocus aria-label="Conversation title" maxLength={160} value={title} onChange={event => setTitle(event.target.value)} />
+          <button className="icon-button" aria-label="Save title"><Check size={16} /></button>
+          <button type="button" className="icon-button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={16} /></button>
+        </form>
+      )}
       {!nativeAvailable && <div className="preview-banner">Browser preview · Open the desktop application to load models and save conversations.</div>}
 
       {exportedPath && <div className="preview-banner" role="status">Saved conversation to {exportedPath}<button className="icon-button" aria-label="Dismiss export confirmation" onClick={() => setExportedPath('')}><X size={16} /></button></div>}
 
       {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
 
-      <Chat
+      <Chat key={newChatKey}
 
         reasoningMode={reasoningOverride ?? data.preferences.reasoningMode}
         projectName={activeProjectName}
 
         attachmentDrafts={attachmentDrafts}
 
-        onAttachmentDraftsChange={setAttachmentDrafts}
+        onAttachmentDraftsChange={change => setAttachmentDrafts(current => {
+          const next = typeof change === 'function' ? change(current) : change;
+          if (activeId || sessionKey === newChatKeyRef.current || !(sessionKey in next)) return next;
+          const owned = { ...next };
+          delete owned[sessionKey];
+          return owned;
+        })}
 
         conversationKey={activeId ?? 'new'}
+        draftOwner={sessionKey}
+        draftProjectId={activeId ? undefined : draftProjectId}
         pendingTurn={savedPending?.conversationId === activeId ? savedPending : null}
         recoveryBusy={busy}
         onRecoverPending={() => {
@@ -1320,10 +1363,10 @@ export default function App() {
 
         composerPermissions={<PermissionSelector accessMode={accessMode} onAccessModeChange={mode => void changeTools(selectedConnectors, selectedTools, mode)} busy={busy} nativeAvailable={nativeAvailable} />}
 
-        contextUsage={contextUsage?.conversationId === activeId ? contextUsage.usage : undefined}
+        contextUsage={session.context}
 
         modelLabel={modelLabel}
-        modelIdentity={JSON.stringify([modelSelection, data.runtime.modelPath, data.config.contextLength, selectedRemoteModel])}
+        modelIdentity={JSON.stringify([modelSelection, data.runtime.modelPath, data.runtime.effectiveContextLength ?? data.config.contextLength, selectedRemoteModel])}
 
         selectionIssue={active?.providerSelectionRequired || (Boolean(modelSelection.providerId) && !remoteReady)}
 
@@ -1331,7 +1374,8 @@ export default function App() {
 
         onDraftChange={changeDraft}
         onRestoreDraft={(owner, value) => {
-          const key = owner === 'new' ? null : owner;
+          if (owner.startsWith('new:') && owner !== newChatKeyRef.current) return;
+          const key = owner === newChatKeyRef.current ? null : owner;
           try {
             const restored = loadDraft(key) || value;
             saveDraft(key, restored);
@@ -1359,7 +1403,7 @@ export default function App() {
         onContinueFailed={messageId => { void send('', undefined, messageId).catch(e => setChatError(errorMessage(e))); }}
 
         onCancel={() => {
-          const request = pendingSends.current.get(activeId ?? 'new');
+          const request = pendingSends.current.get(sessionKey);
           if (request) request.cancelled = true;
           if (request?.backendStarted || (!request && activeId && recoveredRuns.current.has(activeId))) void api.cancelGeneration(activeId ?? undefined).catch(e => setChatError(errorMessage(e)));
         }}

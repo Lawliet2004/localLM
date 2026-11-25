@@ -8,6 +8,7 @@ pub const INVOKE: &str = "tool_invoke";
 pub const MAX_CATALOG: usize = 4096;
 pub const MAX_ADVERTISED: usize = 64;
 const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const GUIDANCE: &str = "Some authorized tool schemas are deferred to keep the request bounded. Use tool_search to find names and exact input schemas, then tool_invoke to call a discovered tool. Its original validation, approvals and audit still apply. Discovery does not broaden selected sources.";
 // Preserve everyday read/edit/process tools when optional development families
 // push the catalog above the provider schema budget. Advanced tools remain
 // discoverable; alphabetical names must not displace core workspace reads.
@@ -25,12 +26,17 @@ const EVERYDAY: &[&str] = &[
     "development_guide",
     "workspace_list_files",
     "workspace_read_file",
+    "workspace_read_files",
+    "workspace_outline",
     "workspace_search_content",
     "workspace_glob_files",
     "workspace_create_file",
+    "workspace_write_file",
     "workspace_apply_patch",
     "workspace_edit_file",
+    "workspace_multi_edit",
     "workspace_open_preview",
+    "workspace_view_image",
     "file_read",
     "file_search",
     "process_start",
@@ -39,15 +45,38 @@ const EVERYDAY: &[&str] = &[
     "shell_run",
     "check_run",
     "check_report",
+    "subagent",
+    "todo_add",
+    "todo_update",
+    "compact_conversation",
     "ask_user",
+    "web_search",
+    "search",
+    "plan_submit",
 ];
 
 const CODING: &[&str] = &[
     SEARCH, INVOKE, "artifact_read", "goal_status", "goal_update", "plan_submit", "ask_user",
-    "workspace_read_file", "workspace_search_content", "workspace_glob_files", "workspace_apply_patch",
-    "workspace_edit_file", "workspace_create_file", "git_status", "git_diff", "shell_run",
-    "process_start", "process_poll", "process_stop", "verification_run", "verification_report",
-    "check_run", "check_report", "ptc_run", "finish", "update_context",
+    "workspace_list_files", "workspace_read_file", "workspace_read_files", "workspace_outline",
+    "workspace_search_content", "workspace_glob_files", "workspace_apply_patch",
+    "workspace_edit_file", "workspace_multi_edit", "workspace_create_file", "workspace_write_file",
+    "workspace_open_preview", "workspace_view_image", "project_inspect", "development_guide",
+    "git_status", "git_diff", "shell_run", "process_start", "process_poll", "process_stop",
+    "verification_run", "verification_report", "check_run", "check_report",
+    "subagent", "todo_add", "todo_update", "compact_conversation", "web_search",
+    "ptc_run", "finish", "update_context",
+];
+
+// On a tight local window, keep search and turn controls directly callable.
+// The second group gives ordinary workspace tasks a direct read/edit path.
+const LOCAL_ESSENTIAL: &[&str] = &[
+    "web_search", "web_read", "web_open", "search", "visit", "plan_submit",
+    "ask_user", "goal_status", "goal_update",
+];
+const LOCAL_WORKSPACE: &[&str] = &[
+    "workspace_list_files", "workspace_read_file", "workspace_read_files", "workspace_outline",
+    "workspace_search_content", "workspace_create_file", "workspace_write_file",
+    "workspace_edit_file", "shell_run", "local_execute_command",
 ];
 
 pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
@@ -60,10 +89,14 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
 }
 #[cfg(test)]
 pub fn attach(tools: &mut Vec<AgentTool>) -> Result<bool, String> {
-    attach_for_turn(tools, false)
+    attach_for_turn(tools, false, None)
 }
 
-pub fn attach_for_turn(tools: &mut Vec<AgentTool>, coding: bool) -> Result<bool, String> {
+pub fn attach_for_turn(
+    tools: &mut Vec<AgentTool>,
+    coding: bool,
+    rules: Option<&crate::permission_rules::RuleSet>,
+) -> Result<bool, String> {
     if tools.len() > MAX_CATALOG {
         return Err(format!(
             "Authorized catalog exceeds {MAX_CATALOG} tools; narrow the selected sources."
@@ -87,17 +120,41 @@ pub fn attach_for_turn(tools: &mut Vec<AgentTool>, coding: bool) -> Result<bool,
             return Err("Authorized tool schemas exceed 8 MiB; narrow the selected sources.".into());
         }
     }
+    if let Some(rules) = rules {
+        tools.retain(|tool| rules.may_offer_tool(&tool.alias));
+        if !wrappers_allowed(Some(rules)) {
+            // Without the discovery pair, advertise permitted tools directly.
+            return Ok(false);
+        }
+    }
     if tools.len() <= MAX_ADVERTISED
         && (!coding || tools.iter().all(|tool| CODING.contains(&tool.alias.as_str()))) {
         return Ok(false);
     }
-    for alias in [SEARCH, INVOKE] {
-        if tools.iter().any(|tool| tool.alias == alias) {
-            return Err("A selected tool conflicts with a reserved discovery alias.".into());
-        }
-        tools.push(AgentTool::harness(alias)?);
-    }
+    attach_wrappers(tools)?;
     Ok(true)
+}
+
+pub(crate) fn wrappers_allowed(rules: Option<&crate::permission_rules::RuleSet>) -> bool {
+    rules.is_none_or(|rules| rules.may_offer_tool(SEARCH) && rules.may_offer_tool(INVOKE))
+}
+
+pub(crate) fn attach_wrappers(tools: &mut Vec<AgentTool>) -> Result<(), String> {
+    if tools.iter().any(|tool| matches!(tool.alias.as_str(), SEARCH | INVOKE)) {
+        return Err("A selected tool conflicts with a reserved discovery alias.".into());
+    }
+    tools.extend([AgentTool::harness(SEARCH)?, AgentTool::harness(INVOKE)?]);
+    Ok(())
+}
+
+pub(crate) fn compact_local(tools: &[AgentTool], include_workspace: bool) -> Vec<Value> {
+    let mut tools: Vec<_> = tools.iter().filter(|tool| {
+        let alias = tool.alias.as_str();
+        CORE.contains(&alias) || LOCAL_ESSENTIAL.contains(&alias)
+            || (include_workspace && LOCAL_WORKSPACE.contains(&alias))
+    }).collect();
+    tools.sort_by(|left, right| left.alias.cmp(&right.alias));
+    tools.into_iter().map(AgentTool::definition).collect()
 }
 pub fn advertised<'a>(tools: impl IntoIterator<Item = &'a AgentTool>) -> Vec<&'a AgentTool> {
     let mut ordered = tools.into_iter().collect::<Vec<_>>();
@@ -124,13 +181,62 @@ pub fn advertised_for_turn<'a>(tools: impl IntoIterator<Item = &'a AgentTool>, c
     if !coding {
         return advertised(tools);
     }
-    let mut selected = tools.into_iter().filter(|tool| CODING.contains(&tool.alias.as_str())).collect::<Vec<_>>();
+    let ordered = tools.into_iter().collect::<Vec<_>>();
+    let mut selected: Vec<&'a AgentTool> = ordered
+        .iter()
+        .copied()
+        .filter(|tool| CODING.contains(&tool.alias.as_str()))
+        .collect();
+    // Preserve explicitly attached MCP connector tools up to MAX_ADVERTISED so
+    // user-selected integrations remain directly callable alongside a workspace.
+    let remaining = MAX_ADVERTISED.saturating_sub(selected.len());
+    selected.extend(
+        ordered
+            .into_iter()
+            .filter(|tool| tool.is_mcp() && !CODING.contains(&tool.alias.as_str()))
+            .take(remaining),
+    );
     selected.sort_by(|left, right| left.alias.cmp(&right.alias));
     selected
 }
 pub fn visible(tools: &[Value], alias: &str) -> bool {
     tools.iter().any(|v| v["function"]["name"] == alias)
 }
+
+pub(crate) fn resolve_advertised<'a>(
+    tools: impl IntoIterator<Item = &'a AgentTool>,
+    definitions: &[Value],
+    alias: &str,
+    args: Value,
+) -> Result<(&'a AgentTool, Value), String> {
+    if visible(definitions, alias) {
+        return resolve(tools, alias, args);
+    }
+    if visible(definitions, SEARCH) && visible(definitions, INVOKE) {
+        Err("Tool schema is deferred or unavailable. Use tool_search and tool_invoke for authorized deferred tools.".into())
+    } else {
+        Err("This tool is unavailable for this turn. Use an advertised tool.".into())
+    }
+}
+
+/// A model can repeat an old tool name from history. An explicit denial
+/// still needs its usual audit and stop behavior when its schema is hidden.
+pub(crate) fn rejected_call(
+    rules: Option<&crate::permission_rules::RuleSet>,
+    call: &crate::tool_calls::ToolCall,
+    error: &str,
+) -> (&'static str, Value) {
+    let target = if call.name == INVOKE { call.arguments["name"].as_str() } else { None };
+    let denied = rules.and_then(|rules| {
+        std::iter::once(call.name.as_str()).chain(target).find(|alias| !rules.may_offer_tool(alias))
+    });
+    let (decision, code, reason) = match denied {
+        Some(alias) => ("denied", "permission-denied", format!("Denied by a permission rule for tool '{alias}'.")),
+        None => ("unavailable", "unavailable-tool", error.to_owned()),
+    };
+    (decision, crate::tool_envelope::failure_notice(code, &reason, false, crate::tool_envelope::SIDE_NONE, &json!({})))
+}
+
 pub fn resolve<'a>(
     tools: impl IntoIterator<Item = &'a AgentTool>,
     alias: &str,
@@ -163,10 +269,25 @@ pub fn resolve<'a>(
     // intentionally detaches its session and would break foreground execution.
     Ok((target, args["arguments"].clone()))
 }
+
+pub struct SearchPolicy {
+    capabilities: crate::capabilities::ToolPolicy,
+    rules: crate::permission_rules::RuleSet,
+}
+
+impl SearchPolicy {
+    pub fn load(store: &crate::store::Store) -> Result<Self, String> {
+        Ok(Self {
+            capabilities: crate::capabilities::ToolPolicy::resolve(store),
+            rules: crate::permission_rules::load_checked(store)?,
+        })
+    }
+}
+
 pub fn search<'a>(
     tools: impl IntoIterator<Item = &'a AgentTool>,
     args: &Value,
-    policy: &crate::capabilities::ToolPolicy,
+    policy: &SearchPolicy,
 ) -> Result<Value, String> {
     let schema = registry().remove(0).input;
     crate::tool_validation::validate(&schema, args)?;
@@ -179,7 +300,8 @@ pub fn search<'a>(
         .into_iter()
         .filter(|tool| {
             !matches!(tool.alias.as_str(), SEARCH | INVOKE)
-                && policy.allows_tool(tool)
+                && policy.capabilities.allows_tool(tool)
+                && policy.rules.may_offer_tool(&tool.alias)
                 && tool.discovery_available()
         })
         .collect::<Vec<_>>();
@@ -310,8 +432,8 @@ mod catalog_tests {
             })
             .collect()
     }
-    fn policy() -> crate::capabilities::ToolPolicy {
-        crate::capabilities::ToolPolicy::resolve(&crate::store::Store::open_memory().unwrap())
+    fn policy() -> SearchPolicy {
+        SearchPolicy::load(&crate::store::Store::open_memory().unwrap()).unwrap()
     }
     #[test]
     fn bounded_advertisement_keeps_every_authorized_tool_and_core_control() {
@@ -458,15 +580,64 @@ mod catalog_tests {
         store
             .save_setting(crate::capabilities::DISABLED_KEY, &vec!["git_tools"])
             .unwrap();
-        let policy = crate::capabilities::ToolPolicy::resolve(&store);
+        let policy = SearchPolicy::load(&store).unwrap();
         let searched = search(tools.iter(), &json!({"query":"git"}), &policy).unwrap();
         assert_eq!(searched["total"], 0);
         assert!(
-            policy.denial_for_tool(commit).is_some(),
+            policy.capabilities.denial_for_tool(commit).is_some(),
             "resolving never substitutes for the original dispatch capability gate"
         );
         let todo = search(tools.iter(), &json!({"query":"todo"}), &policy).unwrap();
         assert_eq!(todo["total"], 1);
+    }
+
+    #[test]
+    fn permission_denials_filter_deferred_targets_and_invalidate_search_pages() {
+        use crate::permission_rules::{self, Action, Effect, Rule, RuleSet};
+        let store = crate::store::Store::open_memory().unwrap();
+        let deny = |name: &str| Rule { action: Action::Tool, resource: name.into(), effect: Effect::Deny };
+        let mut rules = RuleSet { rules: vec![deny("selected_0099")] };
+        permission_rules::save(&store, &rules).unwrap();
+        let mut tools = synthetic(100);
+        assert!(attach_for_turn(&mut tools, false, Some(&rules)).unwrap());
+        assert!(resolve(&tools, INVOKE, json!({"name":"selected_0099","arguments":{}})).is_err());
+        let page = search(&tools, &json!({"query":""}), &SearchPolicy::load(&store).unwrap()).unwrap();
+        assert_eq!(page["total"], 99);
+
+        rules.rules.push(deny("selected_0098"));
+        permission_rules::save(&store, &rules).unwrap();
+        let policy = SearchPolicy::load(&store).unwrap();
+        assert!(search(&tools, &json!({"query":"","expected_catalog_sha256":page["catalogSha256"]}), &policy).is_err());
+        assert_eq!(search(&tools, &json!({"query":"selected_0098"}), &policy).unwrap()["total"], 0);
+
+        for (name, args, expected) in [
+            ("selected_0099", json!({}), "denied"),
+            (INVOKE, json!({"name":"selected_0099","arguments":{}}), "denied"),
+            ("missing", json!({}), "unavailable"),
+            (INVOKE, json!({"name":"missing","arguments":{}}), "unavailable"),
+        ] {
+            let call = crate::tool_calls::ToolCall { id: "test".into(), name: name.into(), arguments: args, extra_content: None };
+            let (decision, result) = rejected_call(Some(&rules), &call, "Unavailable.");
+            assert_eq!(decision, expected);
+            assert_eq!(result["error"]["code"], if expected == "denied" { "permission-denied" } else { "unavailable-tool" });
+        }
+    }
+
+    #[test]
+    fn disabling_either_discovery_wrapper_keeps_direct_schemas_bounded() {
+        use crate::permission_rules::{Action, Effect, Rule, RuleSet};
+        for wrapper in [SEARCH, INVOKE] {
+            let rules = RuleSet { rules: vec![Rule { action: Action::Tool, resource: wrapper.into(), effect: Effect::Deny }] };
+            let mut tools = synthetic(80);
+            let discovery = attach_for_turn(&mut tools, true, Some(&rules)).unwrap();
+            assert!(!discovery);
+            let schemas: Vec<_> = advertised_for_turn(&tools, discovery).iter().map(|tool| tool.definition()).collect();
+            assert_eq!(schemas.len(), MAX_ADVERTISED);
+            assert!(visible(&schemas, "selected_0000"));
+            assert!(!visible(&schemas, SEARCH) && !visible(&schemas, INVOKE));
+            let error = resolve_advertised(&tools, &schemas, "selected_0079", json!({})).err().unwrap();
+            assert!(!error.contains(SEARCH) && !error.contains(INVOKE));
+        }
     }
 }
 
@@ -717,7 +888,7 @@ mod protocol_tests {
         let found = search(
             tools.iter(),
             &json!({"query":target_name}),
-            &crate::capabilities::ToolPolicy::guard(state.database()),
+            &SearchPolicy::load(&state.database().unwrap()).unwrap(),
         )
         .unwrap();
         assert_eq!(found["total"], 1);
@@ -780,7 +951,7 @@ mod protocol_tests {
             .selected_tools(&[], &selections)
             .unwrap();
         assert_eq!(tools.len(), 1);
-        let policy = crate::capabilities::ToolPolicy::guard(state.database());
+        let policy = SearchPolicy::load(&state.database().unwrap()).unwrap();
         let found = search(tools.iter(), &json!({"query":""}), &policy).unwrap();
         assert_eq!(found["total"], 1);
         assert_eq!(

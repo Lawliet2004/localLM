@@ -28,11 +28,15 @@ function language(path: string) {
 }
 
 const highlighting = HighlightStyle.define([
-  { tag: [tags.keyword, tags.operator], color: 'var(--editor-keyword, #c792ea)' },
-  { tag: [tags.string, tags.regexp], color: 'var(--accent)' },
-  { tag: [tags.number, tags.bool, tags.null], color: 'var(--warn)' },
-  { tag: tags.comment, color: 'var(--muted)', fontStyle: 'italic' },
-  { tag: [tags.function(tags.variableName), tags.typeName, tags.tagName], color: 'var(--folder)' },
+  { tag: [tags.keyword, tags.operator], color: 'var(--syn-keyword)' },
+  { tag: [tags.string, tags.regexp], color: 'var(--syn-string)' },
+  { tag: [tags.number, tags.bool, tags.null], color: 'var(--syn-number)' },
+  { tag: tags.comment, color: 'var(--syn-comment)', fontStyle: 'italic' },
+  { tag: tags.function(tags.variableName), color: 'var(--syn-function)' },
+  { tag: tags.typeName, color: 'var(--syn-type)' },
+  { tag: [tags.attributeName, tags.propertyName], color: 'var(--syn-attr)' },
+  { tag: [tags.tagName, tags.meta], color: 'var(--syn-meta)' },
+  { tag: [tags.link, tags.url], color: 'var(--syn-link)' },
 ]);
 
 export function CodeEditor({ initialContent, path, onChange, onSave, onCursor }: {
@@ -59,13 +63,13 @@ export function CodeEditor({ initialContent, path, onChange, onSave, onCursor }:
           }
         }),
         EditorView.theme({
-          '&': { height: '100%', color: 'var(--text)', backgroundColor: 'var(--background)', fontSize: 'var(--code-font-size, 13px)' },
+          '&': { height: '100%', color: 'var(--code-fg)', backgroundColor: 'var(--code-bg)', fontSize: 'var(--code-font-size, 13px)' },
           '.cm-scroller': { overflow: 'auto', fontFamily: 'var(--font-mono, Consolas, monospace)' },
-          '.cm-content': { caretColor: 'var(--text)', padding: '12px 0' },
+          '.cm-content': { caretColor: 'var(--code-fg)', padding: '12px 0' },
           '.cm-line': { padding: '0 16px' },
-          '.cm-gutters': { backgroundColor: 'var(--sidebar)', color: 'var(--muted)', borderColor: 'var(--border)' },
+          '.cm-gutters': { backgroundColor: 'var(--code-header-bg)', color: 'var(--code-gutter)', borderColor: 'var(--code-border)' },
           '.cm-activeLine, .cm-activeLineGutter': { backgroundColor: 'var(--hover)' },
-          '.cm-cursor': { borderLeftColor: 'var(--text)' },
+          '.cm-cursor': { borderLeftColor: 'var(--code-fg)' },
           '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: 'var(--editor-selection, #596c994a)' },
           '.cm-panels, .cm-tooltip': { backgroundColor: 'var(--elevated)', color: 'var(--text)', borderColor: 'var(--border)' },
           '.cm-searchMatch': { backgroundColor: '#f1b45440' },

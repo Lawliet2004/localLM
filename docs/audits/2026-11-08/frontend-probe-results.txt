@@ -1,0 +1,47 @@
+
+ RUN  v5.0.0 /home/papan/Desktop/Projects/localLM
+
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+ ✓ docs/audits/2026-11-08/app-probes.test.tsx > diagnostic: reused call ids overwrite the prior live operation and join their output 893ms
+stdout | docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > drops a saved message-only tool when any other journal call exists
+CONFIRMED: mixed journal/message-only tool history omits the saved write
+
+stdout | docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > classifies native file writes as reads and AREX web tools as file search/generic tools
+CONFIRMED: file_write -> read; AREX search -> file search; visit -> generic tool
+
+stdout | docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > folds successful file writes into a read-files group
+CONFIRMED: two successful writes are hidden behind a Read 2 files disclosure
+
+stdout | docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > omits batch patch changes and basic file_write deliverables from file summary
+CONFIRMED: successful batch patch and basic file_write have no changed-file summary
+
+stdout | docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > mounts command details live but leaves them expanded after successful completion
+CONFIRMED: automatic live expansion persists on success; completed history defaults differently
+
+ ✓ docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > drops a saved message-only tool when any other journal call exists 5ms
+ ✓ docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > classifies native file writes as reads and AREX web tools as file search/generic tools 1ms
+ ✓ docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > folds successful file writes into a read-files group 41ms
+ ✓ docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > omits batch patch changes and basic file_write deliverables from file summary 7ms
+ ✓ docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > mounts command details live but leaves them expanded after successful completion 37ms
+stdout | docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > hydrates source footer without hydrating the inline citation map
+CONFIRMED: restored artifact source is linked in footer while the answer citation remains unresolved
+
+stdout | docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > keeps bounded successful reads outside exploration folding because partial means attention
+CONFIRMED: clipped successful reads receive attention grouping even with no operation error
+
+stdout | docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > labels a successful process launch as finished while the process state remains running
+CONFIRMED: process_start state=running is presented with a Finished badge
+
+ ✓ docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > hydrates source footer without hydrating the inline citation map 123ms
+ ✓ docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > keeps bounded successful reads outside exploration folding because partial means attention 2ms
+ ✓ docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > labels a successful process launch as finished while the process state remains running 27ms
+ ✓ docs/audits/2026-11-08/frontend-probes.test.tsx > diagnostic frontend reproductions > makes an opened completed command retain its inspection state 12ms
+
+ Test Files  2 passed (2)
+      Tests  10 passed (10)
+   Start at  10:43:36
+   Duration  4.71s (environment 31%, tests 27%, transform 19%, import 18%, setup 5%)
+
+    Isolate  2 workers spawned · ~857ms startup each (spawn + environment, per file)
+             at least ~857ms faster with isolate: false — reuses workers across files instead of one per file
+

@@ -365,12 +365,13 @@ fn refresh_plan_focus(messages: &mut Vec<Value>, todos: &[crate::plans::Todo]) {
     messages.push(json!({"role":"user","_continuation":true,"_plan_focus":true,"content":text}));
 }
 
-fn inject_plan_mode(plan: &mut TurnPlan, plan_mode: bool) {
+fn inject_plan_mode(plan: &mut TurnPlan, plan_mode: bool, rules: Option<&crate::permission_rules::RuleSet>) {
     if plan_mode {
         plan.injections
             .push(("plan_mode".into(), PLAN_MODE_INSTRUCTION.into()));
         // Approval needs plan_submit even under presets that do not list it.
         if plan.backend.supports_tools()
+            && rules.is_none_or(|rules| rules.may_offer_tool("plan_submit"))
             && !plan.tools.iter().any(|tool| tool.alias == "plan_submit")
         {
             if let Ok(tool) = crate::connectors::AgentTool::harness("plan_submit") {
@@ -1031,9 +1032,7 @@ fn append_workspace_tools(
 }
 
 /// Assemble the exact payload components for one turn of `conversation_id`.
-/// An empty id means a brand-new conversation: defaults apply and nothing is
-/// read from per-conversation rows.
-#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn assemble_turn(
     state: &AppState,
     conversation_id: &str,
@@ -1043,25 +1042,35 @@ pub(crate) async fn assemble_turn(
     new_chat_preset: Option<&str>,
     reasoning_override: Option<crate::store::ReasoningMode>,
 ) -> Result<TurnPlan, String> {
-    assemble_turn_for_task(state, conversation_id, content, connector_ids, connector_tools,
-        new_chat_preset, reasoning_override, None).await
+    assemble_turn_for_task(
+        state, conversation_id, content, connector_ids, connector_tools,
+        TurnOptions { new_chat_preset, reasoning_override, ..Default::default() },
+    ).await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Default)]
+struct TurnOptions<'a> {
+    new_chat_preset: Option<&'a str>,
+    draft_workspace: Option<String>,
+    reasoning_override: Option<crate::store::ReasoningMode>,
+    plan_mode: bool,
+    resumed_task: Option<&'a crate::research_tasks::ResearchTask>,
+    retry_failed_round: bool,
+}
+
+/// A draft without a conversation ID uses its own project and starts with no history.
 async fn assemble_turn_for_task(
     state: &AppState,
     conversation_id: &str,
     content: &str,
     connector_ids: Vec<String>,
     connector_tools: Option<Vec<crate::connectors::ToolSelection>>,
-    new_chat_preset: Option<&str>,
-    reasoning_override: Option<crate::store::ReasoningMode>,
-    resumed_task: Option<&crate::research_tasks::ResearchTask>,
+    options: TurnOptions<'_>,
 ) -> Result<TurnPlan, String> {
     let (exists, preset_id) = {
         let store = state.database()?;
         let exists = !conversation_id.is_empty() && store.conversation_exists(conversation_id)?;
-        let preset_id = match new_chat_preset.filter(|_| !exists) {
+        let preset_id = match options.new_chat_preset.filter(|_| !exists) {
             Some(id) => id.to_string(),
             None => store
                 .conversation_preset(conversation_id)
@@ -1069,11 +1078,14 @@ async fn assemble_turn_for_task(
         };
         (exists, preset_id)
     };
-    let workspace_path = {
+    let workspace_path = if let Some(path) = options.draft_workspace {
+        path
+    } else {
         let store = state.database()?;
         crate::workspace_ui::task_workspace(&store, conversation_id)?
             .unwrap_or(store.workspace_path()?)
     };
+    let resumed_task = options.resumed_task;
     if let Some(workspace) = resumed_task.and_then(|task| task.context.workspace.as_ref()) {
         workspace.verify(std::path::Path::new(&workspace_path))?;
     }
@@ -1605,36 +1617,33 @@ async fn assemble_turn_for_task(
     let (preferences, mut history) = {
         let store = state.database()?;
         let mut preferences = store.preferences()?.apply_model_defaults();
-        if let Some(mode) = reasoning_override {
+        if let Some(mode) = options.reasoning_override {
             preferences.reasoning_mode = mode;
         }
         backend.prepare_preferences(&mut preferences)?;
         if coding_surface && preferences.max_tokens > 0 && backend.context_is_estimate() {
             let round_limit = match preferences.reasoning_mode {
-                crate::store::ReasoningMode::Think => 16_384,
-                _ => 8_192,
+                crate::store::ReasoningMode::Think => 32_768,
+                crate::store::ReasoningMode::Auto => 16_384,
+                crate::store::ReasoningMode::Quick => 8_192,
             };
             preferences.max_tokens = crate::context::fit_response_budget(
                 preferences.max_tokens.min(round_limit), context_length);
         }
-        let previous = if exists {
-            store.messages(conversation_id)?
-        } else {
-            Vec::new()
-        };
-        let checkpoint = store.compaction(conversation_id)?;
-        let mut history = match store.cached_model_history(conversation_id)? {
-            Some(history) => history,
-            None => crate::history::model_history_with_contents(
-                &previous,
-                checkpoint
-                    .as_ref()
-                    .map(|checkpoint| (checkpoint.cutoff, checkpoint.artifact_id.as_str())),
-                &store.model_contents(conversation_id)?,
-            )?,
-        };
-        if let Some(checkpoint) = checkpoint.as_ref() {
-            crate::compaction::restore_handoff(&store, conversation_id, &checkpoint.artifact_id, &mut history)?;
+        let mut history = Vec::new();
+        if exists {
+            let checkpoint = store.compaction(conversation_id)?;
+            history = match store.cached_model_history(conversation_id)? {
+                Some(history) => history,
+                None => crate::history::model_history_with_contents(
+                    &store.messages(conversation_id)?,
+                    checkpoint.as_ref().map(|checkpoint| (checkpoint.cutoff, checkpoint.artifact_id.as_str())),
+                    &store.model_contents(conversation_id)?,
+                )?,
+            };
+            if let Some(checkpoint) = checkpoint {
+                crate::compaction::restore_handoff(&store, conversation_id, &checkpoint.artifact_id, &mut history)?;
+            }
         }
         crate::automation::remove_model_images(&mut history);
         if !supports_images
@@ -1725,7 +1734,25 @@ async fn assemble_turn_for_task(
         },
         &mut tools,
     )?;
-    if arex_tools {
+    if goal.is_some() {
+        tools.retain(|tool| !matches!(tool.alias.as_str(), "worktree_enter" | "worktree_exit" | "session_move"));
+        if backend.supports_tools() {
+            for alias in ["goal_status", "goal_update"] {
+                tools.push(crate::connectors::AgentTool::harness(alias)?);
+            }
+        }
+    }
+    // Only a readable rule set can prove that an alias is unusable. If
+    // settings are corrupt, dispatch retains its existing audited refusal.
+    let rules = crate::permission_rules::load_checked(&*state.database()?).ok();
+    let compact_workspace =
+        use_workspace && (coding_surface || preset.id == crate::presets::STANDARD);
+    let discovery =
+        crate::tool_discovery::attach_for_turn(&mut tools, compact_workspace, rules.as_ref())?;
+    let compact_coding_catalog = compact_workspace && discovery;
+    let offers = |alias: &str| tools.iter().any(|tool| tool.alias == alias);
+    let arex_tools = arex_tools && offers("finish");
+    if arex_tools && offers("search") && offers("visit") && offers("update_context") {
         injections.push((
             "arex_research".into(),
             crate::arex::RESEARCH_GUIDANCE.into(),
@@ -1733,7 +1760,18 @@ async fn assemble_turn_for_task(
     }
     if coding_surface {
         let scope = if use_execution {
-            format!("The shell lifetime is {} seconds. Omit timeout_seconds to use that limit. shell_run timeout_secs is only a wait. Start longer jobs with process_start and collect the final state. Run each goal gate from cwd '.' with verification_run and collect verification_report for the affected source. For running checks, wait on the saved evidenceId with wait_ms instead of repeating the command. Batch independent reads and reserve time for the final checks and handoff.", execution_config.bash.timeout_seconds)
+            let mut scope = format!("The shell lifetime is {} seconds.", execution_config.bash.timeout_seconds);
+            if offers("process_start") {
+                scope.push_str(" Start longer jobs with process_start and collect the final state. Omit timeout_seconds to use the configured lifetime.");
+            }
+            if offers("shell_run") {
+                scope.push_str(" The shell_run timeout_secs is only a wait.");
+            }
+            if offers("verification_run") && offers("verification_report") {
+                scope.push_str(" Run each goal gate from cwd '.' with verification_run and collect verification_report for the affected source. For running checks, wait on the saved evidenceId with wait_ms instead of repeating the command.");
+            }
+            scope.push_str(" Batch independent reads and reserve time for the final checks and handoff.");
+            scope
         } else {
             "Local execution is turned off for this turn.".into()
         };
@@ -1742,37 +1780,34 @@ async fn assemble_turn_for_task(
         )));
     }
     if let Some(goal) = &goal {
-        tools.retain(|tool| !matches!(tool.alias.as_str(), "worktree_enter" | "worktree_exit" | "session_move"));
-        if backend.supports_tools() {
-            for alias in ["goal_status", "goal_update"] {
-                tools.push(crate::connectors::AgentTool::harness(alias)?);
-            }
-        }
         let details = if let Some(text) = goal_text.as_deref() {
             format!("\n\n{text}")
         } else {
             String::new()
         };
+        let inspect = if offers("goal_status") { " Use goal_status to inspect saved criteria." } else { "" };
+        let update = if offers("goal_update") { " Use goal_update to record evidence or blockers." } else { "" };
         injections.push(("goal_file".into(), format!(
-            "The user selected the goal file {} (SHA-256 {}). Use goal_status to inspect saved criteria and goal_update to record evidence or blockers. Continue independent work through the pending criteria. The goal applies to the selected workspace under its current permissions.{details}", goal.path, goal.sha256
+            "The user selected the goal file {} (SHA-256 {}).{inspect}{update} Continue independent work through the pending criteria. The goal applies to the selected workspace under its current permissions.{details}", goal.path, goal.sha256
         )));
     }
     if let Some(guidance) = crate::authoring::task_hint(goal_text.as_deref().unwrap_or(content), &tools.iter().map(|t| t.alias.as_str()).collect::<Vec<_>>()) {
         injections.push(("development_task".into(), guidance));
     }
-    if crate::tool_discovery::attach_for_turn(&mut tools, coding_surface)? {
-        injections.push(("tool_discovery".into(),"Some authorized tool schemas are deferred to keep the request bounded. Use tool_search to find names and exact input schemas, then tool_invoke to call a discovered tool. Its original validation, approvals and audit still apply. Discovery does not change the advertised schema set or broaden selected sources.".into()));
+    if discovery {
+        injections.push(("tool_discovery".into(), crate::tool_discovery::GUIDANCE.into()));
+    } else if tools.len() > crate::tool_discovery::MAX_ADVERTISED {
+        let notice = format!("A saved permission rule disables tool discovery. {} of {} tools can be advertised directly. Narrow the selected tools to expose a missing tool.", crate::tool_discovery::MAX_ADVERTISED, tools.len());
+        add_tool_notice(&mut tool_notice, notice.clone());
+        injections.push(("unavailable_tools".into(), notice));
     }
+    let use_ptc = preset.id == crate::presets::CODE && offers("ptc_run");
     crate::prompt::sort_tools_by_alias(&mut tools);
-    let ptc_sdk = if preset.id == crate::presets::CODE {
-        let aliases: Vec<String> = crate::tool_discovery::advertised_for_turn(tools.iter(), coding_surface)
-            .into_iter()
-            .map(|tool| tool.alias.clone())
-            .collect();
-        Some(crate::presets::ts_sdk(&aliases))
-    } else {
-        None
-    };
+    let advertised = crate::tool_discovery::advertised_for_turn(tools.iter(), compact_coding_catalog);
+    let ptc_sdk = use_ptc.then(|| {
+        let aliases = advertised.iter().map(|tool| tool.alias.clone()).collect::<Vec<_>>();
+        crate::presets::ts_sdk(&aliases)
+    });
     let selection_hash = {
         let tools_value = if exists {
             serde_json::to_value(state.database()?.conversation_tools(conversation_id)?)
@@ -1793,27 +1828,14 @@ async fn assemble_turn_for_task(
             tool_schemas_suppressed,
         )
     };
-    let selection_hash = format!(
-        "{selection_hash}:{}",
-        tools
-            .iter()
-            .map(|t| t.alias.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    let tool_definitions = freeze_tool_catalog_for_turn(
-        &*state.database()?,
-        conversation_id,
-        exists,
-        selection_hash,
-        &mut tools,
-        coding_surface,
-    )?;
+    let tool_definitions = advertised.into_iter()
+        .map(crate::connectors::AgentTool::definition)
+        .collect();
     let id_slot = match &backend {
         Backend::Local { .. } if state.session_runs.running_count() <= 1 => Some(0),
         _ => None,
     };
-    Ok(TurnPlan {
+    let mut plan = TurnPlan {
         supports_images,
         preset,
         tools,
@@ -1834,7 +1856,90 @@ async fn assemble_turn_for_task(
         context_length,
         id_slot,
         arex_tools,
-    })
+    };
+    inject_plan_mode(&mut plan, options.plan_mode, rules.as_ref());
+    if !options.retry_failed_round {
+        fit_local_tool_catalog(&mut plan, rules.as_ref(), discovery).await?;
+        if exists {
+            let aliases = plan.tools.iter().map(|tool| tool.alias.as_str()).collect::<Vec<_>>().join(",");
+            freeze_tool_catalog_for_turn(
+                &*state.database()?, conversation_id, format!("{selection_hash}:{aliases}"),
+                &plan.tool_definitions,
+            )?;
+        }
+    }
+    Ok(plan)
+}
+
+/// Keep a usable tool catalog even when the first request on a local model
+/// would fill its window with schemas. Check the rendered prompt without the
+/// transcript so growing history can be managed by the existing compaction path.
+async fn fit_local_tool_catalog(
+    plan: &mut TurnPlan,
+    rules: Option<&crate::permission_rules::RuleSet>,
+    discovery: bool,
+) -> Result<(), String> {
+    use crate::tool_discovery;
+    if plan.backend.context_is_estimate() || plan.tool_definitions.is_empty()
+        || !tool_discovery::wrappers_allowed(rules)
+    {
+        return Ok(());
+    }
+    async fn first_prompt_tokens(plan: &TurnPlan) -> Result<u64, String> {
+        let scratchpad = crate::prompt::volatile_scratchpad(&plan.injections);
+        let messages = crate::prompt::build_turn_messages(
+            &frozen_system_for(plan), &[], scratchpad.as_deref(), &plan.draft_message,
+        );
+        let request = request_payload(
+            &messages, &plan.tool_definitions, &plan.preferences, false, false, None, plan.local_arex(),
+        );
+        let payload = plan.backend.payload(&request)?;
+        plan.backend.count_tokens(&payload).await
+    }
+
+    let full = first_prompt_tokens(plan).await?;
+    if crate::context::validate_budget(full, plan.preferences.max_tokens, plan.context_length).is_ok() {
+        return Ok(());
+    }
+    if !discovery {
+        tool_discovery::attach_wrappers(&mut plan.tools)?;
+        plan.injections.push(("tool_discovery".into(), tool_discovery::GUIDANCE.into()));
+    }
+    let full_definitions = std::mem::take(&mut plan.tool_definitions);
+    let full_sdk = plan.ptc_sdk.take();
+    for include_workspace in [true, false] {
+        let definitions = tool_discovery::compact_local(&plan.tools, include_workspace);
+        if definitions == full_definitions {
+            continue;
+        }
+        plan.ptc_sdk = full_sdk.as_ref().map(|_| {
+            let aliases = definitions.iter()
+                .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            crate::presets::ts_sdk(&aliases)
+        });
+        plan.tool_definitions = definitions;
+        let tokens = first_prompt_tokens(plan).await?;
+        // Leave space for the first tool result where possible. On the last
+        // attempt use the smaller payload even if the draft itself needs work.
+        let leaves_room_for_results = !crate::compaction::should_compact(
+            tokens, plan.preferences.max_tokens, plan.context_length,
+        );
+        if tokens < full && (!include_workspace || leaves_room_for_results) {
+            add_tool_notice(
+                &mut plan.tool_notice,
+                "Some tool definitions were deferred to make room in the local context window.".into(),
+            );
+            return Ok(());
+        }
+    }
+    plan.tool_definitions = full_definitions;
+    plan.ptc_sdk = full_sdk;
+    if !discovery {
+        plan.tools.truncate(plan.tools.len() - 2);
+        plan.injections.pop();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1845,44 +1950,38 @@ fn freeze_tool_catalog(
     hash: String,
     tools: &mut [crate::connectors::AgentTool],
 ) -> Result<Vec<Value>, String> {
-    freeze_tool_catalog_for_turn(store, conversation_id, exists, hash, tools, false)
+    let defs = crate::tool_discovery::advertised(tools.iter()).into_iter()
+        .map(crate::connectors::AgentTool::definition).collect::<Vec<_>>();
+    if exists {
+        freeze_tool_catalog_for_turn(store, conversation_id, hash, &defs)?;
+    }
+    Ok(defs)
 }
 
 fn freeze_tool_catalog_for_turn(
     store: &crate::store::Store,
     conversation_id: &str,
-    exists: bool,
     hash: String,
-    tools: &mut [crate::connectors::AgentTool],
-    coding_surface: bool,
-) -> Result<Vec<Value>, String> {
-    crate::prompt::sort_tools_by_alias(tools);
-    let advertised = crate::tool_discovery::advertised_for_turn(tools.iter(), coding_surface);
-    let aliases: Vec<String> = advertised.iter().map(|tool| tool.alias.clone()).collect();
-    let defs: Vec<Value> = advertised.iter().map(|tool| tool.definition()).collect();
-    if !exists || conversation_id.is_empty() {
-        return Ok(defs);
-    }
-    if let Some(freeze) = store.prompt_freeze(conversation_id)? {
-        if freeze.selection_hash == hash {
-            let frozen_defs: Vec<Value> =
-                serde_json::from_str(&freeze.tools_json).unwrap_or_else(|_| defs.clone());
-            let frozen_aliases: Vec<String> =
-                serde_json::from_str(&freeze.aliases_json).unwrap_or_else(|_| aliases.clone());
-            let compatible = frozen_aliases == aliases && frozen_defs == defs;
-            if compatible {
-                return Ok(frozen_defs);
-            }
-        }
+    defs: &[Value],
+) -> Result<(), String> {
+    let aliases = defs.iter()
+        .filter_map(|definition| definition["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    let tools_json = serde_json::to_string(defs).map_err(|error| error.to_string())?;
+    let aliases_json = serde_json::to_string(&aliases).map_err(|error| error.to_string())?;
+    if store.prompt_freeze(conversation_id)?.is_some_and(|freeze| {
+        freeze.selection_hash == hash && freeze.tools_json == tools_json && freeze.aliases_json == aliases_json
+    }) {
+        return Ok(());
     }
     store.save_prompt_freeze(&crate::store::PromptFreeze {
         conversation_id: conversation_id.into(),
         selection_hash: hash,
-        tools_json: serde_json::to_string(&defs).map_err(|error| error.to_string())?,
-        aliases_json: serde_json::to_string(&aliases).map_err(|error| error.to_string())?,
+        tools_json,
+        aliases_json,
         created_at: crate::store::now(),
     })?;
-    Ok(defs)
+    Ok(())
 }
 
 fn frozen_system_for(plan: &TurnPlan) -> String {
@@ -2026,6 +2125,7 @@ impl<'a> TurnRounds<'a> {
     let check_run_offered = plan.tools.iter().any(|tool| matches!(tool.alias.as_str(), "check_run" | "verification_run"));
     let mut repairs_used = 0u32;
     let mut output_recoveries = 0u32;
+    let mut overflow_recoveries = 0u32;
     let mut model_retries = 0;
     let mut round_preferences = plan.preferences.clone();
     // Non-retryable signatures are shared for the run: nested dispatch
@@ -2035,6 +2135,8 @@ impl<'a> TurnRounds<'a> {
     let _blocked_registration = TurnBlockedRegistration { map: &state.turn_blocked, run_id: run.id.clone() };
     let mut paused_exit = false;
     let mut evidence_note: Option<String> = None;
+    let mut file_tracker = crate::workspace::FileReadTracker::new();
+    file_tracker.seed_from_messages(messages);
     let mut ledger = Some(task);
     if let Some(task) = ledger.as_ref() {
         self.research_task_id = Some(task.id.clone());
@@ -2069,6 +2171,12 @@ impl<'a> TurnRounds<'a> {
                     segment += 1;
                     segment_started = tokio::time::Instant::now();
                     segment_made_progress = false;
+                    // Reset deduplicated call signatures across segment boundaries so
+                    // repeating checks or re-reading edited files in later hours counts as progress.
+                    completed_calls.clear();
+                    if let Some(task) = ledger.as_ref() {
+                        save_ledger(state, task);
+                    }
                     let store = state.database()?;
                     emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), None,
                         "work_segment_continued", json!({"segment":segment,"reason":reason}), true);
@@ -2129,7 +2237,19 @@ impl<'a> TurnRounds<'a> {
             event.notice = Some("Context reached 80%. Older activity was archived; continuing this response.".into());
             let _ = channel.send(event);
         }
-        let payload = plan.backend.payload(&request_payload(messages, &plan.tool_definitions, &round_preferences, tool_use_denied, finalizing, plan.id_slot, plan.local_arex()))?;
+        let mut request = request_payload(
+            messages, &plan.tool_definitions, &round_preferences, tool_use_denied, finalizing,
+            plan.id_slot, plan.local_arex(),
+        );
+        request["locallm_cache_key"] = json!(crate::inference::prompt_cache_key(&conversation_id));
+        if round == 0 && !self.recovery_only && plan.history.is_empty()
+            && matches!(plan.backend, Backend::Local { .. })
+        {
+            // A new conversation starts with a cold local prompt. Subsequent
+            // rounds can reuse the prefix of this conversation's own request.
+            request["cache_prompt"] = json!(false);
+        }
+        let payload = plan.backend.payload(&request)?;
         self.seq += 1;
         let _ = channel.send(ChatEvent::new(
             run,
@@ -2186,7 +2306,16 @@ impl<'a> TurnRounds<'a> {
             result = tokio::time::timeout(Duration::from_secs(600), plan.backend.stream(&payload)) => result,
         };
         let mut stream = match response {
-            Ok(result) => result?.bytes_stream(),
+            Ok(Ok(response)) => response.bytes_stream(),
+            Ok(Err(error)) => {
+                if is_context_overflow_error(&error) && overflow_recoveries < 3 {
+                    break 'attempt Some(("context_overflow", error));
+                }
+                if is_transient_stream_error(&error) {
+                    break 'attempt Some(("provider_transient_error", error));
+                }
+                return Err(error);
+            }
             Err(_) => break 'attempt Some(("response_timeout", "Model did not respond within ten minutes.".into())),
         };
         'stream: loop {
@@ -2216,8 +2345,14 @@ impl<'a> TurnRounds<'a> {
                 let Some(value) = value else {if protocol.done{break 'stream;}continue;};
                 if let Some(error) = value.get("error") {
                     let message = plan.backend.stream_error(error);
+                    if is_context_overflow_error(&message) && overflow_recoveries < 3 {
+                        break 'attempt Some(("context_overflow", message));
+                    }
                     if matches!(error["code"].as_str().or_else(|| error["type"].as_str()),
-                        Some("inference_timeout" | "overloaded_error" | "server_error"))
+                        Some("inference_timeout" | "overloaded_error" | "server_error"
+                            | "rate_limit_error" | "rate_limit_exceeded" | "api_error"
+                            | "internal_error" | "service_unavailable" | "resource_exhausted"
+                            | "unavailable" | "timeout"))
                     {
                         break 'attempt Some(("provider_stream_error", message));
                     }
@@ -2314,6 +2449,55 @@ impl<'a> TurnRounds<'a> {
         None
         };
         if let Some((reason, error)) = interrupted {
+            if reason == "context_overflow" {
+                drop(reasoning_item);
+                drop(tool_drafts);
+                answer.truncate(answer_len_before_round);
+                reasoning.truncate(reasoning_len_before_round);
+                if let Some((start, mut measurement)) = active_measurement.take() {
+                    measurement.duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    response_metrics.rounds.push(measurement);
+                }
+                let compacted = force_compact_messages(
+                    state,
+                    &conversation_id,
+                    messages,
+                    true,
+                )?;
+                if compacted.is_none() || overflow_recoveries >= 3 {
+                    return Err(error);
+                }
+                overflow_recoveries += 1;
+                run.transition_to(crate::agent_run::RunState::PreparingNextRound)?;
+                {
+                    let store = state.database()?;
+                    store.update_message(&assistant.id, answer, reasoning, "streaming")?;
+                    store.update_run_status(&run.id, run.status, None, Some(&step_id))?;
+                    emit_session_event(
+                        &store,
+                        &conversation_id,
+                        Some(&run.id),
+                        Some(&step_id),
+                        None,
+                        "compaction",
+                        json!({"artifact": compacted, "auto": true, "reason": "provider_context_overflow", "attempt": overflow_recoveries}),
+                        true,
+                    );
+                }
+                self.seq += 1;
+                let mut evt = ChatEvent::draft(
+                    run,
+                    &step_id,
+                    self.seq,
+                    "Context limit reached · compacting and retrying…",
+                    &assistant.id,
+                    answer,
+                    reasoning,
+                );
+                evt.notice = Some("Provider context limit reached. Older activity was archived; retrying this round.".into());
+                let _ = channel.send(evt);
+                continue 'rounds;
+            }
             if model_retries >= max_model_retries {
                 return Err(error);
             }
@@ -2342,7 +2526,7 @@ impl<'a> TurnRounds<'a> {
                 &assistant.id, answer, reasoning));
             tokio::select! {
                 _ = cancellation.changed() => return Ok(false),
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                _ = tokio::time::sleep(Duration::from_millis(retry_backoff_ms(model_retries))) => {},
             }
             continue 'rounds;
         }
@@ -2436,6 +2620,19 @@ impl<'a> TurnRounds<'a> {
                 round_preferences.max_tokens = recovery_response_budget(
                     previous_budget, self.input_tokens, plan.context_length, None,
                 );
+            } else if previous_budget > 0 {
+                if let Some(model_limit) = plan.backend.response_limit() {
+                    if previous_budget < model_limit {
+                        let room = u64::from(plan.context_length)
+                            .saturating_sub(self.input_tokens.saturating_add(512))
+                            .min(u64::from(model_limit)) as u32;
+                        round_preferences.max_tokens = previous_budget
+                            .saturating_mul(2)
+                            .min(model_limit)
+                            .min(room)
+                            .max(previous_budget);
+                    }
+                }
             }
             let store = state.database()?;
             emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), None,
@@ -2587,7 +2784,13 @@ impl<'a> TurnRounds<'a> {
                         // The rebuild guard rejects native rounds with more
                         // calls than the replay cap; larger rounds keep the
                         // canonical transcript instead of a durable native one.
-                        if finished.len() <= 8 && crate::history::saved_native_message(&message).is_some() { Some(message) } else { None }
+                        if finished.len() <= crate::tool_calls::MAX_CALLS_PER_ROUND
+                            && crate::history::saved_native_message(&message).is_some()
+                        {
+                            Some(message)
+                        } else {
+                            None
+                        }
                     };
                     if let Some((row, result_text)) = run_finish_call(state, channel, run, &step_id, &conversation_id, &assistant.id, &mut self.seq, answer, &research_evidence, plan.access_mode, call, &round_answer, finish_message.as_ref()).await? {
                         self.last_model_message_id = row.id.clone();
@@ -2842,16 +3045,19 @@ impl<'a> TurnRounds<'a> {
         let mut call_index = 0usize;
         while call_index < calls.len() {
             let mut call = calls[call_index].clone();
-            let resolved=if crate::tool_discovery::visible(&plan.tool_definitions,&call.name) {
-                crate::tool_discovery::resolve(plan.tools.iter(),&call.name,call.arguments.clone())
-            } else {Err("Tool schema is deferred or unavailable. Use tool_search and tool_invoke for authorized deferred tools.".into())};
+            let resolved = crate::tool_discovery::resolve_advertised(
+                &plan.tools, &plan.tool_definitions, &call.name, call.arguments.clone(),
+            );
             let (tool,arguments)=match resolved {
                 Ok(resolved)=>resolved,
                 Err(error)=>{
-                    let result=crate::tool_envelope::failure_notice("unavailable-tool",&error,false,crate::tool_envelope::SIDE_NONE,&json!({}));
-                    let store=state.database()?;let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":"Unavailable","name":call.name,"arguments":call.arguments,"callId":call.id,"runId":run.id,"stepId":step_id,"decision":"unavailable"},"result":result}).to_string(),"complete")?;
+                    let store = state.database()?;
+                    let rules = crate::permission_rules::load_checked(&store).ok();
+                    let (decision, result) = crate::tool_discovery::rejected_call(rules.as_ref(), &call, &error);
+                    tool_use_denied |= decision == "denied";
+                    let row=store.append_message(&conversation_id,"tool",&json!({"request":{"connector":"Unavailable","name":call.name,"arguments":call.arguments,"callId":call.id,"runId":run.id,"stepId":step_id,"decision":decision},"result":result}).to_string(),"complete")?;
                     crate::history::remember_native_round(&store,&row,&round_model_message,&mut round_model_saved)?;
-                    emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":row.id,"result":result}), false);
+                    emit_session_event(&store, &conversation_id, Some(&run.id), Some(&step_id), Some(&call.id), "tool_result", json!({"messageId":row.id,"callId":call.id,"name":call.name,"decision":decision,"result":result}), false);
                     messages.push(json!({"role":"tool","tool_call_id":call.id,"content":result.to_string()}));call_index+=1;continue;
                 },
             };
@@ -2934,6 +3140,7 @@ impl<'a> TurnRounds<'a> {
                     call.arguments = arguments;
                 }
             } else {
+              file_tracker.inject_expected_sha256(&tool.alias, &mut call.arguments);
               match tool.prepare_arguments(call.arguments.clone()) {
                 Ok(arguments) => call.arguments = arguments,
                 Err(error) => {
@@ -3446,6 +3653,7 @@ impl<'a> TurnRounds<'a> {
                 }
             };
 
+            file_tracker.observe_result(&result);
             let web_calls = research_progress.calls;
             let evidence_count = research_progress.evidence.len();
             research_progress.observe(&tool.tool.name, &result);
@@ -3455,9 +3663,15 @@ impl<'a> TurnRounds<'a> {
                 && !matches!(result["responseStatus"].as_str(), Some("declined" | "withdrawn" | "unanswered"))
             {
                 let new_call = completed_calls.insert(signature);
+                let mutated = !tool.trusted_read();
+                if mutated {
+                    // After a mutation, re-reading edited files or re-running the
+                    // same build/test command reflects new state and counts as progress.
+                    completed_calls.clear();
+                }
                 let waited_for_process = matches!(call.name.as_str(), "process_poll" | "check_report" | "verification_report")
                     && tool_exec_start.elapsed() >= Duration::from_secs(1);
-                segment_made_progress |= new_call || waited_for_process;
+                segment_made_progress |= new_call || mutated || waited_for_process;
             }
             // The taste profile learns from DECISIONS the user made, not
             // from calls the access mode approved on their own. An
@@ -4509,6 +4723,147 @@ fn cancel_applies(state: &AppState, generation: u64) -> bool {
         crate::agent_run::cancel_matches(control.cancel_generation, generation)).unwrap_or(true)
 }
 
+/// True when a provider error indicates the request exceeded the model's
+/// context window so emergency compaction can recover instead of aborting.
+fn is_context_overflow_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "maximum context length",
+        "context length exceeded",
+        "context window exceeded",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "exceeds the context",
+        "exceeds context limit",
+        "exceeds the maximum number of tokens",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// True when a pre-stream provider or transport failure is likely transient
+/// (rate limits, 5xx overload, brief network drops) and safe to retry before
+/// any tool executes. Permanent auth/quota/validation errors always return false.
+fn is_transient_stream_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if [
+        "insufficient_quota",
+        "invalid_api_key",
+        "authentication_error",
+        "permission_error",
+        "invalid_request_error",
+        "model_not_found",
+        "unsupported_parameter",
+        "unauthorized",
+        "re-authenticate",
+        "http 400",
+        "http 401",
+        "http 403",
+        "http 404",
+        "http 422",
+        "status 400",
+        "status 401",
+        "status 403",
+        "status 404",
+        "status 422",
+        "chat template",
+        "roles must alternate",
+        "system message must be at the beginning",
+        "offline mode",
+        "remote inference was not called",
+        "account switch",
+    ]
+    .iter()
+    .any(|permanent| lower.contains(permanent))
+    {
+        return false;
+    }
+    [
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "529",
+        "rate limit",
+        "rate_limit",
+        "overloaded",
+        "temporarily unavailable",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "error sending request",
+        "could not connect",
+        "dns error",
+    ]
+    .iter()
+    .any(|transient| lower.contains(transient))
+}
+
+fn retry_backoff_ms(attempt: usize) -> u64 {
+    match attempt {
+        0 | 1 => 500,
+        2 => 1_500,
+        3 => 4_000,
+        4 => 10_000,
+        _ => 20_000,
+    }
+}
+
+/// Emergency compaction invoked only after a provider rejects a request with
+/// a context-length-exceeded error. Archives bulky stale tool outputs first,
+/// then compacts older turns down to the smallest useful window.
+fn force_compact_messages(
+    state: &AppState,
+    conversation_id: &str,
+    messages: &mut Vec<Value>,
+    draft_saved: bool,
+) -> Result<Option<String>, String> {
+    let store = state.database()?;
+    if !crate::compaction::capability_enabled(&store) {
+        return Ok(None);
+    }
+    let before_bytes = serde_json::to_vec(messages).map(|v| v.len()).unwrap_or(0);
+    let mut last_artifact = None;
+    if let Some(prune) = crate::compaction::plan_stale_tool_prune(messages, 2, 1024) {
+        let pruned_bytes = serde_json::to_vec(&prune.messages).map(|v| v.len()).unwrap_or(before_bytes);
+        if pruned_bytes < before_bytes {
+            last_artifact = Some(crate::compaction::commit_stale_tool_prune(
+                &store,
+                conversation_id,
+                messages,
+                prune,
+            )?);
+        }
+    }
+    let current_bytes = serde_json::to_vec(messages).map(|v| v.len()).unwrap_or(before_bytes);
+    for window in [2usize, 1, 0] {
+        let Some(plan) = crate::compaction::plan_compaction(messages, window) else {
+            continue;
+        };
+        let candidate_bytes = serde_json::to_vec(&plan.kept).map(|v| v.len()).unwrap_or(current_bytes);
+        if candidate_bytes < current_bytes {
+            last_artifact = Some(crate::compaction::commit_plan(
+                &store,
+                conversation_id,
+                messages,
+                plan,
+                window,
+                draft_saved,
+            )?);
+            break;
+        }
+    }
+    Ok(last_artifact)
+}
+
 /// Count before every generation round. Compaction never runs inside a tool call.
 async fn prepare_context(
     state: &AppState,
@@ -4539,6 +4894,38 @@ async fn prepare_context(
             crate::compaction::keep_last(&store),
         )
     };
+    if auto
+        && crate::compaction::should_compact(
+            tokens,
+            preferences.max_tokens,
+            plan.context_length,
+        )
+    {
+        // Stage 1: archive bulky stale tool outputs older than the recent 6
+        // tool calls before evicting whole conversation turns. Runs only after
+        // the 80% threshold triggers so normal rounds stay cache-stable.
+        if let Some(prune) = crate::compaction::plan_stale_tool_prune(messages, 6, 2048) {
+            let pruned_payload = plan.backend.payload(&request_payload(
+                &prune.messages,
+                &plan.tool_definitions,
+                preferences,
+                denied,
+                finalizing,
+                plan.id_slot,
+                plan.local_arex(),
+            ))?;
+            let pruned_tokens = plan.backend.count_tokens(&pruned_payload).await?;
+            if pruned_tokens < tokens {
+                artifact = Some(crate::compaction::commit_stale_tool_prune(
+                    &*state.database()?,
+                    conversation_id,
+                    messages,
+                    prune,
+                )?);
+                tokens = pruned_tokens;
+            }
+        }
+    }
     if auto
         && crate::compaction::should_compact(
             tokens,
@@ -4788,8 +5175,8 @@ async fn send_message_with_pending(
             Ok(crate::agent_run::begin_generation(control, &cancel))
         }
     })??;
-    if content.trim().is_empty() || content.len() > 1_048_576 {
-        return Err("Enter a message no larger than 1 MiB.".into());
+    if content.trim().is_empty() || crate::attachments::exceeds_message_limit(&content) {
+        return Err("Enter a message within 1 MiB of text or 16 MiB with encoded attachments.".into());
     }
     {
         let store = state.database()?;
@@ -4813,9 +5200,13 @@ async fn send_message_with_pending(
         &content,
         connector_ids.unwrap_or_default(),
         connector_tools,
-        None,
-        reasoning_mode,
-        resumed_task.as_ref(),
+        TurnOptions {
+            reasoning_override: reasoning_mode,
+            plan_mode: !recovery_only && plan_mode.unwrap_or(false),
+            resumed_task: resumed_task.as_ref(),
+            retry_failed_round: recovery_only,
+            ..Default::default()
+        },
         ) => result?,
     };
     let presentation_mode = state.database()?.presentation_mode(Some(&conversation_id))?.effective_mode;
@@ -4827,9 +5218,6 @@ async fn send_message_with_pending(
         plan.tools.clear();
         plan.tool_definitions.clear();
     }
-    // Rides on the draft as a volatile injection so the prompt-cache prefix
-    // and the logged injections stay identical to every other turn.
-    inject_plan_mode(&mut plan, plan_mode);
     if let Some(notice) = &plan.tool_notice {
         let mut event = ChatEvent::progress("", "", "", "Preparing request…", None);
         event.notice = Some(notice.clone());
@@ -5263,28 +5651,39 @@ pub async fn context_preflight(
     plan_mode: Option<bool>,
     reasoning_mode: Option<crate::store::ReasoningMode>,
     presentation_mode: Option<crate::presentation::Mode>,
+    project_id: Option<String>,
 ) -> Result<ContextPreflight, String> {
     let conversation_id = conversation_id.unwrap_or_default();
-    if draft.len() > 1_048_576 {
+    if crate::attachments::exceeds_message_limit(&draft) {
         return Ok(unavailable_preflight(
-            "Drafts count toward the same 1 MiB message limit.".into(),
+            "Drafts must fit within 1 MiB of text or 16 MiB with encoded attachments.".into(),
         ));
     }
-    let mut plan = match assemble_turn(
+    let draft_workspace = if conversation_id.is_empty() {
+        let store = state.database()?;
+        Some(crate::workspace_ui::project_workspace(&store, project_id.as_deref())?.unwrap_or_default())
+    } else {
+        None
+    };
+    let plan = match assemble_turn_for_task(
         &state,
         &conversation_id,
         &draft,
         connector_ids.unwrap_or_default(),
         connector_tools,
-        preset.as_deref(),
-        reasoning_mode,
+        TurnOptions {
+            new_chat_preset: preset.as_deref(),
+            draft_workspace,
+            reasoning_override: reasoning_mode,
+            plan_mode: plan_mode.unwrap_or(false),
+            ..Default::default()
+        },
     )
     .await
     {
         Ok(plan) => plan,
         Err(error) => return Ok(unavailable_preflight(error)),
     };
-    inject_plan_mode(&mut plan, plan_mode.unwrap_or(false));
     let frozen = frozen_system_for(&plan);
     let volatile = crate::prompt::volatile_scratchpad(&plan.injections);
     let messages = crate::prompt::build_turn_messages(
@@ -5312,7 +5711,7 @@ pub async fn context_preflight(
                 false,
                 false,
                 None,
-                false,
+                plan.local_arex(),
             ))?)
             .await
     }
@@ -5350,7 +5749,12 @@ pub async fn context_preflight(
             fits,
             notice: plan.tool_notice.clone(),
             overflow: (!fits).then(|| {
-                "This draft plus the response reserve will not fit the loaded context. Shorten the message, deselect tools, compact the conversation, or increase the context and reload the model.".into()
+                let guidance = if plan.history.is_empty() {
+                    "Shorten the draft, deselect tools or skills, or increase the context window."
+                } else {
+                    "Compact the conversation, shorten the draft, deselect tools or skills, or increase the context window."
+                };
+                format!("This request needs {total} input tokens and reserves {} for the reply. The model has {} context tokens. {guidance}", plan.preferences.max_tokens, plan.context_length)
             }),
         }),
     })
@@ -5566,6 +5970,82 @@ fn request_payload(
 
 #[cfg(test)]
 mod finish_tests {
+    #[tokio::test]
+    async fn fresh_local_chat_starts_cold_with_a_catalog_that_fits() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let previous_workspace = root.path().join("previous");
+        let next_workspace = root.path().join("next");
+        std::fs::create_dir(&previous_workspace).unwrap();
+        std::fs::create_dir(&next_workspace).unwrap();
+        std::fs::write(previous_workspace.join("AGENTS.md"), "Prior project's private marker").unwrap();
+        std::fs::write(next_workspace.join("AGENTS.md"), "Current project's marker").unwrap();
+        let state = crate::test_support::app_state(root.path());
+        let model = "fresh-local-catalog-fixture.gguf";
+        let id = {
+            let store = state.database().unwrap();
+            store.save_workspace_path(previous_workspace.to_str().unwrap()).unwrap();
+            let old = store.create_conversation().unwrap();
+            store.begin_turn(&old.id, "Prior chat marker").unwrap();
+            store.save_setting("workspace_index_v1", &json!({
+                "projects":[{"id":"next","name":"Next","path":next_workspace}], "tasks":{}
+            })).unwrap();
+            store.save_preferences(&crate::store::Preferences {
+                model_path: model.into(), max_tokens: 2048, ..Default::default()
+            }).unwrap();
+            let mut execution = store.execution_config().unwrap();
+            execution.node_path = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+            store.save_execution_config(&execution).unwrap();
+            // Omit the time injection so preflight and send use identical bytes.
+            store.save_setting(crate::capabilities::DISABLED_KEY, &vec!["system_time"]).unwrap();
+            let fresh = store.create_conversation().unwrap();
+            crate::workspace_ui::file_task(&store, &fresh.id, Some("next")).unwrap();
+            fresh.id
+        };
+        THINKING_CONTROLS.get_or_init(Default::default).lock().unwrap().insert(model.into(), None);
+        let answer = format!("data: {}\r\n\r\ndata: [DONE]\r\n\r\n", json!({
+            "choices":[{"delta":{"content":"The response fits."},"finish_reason":"stop"}]
+        }));
+        let (base, requests, server) = crate::test_support::scripted_sse(vec![
+            json!({"input_tokens":14793}).to_string(),
+            json!({"input_tokens":3400}).to_string(),
+            answer,
+        ]).await;
+        {
+            let mut runtime = state.runtime.lock().await;
+            runtime.status.phase = "ready".into();
+            runtime.context_length = 8192;
+            runtime.endpoint = base.trim_end_matches("/v1").into();
+            runtime.api_key = "fresh-local-catalog".into();
+        }
+        let prompt = "Search the web for an example model.";
+        let sources = vec!["__workspace".into()];
+        let preview = assemble_turn_for_task(&state, "", prompt, sources.clone(), None, TurnOptions {
+            draft_workspace: Some(next_workspace.to_string_lossy().into_owned()), ..Default::default()
+        }).await.unwrap();
+        assert!(preview.history.is_empty());
+        assert!(preview.project_instructions.contains("Current project's marker"));
+        assert!(preview.tools.iter().any(|tool| tool.alias == "workspace_copy_file"));
+        assert!(!crate::tool_discovery::visible(&preview.tool_definitions, "workspace_copy_file"));
+        send_message_inner(
+            &state, id.clone(), prompt.into(), Some(sources), None, None, None, Channel::new(|_| Ok(())),
+        ).await.unwrap();
+        server.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].body["tools"].as_array().unwrap().len() > preview.tool_definitions.len());
+        let sent = &requests[2].body;
+        assert_eq!(sent["cache_prompt"], false);
+        assert_eq!(sent["messages"].as_array().unwrap().len(), 2);
+        assert!(!sent.to_string().contains("Prior chat marker"));
+        assert!(!sent.to_string().contains("Prior project's private marker"));
+        assert_eq!(sent["tools"], json!(preview.tool_definitions));
+        for alias in ["web_search", "tool_search", "tool_invoke", "workspace_read_file"] {
+            assert!(crate::tool_discovery::visible(sent["tools"].as_array().unwrap(), alias), "missing {alias}");
+        }
+        assert_eq!(state.database().unwrap().messages(&id).unwrap().last().unwrap().content, "The response fits.");
+    }
+
     fn sse_event(value: serde_json::Value) -> String {
         format!("data: {value}\r\n\r\n")
     }
@@ -6931,6 +7411,7 @@ mod read_group_tests {
             id: id.into(),
             name: name.into(),
             arguments,
+            extra_content: None,
         }
     }
 

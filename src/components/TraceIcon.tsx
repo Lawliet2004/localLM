@@ -41,16 +41,3 @@ export function TraceIcon({ kind, size = 13, children }: { kind: TraceKind; size
     </i>
   );
 }
-
-/**
- * Pick a representative icon for a collapsed group of tool calls.
- * Homogeneous groups get their own icon; mixed exploration gets `explore`.
- */
-export function groupKindOf(kinds: TraceKind[]): TraceKind {
-  if (!kinds.length) return 'explore';
-  const unique = new Set(kinds);
-  if (unique.size === 1) return kinds[0];
-  if (unique.has('web')) return 'web';
-  if (unique.has('command')) return 'command';
-  return 'explore';
-}

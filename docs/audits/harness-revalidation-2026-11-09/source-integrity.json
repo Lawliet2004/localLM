@@ -1,0 +1,135 @@
+{
+  "startHead": "609209e7c5c3b69a456dca577a7ee6bcc046a0e7",
+  "endHead": "609209e7c5c3b69a456dca577a7ee6bcc046a0e7",
+  "initialEntries": 1214,
+  "unchangedInitialEntries": 1205,
+  "changed": {
+    "scripts/run-harness-comparison.py": {
+      "before": {
+        "kind": "file",
+        "sha256": "87913f7906dc380a04de629873d8d9e03104538caac4040ab9ca7e86bfbb5570"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "48dc1ad2a91090eef5a2ae0e75b735b80c5cf003ed8f0181375727f3c6fd4b5e"
+      }
+    },
+    "src-tauri/src/chat.rs": {
+      "before": {
+        "kind": "file",
+        "sha256": "b76229727102a6884d4954397fc0764a10f1e4d01361e1fe1f79f9f187c28369"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "09c30dc8d7df0f2e9a30c71cf73b2d6bb28a81a2cc66fcbd5a0974679a787bb3"
+      }
+    },
+    "src-tauri/src/chat_reliability_tests.rs": {
+      "before": {
+        "kind": "file",
+        "sha256": "a5be313831f2510d6e75f1044b64e146d2a48342316715f8c7276e800b5cf626"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "1fd6688363f9500171a58c871f5bce9a64b86eebc48a4cf258c976b691df209e"
+      }
+    },
+    "src-tauri/src/claude_adapter.rs": {
+      "before": {
+        "kind": "file",
+        "sha256": "29380d7bf515690f534f03ca360db1e1ff8f9e75a081557e04876e8f961922af"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "ed5fdce3a73b1dc0705a9ad5170c153777bc91993ccbaa78a2d1adabb25bc1a1"
+      }
+    },
+    "src-tauri/src/responses_adapter.rs": {
+      "before": {
+        "kind": "file",
+        "sha256": "14c21abbc22be6a81d0ed73064ec80b7b948ca208ee6df3ecae02c00e9decae6"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "ab4f6a8fb240c66cfa3fff6a052f8952d50e8dbff2ea86efbe36410f2034b9e1"
+      }
+    },
+    "src-tauri/src/sse.rs": {
+      "before": {
+        "kind": "file",
+        "sha256": "a2aeeaf34ac6dd157287e7142c7d44eabb09cc2f02a7439ff3ea4bd7be56738b"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "f5d9d11ac75677e698489775b57cc1a92c86c9c317249fa0739203cc061d6730"
+      }
+    },
+    "src/App.test.tsx": {
+      "before": {
+        "kind": "file",
+        "sha256": "ceb76810cf150027f127f674d8bdbed89239b95d91a0b9792bae2479a8a46911"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "96c9c30516e106c5ebb6b395bd8807c183d19f3fb89a888453ce9624d8976a1c"
+      }
+    },
+    "src/App.tsx": {
+      "before": {
+        "kind": "file",
+        "sha256": "1adba7493c6788c7ee4872f270fa2b146b223dfff802ddc668eddc384f55afba"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "d2a06ff003782f798aea800472bf6eab62eaaa48b77f81d09ac1596ef107338f"
+      }
+    },
+    "src/lib/api.ts": {
+      "before": {
+        "kind": "file",
+        "sha256": "4f86d560f454e0bd0949b79e67d327cc54c51ab5d297f849ef704845f1bb67cc"
+      },
+      "after": {
+        "kind": "file",
+        "sha256": "139f6151f72fe5d33a4344a68002008c2370aeb5566389cb372a2242a4bff591"
+      }
+    }
+  },
+  "added": [
+    "docs/HARNESS_ACCEPTANCE_REVALIDATION_2026-11-09.md",
+    "docs/audits/harness-revalidation-2026-11-09/advisory-db-revision.txt",
+    "docs/audits/harness-revalidation-2026-11-09/commands.txt",
+    "docs/audits/harness-revalidation-2026-11-09/comparison-fixtures.json",
+    "docs/audits/harness-revalidation-2026-11-09/comparison-prefix.json",
+    "docs/audits/harness-revalidation-2026-11-09/comparison-runtime.json",
+    "docs/audits/harness-revalidation-2026-11-09/comparison-summary.json",
+    "docs/audits/harness-revalidation-2026-11-09/comparison-timeout.json",
+    "docs/audits/harness-revalidation-2026-11-09/comparison.json",
+    "docs/audits/harness-revalidation-2026-11-09/database-acceptance.json",
+    "docs/audits/harness-revalidation-2026-11-09/endurance-one-hour.txt",
+    "docs/audits/harness-revalidation-2026-11-09/endurance-smoke.txt",
+    "docs/audits/harness-revalidation-2026-11-09/endurance-summary.json",
+    "docs/audits/harness-revalidation-2026-11-09/endurance-two-hours.txt",
+    "docs/audits/harness-revalidation-2026-11-09/ignored-inventory.txt",
+    "docs/audits/harness-revalidation-2026-11-09/live-model-fixtures.txt",
+    "docs/audits/harness-revalidation-2026-11-09/mysql-acceptance.txt",
+    "docs/audits/harness-revalidation-2026-11-09/npm-audit.json",
+    "docs/audits/harness-revalidation-2026-11-09/postgres-acceptance.txt",
+    "docs/audits/harness-revalidation-2026-11-09/protocol-before-fix.txt",
+    "docs/audits/harness-revalidation-2026-11-09/registered-protocol.txt",
+    "docs/audits/harness-revalidation-2026-11-09/restart-and-batching.txt",
+    "docs/audits/harness-revalidation-2026-11-09/rsa-tree.txt",
+    "docs/audits/harness-revalidation-2026-11-09/rust-audit.json",
+    "docs/audits/harness-revalidation-2026-11-09/source-integrity.json",
+    "docs/audits/harness-revalidation-2026-11-09/verification.txt"
+  ],
+  "missing": [],
+  "indexEmpty": true,
+  "unexpectedEditedFiles": [],
+  "unexpectedAddedFiles": [],
+  "opaqueDirectories": [
+    "showcase/2026-11-06/demo-workspace"
+  ],
+  "initialHashedFiles": 1213,
+  "unchangedHashedFiles": 1204
+}

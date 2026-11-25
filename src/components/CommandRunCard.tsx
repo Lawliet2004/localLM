@@ -1,30 +1,11 @@
 import { safeSourceUrl, sourceIdentity } from '../lib/sources';
-import { memo, useState, useEffect, useMemo, useRef, type ReactNode } from 'react';
-import { ArrowDown, Check, Copy, ChevronRight, FileCode, FileText, AlertCircle, XCircle, Atom, ExternalLink, LoaderCircle } from 'lucide-react';
+import { memo, useState, useEffect, useMemo, useRef } from 'react';
+import { ArrowDown, Check, Copy, ChevronRight, AlertCircle, XCircle, ExternalLink } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
-import { AccumulatedAnsiParser, type AnsiLine } from '../lib/ansi';
-import { TRACE_ICONS, toolKindOf, type TraceKind } from './TraceIcon';
+import { AccumulatedAnsiParser, parseAnsi, type AnsiLine } from '../lib/ansi';
+import { toolKindOf } from './TraceIcon';
 import { CodeBlock } from './CodeBlock';
 import { DiffLines, diffCounts } from './DiffView';
-
-export function FileIcon({ filename, size = 14 }: { filename?: string; size?: number }) {
-  if (!filename) return <FileCode size={size} className="cmd-icon" />;
-  const lower = filename.toLowerCase();
-  const ext = lower.split('.').pop() || '';
-  if (ext === 'tsx' || ext === 'jsx') {
-    return <Atom size={size} className="cmd-icon file-icon-react" />;
-  }
-  if (ext === 'ts') {
-    return <span className="file-icon-ts">TS</span>;
-  }
-  if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
-    return <span className="file-icon-js">JS</span>;
-  }
-  if (lower.includes('log') || ext === 'log') {
-    return <FileText size={size} className="cmd-icon file-icon-log" />;
-  }
-  return <FileCode size={size} className="cmd-icon" />;
-}
 
 export interface CommandRunCardProps {
   toolName: string;
@@ -44,9 +25,12 @@ export interface CommandRunCardProps {
   diff?: string | null;
   durationMs?: number;
   error?: string | null;
+  errorCode?: string;
   resultStatus?: string;
   envelopeStatus?: string;
+  resultPath?: string;
   structuredResult?: string | null;
+  diagnosticResult?: Record<string, unknown> | null;
   arguments?: Record<string, unknown>;
   artifactId?: string | null;
   originalBytes?: number | null;
@@ -61,14 +45,51 @@ interface WebSource {
   url?: string;
 }
 
-function parseObjectJson(value?: string | null): Record<string, unknown> | null {
+type ResultView = 'terminal' | 'diff' | 'code' | 'raw' | 'result';
+
+const localToolLabels = new Map([
+  ['artifact_read', 'Artifact excerpt'],
+  ['development_guide', 'Development guide'],
+  ['check_run', 'Run checks'],
+  ['check_report', 'Check report'],
+  ['verification_run', 'Run verification'],
+  ['verification_report', 'Verification report'],
+]);
+
+function parseJson(value?: string | null): unknown {
   if (!value) return null;
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
-  } catch {
-    return null;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function CommandOutputExcerpt({ output, stderr = false }: { output: string; stderr?: boolean }) {
+  // The full inspector uses the incremental parser. A closed row only needs a
+  // few lines and should never parse all of a large saved log.
+  const limit = 8192;
+  let start = Math.max(0, output.length - limit);
+  let end = output.length;
+  if (start > 0) {
+    const boundary = output.indexOf('\n', start);
+    if (boundary >= 0 && boundary < end - 1) start = boundary + 1;
+    else {
+      start = output.lastIndexOf('\n', start - 1) + 1;
+      end = start + limit;
+    }
   }
+  const lines = parseAnsi(output.slice(start, end)).flatMap(line => {
+    const text = line.spans.map(span => span.text).join('').trimEnd();
+    return text ? [text] : [];
+  }).slice(stderr ? -2 : -6);
+  if (!lines.length) return null;
+  return <div className="command-output-excerpt">
+    {stderr && <span className="excerpt-channel">stderr</span>}
+    <pre aria-label={stderr ? 'Recent stderr' : 'Recent command output'}>
+      {lines.map((line, index) => <code className={/^\s*[✓✔]/.test(line) ? 'output-check' : undefined} key={index}>{line.length > 200 ? `${line.slice(0, 200)}…` : line}</code>)}
+    </pre>
+  </div>;
 }
 
 function domainOf(url?: string): string | undefined {
@@ -168,9 +189,12 @@ export function CommandRunCard({
   diff,
   durationMs,
   error,
+  errorCode,
   resultStatus,
   envelopeStatus,
+  resultPath,
   structuredResult,
+  diagnosticResult,
   arguments: args,
   artifactId,
   originalBytes,
@@ -178,13 +202,14 @@ export function CommandRunCard({
   onStop,
   stopLabel = 'Stop response',
 }: CommandRunCardProps) {
-  const [activeTab, setActiveTab] = useState<'terminal' | 'diff' | 'code' | 'raw' | 'result'>(diff ? 'diff' : structuredResult ? 'result' : 'terminal');
-  const [copied, setCopied] = useState(false);
+  const [selectedView, setSelectedView] = useState<ResultView>();
+  const [copied, setCopied] = useState<'command' | 'output'>();
   const [copyError, setCopyError] = useState(false);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(copyTimer.current), []);
-  const [expanded, setExpanded] = useState(status === 'running' || status === 'failed' || status === 'awaiting_approval');
-  const [inspected, setInspected] = useState(expanded);
+  const [expanded, setExpanded] = useState(status === 'failed' || status === 'awaiting_approval');
+  const [inspected, setInspected] = useState(status === 'failed' || status === 'awaiting_approval');
+  const [inspectedMetadata, setInspectedMetadata] = useState(false);
   const [artifactContent, setArtifactContent] = useState<string | null>(null);
   const [loadingArtifact, setLoadingArtifact] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -201,7 +226,7 @@ export function CommandRunCard({
     ? args.AbsolutePath
     : typeof args?.TargetFile === 'string'
     ? args.TargetFile
-    : undefined;
+    : resultPath;
 
   const filename = path ? path.split(/[\\/]/).pop() : undefined;
 
@@ -209,7 +234,7 @@ export function CommandRunCard({
   const endLine = args?.EndLine ?? args?.endLine ?? args?.end;
   const lineRange = startLine !== undefined && endLine !== undefined ? `${startLine}-${endLine}` : undefined;
 
-  const { added: addedCount, removed: removedCount } = diff ? diffCounts(diff) : { added: 0, removed: 0 };
+  const { added: addedCount, removed: removedCount } = useMemo(() => diff ? diffCounts(diff) : { added: 0, removed: 0 }, [diff]);
 
   const summaryTitle = typeof args?.toolSummary === 'string'
     ? args.toolSummary
@@ -234,24 +259,26 @@ export function CommandRunCard({
   const isRead = category === 'read';
   const isTask = category === 'task';
   const isCommand = category === 'command';
+  const isDirectory = category === 'folder' && toolName !== 'project_inspect';
 
   const kind = isWeb ? 'Web' : isEdit ? 'Edit' : isSearch ? 'Explore' : isRead ? 'Read' : isCommand ? 'Terminal' : 'Tool';
 
-  let displayVerb = kind;
+  const running = status === 'running';
+  let displayVerb = running ? 'Running tool' : kind;
   const unsettled = status === 'awaiting_approval' || status === 'failed' || status === 'interrupted';
   if (isWeb) {
     displayVerb = unsettled ? 'Browse' : status === 'running' ? 'Browsing' : ['web_open', 'visit'].includes(toolName) ? 'Opened' : toolName === 'web_fetch_url' || toolName === 'web_fetch' ? 'Fetched' : toolName === 'web_find' ? 'Found' : 'Searched the web';
   } else if (isEdit) displayVerb = unsettled ? 'Edit' : status === 'running' ? 'Editing' : 'Edited';
-  else if (isRead) displayVerb = unsettled ? 'Read' : status === 'running' ? 'Reading' : 'Read';
-  else if (isSearch) displayVerb = unsettled ? 'Search' : status === 'running' ? 'Searching' : 'Searched';
+  else if (isRead) displayVerb = status === 'running' ? 'Reading file' : 'Read file';
+  else if (isDirectory) displayVerb = unsettled ? 'List directory' : status === 'running' ? 'Listing directory' : 'Listed directory';
+  else if (isSearch) displayVerb = unsettled ? 'Search files' : status === 'running' ? 'Searching files' : 'Searched files';
   else if (isTask) {
     const action = typeof args?.Action === 'string' ? args.Action : '';
-    displayVerb = action === 'status' || action === 'check' || !action ? 'Checked task' : 'Task';
+    displayVerb = running ? 'Checking task' : action === 'status' || action === 'check' || !action ? 'Checked task' : 'Task';
   } else if (isCommand) {
     displayVerb = status === 'running' ? 'Running' : unsettled ? 'Run' : 'Ran';
   }
 
-  const firstLine = command ? command.split(/\r?\n/)[0].trim() : '';
   const displayFilename = summaryTitle === 'Task Log'
     ? 'Task Log'
     : (filename ?? (path ? path.split(/[\\/]/).pop() : undefined));
@@ -266,6 +293,8 @@ export function CommandRunCard({
     ? args.question
     : typeof args?.Pattern === 'string'
     ? args.Pattern
+    : typeof args?.pattern === 'string'
+    ? args.pattern
     : typeof args?.url === 'string'
     ? args.url
     : Array.isArray(args?.url) && args.url.every(value => typeof value === 'string')
@@ -277,70 +306,72 @@ export function CommandRunCard({
   const taskTitle = summaryTitle
     ?? (typeof args?.command === 'string' ? args.command : typeof args?.CommandLine === 'string' ? args.CommandLine : typeof args?.TaskId === 'string' ? args.TaskId : undefined);
 
-  const commandTitle = summaryTitle || firstLine || `${environment} · ${toolName}`;
+  const localLabel = environment === 'Local' && !localServerId ? localToolLabels.get(toolName) : undefined;
+  const toolTitle = localLabel ?? `${environment} · ${toolName}`;
+  const commandTitle = summaryTitle || toolTitle;
 
   const displayTitle = isTask
     ? (taskTitle || 'Task')
     : isSearch
-    ? (searchQuery || 'Search')
+    ? (isDirectory ? path || searchQuery || '.' : searchQuery || path || toolTitle)
     : isCommand
-    ? (firstLine || commandTitle)
-    : (displayFilename ?? (path || `${environment} · ${toolName}`));
+    ? commandTitle
+    : (path || displayFilename || toolTitle);
 
-  let searchResultCount: number | undefined = undefined;
-  if (isSearch) {
-    if (typeof args?.resultCount === 'number') searchResultCount = args.resultCount;
-    else if (typeof (args as any)?.totalResults === 'number') searchResultCount = (args as any).totalResults;
-    else {
-      try {
-        const parsed = typeof structuredResult === 'string' ? JSON.parse(structuredResult) : structuredResult;
-        if (typeof parsed?.totalResults === 'number') searchResultCount = parsed.totalResults;
-        else if (Array.isArray(parsed?.results)) searchResultCount = parsed.results.length;
-        else if (Array.isArray(parsed?.matches)) searchResultCount = parsed.matches.length;
-        else if (Array.isArray(parsed)) searchResultCount = parsed.length;
-      } catch { /* ignore */ }
-    }
-
-  }
-
-  const resultObject = parseObjectJson(structuredResult) ?? parseObjectJson(stdout);
+  const searchResult = useMemo(() => isSearch ? parseJson(structuredResult) ?? (isWeb ? parseJson(stdout) : null) : null,
+    [isSearch, isWeb, stdout, structuredResult]);
+  const resultObject = objectRecord(searchResult);
   const webSources = isWeb ? webSourcesFrom(resultObject) : [];
   const webAnswer = isWeb && resultObject && typeof resultObject.answer === 'string' ? resultObject.answer.trim() : '';
-  if (isWeb && resultObject?.sources) searchResultCount = webSources.length;
+  const searchEntries: unknown[] | undefined = [resultObject?.matches, resultObject?.results, resultObject?.entries, searchResult].find(Array.isArray);
+  const partialSearch = Boolean(resultObject?.hasMore || resultObject?.incomplete || resultObject?.truncated);
+  const searchResultCount = isWeb && resultObject?.sources ? webSources.length
+    : (partialSearch ? searchEntries?.length : undefined) ??
+      [args?.resultCount, args?.totalResults, resultObject?.totalResults, searchEntries?.length].find(
+        (value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0,
+      );
+  const searchTargets = isWeb ? webSources.slice(0, 2).map(source => source.title || domainOf(source.url) || source.id)
+    : searchEntries?.slice(0, 3).flatMap(entry => {
+      if (typeof entry === 'string') return [entry];
+      const match = objectRecord(entry);
+      if (typeof match?.path === 'string') return [typeof match.line === 'number' ? `${match.path}:${match.line}` : match.path];
+      return typeof match?.name === 'string' ? [match.name] : [];
+    }) ?? [];
 
-  const traceKind: TraceKind = toolKindOf(toolName, args ?? {}, { diff });
-  const HeaderGlyph = TRACE_ICONS[traceKind];
-  const headerIcon = (
-    <i className={`trace-icon trace-icon-${traceKind}`} aria-hidden="true">
-      {(traceKind === 'read' || traceKind === 'edit') && (path || displayFilename)
-        ? <FileIcon filename={displayFilename ?? path} size={13} />
-        : <HeaderGlyph size={13} />}
-    </i>
-  );
+  const operation = command ? 'Bash'
+    : localLabel ?? (isWeb ? ['web_open', 'visit', 'web_fetch_url', 'web_fetch'].includes(toolName) ? 'WebOpen' : 'WebSearch'
+      : isRead ? 'Read' : isEdit ? 'Update' : isDirectory ? 'List' : isSearch ? 'Search' : isCommand ? 'Terminal' : toolName);
+  const target = command ?? (displayTitle === operation ? '' : displayTitle === toolTitle && operation === toolName ? environment : displayTitle);
+  const accessibleTarget = operation === toolName ? `${operation}${target ? ` ${target}` : ''}` : target || operation;
 
   const combinedOutput = stdout + (stderr ? (stdout ? '\n' : '') + stderr : '');
-  const hasOutput = stdout.length > 0 || stderr.length > 0;
+  const hasOutput = combinedOutput.length > 0;
+  const views: { id: ResultView; label: string }[] = [];
+  if (hasOutput) views.push({ id: 'terminal', label: 'Output' });
+  if (structuredResult) views.push({ id: 'result', label: 'Result' });
+  if (diff) views.push({ id: 'diff', label: 'Diff' });
+  if (code) views.push({ id: 'code', label: 'Code' });
+  if (args && Object.keys(args).length > 0) views.push({ id: 'raw', label: 'Parameters' });
+  const preferredView = structuredResult ? 'result' : diff ? 'diff' : views.find(view => view.id !== 'raw')?.id;
+  const activeTab = views.some(view => view.id === selectedView) ? selectedView : preferredView;
+  const duration = formatDuration(durationMs);
+  const hasMetadata = Boolean(localServerId || authorization || cwd || resultStatus || envelopeStatus || errorCode || localLabel || diagnosticResult);
+  const hasResultDetails = views.length > 0 || Boolean(artifactId);
+  const hasDetails = hasResultDetails || hasMetadata || Boolean(error || (path && path !== displayTitle) || webAnswer || webSources.length);
+  const detailsOpen = expanded && hasDetails;
   // Channels parse independently so ANSI state never bleeds across streams.
   const stdoutParser = useRef(new AccumulatedAnsiParser());
   const stderrParser = useRef(new AccumulatedAnsiParser());
   const stdoutSnapshot = useRef<AnsiLine[]>([]);
   const stderrSnapshot = useRef<AnsiLine[]>([]);
-  const stdoutLines = useMemo(() => { if (expanded && activeTab === 'terminal') stdoutSnapshot.current = stdoutParser.current.update(stdout); return stdoutSnapshot.current; }, [stdout, expanded, activeTab]);
-  const stderrLines = useMemo(() => { if (expanded && activeTab === 'terminal') stderrSnapshot.current = stderrParser.current.update(stderr); return stderrSnapshot.current; }, [stderr, expanded, activeTab]);
-
-  useEffect(() => {
-    if (diff && !combinedOutput && !structuredResult) {
-      setActiveTab('diff');
-    } else if (structuredResult) {
-      setActiveTab('result');
-    }
-  }, [diff, structuredResult]);
+  const stdoutLines = useMemo(() => { if (detailsOpen && activeTab === 'terminal') stdoutSnapshot.current = stdoutParser.current.update(stdout); return stdoutSnapshot.current; }, [stdout, detailsOpen, activeTab]);
+  const stderrLines = useMemo(() => { if (detailsOpen && activeTab === 'terminal') stderrSnapshot.current = stderrParser.current.update(stderr); return stderrSnapshot.current; }, [stderr, detailsOpen, activeTab]);
 
   useEffect(() => {
     if (viewportRef.current && !scrolledUp) {
       viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
     }
-  }, [combinedOutput, status, scrolledUp, expanded, activeTab]);
+  }, [combinedOutput, status, scrolledUp, detailsOpen, activeTab]);
 
   const handleScroll = () => {
     if (!viewportRef.current) return;
@@ -354,12 +385,12 @@ export function CommandRunCard({
     setScrolledUp(false);
   };
 
-  const copyOutput = async () => {
+  const copyText = async (target: 'command' | 'output', text: string) => {
     try {
-      await navigator.clipboard.writeText(combinedOutput || code || '');
-      setCopyError(false); setCopied(true);
+      await navigator.clipboard.writeText(text);
+      setCopyError(false); setCopied(target);
       clearTimeout(copyTimer.current);
-      copyTimer.current = setTimeout(() => setCopied(false), 2000);
+      copyTimer.current = setTimeout(() => setCopied(undefined), 2000);
     } catch {
       setCopyError(true);
     }
@@ -378,20 +409,15 @@ export function CommandRunCard({
     }
   };
 
-  const formatDuration = (ms?: number) => {
+  function formatDuration(ms?: number) {
     if (ms === undefined || ms === null || !Number.isFinite(ms) || ms < 0) return null;
-    if (ms < 1000) return `${ms}ms`;
+    if (ms < 1000) return `${Math.round(ms)}ms`;
     return `${(ms / 1000).toFixed(1)}s`;
-  };
+  }
 
   const renderStatusBadge = () => {
-    if (status === 'running') {
-      return (
-        <span className="status-badge running" data-testid="status-running">
-          <LoaderCircle size={13} className="spinning" />
-          Running…
-        </span>
-      );
+    if (running) {
+      return localLabel && !command ? <span className="status-badge running">Running…</span> : null;
     }
     if (status === 'awaiting_approval') {
       return (
@@ -423,7 +449,8 @@ export function CommandRunCard({
       return (
         <span className="status-badge failure" data-testid="status-failed">
           <AlertCircle size={12} />
-          Failed{exitCode != null && <span data-testid={`status-exit-${exitCode}`}><span aria-hidden="true"> · </span>Exit {exitCode}</span>}
+          {lifecycleState === 'timed_out' || errorCode === 'timeout' ? 'Timed out' : 'Failed'}
+          {exitCode != null && <span data-testid={`status-exit-${exitCode}`}><span aria-hidden="true"> · </span>Exit {exitCode}</span>}
         </span>
       );
     }
@@ -452,25 +479,32 @@ export function CommandRunCard({
   };
 
   const ResultDetails = isWeb ? 'details' : 'div';
-  return (
+  const showDiffExcerpt = status === 'completed' && diff && (addedCount > 0 || removedCount > 0);
+  const searchSummary = isSearch && status === 'completed' && searchResultCount !== undefined
+    ? `${searchResultCount} ${searchResultCount === 1 ? 'result' : 'results'}${partialSearch ? ' shown' : ''}` : null;
+  return <>
     <details
       className={`command-run-card ${status} tool-record`}
       data-testid="command-run-card"
-      data-kind={traceKind}
-      open={expanded}
+      data-kind={category}
+      open={detailsOpen}
       onToggle={e => { const open = e.currentTarget.open; setExpanded(open); if (open) setInspected(true); }}
     >
       {/* Title Bar */}
-      <summary className="card-header" onClick={event => {
+      <summary className="card-header" aria-label={`${displayVerb} ${accessibleTarget}`} onClick={event => {
         if ((event.target as Element).closest('button')) return;
-        event.preventDefault(); setInspected(true); setExpanded(open => !open);
+        event.preventDefault();
+        if (hasDetails) { setInspected(true); setExpanded(!detailsOpen); }
       }}>
         <div className="header-left">
-          {headerIcon}
-          <strong className="activity-kind">{displayVerb}</strong>
-          <span className={`cmd-title ${isCommand || path ? 'cmd-title-mono' : ''}`} title={path ?? displayTitle}>
-            <span>{displayTitle}</span>
+          <span className="tool-dot" aria-hidden="true" />
+          <span className={`activity-entry-label${running ? ' activity-sweep' : ''}`} data-testid={running ? 'status-running' : undefined}>
+            <strong className="activity-kind">{operation}</strong>
+            {target && <span className="tool-target">(<code className={command ? 'command-preview' : 'cmd-title'} title={target}>{target}</code>)</span>}
           </span>
+        </div>
+
+        <div className="header-right">
           {lineRange && <span className="trace-line-range">#L{lineRange}</span>}
           {(diff || addedCount > 0 || removedCount > 0) && (
             <span className="trace-diff-counts">
@@ -478,47 +512,27 @@ export function CommandRunCard({
               <span className="diff-removed">−{removedCount}</span>
             </span>
           )}
-          {isSearch && searchResultCount !== undefined && searchResultCount >= 0 && (
-            <span className="trace-badge">
-              {searchResultCount} {searchResultCount === 1 ? 'result' : 'results'}
-            </span>
-          )}
-          {cwd && <span className="cmd-cwd" title={`Working directory: ${cwd}`}>{cwd}</span>}
-          {command && <span className="env-pill">{environment}</span>}
-        </div>
-
-        <div className="header-right" onClick={e => e.stopPropagation()}>
           {renderStatusBadge()}
           {status === 'running' && onStop && <button type="button" aria-label={stopLabel} onClick={e => { e.preventDefault(); e.stopPropagation(); onStop(); }}>Stop</button>}
 
-          {durationMs !== undefined && (
+          {duration && (
             <span className="duration-pill" title="Execution duration">
-              {formatDuration(durationMs)}
+              {duration}
             </span>
           )}
+          {command && <button type="button" className="icon-action-btn command-copy"
+            aria-label={copied === 'command' ? 'Command copied' : 'Copy command'}
+            onClick={event => { event.stopPropagation(); void copyText('command', command); }}>
+            {copied === 'command' ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
+          </button>}
         </div>
 
-        <ChevronRight size={14} className="trace-chevron" aria-hidden="true" />
+        {hasDetails && <ChevronRight size={14} className="trace-chevron" aria-hidden="true" />}
       </summary>
 
-      {(expanded || inspected) && <div className="card-body">
+      {hasDetails && (detailsOpen || inspected) && <div className="card-body">
+        {error && <p className="tool-error" role="alert"><AlertCircle size={15} aria-hidden="true" /><span>{error}</span></p>}
         {path && path !== displayTitle && <p className="muted">{path}</p>}
-        {/* Working directory and environment already appear in the header. */}
-        {(localServerId || authorization) && (
-          <p className="tool-meta">
-            {[
-              localServerId ? <span key="lsid">Local server <code className="tool-meta-value">{localServerId}</code></span> : null,
-              authorization ? <span key="auth">Authorization: {authorization}</span> : null,
-            ].filter(Boolean).reduce<ReactNode[]>((items, item) => items.length ? [...items, <span key={`sep-${items.length}`} aria-hidden="true">·</span>, item] : [item], [])}
-          </p>
-        )}
-        {copyError && <p role="alert" className="code-block-copy-error">Could not copy output. Select the output and copy it manually.</p>}
-        {error && <p className="error-banner" role="alert">{error}</p>}
-        {(resultStatus || envelopeStatus) && (
-          <p className="muted" data-testid="result-status">
-            Result: {resultStatus ?? 'unknown'}{envelopeStatus ? ` · ${envelopeStatus}` : ''}
-          </p>
-        )}
         {isWeb && (webAnswer || webSources.length > 0) && (
           <div className="web-result-summary">
             {webAnswer && <p className="web-answer-excerpt">{webAnswer.length > 280 ? `${webAnswer.slice(0, 280).trim()}…` : webAnswer}</p>}
@@ -547,174 +561,143 @@ export function CommandRunCard({
           </div>
         )}
 
-        {/* The header already shows a single-line command; repeat it only when the header truncates or drops lines. */}
-        {command && (command.includes('\n') || command.trim() !== firstLine || firstLine.length > 120) && (
-          <div className="tool-input" data-testid="command-input">
-            <CodeBlock code={command} language="bash" streaming={status === 'running'} ariaLabel={`Command: ${command}`} />
-          </div>
-        )}
-
-        <ResultDetails className={isWeb ? 'web-technical-details' : 'tool-output-details'}>
-          {isWeb && <summary>Raw result, logs and parameters</summary>}
-        {/* Subheader tabs & actions */}
-        <div className="terminal-actions-bar">
-          <div className="tab-group" role="group" aria-label="Result view">
-            <button
-              type="button"
-              aria-pressed={activeTab === 'terminal'}
-                className={`tab-btn ${activeTab === 'terminal' ? 'active' : ''}`}
-              onClick={() => setActiveTab('terminal')}
-            >
-              Output
-            </button>
-            {structuredResult && (
-              <button
-                type="button"
-                aria-pressed={activeTab === 'result'}
-                className={`tab-btn ${activeTab === 'result' ? 'active' : ''}`}
-                onClick={() => setActiveTab('result')}
-              >
-                Result
-              </button>
-            )}
-            {diff && (
-              <button
-                type="button"
-                aria-pressed={activeTab === 'diff'}
-                className={`tab-btn ${activeTab === 'diff' ? 'active' : ''}`}
-                onClick={() => setActiveTab('diff')}
-              >
-                Diff
-              </button>
-            )}
-            {code && (
-              <button
-                type="button"
-                aria-pressed={activeTab === 'code'}
-                className={`tab-btn ${activeTab === 'code' ? 'active' : ''}`}
-                aria-label="Code" onClick={() => setActiveTab('code')}
-              >
-                Code{language ? ` · ${language}` : ''}
-              </button>
-            )}
-            {args && (
-              <button
-                type="button"
-                aria-pressed={activeTab === 'raw'}
-                className={`tab-btn ${activeTab === 'raw' ? 'active' : ''}`}
-                onClick={() => setActiveTab('raw')}
-              >
-                Parameters
-              </button>
-            )}
-          </div>
-
-          <div className="action-buttons">
-            {combinedOutput && (
-              <button
-                type="button"
-                className="icon-action-btn"
-                onClick={() => void copyOutput()}
-                title="Copy terminal output"
-              >
-                {copied ? <Check size={13} className="text-success" /> : <Copy size={13} />}
-                <span>{copied ? 'Copied' : 'Copy'}</span>
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Tab 1: Monospace Terminal Viewport */}
-        {activeTab === 'terminal' && (
-          <div
-            className="terminal-viewport"
-            ref={viewportRef}
-            onScroll={handleScroll}
-            data-testid="terminal-viewport"
-          >
-            {!hasOutput ? (
-              <div className="terminal-empty">
-                {status === 'running' ? (
-                  <span className="terminal-waiting">Waiting for command output…</span>
-                ) : (
-                  <span className="terminal-no-output">No output was produced.</span>
-                )}
-              </div>
-            ) : (
-              <>
-                {stdoutLines.length > 0 && <OutputChannel name={stderrLines.length ? 'stdout' : undefined} lines={stdoutLines} live={status === 'running'} following={!scrolledUp} />}
-                {stderrLines.length > 0 && <OutputChannel name="stderr" lines={stderrLines} live={status === 'running'} following={!scrolledUp} />}
-              </>
-            )}
-            {scrolledUp && hasOutput && (
-              <button type="button" className="terminal-latest" onClick={jumpToLatest} aria-label="Jump to latest output">
-                <ArrowDown size={12} /> Latest
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* Tab 1b: Structured result (separate from logs) */}
-        {activeTab === 'result' && structuredResult && (
-          <div className="code-view" data-testid="result-viewport">
-            <CodeBlock code={structuredResult} language="json" ariaLabel="Structured result" />
-          </div>
-        )}
-
-        {/* Tab 2: Diff View */}
-        {activeTab === 'diff' && diff && (
-          <div className="diff-viewport" data-testid="diff-viewport">
-            <DiffLines diff={diff} path={path} />
-          </div>
-        )}
-
-        {/* Tab 3: Code View */}
-        {activeTab === 'code' && code && (
-          <div className="code-view" data-testid="code-viewport">
-            <CodeBlock code={code} language={language} ariaLabel={`${language ?? 'code'} input`} />
-          </div>
-        )}
-
-        {/* Tab 4: Raw Arguments */}
-        {activeTab === 'raw' && args && (
-          <div className="raw-viewport">
-            <dl className="param-list">
-              {Object.entries(args).map(([key, value]) => (
-                <div key={key} className="param-row">
-                  <dt className="param-key">{key}</dt>
-                  <dd className="param-value">
-                    {value !== null && typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}
-                  </dd>
-                </div>
+        {hasResultDetails && <ResultDetails className={isWeb ? 'web-technical-details' : 'tool-output-details'}>
+          {isWeb && <summary>Technical result</summary>}
+          {views.length > 0 && <div className="terminal-actions-bar">
+            <div className="tab-group" role="group" aria-label="Result view">
+              {views.map(({ id, label }) => (
+                <button key={id} type="button" aria-pressed={activeTab === id}
+                  className={`tab-btn ${activeTab === id ? 'active' : ''}`}
+                  onClick={() => setSelectedView(current => id === 'raw' && current === id ? undefined : id)}>
+                  {label}
+                </button>
               ))}
-            </dl>
-          </div>
-        )}
-
-        {/* Artifact Drawer if captured */}
-        {artifactId && (
-          <div className="tool-artifact-box artifact-bar">
-            <div className="tool-artifact-header artifact-info">
-              <span>Full result captured in artifact: <code>{artifactId}</code></span>
-              {typeof originalBytes === 'number' && (
-                <small>({(originalBytes / 1024).toFixed(1)} KB)</small>
-              )}
-              <button
-                type="button"
-                className="secondary text-btn artifact-inspect-btn"
-                onClick={() => void inspectArtifact()}
-                disabled={loadingArtifact}
-              >
-                {loadingArtifact ? 'Loading…' : artifactContent !== null ? 'Loaded' : 'Inspect artifact'}
-              </button>
             </div>
-            {artifactContent !== null && (
-              <pre className="tool-artifact-preview artifact-preview">{artifactContent}</pre>
-            )}
+
+            <div className="action-buttons">
+              {activeTab === 'terminal' && hasOutput && (
+                <button
+                  type="button"
+                  className="icon-action-btn"
+                  onClick={() => void copyText('output', combinedOutput)}
+                  title="Copy terminal output"
+                >
+                  {copied === 'output' ? <Check size={13} className="text-success" /> : <Copy size={13} />}
+                  <span>{copied === 'output' ? 'Copied' : 'Copy'}</span>
+                </button>
+              )}
+            </div>
+          </div>}
+
+          {activeTab === 'terminal' && (
+            <div
+              className="terminal-viewport"
+              ref={viewportRef}
+              onScroll={handleScroll}
+              data-testid="terminal-viewport"
+            >
+              {stdoutLines.length > 0 && <OutputChannel name={stderrLines.length ? 'stdout' : undefined} lines={stdoutLines} live={running} following={!scrolledUp} />}
+              {stderrLines.length > 0 && <OutputChannel name="stderr" lines={stderrLines} live={running} following={!scrolledUp} />}
+              {scrolledUp && hasOutput && (
+                <button type="button" className="terminal-latest" onClick={jumpToLatest} aria-label="Jump to latest output">
+                  <ArrowDown size={12} /> Latest
+                </button>
+              )}
+            </div>
+          )}
+
+          {activeTab === 'result' && structuredResult && (
+            <div className="code-view" data-testid="result-viewport">
+              <CodeBlock code={structuredResult} language="json" ariaLabel="Structured result" />
+            </div>
+          )}
+
+          {activeTab === 'diff' && diff && (
+            <div className="diff-viewport" data-testid="diff-viewport">
+              <DiffLines diff={diff} path={path} />
+            </div>
+          )}
+
+          {activeTab === 'code' && code && (
+            <div className="code-view" data-testid="code-viewport">
+              <CodeBlock code={code} language={language} ariaLabel={`${language ?? 'code'} input`} />
+            </div>
+          )}
+
+          {activeTab === 'raw' && args && (
+            <div className="raw-viewport">
+              <dl className="param-list">
+                {Object.entries(args).map(([key, value]) => (
+                  <div key={key} className="param-row">
+                    <dt className="param-key">{key}</dt>
+                    <dd className="param-value">
+                      {value !== null && typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+
+          {artifactId && (
+            <div className="tool-artifact-box artifact-bar">
+              <div className="tool-artifact-header artifact-info">
+                <span>Full result captured in artifact: <code>{artifactId}</code></span>
+                {typeof originalBytes === 'number' && (
+                  <small>({(originalBytes / 1024).toFixed(1)} KB)</small>
+                )}
+                <button
+                  type="button"
+                  className="secondary text-btn artifact-inspect-btn"
+                  onClick={() => void inspectArtifact()}
+                  disabled={loadingArtifact}
+                >
+                  {loadingArtifact ? 'Loading…' : artifactContent !== null ? 'Loaded' : 'Inspect artifact'}
+                </button>
+              </div>
+              {artifactContent !== null && (
+                <pre className="tool-artifact-preview artifact-preview">{artifactContent}</pre>
+              )}
+            </div>
+          )}
+        </ResultDetails>}
+        {hasMetadata && <details className="tool-metadata" onToggle={event => {
+          if (event.currentTarget.open) setInspectedMetadata(true);
+        }}>
+          <summary><ChevronRight size={13} aria-hidden="true" />Execution details</summary>
+          <div className="tool-meta">
+            {localLabel && <span>Tool <code className="tool-meta-value">{toolName}</code></span>}
+            {localServerId && <span>Local server <code className="tool-meta-value">{localServerId}</code></span>}
+            {cwd && <span>Working directory <code className="tool-meta-value">{cwd}</code></span>}
+            {authorization && <span>Authorization: {authorization}</span>}
+            {(resultStatus || envelopeStatus) && <span data-testid="result-status">
+              {resultStatus ? `Result: ${resultStatus}${envelopeStatus ? ` · ${envelopeStatus}` : ''}` : `Status: ${envelopeStatus}`}
+            </span>}
+            {errorCode && <span>Error code <code className="tool-meta-value">{errorCode}</code></span>}
           </div>
-        )}
-        </ResultDetails>
+          {inspectedMetadata && diagnosticResult && <div className="code-view">
+            <CodeBlock code={JSON.stringify(diagnosticResult, null, 2)} language="json" ariaLabel="Raw tool result" />
+          </div>}
+        </details>}
       </div>}
+      {copyError && <p role="alert" className="code-block-copy-error">Clipboard access failed.</p>}
     </details>
-  );
+    {!detailsOpen && showDiffExcerpt && <div className="activity-excerpt diff-excerpt">
+      <p className="transcript-branch">Updated with {addedCount} {addedCount === 1 ? 'addition' : 'additions'}{removedCount > 0 ? ` and ${removedCount} ${removedCount === 1 ? 'removal' : 'removals'}` : ''}</p>
+      <DiffLines diff={diff} path={path} excerpt />
+    </div>}
+    {!detailsOpen && searchSummary && <div className="activity-excerpt">
+      <p className="transcript-branch">{searchSummary}</p>
+      {searchTargets.length > 0 && <ul className="search-excerpt" aria-label="Result excerpt">
+        {searchTargets.map((target, index) => {
+          const label = target.length > 240 ? `${target.slice(0, 240)}…` : target;
+          return <li key={index}>{isWeb ? label : <code>{label}</code>}</li>;
+        })}
+      </ul>}
+    </div>}
+    {!detailsOpen && isCommand && hasOutput && <div className="activity-excerpt transcript-branch">
+      {stdout && <CommandOutputExcerpt output={stdout} />}
+      {stderr && <CommandOutputExcerpt output={stderr} stderr />}
+    </div>}
+  </>;
 }

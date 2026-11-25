@@ -1,0 +1,145 @@
+{
+  "startingFilesChecked": 501,
+  "startingFilesUnchanged": 480,
+  "changedStartingFiles": [
+    {
+      "path": "package-lock.json",
+      "initialSha256": "5a907e2dc5720925c59593b031dfa4a139c7a00470da6be6897e7aa6c1168d27",
+      "finalSha256": "e30c0486480fb709ebf31496a435d7fceb537848090ee885e60eb148c5f41db1"
+    },
+    {
+      "path": "package.json",
+      "initialSha256": "7812bd65518dc82d9726d9e901ecfc20498ee818148403f4955509eb3384cd0e",
+      "finalSha256": "f7f24ded7b20fe3877be925ba17a64d1e339783092e27f2696383992017ee5dc"
+    },
+    {
+      "path": "src/components/ResponseMetrics.test.tsx",
+      "initialSha256": "943a9f48e2db3c26ebf5edfb7ab70eedd81dd3abbd20b2d0694c35e040858add",
+      "finalSha256": "ca390ee7464876b041a29137624d7d1c9a18db6fc71710c34b1697c0f68449a0"
+    },
+    {
+      "path": "src/components/ResponseMetrics.tsx",
+      "initialSha256": "e9aa3c8b717f19ca11668b368f4fe5851777b51f71f09e3a8e335345a6aa5192",
+      "finalSha256": "a25099d3b62ec1d5ac536213c29950f1733fa15da691fc6ddaa9426f98cd0014"
+    },
+    {
+      "path": "src/lib/types.ts",
+      "initialSha256": "f57e223273f8c001359f0bc9dbefc1a7f6fc49aee0ffeef0df22fb5903a8545c",
+      "finalSha256": "1c995ef3a80d8140ffd774610fa564e74824907cdf42506b5f7ff07a08034e33"
+    },
+    {
+      "path": "src-tauri/src/chat.rs",
+      "initialSha256": "c3381ad40de1ae2e696ab775a9c1d5b3d1e0027739f56da7fb202a21670a8725",
+      "finalSha256": "b9ae32982a92f1556691e096cfae6466d6c8fd332f095c6613a5d4958dc80a8c"
+    },
+    {
+      "path": "src-tauri/src/compaction.rs",
+      "initialSha256": "ac1e1042b6cf142d296daf96e854e7122b5476025714760111b1c0cdbf2e5d10",
+      "finalSha256": "cdfb3451ade68f625a3a858288274cdc482b8b55de88b994c90e0833ce430a9d"
+    },
+    {
+      "path": "src-tauri/src/development_tools.rs",
+      "initialSha256": "978bfd7bc06bf5cd170c423be5f9cce36a7a54f7f12fc80638f431f0742aedb8",
+      "finalSha256": "f3e79dcccf3780322e8a9ea68eb63338b07d83562d0840de5ade6c113a40ed10"
+    },
+    {
+      "path": "src-tauri/src/execution.rs",
+      "initialSha256": "0d8a3abaed13687cbd32244e0373a314c2241d9cebdb29a519ecec85e9448b20",
+      "finalSha256": "be455fcd516914b2bb340d5087cf0d793914826aa4ca9da00f1755b641ad0f13"
+    },
+    {
+      "path": "src-tauri/src/harness.rs",
+      "initialSha256": "4234807a2fee7863ed55381e1971b72f3c395a0cd358e5bae8be45654e417e80",
+      "finalSha256": "d3309f527723a4b30a0ae0fbea923f7e28ecbbc0301fac9cf3380dd5ee6aba82"
+    },
+    {
+      "path": "src-tauri/src/inference.rs",
+      "initialSha256": "bbbccd52e72834bbd0185f99a2697285e5a937229a7a17281809d45feee65d67",
+      "finalSha256": "2dd36589f186a2ca72674b3797856922b6eae20ab9af6dbd60aa2cefdaa55a90"
+    },
+    {
+      "path": "src-tauri/src/inference_retry.rs",
+      "initialSha256": "037df3dbef522d2715b40b4858f8d500d4e00a61ab698a8f0444cc587b0bae14",
+      "finalSha256": "6859ae5f2617daff4c8369247c1297165d0a57de35a39e872fb29f5764616056"
+    },
+    {
+      "path": "src-tauri/src/lib.rs",
+      "initialSha256": "f9e764ecd61692698bbdd0ebdc0be78d062ab8ca649bfcc451b6f145dafb25f5",
+      "finalSha256": "57d6beaec6889f1ad29f67bef864bbceadcad301f5d26ff89644fed45eaba99f"
+    },
+    {
+      "path": "src-tauri/src/process_tools.rs",
+      "initialSha256": "52268fdc85182c104fc0077788f268b4e9a652565fc801d0c14d400f00ebffbf",
+      "finalSha256": "3496e00753f62a2a84ba9d6bd6a128f1e4522684f6f82c07c98e58119b6e01b5"
+    },
+    {
+      "path": "src-tauri/src/profile_tools.rs",
+      "initialSha256": "7a69f3336570ef863910136cd88dbed451ee39dbe5a3077afc45f423b1f6269e",
+      "finalSha256": "948237a7bb92c2ff1b2815c8e90511561d8eedd8c1b1d98be5bdf1d7fb6c987b"
+    },
+    {
+      "path": "src-tauri/src/provider_capabilities.rs",
+      "initialSha256": "530c51f41a3a95fa4411d9ea1d6aaacdd79e495fdc5e01b29992d3144055eab6",
+      "finalSha256": "e9dae57a8f1adca50ab5e9a2d6649a1e529b9bfb7dbd57f360911733110b511f"
+    },
+    {
+      "path": "src-tauri/src/ptc.rs",
+      "initialSha256": "1865c9d78e8724836e9c9e10ca5c4c5635846bc118b11353d23e9d1cf2b11c15",
+      "finalSha256": "e061f93f2cc7b0f036f46e753fac3f3d6e61f5daa37aaa6dab021a943451b363"
+    },
+    {
+      "path": "src-tauri/src/research_tasks.rs",
+      "initialSha256": "e8f7f445e73efc41dd12856573eb89aca4482afe91e0b563f4a9b04f128988f5",
+      "finalSha256": "781b645415e2f27d42543eca927e6998aaf209bb5687fc308b277661ae56fb9c"
+    },
+    {
+      "path": "src-tauri/src/store.rs",
+      "initialSha256": "4a87987edee56e93d71142a0785680c29560628ab92ebb835e98c279c5e50531",
+      "finalSha256": "04cd0eeea8b7440d7fb044a01ed68d860c71c308930ae9ef0d559707bd8da7ab"
+    },
+    {
+      "path": "src-tauri/src/subagents.rs",
+      "initialSha256": "de221d056f242d756d5705d9458f0bc045b81f4f5dbe880c11ce25ddc0509251",
+      "finalSha256": "3b8005500a7fe658c392a303c3072809cac70894e149d9938d1a79d77f3ab35a"
+    },
+    {
+      "path": "src-tauri/src/verification_progress.rs",
+      "initialSha256": "0eb1b93533e87695b3ce670dd87f8ab74c65ce5f93341f6fd86667e9f5037294",
+      "finalSha256": "4cf7ca5186e75410042b64d0ac6bb1684f028b22dd92c25a66ae20016b6d804b"
+    }
+  ],
+  "newSourceFiles": [
+    {
+      "path": "src-tauri/src/process_guardian.rs",
+      "sha256": "a76fd0e2e986cba78362a926ea28d4643b5034caae903ee7399a7436d639be1b"
+    },
+    {
+      "path": "src-tauri/src/harness_reliability_tests.rs",
+      "sha256": "07b5577a915efef5b0bd99d33041338057796a3e85fd0df70dd495f114b63416"
+    },
+    {
+      "path": "src-tauri/src/chat_reliability_tests.rs",
+      "sha256": "51f813ba4d12136b6e41aea666b169c9f764bea2afa1ddf842ecc29e2e084b46"
+    },
+    {
+      "path": "src-tauri/src/inference_reliability_tests.rs",
+      "sha256": "1bbdbb57427c9ec483dc6b0228fa5466538a711fc536f9541ab76df871adaa9f"
+    },
+    {
+      "path": "src-tauri/src/subagents/lifecycle.rs",
+      "sha256": "8dc2e5ebbabfb30c3047734a2a9dda0b230d44c179de39762e19eba8f45198b2"
+    },
+    {
+      "path": "src-tauri/src/subagents/usage.rs",
+      "sha256": "1e2cd7df9240992334c27318be324c055149d3564ab8f5b196ddaed8dc3da82c"
+    },
+    {
+      "path": "src-tauri/src/subagents/reliability_tests.rs",
+      "sha256": "e9c3ccdeca8e2664fb33ff83529d5931a6227cbbc64c9705f76f04a7179ea56e"
+    }
+  ],
+  "missingStartingFiles": [],
+  "unexpectedChanges": [],
+  "gitDiffCheck": "passed",
+  "scope": "Hashes compare source, tests and scripts against the pre-fix working-tree snapshot, including pre-existing uncommitted work."
+}

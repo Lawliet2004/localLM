@@ -1,0 +1,14 @@
+{
+  "durationSeconds": 60,
+  "foregroundNarrationCorrelation": 0.9982996582984924,
+  "narrationDefaultTrack": true,
+  "language": "eng",
+  "pictureReencoded": false,
+  "fullDecodeNoErrors": true,
+  "measuredIntegratedLoudnessLUFS": -13.9,
+  "measuredTruePeakDbTP": -1.5,
+  "videoFile": "locallm-short-with-voiceover.mp4",
+  "standaloneNarrationFile": "locallm-voiceover-60s.mp3",
+  "videoSha256": "0b5d74afd5f92fdba066fc5607d1ca0020628a8f956a509f42e9cf74ace80fbf",
+  "speechRecognitionConfirmed": true
+}

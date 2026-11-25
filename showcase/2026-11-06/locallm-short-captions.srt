@@ -1,0 +1,79 @@
+1
+00:00:00,350 --> 00:00:01,915
+What if your AI could actually work
+
+2
+00:00:01,915 --> 00:00:02,630
+with your files?
+
+3
+00:00:04,350 --> 00:00:07,601
+Meet LocalLM. A desktop workspace for local
+
+4
+00:00:07,601 --> 00:00:10,550
+models and your favorite API providers.
+
+5
+00:00:11,350 --> 00:00:13,864
+Connect your endpoint, keep your API key
+
+6
+00:00:13,864 --> 00:00:15,436
+encrypted on your device,
+
+7
+00:00:15,436 --> 00:00:16,630
+and choose a model.
+
+8
+00:00:18,350 --> 00:00:20,688
+Now watch a real request. The model
+
+9
+00:00:20,688 --> 00:00:23,694
+reads these launch metrics, creates a report,
+
+10
+00:00:23,694 --> 00:00:25,231
+and returns the result,
+
+11
+00:00:25,231 --> 00:00:27,302
+with every tool action visible.
+
+12
+00:00:32,350 --> 00:00:34,730
+Open your files, review the changes, and
+
+13
+00:00:34,730 --> 00:00:35,979
+work in the terminal,
+
+14
+00:00:35,979 --> 00:00:37,942
+without leaving the conversation.
+
+15
+00:00:40,350 --> 00:00:43,494
+Add MCP connectors and reusable skills to
+
+16
+00:00:43,494 --> 00:00:46,254
+bring more tools into your workflow.
+
+17
+00:00:47,350 --> 00:00:50,729
+Choose approval controls, tune inference and appearance,
+
+18
+00:00:50,729 --> 00:00:53,806
+and keep your projects and conversations organized.
+
+19
+00:00:55,350 --> 00:00:58,220
+LocalLM. From a prompt to practical work.
+
+20
+00:00:58,220 --> 00:00:59,550
+Explore the source.

@@ -20,7 +20,7 @@
 :root[data-density=compact] .desktop-app .codex-folder-header,
 :root[data-density=compact] .desktop-app .codex-chat-btn { padding-block: 5px; }
 :root[data-density=compact] .desktop-app .message { padding-bottom: 16px; }
-:root[data-density=compact] .desktop-app .message-user { padding: 9px 15px; margin-bottom: 18px; }
+:root[data-density=compact] .desktop-app .message-user { padding: 9px 15px; margin-bottom: max(18px, var(--prompt-copy-space, 0px)); }
 :root[data-density=compact] .desktop-app .markdown { line-height: 1.65; }
 
 :root[data-motion=reduced] *,
@@ -29,4 +29,28 @@
   animation: none !important;
   transition: none !important;
   scroll-behavior: auto !important;
+}
+
+/* Keep the wallpaper on the layout so it stays in place as messages scroll. */
+:root[data-home-wallpaper]:not([data-home-wallpaper=none]) .desktop-app .chat-layout {
+  --wallpaper-overlay: linear-gradient(to bottom, color-mix(in srgb, var(--surface) 82%, transparent) 75%, var(--surface));
+  background-image: var(--wallpaper-overlay), var(--home-wallpaper);
+  background-size: cover;
+  background-position: center;
+}
+:root[data-home-wallpaper]:not([data-home-wallpaper=none]) .desktop-app .chat-home {
+  --wallpaper-overlay: linear-gradient(to bottom, transparent 45%, var(--surface));
+}
+:root[data-home-wallpaper]:not([data-home-wallpaper=none]) .desktop-app .chat-home .welcome {
+  color: var(--text);
+  opacity: 1;
+  padding: 12px;
+  border-radius: var(--radius-xl);
+  background: color-mix(in srgb, var(--surface) 86%, transparent);
+}
+:root[data-home-wallpaper]:not([data-home-wallpaper=none]) .desktop-app .chat-home .composer-meta-bar {
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+  margin-bottom: 4px;
 }

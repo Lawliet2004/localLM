@@ -1,0 +1,50 @@
+[
+  {
+    "duration": 4,
+    "voiceDuration": 2.28,
+    "text": "What if your A I could actually work with your files?",
+    "path": "voice-01.mp3"
+  },
+  {
+    "duration": 7,
+    "voiceDuration": 6.24,
+    "text": "Meet Local L M. A desktop workspace for local models and your favorite A P I providers.",
+    "path": "voice-02.mp3"
+  },
+  {
+    "duration": 7,
+    "voiceDuration": 5.28,
+    "text": "Connect your endpoint, keep your A P I key encrypted on your device, and choose a model.",
+    "path": "voice-03.mp3"
+  },
+  {
+    "duration": 14,
+    "voiceDuration": 8.952,
+    "text": "Now watch a real request. The model reads these launch metrics, creates a report, and returns the result, with every tool action visible.",
+    "path": "voice-04.mp3"
+  },
+  {
+    "duration": 8,
+    "voiceDuration": 5.592,
+    "text": "Open your files, review the changes, and work in the terminal, without leaving the conversation.",
+    "path": "voice-05.mp3"
+  },
+  {
+    "duration": 7,
+    "voiceDuration": 5.904,
+    "text": "Add M C P connectors and reusable skills to bring more tools into your workflow.",
+    "path": "voice-06.mp3"
+  },
+  {
+    "duration": 8,
+    "voiceDuration": 6.456,
+    "text": "Choose approval controls, tune inference and appearance, and keep your projects and conversations organized.",
+    "path": "voice-07.mp3"
+  },
+  {
+    "duration": 5,
+    "voiceDuration": 4.752,
+    "text": "Local L M. From a prompt to practical work. Explore the source.",
+    "path": "voice-08.mp3"
+  }
+]

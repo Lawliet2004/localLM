@@ -4,7 +4,7 @@ import type { Page } from './Sidebar';
 
 export const settingsItems: { page: Page; label: string; group: string; keywords: string; icon: ComponentType<{ size?: number }>; sub?: boolean }[] = [
   { page: 'general', label: 'General', group: 'General', keywords: 'permissions access folder project', icon: Settings },
-  { page: 'appearance', label: 'Appearance', group: 'Appearance', keywords: 'theme light dark system accent color font text code size density spacing width animations motion display readability', icon: Palette },
+  { page: 'appearance', label: 'Appearance', group: 'Appearance', keywords: 'theme light dark system accent app color wallpaper background image palette hex contrast syntax font text code highlighting size density spacing width animations speed motion display readability', icon: Palette },
   { page: 'models', label: 'Models & runtime', group: 'Models & providers', keywords: 'local gguf llama gpu cpu generation diagnostics download provider api key custom openai claude endpoint ollama', icon: Cpu },
   { page: 'inference', label: 'Inference', group: 'Models & providers', keywords: 'sampling temperature top p tokens response system prompt', icon: SlidersHorizontal },
   { page: 'tools', label: 'Tools & permissions', group: 'Tools & permissions', keywords: 'approval access workspace files security', icon: ShieldCheck },

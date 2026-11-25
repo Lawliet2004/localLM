@@ -1,5 +1,13 @@
 use serde_json::{json, Value};
 
+const MAX_ATTACHMENT_MESSAGE: usize = 16 * 1024 * 1024;
+
+pub fn exceeds_message_limit(text: &str) -> bool {
+    text.len() > MAX_ATTACHMENT_MESSAGE
+        || (text.len() > 1024 * 1024
+            && !text.trim_start().starts_with(r#"{"kind":"locallm-attachments-v1","#))
+}
+
 /// Stored message envelopes keep document data separate from the user's request.
 pub fn model_content(text: &str) -> Result<Value, String> {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
@@ -14,7 +22,7 @@ pub fn model_content(text: &str) -> Result<Value, String> {
     let files = value["attachments"]
         .as_array()
         .ok_or("Invalid attachments.")?;
-    if files.len() > 8 || text.len() > 512000 {
+    if files.len() > 8 || text.len() > MAX_ATTACHMENT_MESSAGE {
         return Err("Attachment message exceeds its size limit.".into());
     }
     let mut parts = vec![json!({"type":"text","text":request})];
@@ -40,6 +48,16 @@ pub fn model_content(text: &str) -> Result<Value, String> {
                 return Err("Only embedded PNG, JPEG, and WebP images are supported.".into());
             }
             parts.push(json!({"type":"image_url","image_url":{"url":url}}));
+        } else if let Some(url) = file["mediaUrl"].as_str() {
+            let (media, data) = url.split_once(";base64,").ok_or("Invalid embedded attachment.")?;
+            if data.is_empty() || !data.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte)) {
+                return Err("Invalid embedded attachment data.".into());
+            }
+            parts.push(match media {
+                "data:application/pdf" => json!({"type":"file","file":{"filename":name,"file_data":url}}),
+                "data:video/mp4" => json!({"type":"video_url","video_url":{"url":url}}),
+                _ => return Err("Only embedded PDF and MP4 files are supported.".into()),
+            });
         } else {
             parts.push(json!({"type":"text","text":file["content"].as_str().unwrap_or("")}));
         }

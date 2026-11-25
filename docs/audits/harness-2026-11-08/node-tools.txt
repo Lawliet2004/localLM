@@ -1,0 +1,186 @@
+TAP version 13
+# Subtest: bundled worker checks JSON search through a reverse proxy prefix
+ok 1 - bundled worker checks JSON search through a reverse proxy prefix
+  ---
+  duration_ms: 297.317057
+  type: 'test'
+  ...
+# Subtest: bundled worker fails over between instance URLs and keeps per-query metadata
+ok 2 - bundled worker fails over between instance URLs and keeps per-query metadata
+  ---
+  duration_ms: 356.612087
+  type: 'test'
+  ...
+# Subtest: bundled worker reports JSON setup problems instead of healthy homepages
+ok 3 - bundled worker reports JSON setup problems instead of healthy homepages
+  ---
+  duration_ms: 538.5723
+  type: 'test'
+  ...
+# Subtest: bundled worker distinguishes upstream engine failure from empty search
+ok 4 - bundled worker distinguishes upstream engine failure from empty search
+  ---
+  duration_ms: 260.579273
+  type: 'test'
+  ...
+# Subtest: research emits  progress events on stderr and honors language filter
+ok 5 - research emits  progress events on stderr and honors language filter
+  ---
+  duration_ms: 16805.345749
+  type: 'test'
+  ...
+# Subtest: bundled weather action returns bounded source data without search, storage, or inference
+ok 6 - bundled weather action returns bounded source data without search, storage, or inference
+  ---
+  duration_ms: 315.102345
+  type: 'test'
+  ...
+# Subtest: bundled weather rejects invalid input before network access
+ok 7 - bundled weather rejects invalid input before network access
+  ---
+  duration_ms: 956.968768
+  type: 'test'
+  ...
+# Subtest: bundled weather reports unresolved locations without a forecast request
+ok 8 - bundled weather reports unresolved locations without a forecast request
+  ---
+  duration_ms: 238.206415
+  type: 'test'
+  ...
+# Subtest: bundled weather persists a bounded fresh report across worker restarts
+ok 9 - bundled weather persists a bounded fresh report across worker restarts
+  ---
+  duration_ms: 471.409324
+  type: 'test'
+  ...
+# Subtest: findEdgeBinary picks the first existing candidate
+ok 10 - findEdgeBinary picks the first existing candidate
+  ---
+  duration_ms: 1.816988
+  type: 'test'
+  ...
+# Subtest: renderPage refuses non-public and non-HTTP targets before spawning
+ok 11 - renderPage refuses non-public and non-HTTP targets before spawning
+  ---
+  duration_ms: 2.364955
+  type: 'test'
+  ...
+# Subtest: renderPage returns null when the browser binary is missing
+ok 12 - renderPage returns null when the browser binary is missing
+  ---
+  duration_ms: 6.499336
+  type: 'test'
+  ...
+# Subtest: raw Edge dump is not a fallback and routing is not treated as a sandbox
+ok 13 - raw Edge dump is not a fallback and routing is not treated as a sandbox
+  ---
+  duration_ms: 0.884063
+  type: 'test'
+  ...
+# Subtest: alternate IP forms and mapped addresses never reach the transport
+ok 14 - alternate IP forms and mapped addresses never reach the transport
+  ---
+  duration_ms: 2.95969
+  type: 'test'
+  ...
+# Subtest: canonical public IPv4 is fetched and a mapped form of the same address is not
+ok 15 - canonical public IPv4 is fetched and a mapped form of the same address is not
+  ---
+  duration_ms: 1.524224
+  type: 'test'
+  ...
+# Subtest: public redirect cannot reach a private or obfuscated destination
+ok 16 - public redirect cannot reach a private or obfuscated destination
+  ---
+  duration_ms: 5.912656
+  type: 'test'
+  ...
+# Subtest: DNS is re-resolved on every redirect and a later private answer is not fetched
+ok 17 - DNS is re-resolved on every redirect and a later private answer is not fetched
+  ---
+  duration_ms: 0.855549
+  type: 'test'
+  ...
+# Subtest: a name that resolves to both a public and a private address is blocked
+ok 18 - a name that resolves to both a public and a private address is blocked
+  ---
+  duration_ms: 0.769897
+  type: 'test'
+  ...
+# Subtest: redirects keep the real final URL and origin
+ok 19 - redirects keep the real final URL and origin
+  ---
+  duration_ms: 1.203206
+  type: 'test'
+  ...
+# Subtest: request, byte, time, and concurrency limits fail closed
+ok 20 - request, byte, time, and concurrency limits fail closed
+  ---
+  duration_ms: 1.846053
+  type: 'test'
+  ...
+# Subtest: private iframes, websockets, downloads, popups, and service workers are not fetched
+ok 21 - private iframes, websockets, downloads, popups, and service workers are not fetched
+  ---
+  duration_ms: 1.03078
+  type: 'test'
+  ...
+# Subtest: route handler fulfills only mediated responses and aborts a private subresource
+ok 22 - route handler fulfills only mediated responses and aborts a private subresource
+  ---
+  duration_ms: 1.467456
+  type: 'test'
+  ...
+# Subtest: launch failure is recorded and the fetched document is not returned
+ok 23 - launch failure is recorded and the fetched document is not returned
+  ---
+  duration_ms: 1.087728
+  type: 'test'
+  ...
+# Subtest: mediated render uses an isolated context, the post-redirect origin, and no direct navigation
+ok 24 - mediated render uses an isolated context, the post-redirect origin, and no direct navigation
+  ---
+  duration_ms: 1.966361
+  type: 'test'
+  ...
+# Subtest: a private second hop does not launch the browser
+ok 25 - a private second hop does not launch the browser
+  ---
+  duration_ms: 0.661682
+  type: 'test'
+  ...
+# (node:600272) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: persistent cache migrates old rows, bounds weather reports and clears cache without deleting research history
+ok 26 - persistent cache migrates old rows, bounds weather reports and clears cache without deleting research history
+  ---
+  duration_ms: 35.899589
+  type: 'test'
+  ...
+# Subtest: retrieval rejects every non-public address family
+ok 27 - retrieval rejects every non-public address family
+  ---
+  duration_ms: 9.787116
+  type: 'test'
+  ...
+# Subtest: public redirect cannot reach a private destination
+ok 28 - public redirect cannot reach a private destination
+  ---
+  duration_ms: 2006.90325
+  type: 'test'
+  ...
+# Subtest: robots disallow prevents the article request
+ok 29 - robots disallow prevents the article request
+  ---
+  duration_ms: 1003.478461
+  type: 'test'
+  ...
+1..29
+# tests 29
+# suites 0
+# pass 29
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 19666.903429

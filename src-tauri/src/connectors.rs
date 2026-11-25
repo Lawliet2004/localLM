@@ -476,6 +476,8 @@ impl AgentTool {
                 && matches!(
                     self.tool.name.as_str(),
                     "read_file"
+                        | "read_files"
+                        | "outline"
                         | "list_files"
                         | "list_tree"
                         | "search_files"
@@ -517,6 +519,9 @@ impl AgentTool {
         let mut arguments = arguments;
         crate::process_tools::align_arguments(&self.alias, &mut arguments);
         crate::process_tools::align_arguments(&self.tool.name, &mut arguments);
+        if matches!(&self.backend, ToolBackend::Workspace(_)) {
+            align_workspace_arguments(&self.tool.name, &self.tool.input_schema, &mut arguments);
+        }
         crate::tool_validation::validate(&self.tool.input_schema, &arguments)?;
         if let ToolBackend::Execution(execution) = &self.backend {
             return execution.prepare_arguments(&self.tool.name, arguments);
@@ -672,6 +677,76 @@ impl AgentTool {
                     .map_err(|_| "Workspace operation failed unexpectedly.")?
             }
         }
+    }
+}
+
+/// Normalize common model-generated workspace argument aliases (`file_path` ->
+/// `path`, `old_string` -> `old_text`, `new_string` -> `new_text`) before strict
+/// JSON Schema validation so frontier models trained on different tool schemas
+/// do not waste rounds on benign field-name mismatches. Only rewrites when the
+/// canonical key is absent and declared in the tool's schema.
+fn align_workspace_arguments(name: &str, schema: &Value, arguments: &mut Value) {
+    let Some(object) = arguments.as_object_mut() else {
+        return;
+    };
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let rename_if_declared = |map: &mut serde_json::Map<String, Value>,
+                              alias: &str,
+                              canonical: &str,
+                              declared: bool| {
+        if declared && !map.contains_key(canonical) {
+            if let Some(value) = map.remove(alias) {
+                map.insert(canonical.to_string(), value);
+            }
+        }
+    };
+    let has_prop = |key: &str| properties.is_some_and(|props| props.contains_key(key));
+    rename_if_declared(object, "file_path", "path", has_prop("path"));
+    rename_if_declared(object, "filepath", "path", has_prop("path"));
+    rename_if_declared(object, "old_string", "old_text", has_prop("old_text"));
+    rename_if_declared(object, "new_string", "new_text", has_prop("new_text"));
+    match name {
+        "multi_edit" => {
+            if let Some(edits) = object.get_mut("edits").and_then(Value::as_array_mut) {
+                for edit in edits {
+                    if let Some(map) = edit.as_object_mut() {
+                        rename_if_declared(map, "old_string", "old_text", true);
+                        rename_if_declared(map, "new_string", "new_text", true);
+                    }
+                }
+            }
+        }
+        "apply_patch" => {
+            if let Some(changes) = object.get_mut("changes").and_then(Value::as_array_mut) {
+                for change in changes {
+                    if let Some(map) = change.as_object_mut() {
+                        rename_if_declared(map, "file_path", "path", true);
+                        rename_if_declared(map, "filepath", "path", true);
+                        if let Some(replacements) =
+                            map.get_mut("replacements").and_then(Value::as_array_mut)
+                        {
+                            for replacement in replacements {
+                                if let Some(rep) = replacement.as_object_mut() {
+                                    rename_if_declared(rep, "old_string", "old_text", true);
+                                    rename_if_declared(rep, "new_string", "new_text", true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "read_files" => {
+            if let Some(files) = object.get_mut("files").and_then(Value::as_array_mut) {
+                for item in files {
+                    if let Some(map) = item.as_object_mut() {
+                        rename_if_declared(map, "file_path", "path", true);
+                        rename_if_declared(map, "filepath", "path", true);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1743,13 +1818,15 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
         let tools = workspace.tools();
         assert_eq!(tools.len(), crate::workspace::TOOL_COUNT);
         assert!(tools.iter().any(|tool| tool.tool.name == "edit_file"));
-        assert_eq!(tools.iter().filter(|tool| tool.trusted_read()).count(), 11);
+        assert_eq!(tools.iter().filter(|tool| tool.trusted_read()).count(), 13);
         for tool in tools {
             assert_eq!(
                 tool.trusted_read(),
                 matches!(
                     tool.tool.name.as_str(),
                     "read_file"
+                        | "read_files"
+                        | "outline"
                         | "list_files"
                         | "list_tree"
                         | "search_files"

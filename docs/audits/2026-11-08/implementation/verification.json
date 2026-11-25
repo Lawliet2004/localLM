@@ -1,0 +1,34 @@
+{
+  "date": "2026-11-08",
+  "rust": {
+    "passed": 1066,
+    "failed": 0,
+    "ignored": 35
+  },
+  "frontend": {
+    "passed": 907,
+    "failed": 0,
+    "skipped": 1
+  },
+  "typecheck": "passed",
+  "rustCheck": "passed",
+  "embeddedBuild": "passed",
+  "nativeVisualReview": {
+    "light": [
+      1280,
+      840
+    ],
+    "dark": [
+      760,
+      560
+    ],
+    "longHistoryTurns": 101,
+    "reasoningExpanded": true,
+    "streamingFrameTimingMeasured": false
+  },
+  "sourceSha256": "74f73b78b5b676116b4567ca2ee1690911c46a043783facd2792b5921953b507",
+  "binarySha256": "cb68e90ef078bbdae92dbb331d2c1f9b15ec9a2a00d0588e6d1c20dcdda7d0c8",
+  "paidInference": false,
+  "browserPreview": false,
+  "sameModelHarnessBenchmark": false
+}

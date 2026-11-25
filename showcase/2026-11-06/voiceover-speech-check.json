@@ -1,0 +1,51 @@
+{
+  "source": "locallm-short-with-voiceover.mp4",
+  "language": "en",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 4.0,
+      "text": "With your AI, I can actually work with your files."
+    },
+    {
+      "start": 4.0,
+      "end": 11.0,
+      "text": "Meet local LM, a desktop workspace for local models and your favorite API providers."
+    },
+    {
+      "start": 11.0,
+      "end": 18.0,
+      "text": "Connect your endpoint, keep your API key encrypted on your device, and choose a model."
+    },
+    {
+      "start": 18.0,
+      "end": 20.0,
+      "text": "Now, watch a real request."
+    },
+    {
+      "start": 20.0,
+      "end": 29.0,
+      "text": "The model reads these launch metrics, creates a report, and returns the result with every tool action visible."
+    },
+    {
+      "start": 29.0,
+      "end": 40.0,
+      "text": "Open your files, review the changes, and work in the terminal, without leaving the conversation."
+    },
+    {
+      "start": 40.0,
+      "end": 47.0,
+      "text": "Add MCP connectors and reusable skills to bring more tools into your workflow."
+    },
+    {
+      "start": 47.0,
+      "end": 55.0,
+      "text": "Choose approval controls, tune inference and appearance, and keep your projects and conversations organized."
+    },
+    {
+      "start": 55.0,
+      "end": 59.0,
+      "text": "Look at LM, from a prompt to practical work. Explore the source."
+    }
+  ]
+}

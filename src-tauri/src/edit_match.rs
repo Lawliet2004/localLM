@@ -39,6 +39,9 @@ pub enum MatchKind {
     Normalized,
     /// The search text was found as whole lines with trailing whitespace ignored.
     LineTrimmed,
+    /// The search text was found after normalizing leading indentation while
+    /// preserving relative nesting across lines.
+    IndentationFlexible,
 }
 
 impl MatchKind {
@@ -48,6 +51,7 @@ impl MatchKind {
             MatchKind::Exact => "exact",
             MatchKind::Normalized => "normalized",
             MatchKind::LineTrimmed => "line_trimmed",
+            MatchKind::IndentationFlexible => "indentation_flexible",
         }
     }
 }
@@ -82,6 +86,9 @@ impl MatchReport {
             MatchKind::LineTrimmed => {
                 "line-trimmed match: trailing whitespace on each line was ignored".to_string()
             }
+            MatchKind::IndentationFlexible => {
+                "indentation-flexible match: leading indentation was normalized".to_string()
+            }
         }
     }
 }
@@ -103,7 +110,7 @@ pub fn find_matches(source: &str, old_text: &str) -> MatchReport {
             matches: exact.into_iter().map(|(start, end)| Match { start, end }).collect(),
         };
     }
-    // Tiers 2 and 3 work on a folded view of the source: line endings are
+    // Tiers 2–4 work on a folded view of the source: line endings are
     // normalized to LF and typographic variants are folded, so a CRLF file or
     // a smart quote never blocks a match. Offsets are mapped back to the
     // original bytes.
@@ -124,9 +131,17 @@ pub fn find_matches(source: &str, old_text: &str) -> MatchReport {
         };
     }
     // Tier 3: whole lines, trailing whitespace ignored.
+    let trimmed = find_line_trimmed(&view, &pattern);
+    if !trimmed.is_empty() {
+        return MatchReport {
+            kind: MatchKind::LineTrimmed,
+            matches: trimmed,
+        };
+    }
+    // Tier 4: whole lines with flexible base indentation and preserved relative nesting.
     MatchReport {
-        kind: MatchKind::LineTrimmed,
-        matches: find_line_trimmed(&view, &pattern),
+        kind: MatchKind::IndentationFlexible,
+        matches: find_indentation_flexible(&view, &pattern),
     }
 }
 
@@ -160,10 +175,10 @@ pub fn replace(
     }
     let report = find_matches(source, old_text);
     if !report.found() {
-        return Err(
-            "The text to replace was not found. Checked exact, typographic and trailing-whitespace variants."
-                .into(),
-        );
+        let hint = nearest_line_hint(source, old_text).unwrap_or_default();
+        return Err(format!(
+            "The text to replace was not found. Checked exact, typographic, trailing-whitespace and indentation-flexible variants.{hint}"
+        ));
     }
     let count = report.count();
     if !replace_all && count > 1 {
@@ -183,9 +198,14 @@ pub fn replace(
         if verbatim {
             updated.push_str(new_text);
         } else {
+            let adjusted = if report.kind == MatchKind::IndentationFlexible {
+                reindent_replacement(&source[located.start..located.end], old_text, new_text)
+            } else {
+                new_text.to_string()
+            };
             updated.push_str(&build_replacement(
                 &source[located.start..located.end],
-                new_text,
+                &adjusted,
                 dominant,
             ));
         }
@@ -193,6 +213,65 @@ pub fn replace(
     }
     updated.push_str(&source[cursor..]);
     Ok((updated, count, report.kind))
+}
+
+/// Replace one already located region of `source`, re-indenting when matched
+/// via [`MatchKind::IndentationFlexible`].
+pub fn replace_at_kind(
+    source: &str,
+    located: &Match,
+    old_text: &str,
+    new_text: &str,
+    kind: MatchKind,
+    dominant: &str,
+) -> String {
+    let adjusted = if kind == MatchKind::IndentationFlexible {
+        reindent_replacement(&source[located.start..located.end], old_text, new_text)
+    } else {
+        new_text.to_string()
+    };
+    replace_at(source, located, &adjusted, dominant)
+}
+
+/// Hint naming the closest matching line in `source` when `old_text` is not found.
+pub fn nearest_line_hint(source: &str, old_text: &str) -> Option<String> {
+    let anchor = old_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .max_by_key(|line| line.len())?;
+    let anchor_tokens: Vec<String> = anchor
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|tok| tok.len() >= 2)
+        .map(|tok| tok.to_ascii_lowercase())
+        .collect();
+    if anchor_tokens.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize, &str)> = None;
+    for (index, raw_line) in source.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let score = anchor_tokens
+            .iter()
+            .filter(|tok| lower.contains(tok.as_str()))
+            .count();
+        if score == 0 {
+            continue;
+        }
+        if best.is_none_or(|(best_score, _, _)| score > best_score) {
+            best = Some((score, index + 1, trimmed));
+        }
+    }
+    let (score, line_no, snippet) = best?;
+    if score * 2 < anchor_tokens.len().min(4) {
+        return None;
+    }
+    let preview: String = snippet.chars().take(100).collect();
+    Some(format!(" Closest match near line {line_no}: `{preview}`."))
 }
 
 /// Replace one already located region of `source`.
@@ -499,6 +578,161 @@ fn find_line_trimmed(view: &View, pattern: &str) -> Vec<Match> {
         index += wanted;
     }
     found
+}
+
+fn leading_ws(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() && matches!(bytes[end], b' ' | b'\t') {
+        end += 1;
+    }
+    &line[..end]
+}
+
+fn indent_columns(ws: &str) -> usize {
+    ws.bytes().map(|b| if b == b'\t' { 4 } else { 1 }).sum()
+}
+
+/// Whole-line matches where base leading indentation differs while trimmed line
+/// content and relative indentation nesting match.
+fn find_indentation_flexible(view: &View, pattern: &str) -> Vec<Match> {
+    let mut found = Vec::new();
+    let view_lines = split_line_spans(&view.text);
+    let pattern_lines = split_line_spans(pattern);
+    if pattern_lines.is_empty() {
+        return found;
+    }
+    let pat_info: Vec<(&str, usize)> = pattern_lines
+        .iter()
+        .map(|span| {
+            let line = &pattern[span.start..span.end];
+            (line.trim(), indent_columns(leading_ws(line)))
+        })
+        .collect();
+    if pat_info.iter().all(|(trimmed, _)| trimmed.is_empty()) {
+        return found;
+    }
+    let min_pat = pat_info
+        .iter()
+        .filter(|(t, _)| !t.is_empty())
+        .map(|(_, cols)| *cols)
+        .min()
+        .unwrap_or(0);
+    let wanted = pattern_lines.len();
+    let pattern_ends_with_newline = pattern.ends_with('\n');
+    let mut index = 0usize;
+    while index + wanted <= view_lines.len() {
+        let mut content_matches = true;
+        let mut min_cand = usize::MAX;
+        let mut cand_cols = Vec::with_capacity(wanted);
+        for offset in 0..wanted {
+            let span = &view_lines[index + offset];
+            let line = &view.text[span.start..span.end];
+            let trimmed = line.trim();
+            if trimmed != pat_info[offset].0 {
+                content_matches = false;
+                break;
+            }
+            let cols = indent_columns(leading_ws(line));
+            if !trimmed.is_empty() && cols < min_cand {
+                min_cand = cols;
+            }
+            cand_cols.push(cols);
+        }
+        if !content_matches {
+            index += 1;
+            continue;
+        }
+        // Require relative nesting structure to be preserved (either exact
+        // relative column offsets or consistent ordering of indent levels).
+        let exact_rel = (0..wanted).all(|o| {
+            pat_info[o].0.is_empty() || (cand_cols[o] - min_cand) == (pat_info[o].1 - min_pat)
+        });
+        let order_rel = exact_rel
+            || (0..wanted).all(|a| {
+                if pat_info[a].0.is_empty() {
+                    return true;
+                }
+                (0..wanted).all(|b| {
+                    pat_info[b].0.is_empty()
+                        || pat_info[a].1.cmp(&pat_info[b].1) == cand_cols[a].cmp(&cand_cols[b])
+                })
+            });
+        if !order_rel {
+            index += 1;
+            continue;
+        }
+        let last = index + wanted - 1;
+        let end = if pattern_ends_with_newline {
+            if view_lines[last].next <= view_lines[last].end {
+                index += 1;
+                continue;
+            }
+            view_lines[last].next
+        } else {
+            view_lines[last].end
+        };
+        found.push(Match {
+            start: view.source_start(view_lines[index].start),
+            end: view.source_end(end),
+        });
+        index += wanted;
+    }
+    found
+}
+
+/// Shift `new_text` from `old_text`'s base indentation to `region`'s base
+/// indentation so Tier-4 indentation-flexible edits preserve the file's style.
+fn reindent_replacement(region: &str, old_text: &str, new_text: &str) -> String {
+    let region_base = region
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(leading_ws)
+        .min_by_key(|ws| indent_columns(ws))
+        .unwrap_or("");
+    let old_base = old_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(leading_ws)
+        .min_by_key(|ws| indent_columns(ws))
+        .unwrap_or("");
+    if region_base == old_base {
+        return new_text.to_string();
+    }
+    let old_cols = indent_columns(old_base);
+    let mut out = String::with_capacity(new_text.len() + region_base.len() * 4);
+    for line in split_lines(new_text) {
+        if line.content.trim().is_empty() {
+            out.push_str(line.content);
+        } else if let Some(rest) = line.content.strip_prefix(old_base) {
+            out.push_str(region_base);
+            out.push_str(rest);
+        } else {
+            // Strip up to `old_cols` columns of leading whitespace if indent style differs.
+            let mut cols = 0usize;
+            let mut cut = 0usize;
+            for (idx, ch) in line.content.char_indices() {
+                if cols >= old_cols {
+                    break;
+                }
+                match ch {
+                    ' ' => {
+                        cols += 1;
+                        cut = idx + 1;
+                    }
+                    '\t' => {
+                        cols += 4;
+                        cut = idx + 1;
+                    }
+                    _ => break,
+                }
+            }
+            out.push_str(region_base);
+            out.push_str(&line.content[cut..]);
+        }
+        out.push_str(line.terminator);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -904,5 +1138,37 @@ mod tests {
         assert_eq!(report.kind, MatchKind::Exact);
         assert_eq!(report.matches[0].start, 0);
         assert_eq!(report.matches[0].end, 8);
+    }
+
+    #[test]
+    fn indentation_flexible_tier_matches_reindents_and_rejects_wrong_nesting() {
+        let source = "fn demo() {\n    if ready {\n        run_step();\n    }\n}\n";
+        let old = "if ready {\n    run_step();\n}";
+        let new = "if ready {\n    prepare();\n    run_step();\n}";
+        let (updated, count, kind) = replace(source, old, new, false).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(kind, MatchKind::IndentationFlexible);
+        assert_eq!(
+            updated,
+            "fn demo() {\n    if ready {\n        prepare();\n        run_step();\n    }\n}\n"
+        );
+        // Wrong relative nesting must not match.
+        let bad_nesting = "    if ready {\nrun_step();\n    }";
+        assert!(!find_matches(source, bad_nesting).found());
+    }
+
+    #[test]
+    fn missing_text_includes_nearest_line_hint() {
+        let source = "fn alpha() {}\nfn compute_mesh_normals(verts: &[Vec3]) {}\nfn omega() {}\n";
+        let err = replace(
+            source,
+            "fn compute_mesh_normals(vertices: &[Vec3]) {}",
+            "fn compute_mesh_normals(vertices: &[Vec3]) -> Vec<Vec3> {}",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains("compute_mesh_normals"), "{err}");
     }
 }

@@ -1,0 +1,2 @@
+    Checking locallm v0.1.0 (/home/papan/Desktop/Projects/localLM/src-tauri)
+    Finished `dev` profile [unoptimized] target(s) in 17.71s

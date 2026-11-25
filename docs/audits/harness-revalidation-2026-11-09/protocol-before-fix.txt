@@ -1,0 +1,33 @@
+Only the regression fixtures had been added at this point. Four cases reached the file-exists assertion after the unexpected write. The closed-tool check inherited from the previous continuation passed.
+65:    assert!(!root.path().join("unexpected.txt").exists(), "{outcome:?}");
+running 5 tests
+
+thread 'chat::reliability_regressions::registered_turn_rejects_fragments_from_a_second_compatible_choice' (836859) panicked at src/chat_reliability_tests.rs:65:5:
+Err("Could not reach provider. Check the HTTPS base URL and network connection.")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test chat::reliability_regressions::registered_turn_rejects_fragments_from_a_second_compatible_choice ... FAILED
+
+thread 'chat::reliability_regressions::registered_turn_rejects_native_claude_write_with_unclosed_thinking' (836860) panicked at src/chat_reliability_tests.rs:65:5:
+Err("Could not reach Claude. Check the HTTPS base URL and network connection.")
+test chat::reliability_regressions::registered_turn_rejects_native_claude_write_with_unclosed_thinking ... FAILED
+test chat::reliability_regressions::registered_turn_rejects_native_claude_write_without_a_closed_tool_block ... ok
+
+thread 'chat::reliability_regressions::registered_turn_rejects_responses_arguments_extended_after_done' (836866) panicked at src/chat_reliability_tests.rs:65:5:
+Err("Could not reach provider. Check the HTTPS base URL and network connection.")
+test chat::reliability_regressions::registered_turn_rejects_responses_arguments_extended_after_done ... FAILED
+
+thread 'chat::reliability_regressions::registered_turn_rejects_responses_refusal_relabelled_as_output_text' (836869) panicked at src/chat_reliability_tests.rs:65:5:
+Err("Could not reach provider. Check the HTTPS base URL and network connection.")
+test chat::reliability_regressions::registered_turn_rejects_responses_refusal_relabelled_as_output_text ... FAILED
+
+failures:
+
+failures:
+    chat::reliability_regressions::registered_turn_rejects_fragments_from_a_second_compatible_choice
+    chat::reliability_regressions::registered_turn_rejects_native_claude_write_with_unclosed_thinking
+    chat::reliability_regressions::registered_turn_rejects_responses_arguments_extended_after_done
+    chat::reliability_regressions::registered_turn_rejects_responses_refusal_relabelled_as_output_text
+
+test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 1139 filtered out; finished in 0.53s
+
+error: test failed, to rerun pass `--lib`

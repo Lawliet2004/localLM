@@ -1,0 +1,1106 @@
+[
+  {
+    "run": "0-single_read-LocalLM-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "0-single_read-LocalLM-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 3,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "0-single_read-Claude-Code-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 366,
+      "firstSha256": "629ac9fbe23c3e985e4f0ce800d47418bf8a303d50b144f04eb0a2bd8d71204d"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 1,
+    "cacheMeasurements": 2,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "0-single_read-Claude-Code-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 366,
+      "firstSha256": "629ac9fbe23c3e985e4f0ce800d47418bf8a303d50b144f04eb0a2bd8d71204d"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 2,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "0-four_file_join-Claude-Code-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 369,
+      "firstSha256": "ddf035e33cd94999807b47b60b830c2226e3c8129888e6cf009224dba6440f37"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 63,
+    "cacheMeasurements": 64,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "0-four_file_join-Claude-Code-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 369,
+      "firstSha256": "ddf035e33cd94999807b47b60b830c2226e3c8129888e6cf009224dba6440f37"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 64,
+    "cacheMeasurements": 64,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "0-four_file_join-LocalLM-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "0-four_file_join-LocalLM-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 3,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "1-single_read-Claude-Code-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 366,
+      "firstSha256": "e2e17fb9b292604eb55ebc49f616985e1ce97bf4267d18906871750b3940c249"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 1,
+    "cacheMeasurements": 2,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "1-single_read-Claude-Code-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 366,
+      "firstSha256": "e2e17fb9b292604eb55ebc49f616985e1ce97bf4267d18906871750b3940c249"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 2,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "1-single_read-LocalLM-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "1-single_read-LocalLM-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 3,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "1-four_file_join-LocalLM-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "1-four_file_join-LocalLM-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 3,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "1-four_file_join-Claude-Code-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 369,
+      "firstSha256": "b0b9fb61a474009e9f8be03d3486f52868fdd6f132b1f1aa82c012ee3952689b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "1-four_file_join-Claude-Code-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 369,
+      "firstSha256": "b0b9fb61a474009e9f8be03d3486f52868fdd6f132b1f1aa82c012ee3952689b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 62,
+    "cacheMeasurements": 62,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "2-single_read-LocalLM-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 1,
+    "cacheMeasurements": 2,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "2-single_read-LocalLM-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 2,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "2-single_read-Claude-Code-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 366,
+      "firstSha256": "3ec5d8c77b79da0c0fca70d0237f671b103185070984ebc84653af8ec0c6d13f"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 1,
+    "cacheMeasurements": 2,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "2-single_read-Claude-Code-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 366,
+      "firstSha256": "3ec5d8c77b79da0c0fca70d0237f671b103185070984ebc84653af8ec0c6d13f"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 2,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "2-four_file_join-Claude-Code-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 369,
+      "firstSha256": "b9977225beeaa660a3dbc48e5eff420c9470cf44767023970c29553049235346"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 63,
+    "cacheMeasurements": 64,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "2-four_file_join-Claude-Code-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 369,
+      "firstSha256": "b9977225beeaa660a3dbc48e5eff420c9470cf44767023970c29553049235346"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 1786,
+      "firstSha256": "ae605269b86f897173a6c66e529c37eddb928c24c2217e5f39fb3dd0c2a45559"
+    },
+    "sortedToolNames": null,
+    "advertisedTools": [
+      "Edit",
+      "Read"
+    ],
+    "wireRoutes": [
+      "/v1/messages"
+    ],
+    "requestsWithPositiveCache": 64,
+    "cacheMeasurements": 64,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "2-four_file_join-LocalLM-cold",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 2,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  },
+  {
+    "run": "2-four_file_join-LocalLM-warm",
+    "system": {
+      "same": true,
+      "firstBytes": 1204,
+      "firstSha256": "39e86b509b8e098950d092821621798dd71cc29eb4f1ed66f69a7ff6427b897b"
+    },
+    "tools": {
+      "same": true,
+      "firstBytes": 23948,
+      "firstSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+    },
+    "sortedToolNames": true,
+    "advertisedTools": [
+      "artifact_read",
+      "compact_conversation",
+      "models",
+      "session_rename",
+      "skill_list",
+      "skill_load",
+      "taste_recall",
+      "todo_write",
+      "workspace_append_file",
+      "workspace_apply_patch",
+      "workspace_copy_directory",
+      "workspace_copy_file",
+      "workspace_create_directory",
+      "workspace_create_file",
+      "workspace_delete_directory",
+      "workspace_delete_file",
+      "workspace_document_inspect",
+      "workspace_document_read",
+      "workspace_edit_file",
+      "workspace_edit_lines",
+      "workspace_file_info",
+      "workspace_glob_files",
+      "workspace_list_files",
+      "workspace_list_tree",
+      "workspace_move_directory",
+      "workspace_move_file",
+      "workspace_multi_edit",
+      "workspace_notebook_edit",
+      "workspace_notebook_read",
+      "workspace_read_file",
+      "workspace_recover_patch",
+      "workspace_search_content",
+      "workspace_search_files",
+      "workspace_view_image",
+      "workspace_write_file",
+      "workspace_write_file_base64"
+    ],
+    "wireRoutes": [
+      "/v1/chat/completions"
+    ],
+    "requestsWithPositiveCache": 3,
+    "cacheMeasurements": 3,
+    "network": {
+      "ipv4": [
+        "127.0.0.1"
+      ],
+      "ipv6": []
+    }
+  }
+]

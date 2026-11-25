@@ -1,5 +1,5 @@
 import { createContext, useContext, Fragment, Children, isValidElement, lazy, memo, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { PanelRight, X } from 'lucide-react';
+import { PanelRight, PencilLine, X } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import type { PluggableList } from 'unified';
 import remarkGfm from 'remark-gfm';
@@ -58,6 +58,7 @@ export interface MarkdownViewProps {
   assistant?: boolean;
   /** True while content may still be growing. */
   streaming?: boolean;
+  showStreamingIndicator?: boolean;
   /** Serialized citation map: citation id -> URL. */
   sourceLinks?: string;
   onSendPrompt?: (text: string) => void;
@@ -110,7 +111,7 @@ const MarkdownBlockView = memo(function MarkdownBlockView({ content, context, pl
 });
 const KATEX_PLUGINS: PluggableList = [[rehypeKatex, { trust: false, strict: 'ignore', throwOnError: false, maxSize: 20, maxExpand: 1000 }]];
 
-export const MarkdownView = memo(function MarkdownView({ content, assistant = false, streaming = false, sourceLinks = '{}', onSendPrompt, onOpenCanvas, allowedLinkUrls, allowImages = true }: MarkdownViewProps) {
+export const MarkdownView = memo(function MarkdownView({ content, assistant = false, streaming = false, showStreamingIndicator = true, sourceLinks = '{}', onSendPrompt, onOpenCanvas, allowedLinkUrls, allowImages = true }: MarkdownViewProps) {
   const buffer = useRef(new MarkdownBlockBuffer());
   const blocks = useMemo(() => buffer.current.update(content), [content]);
   const plugins = useMemo<PluggableList>(() => {
@@ -125,7 +126,13 @@ export const MarkdownView = memo(function MarkdownView({ content, assistant = fa
   }, [sourceLinks]);
   const stableContext = useMemo(() => ({ assistant, streaming: false, onSendPrompt, onOpenCanvas, allowedLinkUrls, allowImages }), [assistant, onSendPrompt, onOpenCanvas, allowedLinkUrls, allowImages]);
   const liveContext = useMemo(() => ({ ...stableContext, streaming }), [stableContext, streaming]);
-  return <div className={`markdown${streaming && content ? ' is-streaming' : ''}`}>
+  return <div className="markdown">
     {blocks.map((block, index) => <Fragment key={block.offset}>{index > 0 ? '\n' : null}<MarkdownBlockView content={block.content} context={block.stable ? stableContext : liveContext} plugins={plugins} /></Fragment>)}
+    {streaming && showStreamingIndicator && Boolean(content.trim()) && (
+      <span className="response-streaming-indicator" role="status">
+        <PencilLine size={14} aria-hidden="true" />
+        <span className="activity-sweep">Generating…</span>
+      </span>
+    )}
   </div>;
 });

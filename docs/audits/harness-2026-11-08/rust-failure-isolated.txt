@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized] target(s) in 2.20s
+     Running unittests src/lib.rs (target/debug/deps/tauri_app_lib-1f9b5e0a6b72a6ac)
+
+running 1 test
+test development_tools::tests::observations_finish_without_report_polling_and_remain_historical ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1100 filtered out; finished in 2.45s
+

@@ -58,6 +58,7 @@ describe('response audit regressions', () => {
   it('keeps a command opened while running open after successful completion', () => {
     const view = render(<CommandRunCard toolName="shell_run" command="npm test" status="running" stdout="started" />);
     const card = screen.getByTestId('command-run-card');
+    fireEvent.click(card.querySelector('summary')!);
     expect(card).toHaveAttribute('open');
     view.rerender(<CommandRunCard toolName="shell_run" command="npm test" status="completed" stdout="all tests passed" exitCode={0} />);
     expect(card).toHaveAttribute('open');
@@ -72,11 +73,13 @@ describe('response audit regressions', () => {
     await waitFor(() => expect(container.querySelector('.markdown a')).toHaveAttribute('href', 'https://example.com/source'));
   });
 
-  it('folds clipped successful reads without treating clipping as failure', () => {
+  it('keeps clipped successful reads visible without treating clipping as failure', () => {
     const rows = [tool('a', 'workspace_read_file', { path: 'a.md' }, { schemaVersion: 'locallm.tool-envelope/1', status: 'partial', error: null, _truncated: true }),
       tool('b', 'workspace_read_file', { path: 'b.md' }, { schemaVersion: 'locallm.tool-envelope/1', status: 'partial', error: null, _truncated: true })];
-    const { container } = render(<ActivityTimeline events={[]} messages={rows} renderTool={m => <p>{m.id}</p>} renderMessage={m => <p>{m.content}</p>} />);
-    expect(container.querySelector('.activity-summary')).not.toBeNull();
+    render(<Chat messages={rows} generating={false} ready={false} loading={false} onSend={async () => {}} onCancel={() => {}} onConfigure={() => {}} />);
+    expect(screen.getByText('a.md')).toBeVisible();
+    expect(screen.getByText('b.md')).toBeVisible();
+    expect(screen.queryByTestId('status-failed')).not.toBeInTheDocument();
   });
 
   it('shows a live process as running with decoded terminal output', () => {

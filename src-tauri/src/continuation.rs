@@ -111,7 +111,7 @@ impl Default for Budgets {
             max_rounds: 64,
             max_searches: 16,
             max_fetches: 16,
-            max_retries: 1,
+            max_retries: 4,
             rounds_used: 0,
             searches_used: 0,
             fetches_used: 0,

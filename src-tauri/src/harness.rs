@@ -215,7 +215,7 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
                 "run_in_background": {"type": "boolean", "default": false},
                 "label": {"type": "string"}, "depth_limit": {"type": "integer", "minimum": 0, "maximum": 8},
                 "tool_filter": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
-                "persona": {"type": "string"}, "output_schema": {"type": "object"}, "max_rounds": {"type": "integer", "minimum": 1, "maximum": 8},
+                "persona": {"type": "string"}, "output_schema": {"type": "object"}, "max_rounds": {"type": "integer", "minimum": 1, "maximum": 24},
                 "agent_options": {"type": "object"}
             }), &["prompt"])),
         ("send_message".into(), "Deliver a followup note to a running background child (exact direct parent only).".into(),
@@ -229,7 +229,7 @@ pub fn registry() -> Vec<crate::tool_spec::ToolSpec> {
             schema(json!({"mode": {"type": "string", "enum": ["sequential", "parallel"]},
                 "steps": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "object",
                     "properties": {"prompt": {"type": "string"}, "label": {"type": "string"}}, "required": ["prompt"]}},
-                "max_rounds": {"type": "integer", "minimum": 1, "maximum": 8}}), &["mode", "steps"])),
+                "max_rounds": {"type": "integer", "minimum": 1, "maximum": 24}}), &["mode", "steps"])),
         ("ralph_run".into(), "Fixed-objective iteration loop with fresh child per round and bounded handoffs.".into(),
             schema(json!({"objective": str_prop("1-2000 characters"), "max_rounds": {"type": "integer", "minimum": 1, "maximum": 5}}), &["objective"])),
         ("terminal_create".into(), "Open a persistent shell session (used by Minimal mode and PTC).".into(), schema(json!({}), &[])),
@@ -662,8 +662,8 @@ async fn execute_inner(
     }
     match alias {
         "tool_search" => {
-            let policy=crate::capabilities::ToolPolicy::guard(ctx.state.database());
-            Ok(HarnessOutcome::value(crate::tool_discovery::search(ctx.inherit_tools.iter(),&args,&policy)?))
+            let policy = crate::tool_discovery::SearchPolicy::load(&*ctx.state.database()?)?;
+            Ok(HarnessOutcome::value(crate::tool_discovery::search(ctx.inherit_tools.iter(), &args, &policy)?))
         },
         "tool_invoke" => Err("tool_invoke must resolve to its original authorized tool before dispatch.".into()),
         name if crate::development_tools::owns(name) => {
@@ -985,7 +985,7 @@ async fn execute_inner(
             let value = crate::subagents::run_workflow(
                 ctx.state, &ctx.snapshot, &ctx.conversation_id, &ctx.run_id,
                 ctx.depth, crate::subagents::ChildPolicy::from_access(ctx.access_mode),
-                mode, steps, max_rounds.clamp(1, 8), ctx.inherit_tools,
+                mode, steps, max_rounds.clamp(1, crate::subagents::MAX_CHILD_ROUNDS), ctx.inherit_tools,
             )
             .await?;
             Ok(HarnessOutcome::value(value).event("workflow", json!({"mode": mode})))
@@ -1372,7 +1372,7 @@ async fn execute_subagent(ctx: &HarnessCtx<'_>, args: Value) -> Result<HarnessOu
         label: label.clone(),
         prompt,
         depth: ctx.depth,
-        max_rounds: max_rounds.clamp(1, 8),
+        max_rounds: max_rounds.clamp(1, crate::subagents::MAX_CHILD_ROUNDS),
         tool_filter,
         persona,
         output_schema,

@@ -1,0 +1,122 @@
+[
+  {
+    "build": "starting",
+    "requestedSeconds": 3600,
+    "startedAt": "2026-11-09T10:44:40,142482500+05:30",
+    "endedAt": "2026-11-09T11:44:40,398051119+05:30",
+    "wallSeconds": 3600.255569,
+    "binarySha256": "9c103a446062d2c5ad394ea2999db68c76cffb5d350edf3c864ae6249d137543",
+    "peakSampledRssBytes": 90472448,
+    "progressSamples": 125,
+    "workspaceRemoved": true,
+    "context": {
+      "firstMessageBytes": 8183,
+      "lastMessageBytes": 12362,
+      "maxCompactedInputTokens": 13607
+    },
+    "result": {
+      "compactions": 24,
+      "elapsedSeconds": 3600.085882537,
+      "ledgerStatus": "completed",
+      "partial": false,
+      "realFileReads": 24,
+      "reopenPreservedCompletion": true,
+      "requests": 25,
+      "residentEndBytes": 37859328,
+      "residentStartBytes": 72646656,
+      "runStatus": "completed",
+      "scope": "One registered read-only turn with paced scripted inference.",
+      "turnStatus": "complete"
+    }
+  },
+  {
+    "build": "starting",
+    "requestedSeconds": 7200,
+    "startedAt": "2026-11-09T10:44:40,142481067+05:30",
+    "endedAt": "2026-11-09T12:44:40,327094792+05:30",
+    "wallSeconds": 7200.184613,
+    "binarySha256": "9c103a446062d2c5ad394ea2999db68c76cffb5d350edf3c864ae6249d137543",
+    "peakSampledRssBytes": 86204416,
+    "progressSamples": 250,
+    "workspaceRemoved": true,
+    "context": {
+      "firstMessageBytes": 8183,
+      "lastMessageBytes": 12362,
+      "maxCompactedInputTokens": 13607
+    },
+    "result": {
+      "compactions": 24,
+      "elapsedSeconds": 7200.058286846,
+      "ledgerStatus": "completed",
+      "partial": false,
+      "realFileReads": 24,
+      "reopenPreservedCompletion": true,
+      "requests": 25,
+      "residentEndBytes": 43687936,
+      "residentStartBytes": 66461696,
+      "runStatus": "completed",
+      "scope": "One registered read-only turn with paced scripted inference.",
+      "turnStatus": "complete"
+    }
+  },
+  {
+    "build": "finished",
+    "requestedSeconds": 3600,
+    "startedAt": "2026-11-09T10:56:00,082986169+05:30",
+    "endedAt": "2026-11-09T11:56:00,407097129+05:30",
+    "wallSeconds": 3600.324111,
+    "binarySha256": "9024c408c1c5dcf66867b73bd4f1984948456c6bb932c7e24e094fc3a5e9f4bf",
+    "peakSampledRssBytes": 97054720,
+    "progressSamples": 125,
+    "workspaceRemoved": true,
+    "context": {
+      "firstMessageBytes": 8178,
+      "lastMessageBytes": 12357,
+      "maxCompactedInputTokens": 13606
+    },
+    "result": {
+      "compactions": 24,
+      "elapsedSeconds": 3600.086026351,
+      "ledgerStatus": "completed",
+      "partial": false,
+      "realFileReads": 24,
+      "reopenPreservedCompletion": true,
+      "requests": 25,
+      "residentEndBytes": 39768064,
+      "residentStartBytes": 73498624,
+      "runStatus": "completed",
+      "scope": "One registered read-only turn with paced scripted inference.",
+      "turnStatus": "complete"
+    }
+  },
+  {
+    "build": "finished",
+    "requestedSeconds": 7200,
+    "startedAt": "2026-11-09T10:56:00,083967047+05:30",
+    "endedAt": "2026-11-09T12:56:00,313211167+05:30",
+    "wallSeconds": 7200.229244,
+    "binarySha256": "9024c408c1c5dcf66867b73bd4f1984948456c6bb932c7e24e094fc3a5e9f4bf",
+    "peakSampledRssBytes": 97062912,
+    "progressSamples": 250,
+    "workspaceRemoved": true,
+    "context": {
+      "firstMessageBytes": 8178,
+      "lastMessageBytes": 12357,
+      "maxCompactedInputTokens": 13606
+    },
+    "result": {
+      "compactions": 24,
+      "elapsedSeconds": 7200.068977322,
+      "ledgerStatus": "completed",
+      "partial": false,
+      "realFileReads": 24,
+      "reopenPreservedCompletion": true,
+      "requests": 25,
+      "residentEndBytes": 46637056,
+      "residentStartBytes": 73240576,
+      "runStatus": "completed",
+      "scope": "One registered read-only turn with paced scripted inference.",
+      "turnStatus": "complete"
+    }
+  }
+]

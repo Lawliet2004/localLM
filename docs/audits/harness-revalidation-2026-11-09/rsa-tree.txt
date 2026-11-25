@@ -1,0 +1,3 @@
+rsa v0.9.10
+└── sqlx-mysql v0.8.6
+    └── locallm v0.1.0 (/home/papan/Desktop/Projects/localLM/src-tauri)

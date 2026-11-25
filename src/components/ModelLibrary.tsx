@@ -17,6 +17,25 @@ function modelStatus(model: InstalledModel, selectedPath: string, loadedPath: st
   return null;
 }
 
+type TransferSample = { time: number; received: number; path: string | null };
+
+function transferDetails(received: number, total: number, speed: number | null) {
+  const percent = total > 0 ? Math.min(100, Math.max(0, received / total * 100)) : null;
+  const parts = percent === null ? [] : [`${percent === 100 ? '100' : Math.floor(percent * 10) / 10}%`];
+  if (speed === 0) parts.push('Speed: 0 KiB/s', 'Time remaining: waiting for data', 'No data received recently');
+  else if (speed === null) parts.push('Measuring speed…', 'Time remaining: calculating…');
+  else {
+    const mib = speed >= 1024 ** 2;
+    parts.push(`Speed: ${(speed / (mib ? 1024 ** 2 : 1024)).toFixed(1)} ${mib ? 'MiB' : 'KiB'}/s`);
+    if (total > received) {
+      const minutes = Math.ceil((total - received) / speed / 60);
+      const remaining = minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} hr ${minutes % 60} min`;
+      parts.push(minutes === 1 ? 'Less than 1 min left' : `About ${remaining} left`);
+    }
+  }
+  return parts.join(' · ');
+}
+
 interface Props {
   models: InstalledModel[]; loading: boolean; busy: boolean; selectedPath: string; loadedPath: string | null;
   onRefresh: () => Promise<void>; onUse: (model: InstalledModel) => Promise<void>; onDeleted: () => Promise<void>;
@@ -32,7 +51,10 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
   const [projector, setProjector] = useState('');
   const [working, setWorking] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [pausing, setPausing] = useState(false);
   const [status, setStatus] = useState<ModelInstallStatus | null>(null);
+  const [speed, setSpeed] = useState<number | null>(null);
+  const [catalogError, setCatalogError] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [remove, setRemove] = useState<string | null>(null);
@@ -45,11 +67,25 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
     let wasBusy = false;
+    let samples: TransferSample[] = [];
     async function poll() {
       try {
         const value = await api.modelInstallStatus();
         if (!disposed) {
           setStatus(value);
+          if (value.busy && (value.phase === 'downloading' || value.phase === 'resuming')) {
+            const time = performance.now();
+            const last = samples[samples.length - 1];
+            if (last && (last.path !== value.path || last.received > value.received)) samples = [];
+            samples.push({ time, received: value.received, path: value.path });
+            while (samples.length > 1 && time - samples[1].time >= 10_000) samples.shift();
+            const elapsed = time - samples[0].time;
+            const delta = value.received - samples[0].received;
+            setSpeed(elapsed > 0 && (delta > 0 || elapsed >= 10_000) ? delta * 1000 / elapsed : null);
+          } else {
+            samples = [];
+            setSpeed(null);
+          }
           if (wasBusy && !value.busy) await onRefresh();
           wasBusy = value.busy;
         }
@@ -66,11 +102,17 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
     const request = hubRequest.current;
     void api.searchHuggingFace('').then(value => {
       if (!disposed && request === hubRequest.current) { setResults(value); setSearched(true); setBrowseMode('popular'); }
-    }).catch(e => { if (!disposed && request === hubRequest.current) setError(errorMessage(e)); });
+    }).catch(e => { if (!disposed && request === hubRequest.current) setCatalogError(errorMessage(e)); });
     return () => { disposed = true; };
   }, []);
   const locked = busy || working;
   const downloadLocked = locked || downloading || Boolean(status?.busy);
+  async function pauseDownload() {
+    setPausing(true); setError('');
+    try { await api.cancelModelInstall(); }
+    catch (e) { setError(errorMessage(e)); }
+    finally { setPausing(false); }
+  }
   async function download(repo: string, revision: string, file: string, projectorFile?: string) {
     setDownloading(true); setError(''); setNotice('');
     try {
@@ -82,7 +124,7 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
     finally { setDownloading(false); }
   }
   async function run(action: () => Promise<void>) {
-    setWorking(true); setError(''); setNotice('');
+    setWorking(true); setError(''); setCatalogError(''); setNotice('');
     try { await action(); } catch (e) { setError(errorMessage(e)); }
     finally { setWorking(false); }
   }
@@ -131,6 +173,14 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
     const haystack = `${modelLabel(model.filename)} ${model.filename} ${model.repo ?? ''}`.toLowerCase();
     return haystack.includes(libraryQuery.trim().toLowerCase());
   });
+  const activeStatus = status?.busy ? status : null;
+  const matchesDownload = (model: InstalledModel) => samePath(activeStatus?.path, model.path.replace(/\.part$/, ''));
+  const standaloneDownload = activeStatus && !visibleModels.some(matchesDownload);
+  const progressLabel = activeStatus?.phase === 'verifying' ? 'Verifying'
+    : activeStatus?.phase === 'resolving' || activeStatus?.phase === 'preparing' ? 'Preparing' : 'Downloading';
+  const transfer = progressLabel === 'Downloading' && activeStatus
+    ? transferDetails(activeStatus.received, activeStatus.total, speed) : '';
+  const pauseButton = <button type="button" className="secondary" disabled={pausing} onClick={() => void pauseDownload()}>{pausing ? 'Pausing…' : 'Pause download'}</button>;
   return <div className="studio">
     <div className="studio-switch" role="tablist" aria-label="Model library">
       <button type="button" role="tab" aria-selected={view === 'discover'} onClick={() => setView('discover')}><Search size={14} />Discover</button>
@@ -149,9 +199,9 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
           <button className="primary" disabled={locked}>Search</button>
         </form>
         {working && <p role="status">Searching Hugging Face…</p>}
-        {error && <p className="error" role="alert">{error}</p>}
+        {(error || catalogError) && <p className="error" role="alert">{error || catalogError}</p>}
         <details className="hub-access"><summary>Private or gated repository</summary><label>Hugging Face read token<input type="password" autoComplete="off" value={token} onChange={e => setToken(e.target.value)} placeholder="hf_…" /></label><small>Used only for this page session. Accept any required license on Hugging Face first.</small></details>
-        {searched && !results.length && !catalog && !working && !error && <p>No matching repositories. Try another name or paste an owner/model.</p>}
+        {searched && !results.length && !catalog && !working && !error && !catalogError && <p>No matching repositories. Try another name or paste an owner/model.</p>}
         {results.length > 0 && <div className="studio-results" aria-label={browseMode === 'popular' ? 'Popular GGUF models' : 'Hugging Face search results'}>
           <p className="hub-results-heading">{browseMode === 'popular' ? 'Popular GGUF models' : 'Search results'}</p>
           {results.map(hit => {
@@ -201,42 +251,54 @@ export function ModelLibrary({ models, loading, busy, selectedPath, loadedPath, 
       </section>
     </div> : <section className="studio-pane studio-library" aria-labelledby="library-heading">
       <div className="studio-pane-head">
-        <div><p className="eyebrow">On this machine</p><h2 id="library-heading">My Models <span className="selection-badge">{models.length}</span></h2></div>
+        <div><h2 id="library-heading">My Models <span className="selection-badge">{models.length}</span></h2></div>
         <button type="button" className="secondary" disabled={locked || loading} onClick={() => void run(onRefresh)}><RefreshCw size={14} />Refresh</button>
       </div>
-      <p className="section-description">Load any downloaded GGUF, including the original catalog models. Each file remembers its runtime settings. Deleting a model keeps your conversations.</p>
-      {models.length > 0 && <label className="studio-search-field">Filter downloaded models<input placeholder="Filter by name or publisher" value={libraryQuery} onChange={e => setLibraryQuery(e.target.value)} /></label>}
+      <p className="section-description">Download a model, then select Use model to start chatting. Your conversations stay safe when you remove a model.</p>
+      {models.length > 0 && <label className="studio-search-field library-search">Search your models<span><Search size={16} aria-hidden="true" /><input placeholder="Search by name or publisher" value={libraryQuery} onChange={e => setLibraryQuery(e.target.value)} /></span></label>}
       {loading && <p>Reading your model library…</p>}
-      {!loading && !models.length && <div className="library-empty"><HardDrive size={24} /><h3>No models downloaded yet</h3><p>Open Discover, pick a GGUF quantization that fits, then download it.</p><button type="button" className="primary" onClick={() => setView('discover')}>Discover models</button></div>}
+      {standaloneDownload && <div className="library-model">
+        <span className="studio-avatar" aria-hidden><Download size={14} /></span>
+        <div className="library-model-info">
+          <strong>{activeStatus.path?.split(/[\\/]/).pop() || 'Model download'}</strong>
+          <small role="status">{progressLabel}{activeStatus.total > 0 ? ` · ${gib(activeStatus.received)} of ${gib(activeStatus.total)}` : ''}{transfer && ` · ${transfer}`}</small>
+          <progress aria-label="Model download progress" value={activeStatus.total > 0 ? activeStatus.received : undefined} max={activeStatus.total || 1} />
+        </div>
+        <div className="library-actions">{pauseButton}</div>
+      </div>}
+      {!loading && !models.length && !standaloneDownload && <div className="library-empty"><HardDrive size={24} /><h3>No models downloaded yet</h3><p>Open Discover, pick a GGUF quantization that fits, then download it.</p><button type="button" className="primary" onClick={() => setView('discover')}>Discover models</button></div>}
+      {!loading && models.length > 0 && visibleModels.length === 0 && <p role="status">No models match “{libraryQuery}”. Try another name or publisher.</p>}
       <div className="library-list">{visibleModels.map(model => {
-        const activeDownload = status?.busy && samePath(status.path, model.path.replace(/\.part$/, ''));
-        const received = activeDownload ? status.received : downloadedBytes(model);
-        const statusLabel = activeDownload ? (status.phase === 'verifying' ? 'Verifying' : 'Downloading') : modelStatus(model, selectedPath, loadedPath);
+        const activeDownload = activeStatus && matchesDownload(model) ? activeStatus : null;
+        const received = activeDownload ? activeDownload.received : downloadedBytes(model);
+        const statusLabel = activeDownload ? progressLabel : modelStatus(model, selectedPath, loadedPath);
+        const total = activeDownload?.total || model.bytes;
         const quant = quantLabel(model.filename);
         return <article className={`library-model${statusLabel === 'Running' ? ' running' : ''}`} key={model.id}>
           <span className="studio-avatar" aria-hidden>{(model.repo?.split('/')[0] ?? 'G').slice(0, 1).toUpperCase()}</span>
           <div className="library-model-info">
             <strong>{modelLabel(model.filename)}</strong>
             <span>{model.repo ? `Hugging Face · ${model.repo}` : 'Local GGUF file'}</span>
-            <small>{quant} · {model.complete ? gib(model.bytes) : `${gib(received)} of ${gib(model.bytes)} saved`} · {model.files.length > 1 ? `${model.files.length} files` : '1 file'}{model.projectorFilename ? ` · Vision: ${model.projectorFilename}` : ''}</small>
+            <small>{quant} · {model.complete && !activeDownload ? gib(model.bytes) : `${gib(received)} of ${gib(total)} saved`} · {model.files.length > 1 ? `${model.files.length} files` : '1 file'}{model.projectorFilename ? ' · Supports images' : ''}</small>
             {statusLabel && <span className={`library-chip${statusLabel === 'Incomplete' || statusLabel === 'Interrupted' ? ' warning' : ''}`}>{statusLabel}</span>}
-            {!model.complete && <progress aria-label={`${modelLabel(model.filename)} download progress`} value={received} max={model.bytes || 1} />}
-            <details><summary>File location & source</summary>{model.files.map(path => <p key={path}>{path}</p>)}{model.repo && <a href={`https://huggingface.co/${model.repo}`} target="_blank" rel="noreferrer">View on Hugging Face ↗</a>}{model.revision && <small>Revision {model.revision}</small>}</details>
+            {activeDownload && transfer && <small>{transfer}</small>}
+            {(!model.complete || activeDownload) && <progress aria-label={`${modelLabel(model.filename)} download progress`} value={total > 0 ? received : undefined} max={total || 1} />}
+            <details><summary>Model details</summary>{model.projectorFilename && <p>Vision: {model.projectorFilename}</p>}{model.files.map(path => <p key={path}>{path}</p>)}{model.repo && <a href={`https://huggingface.co/${model.repo}`} target="_blank" rel="noreferrer">View on Hugging Face ↗</a>}{model.revision && <small>Revision {model.revision}</small>}</details>
           </div>
           <div className="library-actions">
-            <button className="primary" type="button" disabled={locked || !model.complete} onClick={() => void run(async () => { await onUse(model); setNotice(`${modelLabel(model.filename)} is ready to use.`); })}><Play size={14} />Use model</button>
-            {!model.complete && <button type="button" className="secondary" disabled={downloadLocked} onClick={() => {
+            <button className="primary" type="button" disabled={locked || !model.complete || Boolean(activeDownload)} onClick={() => void run(async () => { await onUse(model); setNotice(`${modelLabel(model.filename)} is ready to use.`); })}><Play size={14} />Use model</button>
+            {activeDownload ? pauseButton : !model.complete && <button type="button" className="secondary" disabled={downloadLocked} onClick={() => {
               if (model.repo && model.revision) void download(model.repo, model.revision, model.filename, model.projectorFilename ?? undefined);
               else if (model.repo) void run(() => openRepo(model.repo!));
               else { setNotice('Enter the Hugging Face repository in Discover to finish this download.'); setView('discover'); }
-            }}><Download size={14} />{activeDownload ? 'Downloading…' : downloadedBytes(model) > 0 ? 'Resume download' : 'Retry download'}</button>}
+            }}><Download size={14} />{downloadedBytes(model) > 0 ? 'Resume download' : 'Retry download'}</button>}
             <button type="button" className="secondary" aria-label={`Delete ${modelLabel(model.filename)}`} disabled={downloadLocked} onClick={() => setRemove(model.id)}><Trash2 size={14} />Delete</button>
           </div>
           {remove === model.id && <div className="library-delete" role="group" aria-label="Confirm model deletion"><p>Delete {modelLabel(model.filename)} ({gib(model.bytes)}) from disk? Every listed copy will be removed. A running copy will be unloaded. Conversations are kept.</p><button type="button" className="secondary" disabled={locked} onClick={() => setRemove(null)}>Keep model</button><button type="button" className="primary" disabled={downloadLocked} onClick={() => void run(async () => { await api.deleteInstalledModel(model.id); setRemove(null); await onDeleted(); await onRefresh(); setNotice('Model deleted.'); })}>Delete from disk</button></div>}
         </article>;
       })}</div>
     </section>}
-    {view === 'library' && error && <p className="error" role="alert">{error}</p>}
+    {view === 'library' && (error || status?.error) && <p className="error" role="alert">{error || status?.error}</p>}
     {notice && <p className="success" role="status">{notice}</p>}
   </div>;
 }

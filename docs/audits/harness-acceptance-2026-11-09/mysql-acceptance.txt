@@ -1,0 +1,22 @@
+test remote_database::acceptance::real_mysql_readonly_and_disposable_rehearsal ... MYSQL_SCHEMA_EVIDENCE {"columns":["TABLE_SCHEMA","TABLE_NAME","COLUMN_NAME","COLUMN_TYPE","IS_NULLABLE","COLUMN_DEFAULT"],"engine":"mysql","limitation":"Use a database account restricted to read access. Omitted column encodings are explicit; temporary-table privileges and external side effects of privileged server extensions are not OS-isolated.","profileId":"dev-db-mysql-source","readOnly":true,"rowLimit":200,"rows":[["locallm_acceptance","source_guard","id","int","NO",null],["locallm_acceptance","source_guard","name","varchar(128)","NO",null]],"truncated":false,"untrustedDatabaseContent":true}
+MYSQL_REHEARSAL_EVIDENCE {"failed":{"cleanupComplete":true,"message":"MySQL migration failed in the disposable database; DDL may have committed only inside that disposable database.","sourceUnchanged":true},"successful":{"cleanupComplete":true,"constraint":[{"enforced":"YES","name":"positive_id","table":"source_guard","type":"CHECK"},{"enforced":"YES","name":"PRIMARY","table":"source_guard","type":"PRIMARY KEY"}],"quickIntegrity":[{"message":"OK","messageType":"status","operation":"check","table":"source_guard"}],"sourceUnchanged":true},"verifiedScratchRolesAndSchemasAbsent":true}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1139 filtered out; finished in 0.64s
+
+SELECT VERSION()
+exit=0
+VERSION()
+8.4.13
+
+CREATE TABLE t(id INT PRIMARY KEY)
+exit=0
+
+PREPARE locallm_check FROM 'CHECK TABLE t QUICK'
+exit=1
+ERROR 1295 (HY000) at line 1: This command is not supported in the prepared statement protocol yet
+
+CHECK TABLE t QUICK
+exit=0
+Table	Op	Msg_type	Msg_text
+repro.t	check	status	OK
+
+Owned probe container removed

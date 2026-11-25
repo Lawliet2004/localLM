@@ -48,6 +48,10 @@ pub struct TaskCheckpoint {
     pub archive_ids: Vec<String>,
     #[serde(default)]
     pub attachment_refs: Vec<String>,
+    #[serde(default)]
+    pub modified_files: Vec<String>,
+    #[serde(default)]
+    pub verification_summary: Vec<String>,
 }
 
 /// Constraints are sentences the user stated. Completed ids come from tool
@@ -72,6 +76,8 @@ pub fn checkpoint_from_audits(
         next_action: unresolved.first().cloned(),
         archive_ids: archive_ids.to_vec(),
         attachment_refs: Vec::new(),
+        modified_files: Vec::new(),
+        verification_summary: Vec::new(),
     }
 }
 
@@ -150,28 +156,66 @@ pub fn task_checkpoint(messages: &[Value], archive_id: &str) -> TaskCheckpoint {
                 let verdict = data.pointer("/report/verdict").or_else(|| data.pointer("/check/report/verdict")).and_then(Value::as_str)
                     .or_else(|| data["processState"].as_str()).or_else(|| data["state"].as_str())
                     .or_else(|| crate::tool_envelope::operation_status(result)).unwrap_or("returned");
-                push_unique(&mut checkpoint.findings, bounded(&format!("Observed tool result: {name} {paths} — {verdict}. Archived outcome; checks must be rerun after later edits."), 400), 5);
+                push_unique(&mut checkpoint.findings, bounded(&format!("Observed tool result: {name} {paths} — {verdict}. Archived outcome; checks must be rerun after later edits."), 400), 20);
+                if !crate::tool_envelope::failed(result) {
+                    if matches!(
+                        name,
+                        "create_file" | "workspace_create_file" | "write_file" | "workspace_write_file"
+                            | "write_file_base64" | "workspace_write_file_base64" | "edit_file"
+                            | "workspace_edit_file" | "multi_edit" | "workspace_multi_edit"
+                            | "edit_lines" | "workspace_edit_lines" | "append_file"
+                            | "workspace_append_file" | "apply_patch" | "workspace_apply_patch"
+                            | "file_write"
+                    ) {
+                        if let Some(path) = data["path"].as_str() {
+                            push_unique(&mut checkpoint.modified_files, bounded(path, 200), 32);
+                        }
+                        if let Some(changes) = data["changes"].as_array() {
+                            for change in changes {
+                                if let Some(path) = change["path"].as_str() {
+                                    push_unique(&mut checkpoint.modified_files, bounded(path, 200), 32);
+                                }
+                            }
+                        }
+                    }
+                    if matches!(
+                        name,
+                        "verification_run" | "verification_report" | "check_run" | "check_report"
+                            | "shell_run" | "process_poll"
+                    ) {
+                        let exit = data["exitCode"]
+                            .as_i64()
+                            .or_else(|| data.pointer("/report/exitCode").and_then(Value::as_i64))
+                            .map(|code| format!(" exit={code}"))
+                            .unwrap_or_default();
+                        push_unique(
+                            &mut checkpoint.verification_summary,
+                            bounded(&format!("{name}: {verdict}{exit}"), 240),
+                            16,
+                        );
+                    }
+                }
                 if data["state"] == "running" || data["status"] == "running" || data["processState"] == "running" {
                     let process = data["id"].as_str().or_else(|| data["processId"].as_str()).unwrap_or(id);
-                    push_unique(&mut checkpoint.unresolved, format!("Process {} was still running at compaction; poll its owned handle before claiming completion.", bounded(process, 160)), 8);
+                    push_unique(&mut checkpoint.unresolved, format!("Process {} was still running at compaction; poll its owned handle before claiming completion.", bounded(process, 160)), 16);
                 } else if !crate::tool_envelope::failed(result)
                     && crate::tool_envelope::operation_status(result) != Some("partial") && !result.is_null() {
-                    push_unique(&mut checkpoint.completed_operation_ids, bounded(id, 160), 32);
+                    push_unique(&mut checkpoint.completed_operation_ids, bounded(id, 160), 64);
                 } else {
-                    push_unique(&mut checkpoint.unresolved, format!("Tool {id} did not confirm completion; consult the archive before retrying."), 8);
+                    push_unique(&mut checkpoint.unresolved, format!("Tool {id} did not confirm completion; consult the archive before retrying."), 16);
                 }
             }
             fn sources(value: &Value, refs: &mut Vec<String>, depth: usize) {
                 if depth > 6 { return; }
                 if let Some(url) = value["url"].as_str().filter(|url| url.starts_with("https://") || url.starts_with("http://")) {
-                    push_unique(refs, bounded(url, 400), 12);
+                    push_unique(refs, bounded(url, 400), 24);
                 }
                 if let Some(object) = value.as_object() { for child in object.values() { if child.is_object() || child.is_array() { sources(child, refs, depth + 1); } } }
                 if let Some(array) = value.as_array() { for child in array.iter().take(64) { sources(child, refs, depth + 1); } }
             }
             sources(result, &mut checkpoint.source_refs, 0);
         } else if message["role"] == "assistant" && !text.trim().is_empty() {
-            push_unique(&mut checkpoint.findings, format!("Assistant note (unverified): {}", bounded(text, 400)), 5);
+            push_unique(&mut checkpoint.findings, format!("Assistant note (unverified): {}", bounded(text, 400)), 20);
         }
     }
     push_unique(&mut checkpoint.archive_ids, archive_id.into(), 6);
@@ -275,6 +319,110 @@ pub struct CompactionPlan {
     /// Removed messages and, for the first active exchange, its request.
     /// Handoff attachment indices are relative to this exact array.
     pub archived: Vec<Value>,
+}
+
+/// Stage-1 micro-compaction plan: archives bulky stale tool outputs older than
+/// the most recent `keep_recent_tools` tool messages into one artifact while
+/// preserving every conversation turn, assistant reasoning trace, and active
+/// handle. Only invoked once the 80% compaction threshold triggers, keeping
+/// normal rounds 100% cache-stable.
+pub struct StaleToolPrunePlan {
+    pub id: String,
+    pub messages: Vec<Value>,
+    pub archived: Vec<Value>,
+    pub pruned_count: usize,
+}
+
+pub fn plan_stale_tool_prune(
+    messages: &[Value],
+    keep_recent_tools: usize,
+    min_bytes: usize,
+) -> Option<StaleToolPrunePlan> {
+    let tool_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m["role"] == "tool")
+        .map(|(i, _)| i)
+        .collect();
+    if tool_indices.len() <= keep_recent_tools {
+        return None;
+    }
+    let cutoff = tool_indices.len() - keep_recent_tools;
+    let id = format!("art_{}", uuid::Uuid::new_v4().simple());
+    let mut updated = messages.to_vec();
+    let mut archived = Vec::new();
+    let mut pruned_count = 0usize;
+    for &msg_idx in &tool_indices[..cutoff] {
+        let content = messages[msg_idx]["content"].as_str().unwrap_or("");
+        if content.len() < min_bytes || content.contains("\"_pruned\":true") {
+            continue;
+        }
+        let parsed = serde_json::from_str::<Value>(content).unwrap_or(Value::Null);
+        let data = parsed.get("data").unwrap_or(&parsed);
+        let mut stub = json!({
+            "_pruned": true,
+            "_archiveArtifactId": id,
+            "_originalBytes": content.len(),
+            "status": crate::tool_envelope::operation_status(&parsed)
+                .unwrap_or(if crate::tool_envelope::failed(&parsed) { "error" } else { "ok" }),
+            "note": "Earlier large tool output archived to free context. Use artifact_read with _archiveArtifactId to inspect full details."
+        });
+        for key in ["path", "sha256", "id", "processId", "evidenceId", "verdict"] {
+            if let Some(value) = data.get(key).filter(|v| v.is_string() || v.is_number()) {
+                stub[key] = value.clone();
+            }
+        }
+        archived.push(json!({
+            "messageIndex": msg_idx,
+            "toolCallId": messages[msg_idx]["tool_call_id"],
+            "content": content,
+        }));
+        updated[msg_idx]["content"] = json!(stub.to_string());
+        pruned_count += 1;
+    }
+    if pruned_count == 0 {
+        return None;
+    }
+    Some(StaleToolPrunePlan {
+        id,
+        messages: updated,
+        archived,
+        pruned_count,
+    })
+}
+
+pub fn commit_stale_tool_prune(
+    store: &crate::store::Store,
+    conversation_id: &str,
+    messages: &mut Vec<Value>,
+    plan: StaleToolPrunePlan,
+) -> Result<String, String> {
+    let StaleToolPrunePlan {
+        id,
+        messages: pruned,
+        archived,
+        pruned_count,
+    } = plan;
+    let content = json!({
+        "kind": "stale-tool-prune",
+        "prunedCount": pruned_count,
+        "entries": archived,
+    })
+    .to_string();
+    use sha2::{Digest, Sha256};
+    store.save_artifact(&crate::artifacts::ArtifactRecord {
+        id: id.clone(),
+        conversation_id: conversation_id.into(),
+        run_id: None,
+        tool_name: "compact_conversation".into(),
+        mime_type: "application/json".into(),
+        size_bytes: content.len(),
+        sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+        content,
+        created_at: crate::store::now(),
+    })?;
+    *messages = pruned;
+    Ok(id)
 }
 
 /// Plan a compaction of the model-visible buffer.
@@ -1229,5 +1377,72 @@ mod handoff_regressions {
         assert_eq!(second_archive["handoff"]["completedOperationIds"], json!(["first", "second"]));
         assert!(second_archive["messages"].as_array().unwrap().iter().all(|message| message != &user));
         assert!(plan_compaction(&messages, 0).is_none());
+    }
+
+    #[test]
+    fn stage_one_stale_tool_pruning_archives_bulky_old_outputs_and_preserves_recent_ones() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let owner = store.create_conversation().unwrap().id;
+        let mut messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"Audit the workspace."}),
+        ];
+        for i in 0..8 {
+            messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":format!("t{i}"),"type":"function","function":{"name":"workspace_read_file","arguments":"{}"}}]}));
+            let body = crate::tool_envelope::success(json!({
+                "path": format!("src/file_{i}.rs"),
+                "sha256": format!("{:064x}", i + 1),
+                "content": "line\n".repeat(800)
+            }));
+            messages.push(json!({"role":"tool","tool_call_id":format!("t{i}"),"content":body.to_string()}));
+        }
+        let plan = plan_stale_tool_prune(&messages, 6, 2048).unwrap();
+        assert_eq!(plan.pruned_count, 2);
+        let art_id = commit_stale_tool_prune(&store, &owner, &mut messages, plan).unwrap();
+        let artifact = store.artifact(&art_id).unwrap().unwrap();
+        let archived: Value = serde_json::from_str(&artifact.content).unwrap();
+        assert_eq!(archived["prunedCount"], 2);
+        // First 2 tool outputs are stubbed with handles; last 6 remain intact.
+        let tool_msgs: Vec<&Value> = messages.iter().filter(|m| m["role"] == "tool").collect();
+        for idx in 0..2 {
+            let parsed: Value = serde_json::from_str(tool_msgs[idx]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(parsed["_pruned"], true);
+            assert_eq!(parsed["_archiveArtifactId"], art_id);
+            assert_eq!(parsed["path"], format!("src/file_{idx}.rs"));
+        }
+        for idx in 2..8 {
+            assert!(tool_msgs[idx]["content"].as_str().unwrap().len() > 3000);
+        }
+        // Re-running does not double-prune already pruned stubs.
+        assert!(plan_stale_tool_prune(&messages, 6, 2048).is_none());
+    }
+
+    #[test]
+    fn enriched_task_checkpoint_tracks_modified_files_verification_and_backward_compat() {
+        let messages = vec![
+            json!({"role":"user","content":"Implement the 3D exporter and verify tests."}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"w1","type":"function","function":{"name":"workspace_create_file","arguments":"{\"path\":\"src/mesh.rs\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"w1","content":crate::tool_envelope::success(json!({"path":"src/mesh.rs","sha256":"a".repeat(64)})).to_string()}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"v1","type":"function","function":{"name":"verification_run","arguments":"{\"command\":\"cargo test\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"v1","content":crate::tool_envelope::success(json!({"report":{"verdict":"passed","exitCode":0}})).to_string()}),
+        ];
+        let cp = task_checkpoint(&messages, "art_test");
+        assert_eq!(cp.modified_files, vec!["src/mesh.rs".to_string()]);
+        assert_eq!(cp.verification_summary, vec!["verification_run: passed exit=0".to_string()]);
+        // Legacy checkpoint JSON without new fields still deserializes cleanly.
+        let legacy = json!({
+            "version": 1,
+            "originalRequest": "Old task",
+            "constraints": [],
+            "completedOperationIds": [],
+            "findings": [],
+            "sourceRefs": [],
+            "unresolved": [],
+            "nextAction": null,
+            "archiveIds": ["art_old"]
+        });
+        let parsed: TaskCheckpoint = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.modified_files.is_empty());
+        assert!(parsed.verification_summary.is_empty());
     }
 }

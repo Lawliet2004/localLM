@@ -1,0 +1,16 @@
+Re-extracting code files in . (no LLM needed)...
+[graphify watch] 34 file(s) not classified (no supported extension or shebang), skipped: .gitignore, AppearanceSettings.css, AutomationSettings.css, IBMPlexSans-Medium.ttf, IBMPlexSans-Regular.ttf, IBMPlexSans-SemiBold.ttf (+28 more)
+  AST extraction: 100/437 uncached files (22%) [12 workers]
+  AST extraction: 200/437 uncached files (45%) [12 workers]
+  AST extraction: 300/437 uncached files (68%) [12 workers]
+  AST extraction: 400/437 uncached files (91%) [12 workers]
+  AST extraction: 437/437 uncached files (100%) [12 workers]
+  warning: 93 code file(s) yielded no symbols (0.24 MB) — a data file, or source this extractor models no symbols for: docs/audits/2026-11-08/frontend-probes.config.ts, docs/audits/2026-11-08/rust-chat-probes.inc, docs/audits/2026-11-08/rust-lib-probes.inc, docs/audits/2026-11-08/rust-subagents-probes.inc, e2e/automation.spec.ts (+88 more)
+[graphify watch] community set changed since labeling (0 saved labels, 359 communities now; renamed 40 community(ies) by their hub). Run `graphify label` to refresh names with the LLM.
+Graph has 9017 nodes (above 5000 limit). Building aggregated community view...
+graph.html written (aggregated: 359 community nodes, 1510 cross-community edges)
+Tip: run with --obsidian for full node-level detail.
+[graphify watch] Rebuilt: 9017 nodes, 21275 edges, 359 communities
+[graphify watch] graph.json, graph.html and GRAPH_REPORT.md updated in graphify-out
+Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.
+Tip: set GEMINI_API_KEY or GOOGLE_API_KEY to use Gemini for semantic extraction.

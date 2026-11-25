@@ -80,3 +80,19 @@ it('preserves a code block node and wrap preference when later prose streams', (
   expect(screen.getByLabelText('typescript source')).toBe(source);
   expect(screen.getByRole('button', { name: 'Disable line wrap' })).toHaveAttribute('aria-pressed', 'true');
 });
+
+it('keeps one streaming indicator below the latest block until the response finishes', () => {
+  const prose = 'Here is the code.';
+  const view = render(<MarkdownView content={prose} streaming />);
+  const indicator = screen.getByRole('status');
+  expect(indicator).toHaveTextContent('Generating…');
+  expect(indicator.previousElementSibling).toHaveTextContent(prose);
+
+  const content = prose + '\n\n```ts\nconst value = 1;\n```';
+  view.rerender(<MarkdownView content={content} streaming />);
+  expect(view.container.querySelector('.markdown')?.lastElementChild).toBe(indicator);
+  expect(indicator.previousElementSibling).toContainElement(screen.getByLabelText('typescript source'));
+
+  view.rerender(<MarkdownView content={content} />);
+  expect(indicator).not.toBeInTheDocument();
+});

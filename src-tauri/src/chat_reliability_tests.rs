@@ -93,7 +93,8 @@ async fn goal_tool_flow_keeps_independent_release_evidence_and_rechecks_after_ex
     let wire = request_payload(&build_turn_messages(&plan), &plan.tool_definitions, &plan.preferences, false, false, None, false);
     assert_eq!(wire["messages"][0]["role"], "system");
     assert_eq!(wire["messages"].to_string().matches("Create the release source").count(), 1);
-    assert!(plan.tool_definitions.len() <= 26);
+    assert!(plan.tool_definitions.len() <= 38, "got {} tools", plan.tool_definitions.len());
+    assert!(plan.tool_definitions.len() < plan.tools.len());
     let run = crate::agent_run::RunRecord { id:"goal-fixture".into(), conversation_id:owner.clone(),
         status:crate::agent_run::RunState::ExecutingTools, model_provider:None, model_id:None,
         checkpoint:None, error:None, created_at:1, updated_at:1 };
@@ -856,4 +857,74 @@ async fn read_only_ptc_saves_a_model_round_without_false_verification() {
         "scripted_ptc_equivalence",
         json!({"cases":observations,"limitation":"Scripted model chooses the plan. This tests orchestration and result parity, not real-model task accuracy or comparative harness performance."}),
     );
+}
+
+#[tokio::test]
+async fn provider_context_overflow_auto_compacts_and_retries_cleanly() {
+    let root = tempfile::tempdir().unwrap();
+    let state = crate::test_support::app_state(root.path());
+    crate::test_support::select_fixture_model(&state, root.path());
+    std::fs::write(root.path().join("big.txt"), "payload-line\n".repeat(400)).unwrap();
+    let overflow_event = format!(
+        "data: {}\r\n\r\n",
+        json!({"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens."}})
+    );
+    let (base, requests, server) = crate::test_support::scripted_sse(vec![
+        call("read-1", "workspace_read_file", json!({"path":"big.txt"})),
+        call("read-2", "workspace_read_file", json!({"path":"big.txt"})),
+        call("read-3", "workspace_read_file", json!({"path":"big.txt"})),
+        overflow_event,
+        text("Recovered cleanly after automatic emergency compaction."),
+    ])
+    .await;
+    let owner = conversation(&state, base);
+    send_registered_message(
+        &state,
+        owner.clone(),
+        "Read big.txt and summarize.".into(),
+        Some(vec!["__workspace".into()]),
+        Some(vec![]),
+        None,
+        None,
+        Channel::new(|_| Ok(())),
+        None,
+    )
+    .await
+    .unwrap();
+    server.await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(
+        serde_json::to_vec(&requests[4].body).unwrap().len()
+            < serde_json::to_vec(&requests[3].body).unwrap().len(),
+        "retry after context overflow must carry a compacted smaller payload"
+    );
+    let store = state.database().unwrap();
+    let reply = store
+        .messages(&owner)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.role == "assistant")
+        .unwrap();
+    assert_eq!(
+        reply.content,
+        "Recovered cleanly after automatic emergency compaction."
+    );
+    let events = store.session_events(&owner, None, None).unwrap();
+    assert!(events.iter().any(|e| e.event_type == "compaction"
+        && e.payload["reason"] == "provider_context_overflow"));
+}
+
+#[test]
+fn transient_and_overflow_error_classifiers_distinguish_permanent_failures() {
+    assert!(is_context_overflow_error("context_length_exceeded: too many tokens"));
+    assert!(is_context_overflow_error("Prompt is too long for this model."));
+    assert!(!is_context_overflow_error("HTTP 401 unauthorized"));
+
+    assert!(is_transient_stream_error("Provider returned HTTP 429 rate limit exceeded"));
+    assert!(is_transient_stream_error("Provider returned HTTP 529 overloaded"));
+    assert!(is_transient_stream_error("error sending request: connection reset by peer"));
+    assert!(!is_transient_stream_error("HTTP 401 unauthorized: invalid_api_key"));
+    assert!(!is_transient_stream_error("HTTP 429: insufficient_quota"));
+    assert!(!is_transient_stream_error("HTTP 400 invalid_request_error"));
 }

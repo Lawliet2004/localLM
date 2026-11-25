@@ -275,14 +275,23 @@ fn rewrap_envelope(
 /// Excerpt budget in serialized UTF-8 bytes for one tool result, derived from the tokens
 /// still free after the counted input and the response reserve. At most half
 /// of the remaining allowance is spent, so the next model round keeps
-/// headroom; the budget stays within [512, 8192] bytes either way.
+/// headroom; the ceiling scales cleanly with context window capacity
+/// (8 KiB <= 32K, 16 KiB <= 64K, 32 KiB > 64K) so large-context API models
+/// avoid wasted `artifact_read` round trips on ordinary source files and logs.
 pub fn excerpt_budget(context_length: u32, input_tokens: u64, response_reserve: u32) -> usize {
     let used = input_tokens.min(u64::from(context_length)) as u32;
     let remaining = context_length
         .saturating_sub(used)
         .saturating_sub(response_reserve);
+    let ceiling = if context_length > 65_536 {
+        32_768
+    } else if context_length > 32_768 {
+        16_384
+    } else {
+        8_192
+    };
     let chars = (remaining as usize).saturating_mul(4) / 2;
-    chars.clamp(512, 8192)
+    chars.clamp(512, ceiling)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1945,8 +1954,10 @@ mod tests {
         );
         // Saturates at the floor when the context is nearly full.
         assert_eq!(excerpt_budget(8192, 8_100, 512), 512);
-        // And at the ceiling when the context is huge.
-        assert_eq!(excerpt_budget(131_072, 1_000, 512), 8192);
+        // Scales cleanly across local (<=32K), mid (<=64K), and large API (>64K) windows.
+        assert_eq!(excerpt_budget(32_768, 1_000, 512), 8_192);
+        assert_eq!(excerpt_budget(65_536, 1_000, 512), 16_384);
+        assert_eq!(excerpt_budget(131_072, 1_000, 512), 32_768);
         // Input larger than the context never underflows.
         assert_eq!(excerpt_budget(8192, 99_999, 512), 512);
     }

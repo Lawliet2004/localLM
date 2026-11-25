@@ -3,6 +3,7 @@
 @font-face { font-family: 'IBM Plex Sans'; src: url('./assets/fonts/IBMPlexSans-Medium.ttf') format('truetype'); font-weight: 500; font-display: swap; }
 @font-face { font-family: 'IBM Plex Sans'; src: url('./assets/fonts/IBMPlexSans-SemiBold.ttf') format('truetype'); font-weight: 600 800; font-display: swap; }
 @font-face { font-family: 'IBM Plex Serif'; src: url('./assets/fonts/IBMPlexSerif-Regular.ttf') format('truetype'); font-weight: 400; font-display: swap; }
+@font-face { font-family: 'JetBrains Mono'; src: url('./assets/fonts/JetBrainsMono.woff2') format('woff2'); font-weight: 400 700; font-display: swap; }
 :root {
   color-scheme: light;
   --font-sans: 'IBM Plex Sans', 'Segoe UI', sans-serif;
@@ -17,12 +18,12 @@
   --input: #ffffff;
   --elevated: #ffffff;
   --overlay: #f6f6f0;
-  --text: #26382f;
-  --foreground: #26382f;
-  --secondary: #536153;
-  --muted: #536153;
-  --border: #e1e4da;
-  --border-strong: #c9d0c4;
+  --text: #202d26;
+  --foreground: #202d26;
+  --secondary: #414f43;
+  --muted: #414f43;
+  --border: #d3dace;
+  --border-strong: #b8c5b9;
   --hover: #e9ede3;
   --active: #e0e8da;
   --accent: #356349;
@@ -53,7 +54,7 @@
   --shadow-lg: 0 16px 48px #26382f18;
   --ring: 0 0 0 3px var(--accent-soft);
   --ring-strong: 0 0 0 2px var(--accent);
-  --dur: .18s;
+  --dur: calc(.18s * var(--motion-scale));
   --ease: cubic-bezier(.22, .68, .32, 1);
 
   /* Activity categories: each kind of assistant work keeps one hue across
@@ -124,12 +125,12 @@
   --input: #2a332c;
   --elevated: #303b32;
   --overlay: #29322b;
-  --text: #e8ede2;
-  --foreground: #e8ede2;
-  --secondary: #b2bdae;
-  --muted: #a1ae9d;
-  --border: #374238;
-  --border-strong: #52604f;
+  --text: #f1f5ed;
+  --foreground: #f1f5ed;
+  --secondary: #c4d0c0;
+  --muted: #b8c5b4;
+  --border: #424e44;
+  --border-strong: #687668;
   --hover: #303c32;
   --active: #3b4c3c;
   --accent: #afc9a0;
@@ -230,4 +231,97 @@
   --terminal-bright-magenta: #f3c8eb;
   --terminal-bright-cyan: #b5e5e5;
   --terminal-bright-white: #ffffff;
+}
+
+/* Palette presets: light and dark companions, with optional user overrides. */
+:root:is([data-palette=graphite], [data-palette=indigo]) {
+  --foreground: var(--text);
+  --muted: var(--secondary);
+  --rail-bg: var(--sidebar);
+  --rail-text: var(--secondary);
+  --overlay: var(--surface);
+  --elevated: var(--surface);
+  --hover: color-mix(in srgb, var(--text) 7%, var(--surface));
+  --active: color-mix(in srgb, var(--accent) 16%, var(--surface));
+  --border-strong: color-mix(in srgb, var(--text) 25%, var(--surface));
+  --code-border: var(--border);
+  --code-gutter: var(--secondary);
+}
+
+:root[data-palette=graphite] {
+  --background: #edeff1;
+  --sidebar: #e2e6ea;
+  --surface: #fafbfc;
+  --input: #ffffff;
+  --text: #252b32;
+  --secondary: #4e5b69;
+  --border: #cdd4dd;
+  --code-bg: #f5f7fa;
+  --code-fg: #252b32;
+  --code-header-bg: #e6ebf0;
+}
+
+:root[data-palette=graphite][data-theme=dark] {
+  --background: #17191d;
+  --sidebar: #1d2127;
+  --surface: #242830;
+  --input: #2a3039;
+  --text: #e7eaf0;
+  --secondary: #b3bfce;
+  --border: #424b58;
+  --code-bg: #1a1e25;
+  --code-fg: #e7eaf0;
+  --code-header-bg: #262c36;
+}
+
+:root[data-palette=indigo] {
+  --background: #eeedf8;
+  --sidebar: #e6e4f4;
+  --surface: #faf9ff;
+  --input: #ffffff;
+  --text: #282443;
+  --secondary: #555075;
+  --border: #d5cfe6;
+  --code-bg: #f5f2fc;
+  --code-fg: #282443;
+  --code-header-bg: #eae5f5;
+  --syn-keyword: #793494;
+  --syn-function: #3e4cb2;
+  --syn-string: #24634f;
+}
+
+:root[data-palette=indigo][data-theme=dark] {
+  --background: #181627;
+  --sidebar: #201d32;
+  --surface: #28243c;
+  --input: #312c49;
+  --text: #efebfa;
+  --secondary: #c3bad9;
+  --border: #48415f;
+  --code-bg: #1f1b30;
+  --code-fg: #efebfa;
+  --code-header-bg: #2d2745;
+  --syn-keyword: #e0b0f4;
+  --syn-function: #adb9ff;
+  --syn-string: #a5dfc5;
+}
+
+:root { --motion-scale: 1; }
+:root[data-motion-speed=fast] { --motion-scale: .65; }
+:root[data-motion-speed=slow] { --motion-scale: 1.65; }
+
+:root {
+  --appearance-swatch-ink: #ffffff;
+  --mini-system-bg: #eeeee7;
+  --mini-system-nav: #e1e5d9;
+  --mini-system-surface: #252d27;
+  --mini-system-line: #64745f;
+}
+:root[data-theme=dark] { --appearance-swatch-ink: #202b21; }
+
+/* Keep the transcript typography while inheriting the active app palette. */
+.chat-transcript {
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-sans: var(--font-mono);
+  --activity-sweep-highlight: color-mix(in srgb, var(--accent-strong) 72%, var(--text));
 }

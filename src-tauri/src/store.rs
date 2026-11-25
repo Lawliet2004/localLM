@@ -3040,7 +3040,12 @@ impl Store {
         created_at: i64,
     ) -> Result<Message> {
         let limit = if role == "tool" { crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES } else { 1_048_576 };
-        if content.len() > limit {
+        let too_large = if role == "user" {
+            crate::attachments::exceeds_message_limit(content)
+        } else {
+            content.len() > limit
+        };
+        if too_large {
             return Err(format!("Message exceeds the {limit}-byte storage limit."));
         }
         let message = Message {
@@ -3089,7 +3094,7 @@ impl Store {
 
     pub fn stage_pending_turn_with_resume(&self, conversation_id: &str, content: &str, recovery_id: Option<&str>, resume_task_id: Option<&str>) -> Result<PendingTurn> {
         let content = content.trim();
-        if content.is_empty() || content.len() > 1_048_576 { return Err("Enter a message no larger than 1 MiB.".into()); }
+        if content.is_empty() || crate::attachments::exceeds_message_limit(content) { return Err("Enter a message within 1 MiB of text or 16 MiB with encoded attachments.".into()); }
         if let Some(saved) = self.pending_turn(conversation_id)? {
             if recovery_id == Some(saved.id.as_str()) && saved.content == content
                 && resume_task_id.is_none_or(|id| saved.resume_task_id.as_deref() == Some(id)) { return Ok(saved); }
@@ -3131,8 +3136,8 @@ impl Store {
         pending_id: Option<&str>,
     ) -> Result<Message> {
         let content = content.trim();
-        if content.is_empty() || content.len() > 1_048_576 {
-            return Err("Enter a message no larger than 1 MiB.".into());
+        if content.is_empty() || crate::attachments::exceeds_message_limit(content) {
+            return Err("Enter a message within 1 MiB of text or 16 MiB with encoded attachments.".into());
         }
         let transaction = self.connection.is_autocommit()
             .then(|| self.connection.unchecked_transaction()).transpose().map_err(db_error)?;

@@ -1,0 +1,23 @@
+    Updating crates.io index
+  Installing cargo-audit v0.22.2
+    Updating crates.io index
+warning: spurious network error (3 tries remaining): transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)
+warning: spurious network error (3 tries remaining): transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)
+warning: spurious network error (2 tries remaining): transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)
+warning: spurious network error (2 tries remaining): transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)
+warning: spurious network error (1 try remaining): transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)
+warning: spurious network error (1 try remaining): transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)
+error: failed to get `wasmparser` as a dependency of package `object v0.39.1`
+    ... which satisfies dependency `object = "^0.39"` (locked to 0.39.1) of package `cargo-audit v0.22.2`
+
+Caused by:
+  failed to load source for dependency `wasmparser`
+
+Caused by:
+  unable to update registry `crates-io`
+
+Caused by:
+  download of wa/sm/wasmparser failed
+
+Caused by:
+  transfer too slow: failed to transfer more than 10 bytes in 30s (transferred 0 bytes)

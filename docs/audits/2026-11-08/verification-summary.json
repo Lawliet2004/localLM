@@ -1,0 +1,83 @@
+{
+  "date": "2026-11-08",
+  "revision": "609209e plus existing working-tree changes",
+  "application_sources_modified_by_audit": false,
+  "source_inventory_files": 574,
+  "source_inventory_lines_including_tests": 160503,
+  "open_correctness_findings": [
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B05",
+    "B06",
+    "B07",
+    "B08",
+    "B09",
+    "B10",
+    "F01",
+    "F02",
+    "F03",
+    "F04",
+    "F05",
+    "F06"
+  ],
+  "other_work": [
+    "Q01",
+    "U01",
+    "U02",
+    "U03"
+  ],
+  "checks": {
+    "frontend_suite": {
+      "passed": 894,
+      "skipped": 1
+    },
+    "typecheck": {
+      "passed": false,
+      "diagnostic": "TS2550 src/components/Chat.tsx:42"
+    },
+    "rust_check": {
+      "passed": true
+    },
+    "rust_suite_first": {
+      "passed": 1049,
+      "failed": 1,
+      "ignored": 35,
+      "failure": "chat::read_group_tests::real_turn_cancel_settles_every_dispatched_member"
+    },
+    "rust_cancellation_isolated": {
+      "passed": 1,
+      "failed": 0
+    },
+    "rust_suite_rerun": {
+      "passed": 1050,
+      "failed": 0,
+      "ignored": 35,
+      "test_threads": 2
+    },
+    "rust_diagnostic_probes": {
+      "passed": 11,
+      "failed": 0,
+      "interpretation": "passing reproduces documented bad behavior"
+    },
+    "frontend_probes": {
+      "passed": 10,
+      "failed": 0,
+      "diagnostics": 9,
+      "interaction_controls": 1
+    },
+    "mockup": {
+      "dom_state_checks": true,
+      "browser_visual_inspection": false
+    }
+  },
+  "reference_opencode_commit": "ece56ca58419083275f2a2a81ac28d05f4a1b89b",
+  "limits": [
+    "No paid or real-model comparative benchmark",
+    "No browser preview",
+    "No native visual acceptance",
+    "Ignored tests not claimed passing",
+    "Real authenticated integrations and GPU inference not exercised"
+  ]
+}

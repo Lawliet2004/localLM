@@ -30,8 +30,8 @@ const fixture: Message[] = [
     result: { status: 'success', answer: 'Use vi.useFakeTimers.', sources: { S1: { title: 'Vitest docs', url: 'https://vitest.dev/guide/' } } },
   }, 2),
   tool('t-read', {
-    request: { connector: 'Workspace', name: 'read_file', arguments: { path: 'src/timer.ts' } },
-    result: { status: 'success', content: 'export function tick() {\n  return 1;\n}', path: 'src/timer.ts', totalLines: 3, sha256: 'ab12' },
+    request: { connector: 'Workspace', name: 'read_file', arguments: { path: 'src/timer.ts', start_line: 1, line_count: 5 } },
+    result: { status: 'success', content: '1: export function tick() {\n2:   return 1;\n3: }', path: 'src/timer.ts', totalLines: 3, sha256: 'ab12' },
   }, 3),
   tool('t-cmd-ok', {
     request: { connector: 'Shell', name: 'execute_command', arguments: { command: 'npm test', cwd: '/repo' } },
@@ -61,6 +61,36 @@ const fixture: Message[] = [
 ];
 
 describe('mixed conversation fixture', () => {
+  it('keeps a failed command envelope out of terminal output when it has no logs', () => {
+    const timeout = tool('t-timeout', {
+      request: { connector: 'Harness', name: 'shell_run', arguments: { command: 'npm run check' } },
+      result: { status: 'failure', isError: true, error: { code: 'timeout', message: 'The command reached its time limit.' } },
+    }, 1);
+    render(<Chat {...props} messages={[timeout]} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('The command reached its time limit.');
+    expect(screen.queryByRole('button', { name: 'Output' })).not.toBeInTheDocument();
+    expect(screen.getByText('Execution details')).toBeVisible();
+  });
+
+  it('shows a failed check report even when the recorded process has no logs', () => {
+    const report = tool('t-check', {
+      request: { connector: 'Harness', name: 'check_report', arguments: { id: 'process-1' } },
+      result: {
+        status: 'failure', isError: true,
+        error: { code: 'checks-command_failed', message: 'The command exited unsuccessfully.' },
+        data: {
+          processId: 'process-1', process: { id: 'process-1', state: 'exited', exitCode: 101 },
+          report: { verdict: 'command_failed', cases: [{ name: 'test_parse' }] },
+        },
+      },
+    }, 1);
+    render(<Chat {...props} messages={[report]} />);
+    expect(screen.getByText('Check report')).toBeVisible();
+    expect(screen.getByText('The command exited unsuccessfully.')).toBeVisible();
+    expect(screen.getByTestId('result-viewport')).toHaveTextContent('test_parse');
+    expect(screen.queryByRole('button', { name: 'Output' })).not.toBeInTheDocument();
+  });
+
   it('renders every activity category with its distinct surface', () => {
     render(<Chat {...props} messages={fixture} />);
 
@@ -78,7 +108,7 @@ describe('mixed conversation fixture', () => {
     expect(reasoning[0]).toHaveTextContent('constant');
 
     // Search card with validated citation links.
-    expect(screen.getByText('Searched the web')).toBeInTheDocument();
+    expect(screen.getByText('WebSearch')).toBeInTheDocument();
     const links = screen.getAllByRole('link', { name: 'Vitest docs' });
     expect(links[0]).toHaveAttribute('href', 'https://vitest.dev/guide/');
 
@@ -99,7 +129,8 @@ describe('mixed conversation fixture', () => {
     render(<Chat {...props} messages={fixture} />);
 
     // File read renders through the dedicated path card.
-    expect(document.querySelector('.file-result > summary')).toHaveTextContent('Read src/timer.ts');
+    expect(document.querySelector('.file-result > summary')).toHaveAccessibleName('Read file src/timer.ts (lines 1–3)');
+    expect(screen.getByText('Read 3 lines')).toBeInTheDocument();
     expect(screen.getAllByText('src/timer.ts').length).toBeGreaterThanOrEqual(1);
 
     // Diff counts appear on the work summary and the edit card header.

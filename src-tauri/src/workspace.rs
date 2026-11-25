@@ -21,7 +21,7 @@ pub(crate) mod patch;
 #[path = "workspace_search.rs"]
 mod search;
 
-pub const TOOL_COUNT: usize = 28;
+pub const TOOL_COUNT: usize = 30;
 
 pub struct Workspace {
     directory: Dir,
@@ -92,6 +92,218 @@ pub(crate) fn parent_no_links(directory: &Dir, path: &str) -> std::io::Result<(D
         parent = parent.open_dir_nofollow(part)?;
     }
     Ok((parent, parts[parts.len() - 1].to_string()))
+}
+
+/// Ensure every intermediate parent directory exists inside `directory` without
+/// ever following symlinks. Returns `(parent_dir, leaf_name, newly_created_dirs)`
+/// where `newly_created_dirs` lists relative paths created by this call so a
+/// caller can roll them back if creating the leaf file fails.
+pub(crate) fn ensure_parent_dirs_no_links(
+    directory: &Dir,
+    path: &str,
+) -> std::io::Result<(Dir, String, Vec<String>)> {
+    let mut parent = directory.try_clone()?;
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.is_empty()
+        || parts.iter().any(|part| {
+            part.is_empty() || matches!(*part, "." | "..") || part.contains(['\\', ':'])
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Use a relative path without links or traversal.",
+        ));
+    }
+    let mut created = Vec::new();
+    let mut prefix = String::new();
+    for part in &parts[..parts.len() - 1] {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        match parent.open_dir_nofollow(part) {
+            Ok(dir) => parent = dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut made = false;
+                match parent.create_dir(part) {
+                    Ok(()) => {
+                        made = true;
+                        let _ = patch::sync_dir(&parent);
+                    }
+                    Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(create_err) => {
+                        remove_created_dirs_no_links(directory, &created);
+                        return Err(create_err);
+                    }
+                }
+                match parent.open_dir_nofollow(part) {
+                    Ok(dir) => {
+                        if made {
+                            created.push(prefix.clone());
+                        }
+                        parent = dir;
+                    }
+                    Err(open_err) => {
+                        if made {
+                            created.push(prefix.clone());
+                        }
+                        remove_created_dirs_no_links(directory, &created);
+                        return Err(open_err);
+                    }
+                }
+            }
+            Err(error) => {
+                remove_created_dirs_no_links(directory, &created);
+                return Err(error);
+            }
+        }
+    }
+    Ok((parent, parts[parts.len() - 1].to_string(), created))
+}
+
+pub(crate) fn remove_created_dirs_no_links(directory: &Dir, created: &[String]) {
+    for path in created.iter().rev() {
+        if let Ok((parent, leaf)) = parent_no_links(directory, path) {
+            if parent.remove_dir(&leaf).is_ok() {
+                let _ = patch::sync_dir(&parent);
+            }
+        }
+    }
+}
+
+/// Session-scoped tracker of the latest SHA-256 hash observed for each
+/// workspace file via read/write/edit tool results. Auto-fills omitted
+/// `expected_sha256` on edits and overwrites of files already read or written
+/// in this session while strictly preserving read-before-edit and external
+/// conflict detection.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct FileReadTracker {
+    hashes: std::collections::HashMap<String, String>,
+}
+
+impl FileReadTracker {
+    const MAX_ENTRIES: usize = 4096;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn seed_from_messages(&mut self, messages: &[Value]) {
+        for message in messages {
+            if message["role"] != "tool" {
+                continue;
+            }
+            let Some(text) = message["content"].as_str() else {
+                continue;
+            };
+            if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                self.observe_result(&parsed);
+            }
+        }
+    }
+
+    fn record(&mut self, path: &str, sha256: &str) {
+        if path.is_empty()
+            || sha256.len() != 64
+            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return;
+        }
+        if self.hashes.len() >= Self::MAX_ENTRIES && !self.hashes.contains_key(path) {
+            return;
+        }
+        self.hashes.insert(path.to_string(), sha256.to_ascii_lowercase());
+    }
+
+    pub fn observe_result(&mut self, result: &Value) {
+        if crate::tool_envelope::failed(result) {
+            return;
+        }
+        let data = result.get("data").unwrap_or(result);
+        if let (Some(path), Some(sha)) = (data["path"].as_str(), data["sha256"].as_str()) {
+            self.record(path, sha);
+        }
+        if let Some(files) = data["files"].as_array() {
+            for file in files {
+                if let (Some(path), Some(sha)) = (file["path"].as_str(), file["sha256"].as_str()) {
+                    self.record(path, sha);
+                }
+            }
+        }
+        if let Some(changes) = data["changes"].as_array() {
+            for change in changes {
+                let Some(path) = change["path"].as_str() else {
+                    continue;
+                };
+                if change["kind"].as_str() == Some("delete") {
+                    self.hashes.remove(path);
+                } else if let Some(sha) = change["sha256"].as_str() {
+                    if let Some(rename_to) = change["renameTo"].as_str() {
+                        self.hashes.remove(path);
+                        self.record(rename_to, sha);
+                    } else {
+                        self.record(path, sha);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn get(&self, path: &str) -> Option<&str> {
+        self.hashes.get(path).map(String::as_str)
+    }
+
+    pub fn inject_expected_sha256(&self, alias: &str, args: &mut Value) {
+        let Some(object) = args.as_object_mut() else {
+            return;
+        };
+        let lookup_path = |map: &serde_json::Map<String, Value>| -> Option<String> {
+            for key in ["path", "file_path", "filepath"] {
+                if let Some(path) = map.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    return Some(path.to_string());
+                }
+            }
+            None
+        };
+        match alias {
+            "workspace_edit_file"
+            | "workspace_multi_edit"
+            | "workspace_edit_lines"
+            | "workspace_append_file"
+            | "workspace_write_file"
+            | "workspace_write_file_base64" => {
+                let missing = object
+                    .get("expected_sha256")
+                    .is_none_or(|value| value.is_null());
+                if missing {
+                    if let Some(sha) = lookup_path(object).and_then(|p| self.get(&p)) {
+                        object.insert("expected_sha256".into(), json!(sha));
+                    }
+                }
+            }
+            "workspace_apply_patch" => {
+                if let Some(changes) = object.get_mut("changes").and_then(Value::as_array_mut) {
+                    for change in changes {
+                        let Some(entry) = change.as_object_mut() else {
+                            continue;
+                        };
+                        if entry.get("kind").and_then(Value::as_str) != Some("edit") {
+                            continue;
+                        }
+                        let missing = entry
+                            .get("expected_sha256")
+                            .is_none_or(|value| value.is_null());
+                        if missing {
+                            if let Some(sha) = lookup_path(entry).and_then(|p| self.get(&p)) {
+                                entry.insert("expected_sha256".into(), json!(sha));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) fn open_file_no_links(
@@ -263,12 +475,171 @@ fn search_in(
 #[serde(deny_unknown_fields)]
 struct EditRequest {
     path: String,
-    expected_sha256: String,
+    #[serde(default)]
+    expected_sha256: Option<String>,
     old_text: String,
     new_text: String,
     /// Replace every occurrence instead of requiring a unique match.
     #[serde(default)]
     replace_all: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadFilesRequest {
+    files: Vec<ReadRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutlineRequest {
+    paths: Vec<String>,
+    #[serde(default = "default_outline_symbols")]
+    max_symbols_per_file: usize,
+}
+
+fn default_outline_symbols() -> usize {
+    120
+}
+
+fn extract_outline_symbols(path: &str, text: &str, max_symbols: usize) -> (Vec<String>, bool) {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut symbols = Vec::new();
+    let mut truncated = false;
+    for (idx, raw_line) in text.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+        let matched = match ext.as_str() {
+            "rs" => is_rust_symbol(trimmed),
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => is_ts_js_symbol(trimmed),
+            "py" => is_python_symbol(raw_line, trimmed),
+            "go" => trimmed.starts_with("func ") || trimmed.starts_with("type ") || trimmed.starts_with("const ") || trimmed.starts_with("var "),
+            "md" | "markdown" => trimmed.starts_with('#'),
+            "css" | "scss" | "less" => {
+                trimmed.ends_with('{')
+                    && (trimmed.starts_with('.')
+                        || trimmed.starts_with('#')
+                        || trimmed.starts_with('@')
+                        || trimmed.starts_with(":root")
+                        || trimmed
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic()))
+            }
+            "html" | "htm" | "svg" => {
+                let lower = trimmed.to_ascii_lowercase();
+                lower.starts_with("<section")
+                    || lower.starts_with("<header")
+                    || lower.starts_with("<main")
+                    || lower.starts_with("<nav")
+                    || lower.starts_with("<footer")
+                    || lower.starts_with("<canvas")
+                    || lower.starts_with("<script")
+                    || lower.starts_with("<style")
+                    || lower.contains(" id=\"")
+            }
+            "glsl" | "vert" | "frag" | "comp" | "wgsl" => {
+                trimmed.starts_with("struct ")
+                    || trimmed.starts_with("uniform ")
+                    || trimmed.starts_with("fn ")
+                    || trimmed.starts_with("@vertex")
+                    || trimmed.starts_with("@fragment")
+                    || trimmed.starts_with("@compute")
+                    || trimmed.starts_with("void ")
+                    || trimmed.starts_with("vec")
+                    || trimmed.starts_with("float ")
+            }
+            "toml" => trimmed.starts_with('[') && trimmed.ends_with(']'),
+            "json" => {
+                raw_line.starts_with("  \"") && !raw_line.starts_with("    ") && trimmed.contains("\":")
+            }
+            "yaml" | "yml" => {
+                !raw_line.starts_with(' ') && !trimmed.starts_with('#') && trimmed.contains(':')
+            }
+            _ => is_generic_symbol(trimmed),
+        };
+        if matched {
+            if symbols.len() >= max_symbols {
+                truncated = true;
+                break;
+            }
+            let snippet: String = trimmed.chars().take(120).collect();
+            symbols.push(format!("{}: {snippet}", idx + 1));
+        }
+    }
+    (symbols, truncated)
+}
+
+fn is_rust_symbol(trimmed: &str) -> bool {
+    let rest = if let Some(after) = trimmed.strip_prefix("pub(") {
+        after.split_once(')').map(|(_, tail)| tail.trim_start()).unwrap_or(trimmed)
+    } else {
+        trimmed.strip_prefix("pub ").unwrap_or(trimmed).trim_start()
+    };
+    let rest = rest
+        .strip_prefix("async ")
+        .or_else(|| rest.strip_prefix("unsafe "))
+        .or_else(|| rest.strip_prefix("const "))
+        .unwrap_or(rest)
+        .trim_start();
+    let rest = rest.strip_prefix("fn ").map(|_| "fn ").unwrap_or(rest);
+    rest.starts_with("fn ")
+        || rest.starts_with("struct ")
+        || rest.starts_with("enum ")
+        || rest.starts_with("trait ")
+        || rest.starts_with("impl ")
+        || rest.starts_with("impl<")
+        || rest.starts_with("mod ")
+        || rest.starts_with("type ")
+        || rest.starts_with("macro_rules!")
+        || (trimmed.starts_with("pub const ") || trimmed.starts_with("const "))
+}
+
+fn is_ts_js_symbol(trimmed: &str) -> bool {
+    let rest = trimmed
+        .strip_prefix("export default ")
+        .or_else(|| trimmed.strip_prefix("export "))
+        .unwrap_or(trimmed)
+        .trim_start();
+    let rest = rest
+        .strip_prefix("declare ")
+        .or_else(|| rest.strip_prefix("abstract "))
+        .or_else(|| rest.strip_prefix("async "))
+        .unwrap_or(rest)
+        .trim_start();
+    rest.starts_with("function ")
+        || rest.starts_with("class ")
+        || rest.starts_with("interface ")
+        || rest.starts_with("type ")
+        || rest.starts_with("enum ")
+        || rest.starts_with("namespace ")
+        || ((rest.starts_with("const ") || rest.starts_with("let "))
+            && (trimmed.contains("=>") || trimmed.contains("function(") || trimmed.contains(" = {") || trimmed.starts_with("export ")))
+}
+
+fn is_python_symbol(raw: &str, trimmed: &str) -> bool {
+    let indent = raw.len() - raw.trim_start().len();
+    indent <= 8
+        && (trimmed.starts_with("def ")
+            || trimmed.starts_with("async def ")
+            || trimmed.starts_with("class "))
+}
+
+fn is_generic_symbol(trimmed: &str) -> bool {
+    trimmed.starts_with("function ")
+        || trimmed.starts_with("class ")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("interface ")
+        || trimmed.starts_with("def ")
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("func ")
 }
 fn parse_hash(value: &str) -> Result<[u8; 32], String> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -677,8 +1048,22 @@ impl Workspace {
         if name != "recover_patch" {
             patch::ensure_clear(&self.directory)?;
         }
-        let instruction_paths = ["path", "source", "destination"].iter()
+        let mut instruction_paths = ["path", "source", "destination"].iter()
             .filter_map(|key| arguments[*key].as_str().map(str::to_owned)).collect::<Vec<_>>();
+        if let Some(files) = arguments["files"].as_array() {
+            for item in files {
+                if let Some(path) = item["path"].as_str() {
+                    instruction_paths.push(path.to_owned());
+                }
+            }
+        }
+        if let Some(paths) = arguments["paths"].as_array() {
+            for path in paths {
+                if let Some(path) = path.as_str() {
+                    instruction_paths.push(path.to_owned());
+                }
+            }
+        }
         let result = match name {
             "apply_patch" | "copy_file" | "move_file" | "delete_file" | "recover_patch"
             | "file_info" | "write_file" | "write_file_base64" | "append_file" | "multi_edit"
@@ -743,9 +1128,9 @@ impl Workspace {
                 let request: ReadRequest =
                     serde_json::from_value(arguments).map_err(|error| error.to_string())?;
                 valid_path(&request.path, false)?;
-                if request.start_line == 0 || request.line_count == 0 || request.line_count > 500 {
+                if request.start_line == 0 || request.line_count == 0 || request.line_count > 2000 {
                     return Err(
-                        "Use a positive start_line and line_count between 1 and 500.".into(),
+                        "Use a positive start_line and line_count between 1 and 2000.".into(),
                     );
                 }
                 let file = open_file_no_links(
@@ -782,6 +1167,188 @@ impl Workspace {
                     json!({"path":request.path,"sha256":sha256,"totalLines":text.lines().count(),"content":content}),
                 )
             }
+            "read_files" => {
+                let request: ReadFilesRequest =
+                    serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+                if request.files.is_empty() || request.files.len() > 16 {
+                    return Err("Provide between 1 and 16 files to read.".into());
+                }
+                let permissions = self.search_permissions("read_files")?;
+                let mut results = Vec::with_capacity(request.files.len());
+                let mut total_bytes = 0usize;
+                let mut truncated = false;
+                for item in request.files {
+                    if let Err(error) = valid_path(&item.path, false) {
+                        results.push(json!({"path": item.path, "error": error}));
+                        continue;
+                    }
+                    if permissions.as_ref().is_some_and(|policy| !policy.allows(&item.path)) {
+                        results.push(json!({"path": item.path, "error": "Access to this path is restricted by permission rules."}));
+                        continue;
+                    }
+                    if item.start_line == 0 || item.line_count == 0 || item.line_count > 2000 {
+                        results.push(json!({"path": item.path, "error": "Use a positive start_line and line_count between 1 and 2000."}));
+                        continue;
+                    }
+                    let file = match open_file_no_links(
+                        &self.directory,
+                        &item.path,
+                        OpenOptions::new().read(true),
+                    ) {
+                        Ok(file) => file,
+                        Err(error) => {
+                            results.push(json!({"path": item.path, "error": error.to_string()}));
+                            continue;
+                        }
+                    };
+                    let metadata = match file.metadata() {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            results.push(json!({"path": item.path, "error": error.to_string()}));
+                            continue;
+                        }
+                    };
+                    if !metadata.is_file() || metadata.len() > 1_048_576 {
+                        results.push(json!({"path": item.path, "error": "Read supports regular UTF-8 files up to 1 MiB."}));
+                        continue;
+                    }
+                    let mut bytes = Vec::new();
+                    if let Err(error) = file.take(1_048_577).read_to_end(&mut bytes) {
+                        results.push(json!({"path": item.path, "error": error.to_string()}));
+                        continue;
+                    }
+                    if bytes.len() > 1_048_576 {
+                        results.push(json!({"path": item.path, "error": "File grew beyond the read limit."}));
+                        continue;
+                    }
+                    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+                    let text = match String::from_utf8(bytes) {
+                        Ok(text) => text,
+                        Err(_) => {
+                            results.push(json!({"path": item.path, "error": "File is not UTF-8 text."}));
+                            continue;
+                        }
+                    };
+                    let total_lines = text.lines().count();
+                    let selected: Vec<String> = text
+                        .lines()
+                        .enumerate()
+                        .skip(item.start_line - 1)
+                        .take(item.line_count)
+                        .map(|(index, line)| format!("{}: {line}", index + 1))
+                        .collect();
+                    let end_line = if selected.is_empty() {
+                        item.start_line.saturating_sub(1)
+                    } else {
+                        item.start_line + selected.len() - 1
+                    };
+                    let content = selected.join("\n");
+                    if total_bytes.saturating_add(content.len()) > 131_072 {
+                        truncated = true;
+                        results.push(json!({
+                            "path": item.path,
+                            "sha256": sha256,
+                            "totalLines": total_lines,
+                            "error": "Batch read output exceeded 128 KiB; read this file with a smaller line_count or separate call."
+                        }));
+                        continue;
+                    }
+                    total_bytes += content.len();
+                    results.push(json!({
+                        "path": item.path,
+                        "sha256": sha256,
+                        "totalLines": total_lines,
+                        "startLine": item.start_line,
+                        "endLine": end_line,
+                        "content": content,
+                    }));
+                }
+                Ok(json!({"files": results, "truncated": truncated}))
+            }
+            "outline" => {
+                let request: OutlineRequest =
+                    serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+                if request.paths.is_empty() || request.paths.len() > 16 {
+                    return Err("Provide between 1 and 16 file paths to outline.".into());
+                }
+                if request.max_symbols_per_file == 0 || request.max_symbols_per_file > 500 {
+                    return Err("max_symbols_per_file must be between 1 and 500.".into());
+                }
+                let permissions = self.search_permissions("outline")?;
+                let mut files = Vec::with_capacity(request.paths.len());
+                let mut total_bytes = 0usize;
+                for path in request.paths {
+                    if let Err(error) = valid_path(&path, false) {
+                        files.push(json!({"path": path, "error": error}));
+                        continue;
+                    }
+                    if permissions.as_ref().is_some_and(|policy| !policy.allows(&path)) {
+                        files.push(json!({"path": path, "error": "Access to this path is restricted by permission rules."}));
+                        continue;
+                    }
+                    let file = match open_file_no_links(
+                        &self.directory,
+                        &path,
+                        OpenOptions::new().read(true),
+                    ) {
+                        Ok(file) => file,
+                        Err(error) => {
+                            files.push(json!({"path": path, "error": error.to_string()}));
+                            continue;
+                        }
+                    };
+                    let metadata = match file.metadata() {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            files.push(json!({"path": path, "error": error.to_string()}));
+                            continue;
+                        }
+                    };
+                    if !metadata.is_file() || metadata.len() > 1_048_576 {
+                        files.push(json!({"path": path, "error": "Outline supports regular UTF-8 files up to 1 MiB."}));
+                        continue;
+                    }
+                    let mut bytes = Vec::new();
+                    if let Err(error) = file.take(1_048_577).read_to_end(&mut bytes) {
+                        files.push(json!({"path": path, "error": error.to_string()}));
+                        continue;
+                    }
+                    if bytes.len() > 1_048_576 {
+                        files.push(json!({"path": path, "error": "File grew beyond the outline limit."}));
+                        continue;
+                    }
+                    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+                    let text = match String::from_utf8(bytes) {
+                        Ok(text) => text,
+                        Err(_) => {
+                            files.push(json!({"path": path, "error": "File is not UTF-8 text."}));
+                            continue;
+                        }
+                    };
+                    let total_lines = text.lines().count();
+                    let (symbols, sym_truncated) =
+                        extract_outline_symbols(&path, &text, request.max_symbols_per_file);
+                    let entry_bytes: usize = symbols.iter().map(String::len).sum();
+                    if total_bytes.saturating_add(entry_bytes) > 65_536 {
+                        files.push(json!({
+                            "path": path,
+                            "sha256": sha256,
+                            "totalLines": total_lines,
+                            "error": "Batch outline exceeded 64 KiB; outline fewer files at once."
+                        }));
+                        continue;
+                    }
+                    total_bytes += entry_bytes;
+                    files.push(json!({
+                        "path": path,
+                        "sha256": sha256,
+                        "totalLines": total_lines,
+                        "symbols": symbols,
+                        "truncated": sym_truncated,
+                    }));
+                }
+                Ok(json!({"files": files}))
+            }
             "create_file" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -792,17 +1359,34 @@ impl Workspace {
                 let request: WriteRequest =
                     serde_json::from_value(arguments).map_err(|error| error.to_string())?;
                 valid_path(&request.path, false)?;
-                if request.content.len() > 65_536 {
-                    return Err("New file content exceeds 64 KiB.".into());
+                if request.content.len() > 1_048_576 {
+                    return Err("New file content exceeds 1 MiB.".into());
                 }
-                let mut file = open_file_no_links(
-                    &self.directory,
-                    &request.path,
-                    OpenOptions::new().write(true).create_new(true),
-                )
-                .map_err(|error| {
-                    format!("Could not create file (existing files are preserved): {error}")
-                })?;
+                let (parent, name, created_dirs) =
+                    ensure_parent_dirs_no_links(&self.directory, &request.path).map_err(|error| {
+                        format!("Could not prepare parent directory: {error}")
+                    })?;
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true).follow(FollowSymlinks::No);
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::OpenOptionsExt;
+                    options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+                }
+                let mut file = match parent.open_with(&name, &options) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        remove_created_dirs_no_links(&self.directory, &created_dirs);
+                        return Err(format!(
+                            "Could not create file (existing files are preserved): {error}"
+                        ));
+                    }
+                };
+                if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+                    drop(file);
+                    remove_created_dirs_no_links(&self.directory, &created_dirs);
+                    return Err("Only regular workspace files are supported.".into());
+                }
                 file.write_all(request.content.as_bytes())
                     .and_then(|_| file.sync_all())
                     .map_err(|error| {
@@ -821,9 +1405,13 @@ impl Workspace {
                 let request: PathRequest =
                     serde_json::from_value(arguments).map_err(|error| error.to_string())?;
                 valid_path(&request.path, false)?;
-                let (parent, name) = parent_no_links(&self.directory, &request.path)
-                    .map_err(|error| error.to_string())?;
-                parent.create_dir(name).map_err(|error| error.to_string())?;
+                let (parent, name, created_dirs) =
+                    ensure_parent_dirs_no_links(&self.directory, &request.path)
+                        .map_err(|error| error.to_string())?;
+                if let Err(error) = parent.create_dir(&name) {
+                    remove_created_dirs_no_links(&self.directory, &created_dirs);
+                    return Err(error.to_string());
+                }
                 Ok(json!({"path":request.path,"created":true}))
             }
             "edit_file" => {
@@ -836,7 +1424,13 @@ impl Workspace {
                 if request.new_text.len() > 65_536 {
                     return Err("Replacement text exceeds 64 KiB.".into());
                 }
-                let expected = parse_hash(&request.expected_sha256)?;
+                let expected_hash = request.expected_sha256.as_deref().ok_or_else(|| {
+                    format!(
+                        "Read '{}' first (or supply expected_sha256 from a fresh read) before editing.",
+                        request.path
+                    )
+                })?;
+                let expected = parse_hash(expected_hash)?;
                 let file = open_file_no_links(
                     &self.directory,
                     &request.path,
@@ -1078,10 +1672,12 @@ impl Workspace {
     pub fn tools(self: Arc<Self>) -> Vec<crate::connectors::AgentTool> {
         let mut definitions=vec![
             ("list_files","List up to 500 entries in a workspace directory. Use path . for the root.",json!({"path":{"type":"string"}}),vec!["path"]),
-            ("read_file","Read UTF-8 workspace text with line numbers and SHA-256. Use a workspace-relative path and select the lines needed. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":500}}),vec!["path"]),
-            ("create_file","Create a new UTF-8 file inside the workspace. Existing files are never overwritten. Parent directory must exist.",json!({"path":{"type":"string"},"content":{"type":"string"}}),vec!["path","content"]),
-            ("create_directory","Create one directory inside the workspace. Parent directory must exist.",json!({"path":{"type":"string"}}),vec!["path"]),
-            ("edit_file","Replace one unique text match in an existing UTF-8 file. Requires the SHA-256 from a fresh read_file; fails when the file changed or the match is missing, and fails on an ambiguous match unless replace_all is set. Smart quotes, dash variants, exotic spaces, trailing whitespace and CRLF are tolerated when matching, and the line endings of the replaced region are preserved. Returns a unified diff of the change for review. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"expected_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"SHA-256 from a fresh read of this file."},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean","description":"Replace every occurrence of old_text instead of requiring a unique match. Default false."}}),vec!["path","expected_sha256","old_text","new_text"]),
+            ("read_file","Read UTF-8 workspace text with line numbers and SHA-256. Use a workspace-relative path and select up to 2000 lines (128 KiB slice, 1 MiB file max).",json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":2000}}),vec!["path"]),
+            ("read_files","Batch-read 1–16 UTF-8 workspace files or line ranges in one round (128 KiB aggregate output cap). Returns path, sha256, totalLines and line-numbered content per file.",json!({"files":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"path":{"type":"string","minLength":1,"maxLength":4096},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":2000}},"required":["path"],"additionalProperties":false}}}),vec!["files"]),
+            ("outline","Return compact line-numbered structural symbols (functions, types, classes, components, shaders, CSS rules, headings) plus SHA-256 and totalLines for 1–16 files so you can jump directly to relevant ranges without reading whole files.",json!({"paths":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1,"maxLength":4096}},"max_symbols_per_file":{"type":"integer","minimum":1,"maximum":500}}),vec!["paths"]),
+            ("create_file","Create a new UTF-8 file inside the workspace (up to 1 MiB). Missing parent directories inside the workspace are created automatically. Existing files are never overwritten.",json!({"path":{"type":"string"},"content":{"type":"string"}}),vec!["path","content"]),
+            ("create_directory","Create a directory inside the workspace. Missing parent directories inside the workspace are created automatically.",json!({"path":{"type":"string"}}),vec!["path"]),
+            ("edit_file","Replace one unique text match in an existing UTF-8 file. Fails when the file changed or the match is missing, and fails on an ambiguous match unless replace_all is set. Smart quotes, dash variants, exotic spaces, trailing whitespace, base indentation shifts and CRLF are tolerated when matching, and the line endings of the replaced region are preserved. Returns a unified diff. Maximum file size 1 MiB.",json!({"path":{"type":"string"},"expected_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"SHA-256 from a fresh read of this file. Optional when this file was already read or written in this session."},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean","description":"Replace every occurrence of old_text instead of requiring a unique match. Default false."}}),vec!["path","old_text","new_text"]),
         ];
         definitions.extend(search::definitions());
         definitions.extend(patch::definitions());
@@ -1600,5 +2196,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(second["replacements"], 1);
+    }
+
+    #[test]
+    fn auto_creates_nested_parents_without_following_symlinks_and_supports_1mib_create() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(temp.path().to_str().unwrap()).unwrap();
+        // create_file creates nested parents automatically and accepts > 64 KiB up to 1 MiB.
+        let large = "a".repeat(100_000);
+        let created = workspace
+            .call("create_file", json!({"path":"src/scene/rig/Camera.tsx","content":large}))
+            .unwrap();
+        assert_eq!(created["bytesWritten"], 100_000);
+        assert!(temp.path().join("src/scene/rig/Camera.tsx").is_file());
+        // create_directory creates nested parents automatically.
+        workspace
+            .call("create_directory", json!({"path":"assets/models/exported/gltf"}))
+            .unwrap();
+        assert!(temp.path().join("assets/models/exported/gltf").is_dir());
+        // write_file and apply_patch create nested parents automatically.
+        let written = workspace
+            .call("write_file", json!({"path":"web/components/Hero.tsx","content":"export const Hero = () => null;\n"}))
+            .unwrap();
+        assert_eq!(written["status"], "committed");
+        let patched = workspace
+            .call("apply_patch", json!({"changes":[{"kind":"create","path":"shaders/pbr/tonemap.glsl","content":"void main() {}\n"}]}))
+            .unwrap();
+        assert_eq!(patched["status"], "committed");
+        // Failed create (collision) cleans up nothing pre-existing, and symlink parent is refused.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
+            symlink(outside.path(), temp.path().join("escape")).unwrap();
+            assert!(workspace
+                .call("create_file", json!({"path":"escape/nested/pwn.txt","content":"no"}))
+                .is_err());
+            assert!(workspace
+                .call("write_file", json!({"path":"escape/nested/pwn2.txt","content":"no"}))
+                .is_err());
+            assert!(!outside.path().join("nested").exists());
+        }
+    }
+
+    #[test]
+    fn batch_read_files_outline_and_file_read_tracker_work_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Arc::new(Workspace::open(temp.path().to_str().unwrap()).unwrap());
+        workspace
+            .call(
+                "create_file",
+                json!({
+                    "path": "src/lib.rs",
+                    "content": "pub struct Mesh {\n    pub count: usize,\n}\n\npub fn build_mesh() -> Mesh {\n    Mesh { count: 3 }\n}\n"
+                }),
+            )
+            .unwrap();
+        workspace
+            .call(
+                "create_file",
+                json!({
+                    "path": "src/App.tsx",
+                    "content": "export interface Props { title: string }\nexport function App({ title }: Props) {\n  return <h1>{title}</h1>;\n}\n"
+                }),
+            )
+            .unwrap();
+        // Batch read_files returns both files and handles missing files per-entry.
+        let batch = workspace
+            .call(
+                "read_files",
+                json!({"files":[
+                    {"path":"src/lib.rs"},
+                    {"path":"src/App.tsx","start_line":1,"line_count":2},
+                    {"path":"src/missing.rs"}
+                ]}),
+            )
+            .unwrap();
+        let files = batch["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files[0]["sha256"].as_str().unwrap().len() == 64);
+        assert!(files[0]["content"].as_str().unwrap().contains("pub fn build_mesh"));
+        assert_eq!(files[1]["endLine"], 2);
+        assert!(files[2]["error"].is_string());
+
+        // Outline returns compact symbols + sha256.
+        let outlined = workspace
+            .call("outline", json!({"paths":["src/lib.rs","src/App.tsx"]}))
+            .unwrap();
+        let rust_syms = outlined["files"][0]["symbols"].as_array().unwrap();
+        assert!(rust_syms.iter().any(|s| s.as_str().unwrap().contains("pub struct Mesh")));
+        assert!(rust_syms.iter().any(|s| s.as_str().unwrap().contains("pub fn build_mesh")));
+        let ts_syms = outlined["files"][1]["symbols"].as_array().unwrap();
+        assert!(ts_syms.iter().any(|s| s.as_str().unwrap().contains("export function App")));
+
+        // FileReadTracker auto-fills omitted expected_sha256 after read, while unread files still fail.
+        let mut tracker = FileReadTracker::new();
+        assert!(workspace
+            .call("edit_file", json!({"path":"src/lib.rs","old_text":"count: 3","new_text":"count: 6"}))
+            .is_err());
+        tracker.observe_result(&crate::tool_envelope::success(batch));
+        let mut args = json!({"file_path":"src/lib.rs","old_string":"count: 3","new_string":"count: 6"});
+        tracker.inject_expected_sha256("workspace_edit_file", &mut args);
+        let tools = workspace.clone().tools();
+        let edit_tool = tools.iter().find(|t| t.alias == "workspace_edit_file").unwrap();
+        let prepared = edit_tool.prepare_arguments(args).unwrap();
+        assert_eq!(prepared["path"], "src/lib.rs");
+        assert_eq!(prepared["old_text"], "count: 3");
+        let edited = workspace.call("edit_file", prepared).unwrap();
+        assert_eq!(edited["replacements"], 1);
+        assert!(std::fs::read_to_string(temp.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("count: 6"));
     }
 }

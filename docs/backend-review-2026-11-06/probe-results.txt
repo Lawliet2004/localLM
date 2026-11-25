@@ -1,0 +1,36 @@
+   Compiling locallm v0.1.0 (/tmp/locallm-full-review-nwl0wydj/src-tauri)
+    Finished `test` profile [unoptimized] target(s) in 39.41s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/tauri_app_lib-1f9b5e0a6b72a6ac)
+
+running 14 tests
+AUDIT formatter failure envelope status="success", error=null
+AUDIT keep=10, history_turns=1, dropped=[String("PRESERVE this requirement"), String("Earlier answer")]
+test formatter::audit_review_formatter_probes::audit_review_failed_format_result_normalizes_as_success ... ok
+test compaction::audit_review_compaction_probes::audit_review_retention_drops_history_even_when_keep_exceeds_its_size ... ok
+AUDIT process page: retained_decoded_bytes=12288, returned_frames=0, next_cursor=0, has_more=true
+test process_tools::audit_review_process_probes::audit_review_small_output_page_cannot_advance_over_a_decoded_frame ... ok
+AUDIT snapshot restore: outside file overwritten=true, failed_paths=0
+AUDIT fork artifact still owned by original=true, readable_under_fork=false
+test snapshots::audit_review_snapshot_probe::audit_review_snapshot_restore_follows_a_replaced_parent_outside_the_workspace ... ok
+test store::audit_review_probes::audit_review_fork_retains_artifact_id_owned_by_original_conversation ... ok
+AUDIT hook in global project=true, hook in task project=false
+test hooks::audit_review_hook_probes::audit_review_hook_uses_global_workspace_instead_of_conversations_project ... ok
+AUDIT original archive exists=false, replacement archive exists=true, original dropped text preserved in replacement=false
+AUDIT fork at event 4: copied_events=4, copied_messages=["original request", "first answer", "FUTURE request", "FUTURE answer"]
+test compaction::audit_review_compaction_probes::audit_review_send_compaction_sequence_never_saves_original_archive ... ok
+test store::audit_review_probes::audit_review_fork_includes_messages_after_the_selected_event ... ok
+AUDIT existing_events=5005, replay_events=5000, fork_events=5000
+test store::audit_review_probes::audit_review_replay_and_fork_silently_stop_at_5000_events ... ok
+AUDIT shell_run true elapsed_ms=1005, status="exited"
+test process_tools::audit_review_shell_latency_probe::audit_review_shell_run_sleeps_a_second_even_for_true ... ok
+AUDIT shell_run retained_bytes=150000, returned_bytes=65536, truncated=false, state="exited"
+test process_tools::audit_review_shell_output_probe::audit_review_shell_run_returns_only_one_final_page_without_marking_truncation ... ok
+AUDIT formatter deadline=100ms, elapsed_ms=2009
+test formatter::audit_review_formatter_probes::audit_review_formatter_pipe_join_exceeds_its_deadline ... ok
+AUDIT hook stdin deadline=1000ms, elapsed_ms=2011, result=Ok((0, "", ""))
+test hooks::audit_review_hook_stdin_probe::audit_review_hook_stdin_blocks_before_its_deadline_starts ... ok
+AUDIT hook timed out at 1s, later side effect=true
+test hooks::audit_review_hook_probes::audit_review_timed_out_hook_keeps_running_and_changes_files ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 1071 filtered out; finished in 2.51s
+

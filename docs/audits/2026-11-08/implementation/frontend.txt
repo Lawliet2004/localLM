@@ -1,0 +1,14 @@
+
+ RUN  v5.0.0 /home/papan/Desktop/Projects/localLM
+
+Not implemented: HTMLCanvasElement's getContext() method: without installing the canvas npm package
+
+ Test Files  121 passed | 1 skipped (122)
+      Tests  907 passed | 1 skipped (908)
+   Start at  11:39:06
+   Duration  71.90s (environment 45%, tests 38%, setup 7%, import 7%, transform 2%)
+
+Environment  jsdom was created 122 times · 113.87s total, 45% of tracked time
+             create it once per worker with pool: 'vmThreads' (keeps per-file isolation) or isolate: false (shares it across files)
+             learn more: https://vitest.dev/guide/improving-performance#test-environments
+

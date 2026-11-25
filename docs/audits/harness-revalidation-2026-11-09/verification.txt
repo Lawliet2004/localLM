@@ -1,0 +1,196 @@
+Final test binary
+9024c408c1c5dcf66867b73bd4f1984948456c6bb932c7e24e094fc3a5e9f4bf  /home/papan/Desktop/Projects/localLM/.local/qa/harness-acceptance-2026-11-08/revalidation-2026-11-09.LcNYIf/final-lib
+
+Rust default
+test result: ok. 1107 passed; 0 failed; 37 ignored; 0 measured; 0 filtered out; finished in 63.86s
+
+Rust check
+warning: `glib` (lib) generated 34 warnings (run `cargo fix --lib -p glib` to apply 34 suggestions)
+    Checking locallm v0.1.0 (/home/papan/Desktop/Projects/localLM/src-tauri)
+    Finished `dev` profile [unoptimized] target(s) in 28.73s
+
+Frontend default
+ Test Files  121 passed | 1 skipped (122)
+      Tests  909 passed | 1 skipped (910)
+
+Typecheck
+
+> locallm@0.1.0 typecheck
+> tsc --noEmit
+
+
+Production build
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+✓ built in 1.05s
+
+Explicitly run ignored fixtures
+
+ignored-loopback
+
+running 21 tests
+test api_tools::transport_tests::actual_http_response_validation_redaction_and_evidence ... ok
+test chat::output_recovery_tests::approval_items_match_live_and_replay_for_allow_deny_and_stop ... ok
+test chat::output_recovery_tests::buffered_reasoning_flushes_while_the_provider_is_silent ... ok
+test api_tools::transport_tests::actual_http_redirect_forms_references_and_uncertain_writes ... ok
+test chat::output_recovery_tests::dropped_registered_turn_is_reconciled_after_its_lock_is_released ... ok
+test chat::output_recovery_tests::disconnected_view_can_recover_and_resolve_a_real_pending_approval ... ok
+test chat::output_recovery_tests::explicit_ask_rule_prevents_grouped_read_before_user_decision ... ok
+test chat::output_recovery_tests::glm_reasoning_items_match_live_delivery_and_journal_replay ... ok
+test chat::output_recovery_tests::failed_model_round_resumes_from_durable_tools_without_redispatch ... ok
+test chat::output_recovery_tests::grouped_reads_run_pre_hooks_once_and_preserve_both_results ... ok
+test chat::output_recovery_tests::model_multi_path_edits_respect_rule_on_later_target ... ok
+test chat::output_recovery_tests::partial_tool_request_is_visible_before_completion_and_stop_never_dispatches_it ... ok
+test chat::output_recovery_tests::permission_change_during_group_hooks_blocks_dispatch_and_preserves_audit ... ok
+test chat::output_recovery_tests::real_turn_recovers_empty_or_truncated_tool_output_and_actually_saves_the_file ... ok
+test chat::output_recovery_tests::registered_turns_queue_and_cancel_independently_against_scripted_provider ... ok
+test chat::output_recovery_tests::repeated_output_exhaustion_is_bounded_and_reported_as_failure ... ok
+test chat::output_recovery_tests::permission_change_after_group_dispatch_preserves_both_real_results ... ok
+test chat::output_recovery_tests::sequential_read_authorization_rechecks_before_dispatch_and_reports_truthfully ... ok
+test profile_tools::tests::real_node_inspector_capture ... ok
+test subagents::tests::child_permission_rules_block_or_allow_actual_workspace_reads ... ok
+test subagents::tests::foreground_child_approval_does_not_override_a_new_deny_rule ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 1123 filtered out; finished in 5.82s
+
+
+lsp
+
+running 2 tests
+test lsp_tools::acceptance::real_rust_analyzer ... ok
+test lsp_tools::acceptance::real_typescript_language_server ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1142 filtered out; finished in 5.59s
+
+
+semantic-impact
+
+running 2 tests
+test semantic_impact::acceptance::real_rust_impact ... ok
+test semantic_impact::acceptance::real_typescript_impact ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1142 filtered out; finished in 9.33s
+
+
+debugger
+
+running 2 tests
+test debug_tools::acceptance::real_codelldb ... ok
+test debug_tools::acceptance::real_debugpy ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1142 filtered out; finished in 1.18s
+
+
+live-model-catalog
+
+running 1 test
+Live Hugging Face: 30 search results, 28 GGUF files, 5232 bytes downloaded and verified
+test model_library::tests::live_hub_search_catalog_and_verified_download ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1143 filtered out; finished in 3.56s
+
+
+runtime-flags
+
+running 1 test
+test runtime::tests::recognizes_current_runtime_flags ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1143 filtered out; finished in 0.39s
+
+
+GLib source integrity
+GLib backport verified: 121 upstream file hashes; one patched source file; version unchanged.
+
+GLib optimized behavior
+     Running tests/variant_iter_backport.rs (.local/qa/harness-acceptance-2026-11-08/continuation-2026-11-09/glib-release-target/release/deps/variant_iter_backport-c8c2269fc7251bc0)
+
+running 1 test
+test optimized_string_iteration_preserves_front_back_and_skips ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+Node tools
+# tests 29
+# suites 0
+# pass 29
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 8374.8979
+
+Benchmark runner tests and grader
+..........
+----------------------------------------------------------------------
+Ran 10 tests in 0.274s
+
+OK
+10 grader cases passed
+
+Perf permission probe
+4
+255
+Missing support for build id in kernel mmap events.
+Disable this warning with --no-buildid-mmap
+Error:
+Failure to open event 'cpu/cycles/Pu' on PMU 'cpu' which will be removed.
+Access to performance monitoring and observability operations is limited.
+Consider adjusting /proc/sys/kernel/perf_event_paranoid setting to open
+access to performance monitoring and observability operations for processes
+without CAP_PERFMON, CAP_SYS_PTRACE or CAP_SYS_ADMIN Linux capability.
+More information can be found at 'Perf events and tool security' document:
+https://www.kernel.org/doc/html/latest/admin-guide/perf-security.html
+perf_event_paranoid setting is 4:
+  -1: Allow use of (almost) all events by all users
+      Ignore mlock limit after perf_event_mlock_kb without CAP_IPC_LOCK
+>= 0: Disallow raw and ftrace function tracepoint access
+>= 1: Disallow CPU event access
+>= 2: Disallow kernel profiling
+To make the adjusted perf_event_paranoid setting permanent preserve it
+in /etc/sysctl.conf (e.g. kernel.perf_event_paranoid = <setting>)
+Error:
+Failure to open any events for recording.
+
+Comparison recorder self-test after partial trace repair
+10 grader cases passed
+Timed-out tool trace case passed
+
+Opt-in live MiniCPM fixture
+    Finished `test` profile [unoptimized] target(s) in 0.89s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/tauri_app_lib-1e9317da94d8c2cb)
+ ✓ src/web/extraction/minicpm-live-fixtures.test.ts (1 test) 78597ms
+   ✓ runs the remaining fixture families twice on MiniCPM 69631ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Start at  11:12:20
+   Duration  79.84s (tests 99%, environment 1%)
+
+No llama-server active after fixture
+Owned scratch directory removed
+
+Comparison launch preflight
+The first launcher readiness probe used an unsupported Python context manager. It reaped the server and ran zero trials. The corrected launcher completed the 24 recorded trials.
+
+Ignored fixture scratch
+Removed empty directories left by the development fixtures after all processes exited.
+
+AST code graph refresh
+Graph has 13950 nodes (above 5000 limit). Building aggregated community view...
+graph.html written (aggregated: 469 community nodes, 2165 cross-community edges)
+Tip: run with --obsidian for full node-level detail.
+[graphify watch] Rebuilt: 13950 nodes, 32686 edges, 469 communities
+[graphify watch] graph.json, graph.html and GRAPH_REPORT.md updated in graphify-out
+Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.
+Tip: set GEMINI_API_KEY or GOOGLE_API_KEY to use Gemini for semantic extraction.
+
+GPU after model cleanup
+NVIDIA GeForce RTX 2050, 2 MiB
+
+Final source and fixture reconciliation
+git diff --check passed. HEAD and empty index matched the starting state.
+No owned model, elapsed fixture, or development process remained. The Docker query found no acceptance container.
+All four elapsed scratch directories were removed.

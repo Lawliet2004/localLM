@@ -1,0 +1,42 @@
+{
+  "provider": "River",
+  "baseUrl": "https://api.river.ai/v1",
+  "modelId": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "credentialPresent": true,
+  "providerVerified": true,
+  "nativeBuild": "embedded debug",
+  "binarySha256": "ff904ec649b2213591f94a310af95139dc7dcf126e56a8dd3408a9e42fa7b860",
+  "conversationId": "c9d19dc4-930f-45c9-8399-7be1ac03989e",
+  "scenario": "Real River inference, demo file read/edit/create, local node tests and check_report",
+  "viewportSizes": [
+    [
+      1280,
+      840
+    ],
+    [
+      760,
+      900
+    ]
+  ],
+  "sourceState": "Existing dirty working tree; no application source edits in this review",
+  "externalReferenceScope": "Official documentation consulted; no live Codex/OpenCode app comparison",
+  "turnOutcome": {
+    "answerLength": 1185,
+    "error": null,
+    "reasoningLength": 0,
+    "status": "complete"
+  },
+  "checks": {
+    "verdict": "passed",
+    "counts": {
+      "failed": 0,
+      "passed": 4,
+      "skipped": 0,
+      "todo": 0,
+      "total": 4
+    },
+    "format": "tap",
+    "commandSucceeded": true,
+    "incomplete": false
+  }
+}

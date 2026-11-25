@@ -10,6 +10,8 @@ vi.mock('../lib/api', () => ({
   errorMessage: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
 
+const openInspector = () => fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
+
 it('renders web search as a compact searched-the-web card with sources', () => {
   render(
     <CommandRunCard
@@ -25,7 +27,7 @@ it('renders web search as a compact searched-the-web card with sources', () => {
       })}
     />
   );
-  expect(screen.getByText('Searched the web')).toBeInTheDocument();
+  expect(screen.getByText('WebSearch')).toBeInTheDocument();
   expect(screen.getByText('fusion yield 2024')).toBeInTheDocument();
   expect(screen.getByText('2 results')).toBeInTheDocument();
   fireEvent.click(screen.getByText('fusion yield 2024'));
@@ -33,7 +35,7 @@ it('renders web search as a compact searched-the-web card with sources', () => {
   expect(document.querySelector('.web-answer-excerpt')).toHaveTextContent('scientific yield above one');
 });
 
-it('renders running state with pulse indicator and running badge', () => {
+it('shows one running title with the command and real output', () => {
   render(
     <CommandRunCard
       toolName="execute_command"
@@ -42,24 +44,44 @@ it('renders running state with pulse indicator and running badge', () => {
       stdout="Compiling test..."
     />
   );
-  expect(screen.getByTestId('status-running')).toBeInTheDocument();
-  expect(screen.getByText('Running…')).toBeInTheDocument();
+  expect(screen.getByTestId('status-running')).toHaveTextContent('Bash(cargo test)');
+  expect(screen.getByTestId('status-running')).toHaveClass('activity-sweep');
   expect(screen.getByText('cargo test')).toBeInTheDocument();
   expect(screen.getByText('Compiling test...')).toBeInTheDocument();
+});
+
+it('shows live logs inline until the full inspector is opened and removes the sweep on completion', () => {
+  const props = { toolName: 'shell_run', command: 'npm test', arguments: { command: 'npm test' } };
+  const view = render(<CommandRunCard {...props} status="running" />);
+  const row = screen.getByTestId('command-run-card');
+  expect(row).not.toHaveAttribute('open');
+  expect(screen.queryByTestId('terminal-viewport')).not.toBeInTheDocument();
+
+  view.rerender(<CommandRunCard {...props} status="running" stdout="Running unit tests" />);
+  expect(row).not.toHaveAttribute('open');
+  expect(screen.getByLabelText('Recent command output')).toHaveTextContent('Running unit tests');
+  openInspector();
+  expect(row).toHaveAttribute('open');
+  expect(screen.getByTestId('terminal-viewport')).toHaveTextContent('Running unit tests');
+
+  view.rerender(<CommandRunCard {...props} status="completed" stdout="Tests finished" exitCode={0} />);
+  expect(screen.queryByTestId('status-running')).not.toBeInTheDocument();
+  expect(row).toHaveAttribute('open');
+  expect(screen.getByTestId('terminal-viewport')).toHaveTextContent('Tests finished');
 });
 
 it('uses honest verbs for pending, running, denied, and completed file edits', () => {
   const view = render(<CommandRunCard toolName="workspace_edit_file" status="awaiting_approval" arguments={{ path: 'app.ts' }} />);
   expect(screen.getByTestId('status-awaiting')).toBeInTheDocument();
-  expect(screen.getByText('Edit')).toBeInTheDocument();
-  expect(screen.queryByText('Edited')).not.toBeInTheDocument();
+  expect(screen.getByLabelText('Edit app.ts')).toBeInTheDocument();
+  expect(screen.queryByLabelText('Edited app.ts')).not.toBeInTheDocument();
   view.rerender(<CommandRunCard toolName="workspace_edit_file" status="running" arguments={{ path: 'app.ts' }} />);
-  expect(screen.getByText('Editing')).toBeInTheDocument();
+  expect(screen.getByLabelText('Editing app.ts')).toBeInTheDocument();
   view.rerender(<CommandRunCard toolName="workspace_edit_file" status="failed" decision="denied" arguments={{ path: 'app.ts' }} />);
-  expect(screen.getByText('Edit')).toBeInTheDocument();
+  expect(screen.getByLabelText('Edit app.ts')).toBeInTheDocument();
   expect(screen.getByTestId('status-denied')).toBeInTheDocument();
   view.rerender(<CommandRunCard toolName="workspace_edit_file" status="completed" arguments={{ path: 'app.ts' }} />);
-  expect(screen.getByText('Edited')).toBeInTheDocument();
+  expect(screen.getByLabelText('Edited app.ts')).toBeInTheDocument();
 });
 
 it('renders exit 0 badge on successful command execution', () => {
@@ -103,6 +125,7 @@ it('parses ANSI colors and formats styled spans in terminal viewport', () => {
       stdout={ansiText}
     />
   );
+  openInspector();
   const passSpan = screen.getByText('PASS');
   expect(passSpan).toBeInTheDocument();
   expect(passSpan).toHaveStyle({ color: 'var(--terminal-green, #10b981)' });
@@ -122,6 +145,7 @@ it('renders unified diff view with add and delete lines highlighted', async () =
       diff={diff}
     />
   );
+  openInspector();
   expect(screen.getByTestId('diff-viewport')).toBeInTheDocument();
   expect(screen.getByTestId('diff-viewport').querySelector('.diff-line.del .diff-content')).toHaveTextContent('-old line');
   expect(screen.getByTestId('diff-viewport').querySelector('.diff-line.add .diff-content')).toHaveTextContent('+new line');
@@ -163,6 +187,7 @@ it('copies combined output to clipboard', async () => {
       stdout="hello world"
     />
   );
+  openInspector();
   const copyBtn = screen.getByTitle('Copy terminal output');
   fireEvent.click(copyBtn);
   expect(writeTextMock).toHaveBeenCalledWith('hello world');
@@ -240,6 +265,7 @@ it('renders structured result separately from logs with outcome status', () => {
     />
   );
   fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
+  fireEvent.click(screen.getByText('Execution details'));
   expect(screen.getByTestId('result-status')).toHaveTextContent('Result: ok');
   expect(screen.getByTestId('result-status')).toHaveTextContent('Result: ok · success');
   const resultViewport = screen.getByTestId('result-viewport');
@@ -249,7 +275,23 @@ it('renders structured result separately from logs with outcome status', () => {
   expect(screen.getByText('log line')).toBeInTheDocument();
 });
 
-it('truncates multiline command to first line in header title', () => {
+it('leads with the timeout message and keeps output-free runs compact', () => {
+  const command = 'sleep 100';
+  render(<CommandRunCard toolName="shell_run" status="failed" command={command} arguments={{ command }}
+    durationMs={440.245288} error="The command exceeded its time limit." errorCode="timeout"
+    resultStatus="not_requested" envelopeStatus="failure" />);
+  expect(screen.getByTestId('status-failed')).toHaveTextContent('Timed out');
+  expect(screen.getByText('440ms')).toBeVisible();
+  expect(screen.getByRole('alert')).toHaveTextContent('The command exceeded its time limit.');
+  expect(screen.queryByRole('button', { name: 'Output' })).not.toBeInTheDocument();
+  expect(screen.getByTestId('result-status')).not.toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Parameters' }));
+  expect(screen.getByText('command')).toBeVisible();
+});
+
+it('previews a multiline command before expansion and copies the exact input', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.assign(navigator, { clipboard: { writeText } });
   const multilineCmd = "git status\ngit diff\nnpm test";
   render(
     <CommandRunCard
@@ -258,8 +300,12 @@ it('truncates multiline command to first line in header title', () => {
       status="completed"
     />
   );
-  expect(screen.getByText('git status')).toBeInTheDocument();
-  expect(screen.queryByText('git status\ngit diff\nnpm test')).not.toBeInTheDocument();
+  const card = screen.getByTestId('command-run-card');
+  expect(card.querySelector('.command-preview')?.textContent).toBe(multilineCmd);
+  fireEvent.click(screen.getByRole('button', { name: 'Copy command' }));
+  expect(writeText).toHaveBeenCalledWith(multilineCmd);
+  expect(await screen.findByRole('button', { name: 'Command copied' })).toBeVisible();
+  expect(card).not.toHaveAttribute('open');
 });
 
 
@@ -318,6 +364,7 @@ it('strips unsupported escape sequences instead of rendering them literally', ()
       stdout={'\x1b[?25lhidden cursor\x1b[2Jdone'}
     />
   );
+  openInspector();
   const viewport = screen.getByTestId('terminal-viewport');
   expect(viewport).toHaveTextContent('hidden cursordone');
   expect(viewport.textContent).not.toContain('?25l');
@@ -333,6 +380,7 @@ it('keeps color state across lines and resolves progress rewrites', () => {
       stdout={'Progress: 10%\rProgress: 80%\n\x1b[31merror summary'}
     />
   );
+  openInspector();
   const viewport = screen.getByTestId('terminal-viewport');
   expect(viewport).toHaveTextContent('Progress: 80%');
   expect(viewport.textContent).not.toContain('10%');
@@ -350,6 +398,7 @@ it('reveals a jump-to-latest button after the user scrolls away', () => {
       stdout={longOutput}
     />
   );
+  openInspector();
   const viewport = screen.getByTestId('terminal-viewport');
   expect(screen.queryByRole('button', { name: 'Jump to latest output' })).toBeNull();
   // Simulate the user scrolling up: jsdom defaults scrollHeight 0, so mock it.
@@ -381,6 +430,7 @@ it('shows the most recent 2000 lines when expanded and keeps the full copy avail
   const writeText = vi.fn().mockResolvedValue(undefined);
   Object.assign(navigator, { clipboard: { writeText } });
   const { container } = render(<CommandRunCard toolName="execute_command" status="running" stdout={output} />);
+  openInspector();
   fireEvent.click(screen.getByRole('button', { name: 'Show all 2100 lines' }));
   expect(container.querySelectorAll('.terminal-line')).toHaveLength(2000);
   expect(screen.getByText('record 2100')).toBeInTheDocument();
@@ -407,6 +457,7 @@ it('does not infer a search count from arbitrary log lines', () => {
 it('shows the live tail and freezes the visible lines while reading older output', () => {
   const output = Array.from({ length: 60 }, (_, i) => `entry ${i + 1}`).join('\n');
   const view = render(<CommandRunCard toolName="execute_command" status="running" stdout={output} />);
+  openInspector();
   expect(screen.getByText('entry 60')).toBeInTheDocument();
   expect(screen.queryByText('entry 1')).toBeNull();
   const viewport = screen.getByTestId('terminal-viewport');
@@ -423,12 +474,20 @@ it('shows the live tail and freezes the visible lines while reading older output
 });
 
 it('defers completed command contents until inspection and preserves them on collapse', () => {
-  const view = render(<CommandRunCard toolName="execute_command" command="cargo test" status="completed" stdout={'record\n'.repeat(3000)} />);
+  const stdout = `hidden start\n${'record\n'.repeat(3000)}Progress: 10%\rProgress: 80%\n\x1b[32mTESTS PASSED\x1b[0m\n`;
+  const view = render(<CommandRunCard toolName="execute_command" command="cargo test" status="completed" stdout={stdout} stderr="warning: slow test" />);
   expect(screen.queryByTestId('terminal-viewport')).toBeNull();
+  const excerpt = screen.getByLabelText('Recent command output');
+  expect(excerpt.querySelectorAll('code')).toHaveLength(6);
+  expect(excerpt).toHaveTextContent('Progress: 80%');
+  expect(excerpt).toHaveTextContent('TESTS PASSED');
+  expect(excerpt).not.toHaveTextContent(/hidden start|Progress: 10%|\[32m/);
+  expect(screen.getByLabelText('Recent stderr')).toHaveTextContent('warning: slow test');
   const summary = screen.getByTestId('command-run-card').querySelector('summary')!;
   fireEvent.click(summary);
   const viewport = screen.getByTestId('terminal-viewport');
+  expect(screen.queryByLabelText('Recent command output')).not.toBeInTheDocument();
   fireEvent.click(summary);
-  view.rerender(<CommandRunCard toolName="execute_command" command="cargo test" status="completed" stdout={'record\n'.repeat(3000)} />);
+  view.rerender(<CommandRunCard toolName="execute_command" command="cargo test" status="completed" stdout={stdout} stderr="warning: slow test" />);
   expect(screen.getByTestId('terminal-viewport')).toBe(viewport);
 });

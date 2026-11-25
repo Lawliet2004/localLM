@@ -480,11 +480,13 @@ mod tests {
                 id: "1".into(),
                 name: "finish".into(),
                 arguments: json!({}),
+                extra_content: None,
             },
             crate::tool_calls::ToolCall {
                 id: "2".into(),
                 name: "search".into(),
                 arguments: json!({}),
+                extra_content: None,
             },
         ];
         assert!(validate_batch(&calls).is_err());

@@ -3,6 +3,11 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::borrow::Cow;
 
+/// Maximum parallel tool calls accepted in a single model round across
+/// OpenAI Chat Completions, OpenAI Responses, Claude Messages, and text fallback.
+pub const MAX_CALLS_PER_ROUND: usize = 32;
+const MAX_EXTRA_CONTENT_BYTES: usize = 65_536;
+
 /// Markdown examples are data. Only standalone control output from an opted-in
 /// local template is eligible. Preserve genuine argument bytes exactly: code
 /// fences and backticks inside a file-write argument are not Markdown here.
@@ -19,7 +24,7 @@ pub(crate) fn without_presentation_fences(text: &str) -> Cow<'_, str> {
         }
     };
     for line in text.split_inclusive('\n') {
-        if controls.len() >= 9 && offset >= control_until { blank(&mut masked, offset, text.len()); break; }
+        if controls.len() >= MAX_CALLS_PER_ROUND + 1 && offset >= control_until { blank(&mut masked, offset, text.len()); break; }
         if offset < control_until { offset += line.len(); continue; }
         let trimmed = line.trim_start();
         let indented = line.starts_with("    ") || line.starts_with('\t');
@@ -93,6 +98,7 @@ struct PartialCall {
     id: String,
     name: String,
     arguments: String,
+    extra_content: Option<Value>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +106,11 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// Opaque provider metadata attached to a tool call (for example Gemini's
+    /// `extra_content.google.thought_signature`), replayed verbatim on
+    /// compatible endpoints and stripped on local/non-compatible backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<Value>,
 }
 
 /// Display-only fragments. They are never accepted as executable arguments.
@@ -168,14 +179,17 @@ impl ToolCalls {
             let index = call["index"]
                 .as_u64()
                 .ok_or("Tool call index is missing.")?;
-            if index >= 8 {
-                return Err("The model requested more than eight tools in one round.".into());
+            if index >= MAX_CALLS_PER_ROUND as u64 {
+                return Err(format!("The model requested more than {MAX_CALLS_PER_ROUND} tools in one round."));
             }
             let entry = self.0.entry(index).or_default();
             if let Some(kind) = call.get("type").filter(|kind| !kind.is_null()) {
                 if kind != "function" {
                     return Err("Unsupported tool call type.".into());
                 }
+            }
+            if let Some(extra) = call.get("extra_content").filter(|v| !v.is_null()) {
+                merge_extra_content(&mut entry.extra_content, extra)?;
             }
             // `id` and `function.name` identify the call; `arguments` is the
             // only field OpenAI fragments across deltas. Several
@@ -206,8 +220,8 @@ impl ToolCalls {
     /// see that the round produced calls, so it cannot take the accumulator
     /// apart. A malformed call is a real error here, not an empty round.
     pub fn validated(&self) -> Result<Vec<ToolCall>, String> {
-        if self.0.len() > 8 {
-            return Err("The model requested more than eight tools in one round.".into());
+        if self.0.len() > MAX_CALLS_PER_ROUND {
+            return Err(format!("The model requested more than {MAX_CALLS_PER_ROUND} tools in one round."));
         }
         if self.0.values().map(|call| call.arguments.len()).sum::<usize>() > crate::tool_spec::MAX_ROUND_ARGUMENT_BYTES {
             return Err("Model tool arguments exceed the per-round byte limit.".into());
@@ -240,6 +254,7 @@ impl ToolCalls {
                     id: call.id,
                     name: call.name,
                     arguments,
+                    extra_content: call.extra_content,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -295,6 +310,36 @@ fn merge_identity(target: &mut String, incoming: Option<&str>) -> Result<(), Str
     Err("Tool call identity changed between stream fragments.".into())
 }
 
+pub(crate) fn merge_extra_content(target: &mut Option<Value>, incoming: &Value) -> Result<(), String> {
+    if incoming.is_null() {
+        return Ok(());
+    }
+    if incoming.to_string().len() > MAX_EXTRA_CONTENT_BYTES {
+        return Err("Model extra_content exceeds the replay byte limit.".into());
+    }
+    match target {
+        None => *target = Some(incoming.clone()),
+        Some(existing) if existing == incoming => {}
+        Some(Value::Object(existing_map)) => {
+            if let Some(incoming_map) = incoming.as_object() {
+                let mut merged = existing_map.clone();
+                for (key, value) in incoming_map {
+                    merged.insert(key.clone(), value.clone());
+                }
+                let candidate = Value::Object(merged);
+                if candidate.to_string().len() > MAX_EXTRA_CONTENT_BYTES {
+                    return Err("Model extra_content exceeds the replay byte limit.".into());
+                }
+                *target = Some(candidate);
+            } else {
+                *target = Some(incoming.clone());
+            }
+        }
+        Some(_) => *target = Some(incoming.clone()),
+    }
+    Ok(())
+}
+
 impl ToolCalls {
     /// Wrap text-parsed calls so they pass through `finish()`'s normal
     /// validation (duplicate ids, JSON balance) like structured deltas do.
@@ -307,6 +352,7 @@ impl ToolCalls {
                     id: call.id,
                     name: call.name,
                     arguments: call.arguments.to_string(),
+                    extra_content: call.extra_content,
                 },
             );
         }
@@ -336,13 +382,15 @@ impl ToolCalls {
             };
             let id = call["id"].as_str().unwrap_or("");
             let name = call["function"]["name"].as_str().unwrap_or("");
-            acc.push(&json!({
-                "tool_calls": [{
-                    "index": index,
-                    "id": id,
-                    "function": { "name": name, "arguments": arguments }
-                }]
-            }))?;
+            let mut item = json!({
+                "index": index,
+                "id": id,
+                "function": { "name": name, "arguments": arguments }
+            });
+            if let Some(extra) = call.get("extra_content").filter(|v| !v.is_null()) {
+                item["extra_content"] = extra.clone();
+            }
+            acc.push(&json!({ "tool_calls": [item] }))?;
         }
         acc.finish()
     }
@@ -399,6 +447,7 @@ pub fn parse_text_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
                 id: format!("textcall_{}", calls.len()),
                 name: name.into(),
                 arguments,
+                extra_content: None,
             });
             rest = tail.trim_start();
         } else {
@@ -406,7 +455,7 @@ pub fn parse_text_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         }
         let latest = calls.last()?;
         crate::tool_spec::check_argument_bytes(&latest.name, latest.arguments.to_string().len()).ok()?;
-        if calls.len() > 8 {
+        if calls.len() > MAX_CALLS_PER_ROUND {
             return None;
         }
     }
@@ -444,6 +493,7 @@ fn parse_json_call(inner: &str, index: usize) -> Option<ToolCall> {
         id,
         name: name.into(),
         arguments,
+        extra_content: None,
     })
 }
 
@@ -463,6 +513,7 @@ fn parse_function_block(text: &str, index: usize) -> Option<ToolCall> {
         id: format!("textcall_{index}"),
         name: name.into(),
         arguments,
+        extra_content: None,
     })
 }
 
@@ -569,7 +620,11 @@ fn braces_balanced(text: &str) -> bool {
 }
 impl ToolCall {
     pub fn model_value(&self) -> Value {
-        json!({"id":self.id,"type":"function","function":{"name":self.name,"arguments":self.arguments.to_string()}})
+        let mut value = json!({"id":self.id,"type":"function","function":{"name":self.name,"arguments":self.arguments.to_string()}});
+        if let Some(extra) = &self.extra_content {
+            value["extra_content"] = extra.clone();
+        }
+        value
     }
 }
 
@@ -661,8 +716,9 @@ mod tests {
             id: "a".into(),
             name: "run".into(),
             arguments: json!({}),
+            extra_content: None,
         };
-        assert!(ToolCalls::from_parsed(vec![call.clone(); 9])
+        assert!(ToolCalls::from_parsed(vec![call.clone(); MAX_CALLS_PER_ROUND + 1])
             .finish()
             .is_err());
         let mut large = call;
@@ -707,7 +763,7 @@ mod tests {
     fn rejects_malformed_and_excessive_calls() {
         for fragment in [
             json!({"tool_calls":{}}),
-            json!({"tool_calls":[{"index":8}]}),
+            json!({"tool_calls":[{"index":MAX_CALLS_PER_ROUND}]}),
             json!({"tool_calls":[{"index":0,"function":{"arguments":{}}}]}),
         ] {
             assert!(ToolCalls::default().push(&fragment).is_err());
@@ -717,6 +773,34 @@ mod tests {
             calls.push(&json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"tool","arguments":arguments}}]})).unwrap();
             assert!(calls.finish().is_err());
         }
+    }
+
+    #[test]
+    fn supports_parallel_calls_up_to_cap_and_preserves_gemini_extra_content() {
+        let mut calls = ToolCalls::default();
+        for index in 0..16 {
+            let mut item = json!({
+                "index": index,
+                "id": format!("call_{index}"),
+                "type": "function",
+                "function": {"name": "workspace_read_file", "arguments": format!("{{\"path\":\"file_{index}.rs\"}}")}
+            });
+            if index == 0 {
+                item["extra_content"] = json!({"google": {"thought_signature": "opaque-sig-v1"}});
+            }
+            calls.push(&json!({"tool_calls": [item]})).unwrap();
+        }
+        let finished = calls.finish().unwrap();
+        assert_eq!(finished.len(), 16);
+        assert_eq!(
+            finished[0].model_value()["extra_content"]["google"]["thought_signature"],
+            "opaque-sig-v1"
+        );
+        assert!(finished[1].model_value().get("extra_content").is_none());
+        // Oversized extra_content fails closed.
+        let mut oversized = ToolCalls::default();
+        assert!(oversized.push(&json!({"tool_calls":[{"index":0,"id":"c0","function":{"name":"read","arguments":"{}"},"extra_content":{"google":{"thought_signature":"x".repeat(MAX_EXTRA_CONTENT_BYTES)}}}]}))
+            .is_err());
     }
     #[test]
     fn text_tool_calls_parse_only_complete_blocks() {

@@ -1,0 +1,16 @@
+{
+  "historyTurns": 100,
+  "openedConversationMsIncludingFixedWaitAndAccessibility": 2728.9,
+  "reasoningActionAndStateReadMs": 113.1,
+  "reasoningExpanded": true,
+  "reasoningStatesAfterExpansion": [
+    "8",
+    "10",
+    "11",
+    "12",
+    "24",
+    "25",
+    "30"
+  ],
+  "frameTimingMeasured": false
+}

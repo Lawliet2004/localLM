@@ -1,6 +1,10 @@
 # Authorized tool discovery
 
-Large selected catalogs keep every authorized tool available while advertising at most64 function schemas to the inference provider. Catalogs above64 automatically add `tool_search` and `tool_invoke`. Smaller catalogs retain their existing direct tool set. Finish, context controls, artifact reading, system time and programmatic execution remain directly reachable when authorized. Ordering and the advertised schema bytes stay fixed while discovery runs; search does not rewrite the provider's tool catalog or frozen system prefix.
+LocalLM advertises up to 64 function schemas per model request. It removes aliases covered by a saved tool denial before freezing the catalog. A later tool allow or ask can restore an alias. A later path, command, or host exception keeps the corresponding tool available so dispatch can evaluate the actual arguments. Foreground and background children apply the same filter to their inherited tools.
+
+Large catalogs add `tool_search` and `tool_invoke`. Coding turns also use this pair to defer specialist tools. When a saved rule disables either wrapper, permitted tools are offered directly up to the 64-schema limit. The turn shows a notice if more tools are selected. Searches recheck the current rules, and a changed result set invalidates its pagination hash. The advertised schemas stay fixed throughout the turn.
+
+On local models, LocalLM checks whether the instructions, draft, tool definitions, and reply reserve fit before adding any chat history. If the catalog would overflow, it keeps essential tools such as web search directly available and defers the remaining schemas through discovery. The composer and generation use the same catalog selection.
 
 `tool_search` accepts query (required string; empty lists all), offset0–4096, limit1–10 and optional expected_catalog_sha256. Search matches names, connector names and descriptions. Results include exact invocation names, descriptions and full input schemas. They are drawn from the current turn's selected sources/tools, re-filtered through capability policy and live-peer availability. A pinned page fails explicitly if the authorized catalog/query/schema changes. Tool descriptions are untrusted metadata. Oversized results use the normal saved-result artifact path; read the exact schema with artifact_read before invocation.
 

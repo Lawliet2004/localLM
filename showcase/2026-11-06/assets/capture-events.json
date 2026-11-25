@@ -1,0 +1,836 @@
+[
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980152.9751868,
+    "recordOffset": null
+  },
+  {
+    "op": "click",
+    "name": "Use dark theme",
+    "time": 1793980170.696474,
+    "recordOffset": null
+  },
+  {
+    "op": "click",
+    "name": "Launch campaign report",
+    "time": 1793980171.2823524,
+    "recordOffset": null
+  },
+  {
+    "op": "snap",
+    "name": "home",
+    "time": 1793980171.5274255,
+    "recordOffset": null
+  },
+  {
+    "op": "record",
+    "name": "live-inference",
+    "time": 1793980172.2287495,
+    "recordOffset": 0.600089614999888
+  },
+  {
+    "op": "text",
+    "name": "Message",
+    "time": 1793980173.1642797,
+    "recordOffset": 1.5356175150009221
+  },
+  {
+    "op": "snap",
+    "name": "prompt",
+    "time": 1793980173.40456,
+    "recordOffset": 1.775896458002535
+  },
+  {
+    "op": "click",
+    "name": "Send message",
+    "time": 1793980173.9985514,
+    "recordOffset": 2.3698907120015065
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980177.0996392,
+    "recordOffset": 5.470976251999673
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980177.3175716,
+    "recordOffset": 5.688907536001352
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980187.667155,
+    "recordOffset": 16.0384910770008
+  },
+  {
+    "op": "snap",
+    "name": "inference-progress",
+    "time": 1793980207.7704887,
+    "recordOffset": 36.14182525000069
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980207.9013226,
+    "recordOffset": 36.27265861900014
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980222.6657367,
+    "recordOffset": 51.037072341001476
+  },
+  {
+    "op": "snap",
+    "name": "approval",
+    "time": 1793980227.8250601,
+    "recordOffset": 56.19639601500239
+  },
+  {
+    "op": "click",
+    "name": "Allow once",
+    "time": 1793980228.3901548,
+    "recordOffset": 56.761491948000184
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980232.4912388,
+    "recordOffset": 60.86257562300307
+  },
+  {
+    "op": "snap",
+    "name": "after-approval",
+    "time": 1793980232.7362795,
+    "recordOffset": 61.10761505400296
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980256.5936108,
+    "recordOffset": 84.96494719300244
+  },
+  {
+    "op": "snap",
+    "name": "answer",
+    "time": 1793980256.8350706,
+    "recordOffset": 85.20640712800014
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980268.7491996,
+    "recordOffset": 97.1205361909997
+  },
+  {
+    "op": "snap",
+    "name": "answer",
+    "time": 1793980280.016874,
+    "recordOffset": 108.38821023300261
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980283.117738,
+    "recordOffset": 111.48907452500134
+  },
+  {
+    "op": "record_stop",
+    "name": null,
+    "time": 1793980283.2499998,
+    "recordOffset": 111.62133460000041
+  },
+  {
+    "op": "record",
+    "name": "models",
+    "time": 1793980283.9519103,
+    "recordOffset": 0.600720407001063
+  },
+  {
+    "op": "click",
+    "name": "Models & runtime",
+    "time": 1793980284.562297,
+    "recordOffset": 1.2111071549988992
+  },
+  {
+    "op": "snap",
+    "name": "models",
+    "time": 1793980284.8033936,
+    "recordOffset": 1.4522033530010958
+  },
+  {
+    "op": "click",
+    "name": "Model files",
+    "time": 1793980285.4150782,
+    "recordOffset": 2.063888313998177
+  },
+  {
+    "op": "snap",
+    "name": "model-files",
+    "time": 1793980285.6583412,
+    "recordOffset": 2.3071505859988974
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980287.7592323,
+    "recordOffset": 4.408042511000531
+  },
+  {
+    "op": "click",
+    "name": "Runtime",
+    "time": 1793980288.3484533,
+    "recordOffset": 4.997263362998638
+  },
+  {
+    "op": "snap",
+    "name": "runtime",
+    "time": 1793980288.598355,
+    "recordOffset": 5.247164612999768
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980290.699252,
+    "recordOffset": 7.3480617179993715
+  },
+  {
+    "op": "click",
+    "name": "API providers",
+    "time": 1793980291.3096507,
+    "recordOffset": 7.958460517998901
+  },
+  {
+    "op": "snap",
+    "name": "providers",
+    "time": 1793980291.5510209,
+    "recordOffset": 8.19983005299946
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980291.721706,
+    "recordOffset": 8.370515746999445
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980294.2922955,
+    "recordOffset": 10.941104730998632
+  },
+  {
+    "op": "click",
+    "name": "Edit",
+    "time": 1793980310.0293567,
+    "recordOffset": 26.67816703399876
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980310.330507,
+    "recordOffset": 26.979317060999165
+  },
+  {
+    "op": "snap",
+    "name": "api-key",
+    "time": 1793980310.5747564,
+    "recordOffset": 27.22356624799795
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980310.8925605,
+    "recordOffset": 27.541369840997504
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980318.528817,
+    "recordOffset": 35.177627971999755
+  },
+  {
+    "op": "snap",
+    "name": "api-key",
+    "time": 1793980354.4578564,
+    "recordOffset": 71.10666649099949
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980356.558937,
+    "recordOffset": 73.20774681200055
+  },
+  {
+    "op": "click",
+    "name": "Cancel",
+    "time": 1793980357.2347121,
+    "recordOffset": 73.88352278199818
+  },
+  {
+    "op": "record_stop",
+    "name": null,
+    "time": 1793980357.4994745,
+    "recordOffset": 74.14828284800024
+  },
+  {
+    "op": "click",
+    "name": "Close settings",
+    "time": 1793980358.106625,
+    "recordOffset": 74.755435553001
+  },
+  {
+    "op": "record",
+    "name": "workspace",
+    "time": 1793980358.8080466,
+    "recordOffset": 0.6000326070025039
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980359.1090186,
+    "recordOffset": 0.9010057490013423
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980360.2108707,
+    "recordOffset": 2.0028595630028576
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980360.4229841,
+    "recordOffset": 2.214969093001855
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980367.8443894,
+    "recordOffset": 9.636374939000234
+  },
+  {
+    "op": "click",
+    "name": "launch-summary.md",
+    "time": 1793980380.99336,
+    "recordOffset": 22.78534598800252
+  },
+  {
+    "op": "click",
+    "name": "Expand panel",
+    "time": 1793980381.6054852,
+    "recordOffset": 23.39747133200217
+  },
+  {
+    "op": "snap",
+    "name": "editor",
+    "time": 1793980381.8578103,
+    "recordOffset": 23.649795402001473
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980383.9587333,
+    "recordOffset": 25.75071940700218
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980384.2604175,
+    "recordOffset": 26.05240583700288
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980385.3625143,
+    "recordOffset": 27.15450221900028
+  },
+  {
+    "op": "snap",
+    "name": "review",
+    "time": 1793980385.604943,
+    "recordOffset": 27.39692854200257
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980385.807383,
+    "recordOffset": 27.599368235001748
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980437.7484038,
+    "recordOffset": 79.54038887600109
+  },
+  {
+    "op": "click",
+    "name": "Stage launch-summary.md",
+    "time": 1793980446.5827618,
+    "recordOffset": 88.37474753700008
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980447.6840622,
+    "recordOffset": 89.47604832500292
+  },
+  {
+    "op": "snap",
+    "name": "review-diff",
+    "time": 1793980447.9263759,
+    "recordOffset": 89.7183613030029
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980448.2273262,
+    "recordOffset": 90.01931214300203
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980449.328277,
+    "recordOffset": 91.12026248900293
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980449.5403187,
+    "recordOffset": 91.33230348000143
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980471.2876966,
+    "recordOffset": 113.07968145500126
+  },
+  {
+    "op": "text",
+    "name": "Terminal input",
+    "time": 1793980484.7870648,
+    "recordOffset": 126.5790505440018
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980485.0881534,
+    "recordOffset": 126.88013925500127
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980486.1891646,
+    "recordOffset": 127.98115086700273
+  },
+  {
+    "op": "snap",
+    "name": "terminal",
+    "time": 1793980486.4347842,
+    "recordOffset": 128.22676980300093
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980488.535739,
+    "recordOffset": 130.32772441700217
+  },
+  {
+    "op": "record_stop",
+    "name": null,
+    "time": 1793980488.8504207,
+    "recordOffset": 130.64240504700138
+  },
+  {
+    "op": "click",
+    "name": "Restore panel size",
+    "time": 1793980489.4568632,
+    "recordOffset": 131.24884905300132
+  },
+  {
+    "op": "click",
+    "name": "Close inspector",
+    "time": 1793980490.068765,
+    "recordOffset": 131.86075067300044
+  },
+  {
+    "op": "record",
+    "name": "model-selection",
+    "time": 1793980490.7702606,
+    "recordOffset": 0.6000753170010285
+  },
+  {
+    "op": "click",
+    "name": "River \u00b7 deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "time": 1793980491.3815095,
+    "recordOffset": 1.2113256270022248
+  },
+  {
+    "op": "snap",
+    "name": "model-selector",
+    "time": 1793980491.6248376,
+    "recordOffset": 1.4546519300020009
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980493.725715,
+    "recordOffset": 3.555529789002321
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980494.0267196,
+    "recordOffset": 3.856533969003067
+  },
+  {
+    "op": "record_stop",
+    "name": null,
+    "time": 1793980494.291474,
+    "recordOffset": 4.12128762300199
+  },
+  {
+    "op": "record",
+    "name": "extensions",
+    "time": 1793980494.9929636,
+    "recordOffset": 0.6000790649995906
+  },
+  {
+    "op": "click",
+    "name": "Connectors",
+    "time": 1793980495.6222525,
+    "recordOffset": 1.229367378000461
+  },
+  {
+    "op": "snap",
+    "name": "connectors",
+    "time": 1793980495.865168,
+    "recordOffset": 1.4722832059997017
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980497.9662058,
+    "recordOffset": 3.573320765997778
+  },
+  {
+    "op": "click",
+    "name": "Settings: Skills",
+    "time": 1793980498.582473,
+    "recordOffset": 4.189587507000397
+  },
+  {
+    "op": "snap",
+    "name": "skills",
+    "time": 1793980498.8238196,
+    "recordOffset": 4.430933757997991
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980500.9246604,
+    "recordOffset": 6.531775426999957
+  },
+  {
+    "op": "record_stop",
+    "name": null,
+    "time": 1793980501.5401127,
+    "recordOffset": 7.147225815999263
+  },
+  {
+    "op": "record",
+    "name": "controls",
+    "time": 1793980546.6497004,
+    "recordOffset": 0.6000762500007113
+  },
+  {
+    "op": "click",
+    "name": "Settings: Tools",
+    "time": 1793980547.277833,
+    "recordOffset": 1.2282077569980174
+  },
+  {
+    "op": "snap",
+    "name": "tool-settings",
+    "time": 1793980547.5213916,
+    "recordOffset": 1.4717664790005074
+  },
+  {
+    "op": "click",
+    "name": "Settings: Inference",
+    "time": 1793980548.1243691,
+    "recordOffset": 2.074744744000782
+  },
+  {
+    "op": "snap",
+    "name": "inference-settings",
+    "time": 1793980548.3687797,
+    "recordOffset": 2.3191548859977047
+  },
+  {
+    "op": "click",
+    "name": "Settings: Appearance",
+    "time": 1793980548.9790304,
+    "recordOffset": 2.92940572599764
+  },
+  {
+    "op": "snap",
+    "name": "appearance",
+    "time": 1793980549.220948,
+    "recordOffset": 3.1713234369999554
+  },
+  {
+    "op": "tree",
+    "name": null,
+    "time": 1793980549.4154232,
+    "recordOffset": 3.365798465998523
+  },
+  {
+    "op": "click",
+    "name": "Use light appearance",
+    "time": 1793980569.3684871,
+    "recordOffset": 23.318862070998875
+  },
+  {
+    "op": "snap",
+    "name": "appearance-light",
+    "time": 1793980569.60983,
+    "recordOffset": 23.560205055997358
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980570.710893,
+    "recordOffset": 24.66126817499753
+  },
+  {
+    "op": "click",
+    "name": "Close settings",
+    "time": 1793980571.3252435,
+    "recordOffset": 25.275618954998208
+  },
+  {
+    "op": "snap",
+    "name": "answer-light",
+    "time": 1793980571.5669973,
+    "recordOffset": 25.517371884998283
+  },
+  {
+    "op": "click",
+    "name": "Permission mode: Auto-approve reads",
+    "time": 1793980572.1707156,
+    "recordOffset": 26.12109037799746
+  },
+  {
+    "op": "snap",
+    "name": "permissions",
+    "time": 1793980572.412578,
+    "recordOffset": 26.362953445997846
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980574.513648,
+    "recordOffset": 28.464023697997618
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980574.814735,
+    "recordOffset": 28.765110804997676
+  },
+  {
+    "op": "record_stop",
+    "name": null,
+    "time": 1793980575.1796067,
+    "recordOffset": 29.12998073899871
+  },
+  {
+    "op": "click",
+    "name": "Use dark theme",
+    "time": 1793980595.937899,
+    "recordOffset": 49.88827585999752
+  },
+  {
+    "op": "record",
+    "name": "terminal-demo",
+    "time": 1793980596.7398684,
+    "recordOffset": 0.6000739749979402
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980597.0409977,
+    "recordOffset": 0.9012051559984684
+  },
+  {
+    "op": "click",
+    "name": "Expand panel",
+    "time": 1793980597.6560564,
+    "recordOffset": 1.5162623609976436
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980598.6585991,
+    "recordOffset": 2.5188047150004422
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980600.761948,
+    "recordOffset": 4.6221539250000205
+  },
+  {
+    "op": "snap",
+    "name": "terminal-working",
+    "time": 1793980601.0098166,
+    "recordOffset": 4.870022111997969
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980603.110914,
+    "recordOffset": 6.971119645997533
+  },
+  {
+    "op": "record_stop",
+    "name": null,
+    "time": 1793980603.275415,
+    "recordOffset": 7.135619057997246
+  },
+  {
+    "op": "click",
+    "name": "Restore panel size",
+    "time": 1793980719.3668606,
+    "recordOffset": 123.22706604799896
+  },
+  {
+    "op": "click",
+    "name": "Close inspector",
+    "time": 1793980719.9789207,
+    "recordOffset": 123.83912613799839
+  },
+  {
+    "op": "click",
+    "name": "Open settings",
+    "time": 1793980720.5983968,
+    "recordOffset": 124.45860242599883
+  },
+  {
+    "op": "click",
+    "name": "Settings: Appearance",
+    "time": 1793980721.190681,
+    "recordOffset": 125.05088662699927
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980721.993096,
+    "recordOffset": 125.85330161899765
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980722.294258,
+    "recordOffset": 126.15446443999826
+  },
+  {
+    "op": "click",
+    "name": "Close settings",
+    "time": 1793980722.9046052,
+    "recordOffset": 126.76481073099785
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980723.2057943,
+    "recordOffset": 127.06599977099904
+  },
+  {
+    "op": "click",
+    "name": "Expand panel",
+    "time": 1793980723.8201194,
+    "recordOffset": 127.68032505299925
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980724.7224486,
+    "recordOffset": 128.582654414
+  },
+  {
+    "op": "key",
+    "name": null,
+    "time": 1793980725.7252138,
+    "recordOffset": 129.58541902799698
+  },
+  {
+    "op": "record",
+    "name": "workspace-clean",
+    "time": 1793980726.426714,
+    "recordOffset": 0.6000791349979409
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980728.53045,
+    "recordOffset": 2.7038146749982843
+  },
+  {
+    "op": "snap",
+    "name": "terminal-clean",
+    "time": 1793980728.7752492,
+    "recordOffset": 2.948613311000372
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980730.8761513,
+    "recordOffset": 5.049515865997819
+  },
+  {
+    "op": "click",
+    "name": "launch-summary.md",
+    "time": 1793980731.4904177,
+    "recordOffset": 5.663782325998909
+  },
+  {
+    "op": "snap",
+    "name": "editor-clean",
+    "time": 1793980731.7309227,
+    "recordOffset": 5.90428683600112
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980733.8318152,
+    "recordOffset": 8.00517992299865
+  },
+  {
+    "op": "click",
+    "name": "Review",
+    "time": 1793980734.4532692,
+    "recordOffset": 8.62663376799901
+  },
+  {
+    "op": "snap",
+    "name": "review-clean",
+    "time": 1793980734.6955245,
+    "recordOffset": 8.868888986999082
+  },
+  {
+    "op": "wait",
+    "name": null,
+    "time": 1793980736.7964642,
+    "recordOffset": 10.96982922299867
+  },
+  {
+    "op": "record_stop",
+    "name": null,
+    "time": 1793980736.9611886,
+    "recordOffset": 11.134551807001117
+  }
+]

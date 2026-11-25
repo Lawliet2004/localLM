@@ -225,8 +225,8 @@ export const api = {
   listCapabilities: (conversationId?: string | null) => invoke<Capability[]>('list_capabilities', { conversationId }),
   setCapabilityEnabled: (id: string, enabled: boolean) => invoke<Capability[]>('set_capability_enabled', { id, enabled }),
   dumpConfig: (conversationId?: string | null) => invoke<Record<string, unknown>>('dump_config', { conversationId }),
-  contextPreflight: (conversationId: string | null, draft: string, preset: string | null, connectorIds: string[], connectorTools: ToolSelection[], planMode = false, reasoningMode?: Preferences['reasoningMode'], presentationMode?: import('./types').PresentationMode) =>
-    invoke<{ available: boolean; reason?: string; breakdown?: PreflightBreakdown }>('context_preflight', { conversationId, draft, preset, connectorIds, connectorTools, planMode, reasoningMode, presentationMode }),
+  contextPreflight: (conversationId: string | null, draft: string, preset: string | null, connectorIds: string[], connectorTools: ToolSelection[], planMode = false, reasoningMode?: Preferences['reasoningMode'], presentationMode?: import('./types').PresentationMode, projectId?: string | null) =>
+    invoke<{ available: boolean; reason?: string; breakdown?: PreflightBreakdown }>('context_preflight', { conversationId, draft, preset, connectorIds, connectorTools, planMode, reasoningMode, presentationMode, projectId }),
   listPresets: () => invoke<Preset[]>('list_presets'),
   getPreset: (conversationId: string) => invoke<Preset>('get_preset', { conversationId }),
   setPreset: (conversationId: string, preset: string) => invoke<Preset>('set_preset', { conversationId, preset }),

@@ -142,7 +142,7 @@ describe('chat action reporting and submission', () => {
     ];
     const view = render(<Chat {...props} conversationKey="c1" messages={messages} generating />);
     expect(await screen.findByTestId('status-awaiting')).toBeInTheDocument();
-    expect(screen.getByText('Edit')).toBeInTheDocument();
+    expect(screen.getByLabelText('Edit app.ts')).toBeInTheDocument();
     expect(screen.queryByTestId('status-running')).not.toBeInTheDocument();
     view.rerender(<Chat {...props} conversationKey="c1" messages={messages} generating={false} />);
     expect(screen.getByTestId('status-interrupted')).toBeInTheDocument();
@@ -157,7 +157,8 @@ describe('chat action reporting and submission', () => {
     document.documentElement.dataset.motion = motion;
     window.matchMedia = vi.fn(() => ({ matches: systemReduced })) as unknown as typeof window.matchMedia;
     try {
-      const { container } = render(<Chat {...props} messages={[]} />);
+      const message: Message = { id: 'prompt', conversationId: 'chat', role: 'user', content: 'Hello', reasoning: '', status: 'complete', createdAt: 0 };
+      const { container } = render(<Chat {...props} messages={[message]} />);
       const scroller = container.querySelector('.chat-scroll') as HTMLDivElement;
       Object.defineProperties(scroller, { scrollHeight: { value: 1000 }, clientHeight: { value: 200 }, scrollTop: { value: 0, writable: true } });
       scroller.scrollTo = vi.fn();
@@ -258,13 +259,15 @@ describe('chat action reporting and submission', () => {
   it('renders the recorded local server name with its stable identity', () => {
     const message: Message = { id:'tool', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'local-stable-id',localServerName:'Research server',name:'lookup',arguments:{query:'example'},authorization:'user approval decision'},result:{isError:false}}) };
     const { rerender } = render(<Chat {...props} messages={[message]} />);
-    expect(screen.getByText('Research server · lookup')).toBeInTheDocument();
-    fireEvent.click(screen.getByText('Research server · lookup'));
+    const summary = screen.getByLabelText('Tool lookup Research server');
+    expect(summary).toHaveTextContent('lookup(Research server)');
+    fireEvent.click(summary);
+    fireEvent.click(screen.getByText('Execution details'));
     expect(screen.getByText('local-stable-id')).toBeVisible();
     expect(screen.getByText('Authorization: user approval decision')).toBeVisible();
     // Older audit rows retain their existing label without needing live settings.
     rerender(<Chat {...props} messages={[{...message,content:JSON.stringify({request:{connector:'Legacy',name:'lookup'},result:{}})}]} />);
-    expect(screen.getByText('Legacy · lookup')).toBeInTheDocument();
+    expect(screen.getByLabelText('Tool lookup Legacy')).toBeInTheDocument();
   });
   it('renders web search as a searched-the-web card with source chips', () => {
     const message: Message = {
@@ -275,7 +278,7 @@ describe('chat action reporting and submission', () => {
       }),
     };
     render(<Chat {...props} messages={[message]} />);
-    expect(screen.getByText('Searched the web')).toBeInTheDocument();
+    expect(screen.getByText('WebSearch')).toBeInTheDocument();
     expect(screen.getByText('fusion yield')).toBeInTheDocument();
     expect(screen.getByText('1 result')).toBeInTheDocument();
     fireEvent.click(screen.getByText('fusion yield'));
@@ -284,9 +287,28 @@ describe('chat action reporting and submission', () => {
   it('shows a reviewable unified diff for workspace edits', () => {
     const message: Message = { id:'edit', conversationId:'chat', role:'tool', reasoning:'', createdAt:0, status:'complete', content:JSON.stringify({request:{connector:'Workspace',name:'edit_file',arguments:{path:'note.txt'},decision:'allowed'},result:{replacements:1,diff:'--- a/note.txt\n+++ b/note.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n'}}) };
     render(<Chat {...props} messages={[message]} />);
+    const excerpt = screen.getByLabelText('File changes excerpt');
+    expect(excerpt).toHaveTextContent('-old');
+    expect(excerpt).toHaveTextContent('+new');
     fireEvent.click(screen.getAllByText('note.txt')[0]);
     expect(screen.getByText('Diff')).toBeVisible();
     expect(screen.getAllByText(/--- a\/note\.txt/, { exact: false })[0]).toBeVisible();
+  });
+
+  it('uses recorded search matches and labels a partial page as results shown', () => {
+    const message: Message = {
+      id: 'search-page', conversationId: 'chat', role: 'tool', reasoning: '', createdAt: 0, status: 'complete',
+      content: JSON.stringify({
+        request: { connector: 'Harness', name: 'workspace_search_content', arguments: { query: 'render' } },
+        result: { schemaVersion: 'locallm.tool-envelope/1', status: 'success', data: {
+          matches: [{ path: 'src/App.tsx', line: 24 }, { path: 'src/Chat.tsx', line: 92 }], hasMore: true,
+        } },
+      }),
+    };
+    render(<Chat {...props} messages={[message]} />);
+    expect(screen.getByText('2 results shown')).toBeVisible();
+    expect(screen.getByText('src/App.tsx:24')).toBeVisible();
+    expect(screen.getByText('src/Chat.tsx:92')).toBeVisible();
   });
   it('retries the failed prompt as a new send without changing the draft', async () => {
     const onSend = vi.fn(async (_content: string) => {});
@@ -388,6 +410,24 @@ it('renders live activity timeline during generation', () => {
   expect(screen.getByText('Using tools')).toBeInTheDocument();
 });
 
+it('hands off the backend tool status to the matching live transcript row', () => {
+  const message: Message = {
+    id: 'command', conversationId: 'chat', role: 'tool', content: JSON.stringify({ request: { name: 'execute_command', arguments: { command: 'npm test' } } }),
+    status: 'streaming', reasoning: '', createdAt: 1,
+  };
+  const activity = { state: 'ExecutingTools', activity: 'Running execute_command' };
+  const onCancel = vi.fn();
+  const view = render(<Chat {...props} messages={[]} generating liveActivity={activity} onCancel={onCancel} />);
+  expect(screen.getByRole('status')).toHaveTextContent('Running execute_command');
+  view.rerender(<Chat {...props} messages={[message]} generating liveActivity={activity} onCancel={onCancel}
+    contextUsage={{ inputTokens: 512, responseReserve: 256, contextLength: 4096, outputTokens: 120 }} />);
+  expect(screen.queryByText('Running execute_command')).not.toBeInTheDocument();
+  expect(screen.getByTestId('status-running')).toHaveTextContent('Bash(npm test)');
+  expect(screen.getByLabelText('Transcript status')).toHaveTextContent('tokens 120tools 1');
+  fireEvent.keyDown(screen.getByRole('region', { name: 'Conversation transcript' }), { key: 'Escape' });
+  expect(onCancel).toHaveBeenCalledOnce();
+});
+
 it('keeps one writing cue once answer text is on screen', () => {
   const messages: Message[] = [
     { id: 'user-1', conversationId: 'chat', role: 'user', content: 'Hello', reasoning: '', status: 'complete', createdAt: 0 },
@@ -396,10 +436,11 @@ it('keeps one writing cue once answer text is on screen', () => {
   const view = render(<Chat {...props} messages={messages} generating liveActivity={{ activity: 'Generating response…' }} />);
   const answer = screen.getByRole('article', { name: 'assistant message' });
   expect(within(answer).getByText('Here is the answer')).toBeInTheDocument();
+  expect(within(answer).getByRole('status')).toHaveTextContent('Generating…');
   expect(screen.queryByText('Writing the answer')).not.toBeInTheDocument();
   expect(within(answer).queryByRole('button', { name: 'Copy message' })).not.toBeInTheDocument();
   view.rerender(<Chat {...props} messages={messages} generating liveActivity={{ state: 'ExecutingTools', activity: 'Reading src/App.tsx' }} />);
-  expect(screen.getByRole('status')).toHaveTextContent('Reading src/App.tsx');
+  expect(screen.getByText('Reading src/App.tsx').closest('[role="status"]')).toBeInTheDocument();
   expect(screen.getByText('Using tools')).toBeInTheDocument();
 });
 
@@ -581,7 +622,7 @@ it('renders reasoning block with thinking indicator while streaming and thought 
   const { rerender } = render(<Chat {...props} messages={[streamingMsg]} generating={true} />);
 
   expect(screen.getByText('Reasoning')).toBeInTheDocument();
-  expect(screen.queryByText('Analyzing query parameters...')).not.toBeInTheDocument();
+  expect(screen.getByText('Analyzing query parameters...')).toHaveClass('reasoning-excerpt');
   fireEvent.click(screen.getByText('Reasoning'));
   expect(screen.getByText('Analyzing query parameters...')).toBeInTheDocument();
 

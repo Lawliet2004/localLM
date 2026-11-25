@@ -53,12 +53,12 @@ export function WorkSummary({ messages, events = [], run, children, showActivity
   const verb = status && !['completed', 'complete'].includes(status) ? statusVerbs[status] ?? 'Stopped' : 'Worked';
   const label = duration ? `${verb} for ${duration}` : status && !['completed', 'complete'].includes(status) ? verb : 'Work details';
   return <div className="assistant-work">
+    {children}
     {showActivity && (tools.length > 0 || duration || label !== 'Work details') && <div className="work-summary" aria-label="Recorded work summary">
       <span>{label}</span>
       {tools.length > 0 && <span> · {tools.length} {tools.length === 1 ? 'action' : 'actions'}</span>}
       {files.length > 0 && <span> · {files.length} {files.length === 1 ? 'file' : 'files'} changed <span className="diff-added">+{totals.added}</span> <span className="diff-removed">−{totals.removed}</span></span>}
     </div>}
-    {children}
     {(resumable || unresolved.length > 0 || delivered && (outcome?.partial || verification === 'verified' || verification === 'unverified')) && <div className="task-outcome" aria-label="Task outcome">
       <div className="work-summary" role="status">
         {outcome?.partial && <span>Partial work</span>}

@@ -120,6 +120,27 @@ pub struct RuleSet {
     pub rules: Vec<Rule>,
 }
 
+impl RuleSet {
+    /// Catalog filtering only. Dispatch still evaluates every actual resource
+    /// against the live rules, including all paths in a multi-file operation.
+    pub(crate) fn may_offer_tool(&self, alias: &str) -> bool {
+        let Some(last) = self.rules.iter().rposition(|rule|
+            rule.action == Action::Tool && tool_matches(&rule.resource, alias)
+        ) else {
+            return true;
+        };
+        if self.rules[last].effect != Effect::Deny {
+            return true;
+        }
+        // The alias determines the resource kind. Its value is unknown until
+        // the call, so a later exception of that kind must keep it available.
+        let (kind, _) = classify(alias, &Value::Null);
+        kind != Action::Tool && self.rules[last + 1..].iter().any(|rule|
+            rule.action == kind && rule.effect != Effect::Deny
+        )
+    }
+}
+
 /// The combined decision for one call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -414,6 +435,12 @@ fn classify_resources(alias: &str, args: &Value) -> Vec<(Action, String)> {
         "workspace_apply_patch" => args.get("changes").and_then(Value::as_array)
             .into_iter().flatten().filter_map(|change| change.get("path").and_then(Value::as_str))
             .filter(|path| !path.is_empty()).map(str::to_string).collect(),
+        "workspace_read_files" => args.get("files").and_then(Value::as_array)
+            .into_iter().flatten().filter_map(|item| item.get("path").and_then(Value::as_str))
+            .filter(|path| !path.is_empty()).map(str::to_string).collect(),
+        "workspace_outline" => args.get("paths").and_then(Value::as_array)
+            .into_iter().flatten().filter_map(Value::as_str)
+            .filter(|path| !path.is_empty()).map(str::to_string).collect(),
         "workspace_copy_file" | "workspace_move_file" | "workspace_copy_directory" | "workspace_move_directory" =>
             ["path", "destination"].iter().filter_map(|key| args.get(*key).and_then(Value::as_str))
                 .filter(|path| !path.is_empty()).map(str::to_string).collect(),
@@ -493,8 +520,24 @@ pub fn classify(alias: &str, args: &Value) -> (Action, String) {
         | "file_write"
         | "file_read"
         | "file_search" => (Action::Path, string_arg(args, &["path"])),
-        // `decide_for_call` also checks every later changed path.
+        // `decide_for_call` also checks every later changed or read path.
         "workspace_apply_patch" => (Action::Path, patch_path(args)),
+        "workspace_read_files" => (
+            Action::Path,
+            args.get("files")
+                .and_then(Value::as_array)
+                .and_then(|items| items.iter().find_map(|item| item.get("path").and_then(Value::as_str)))
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        "workspace_outline" => (
+            Action::Path,
+            args.get("paths")
+                .and_then(Value::as_array)
+                .and_then(|items| items.iter().find_map(Value::as_str))
+                .unwrap_or_default()
+                .to_string(),
+        ),
         "web_fetch" | "web_fetch_url" | "web_read" => (Action::Host, host_arg(args)),
         // Everything else — web_search included — is addressed by its alias.
         _ => (Action::Tool, alias.to_string()),
@@ -981,6 +1024,34 @@ mod tests {
     }
 
     #[test]
+    fn catalog_keeps_possible_calls_and_respects_ordered_tool_denials() {
+        let deny = rule(Action::Tool, "*", Effect::Deny);
+        assert!(rules(vec![]).may_offer_tool("workspace_read_file"));
+        for (alias, action, pattern) in [
+            ("workspace_read_file", Action::Path, "src/**"),
+            ("workspace_apply_patch", Action::Path, "src/**"),
+            ("workspace_copy_file", Action::Path, "src/**"),
+            ("verification_run", Action::Command, "cargo test*"),
+            ("web_fetch", Action::Host, "example.org"),
+        ] {
+            for exception in [Effect::Ask, Effect::Allow] {
+                let scoped = rule(action, pattern, exception);
+                assert!(rules(vec![deny.clone(), scoped.clone()]).may_offer_tool(alias));
+                assert!(!rules(vec![scoped.clone(), deny.clone()]).may_offer_tool(alias));
+                assert!(!rules(vec![deny.clone(), scoped]).may_offer_tool("todo_add"));
+            }
+            assert!(!rules(vec![deny.clone(), rule(action, pattern, Effect::Deny)]).may_offer_tool(alias));
+        }
+        let allow = rule(Action::Tool, "workspace_*", Effect::Allow);
+        let block = rule(Action::Tool, "workspace_read_file", Effect::Deny);
+        let path = rule(Action::Path, "src/**", Effect::Ask);
+        let set = rules(vec![deny, allow, path, block]);
+        assert!(set.may_offer_tool("workspace_list_files"));
+        assert!(!set.may_offer_tool("workspace_read_file"));
+        assert!(!set.may_offer_tool("web_read"));
+    }
+
+    #[test]
     fn a_deny_rule_beats_full_access() {
         let set = rules(vec![rule(Action::Command, "rm *", Effect::Deny)]);
         let decision = decide(
@@ -1230,8 +1301,11 @@ mod tests {
         let mode = crate::permissions::AccessMode::FullAccess;
         let patch = json!({"changes":[{"path":"public.txt"},{"path":"private.txt"}]});
         let transfer = json!({"path":"public.txt","destination":"private.txt"});
+        let batch_read = json!({"files":[{"path":"public.txt"},{"path":"private.txt"}]});
+        let outline = json!({"paths":["public.txt","private.txt"]});
         for (alias, args) in [("workspace_apply_patch", &patch), ("workspace_copy_file", &transfer),
-            ("workspace_move_file", &transfer), ("workspace_copy_directory", &transfer), ("workspace_move_directory", &transfer)] {
+            ("workspace_move_file", &transfer), ("workspace_copy_directory", &transfer), ("workspace_move_directory", &transfer),
+            ("workspace_read_files", &batch_read), ("workspace_outline", &outline)] {
             for effect in [Effect::Deny, Effect::Ask] {
                 let rules = RuleSet { rules: vec![Rule { action: Action::Path, resource: "private.txt".into(), effect }] };
                 let result = decide_for_call(&rules, mode, alias, args, false, false);

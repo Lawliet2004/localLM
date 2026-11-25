@@ -1,0 +1,40 @@
+{
+  "evidence": {
+    "cases": [
+      {
+        "answer": "alpha beta",
+        "batched": false,
+        "durableToolAuditRows": 2,
+        "modelRequests": 3,
+        "outerToolCalls": 2,
+        "parentRulesPresent": true,
+        "partial": false,
+        "underlyingReads": 2,
+        "verification": {
+          "checks": [],
+          "revision": 0,
+          "status": "not_required"
+        },
+        "verificationNudges": 0
+      },
+      {
+        "answer": "alpha beta",
+        "batched": true,
+        "durableToolAuditRows": 3,
+        "modelRequests": 2,
+        "outerToolCalls": 1,
+        "parentRulesPresent": true,
+        "partial": false,
+        "underlyingReads": 2,
+        "verification": {
+          "checks": [],
+          "revision": 0,
+          "status": "not_required"
+        },
+        "verificationNudges": 0
+      }
+    ],
+    "limitation": "Scripted model chooses the plan. This tests orchestration and result parity, not real-model task accuracy or comparative harness performance."
+  },
+  "name": "scripted_ptc_equivalence"
+}

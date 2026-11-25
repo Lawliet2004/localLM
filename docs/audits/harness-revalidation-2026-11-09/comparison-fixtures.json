@@ -1,0 +1,89 @@
+[
+  {
+    "seed": 20261108,
+    "task": "single_read",
+    "prompt": "Read answer.txt. Return exactly one JSON object with the key code and its verification code. Do not modify files or run commands.",
+    "expected": {
+      "code": "796973a9b4fd"
+    },
+    "inputHashes": {
+      "answer.txt": "b83b061d594f22bdf784eb280ea737562d9f604eacdf370c4582a8d026e4e312"
+    }
+  },
+  {
+    "seed": 20261108,
+    "task": "four_file_join",
+    "prompt": "Read alpha.json, beta.json, gamma.json, and delta.json. Return exactly one JSON object with keys alpha, beta, gamma, delta containing each file value, plus total containing their sum. Do not modify files or run commands.",
+    "expected": {
+      "alpha": 100,
+      "beta": 132,
+      "gamma": 74,
+      "delta": 93,
+      "total": 399
+    },
+    "inputHashes": {
+      "delta.json": "db39dad2c0abd7eefbd950930139aac2350d7ec95555799500aa0bf8f9ef1b9f",
+      "gamma.json": "defafc69c969e3ff123d855c8e31ae2c79d4d087795e909318d0b6a18ec95b6b",
+      "beta.json": "c242038f756ba365e96e2e71882556d46f8b05a41b9499f387ab8c5f158d4a58",
+      "alpha.json": "e66d77a6d8fac950cbb099c0e80c3a2385c31950c1fec0938be27821450911be"
+    }
+  },
+  {
+    "seed": 20261109,
+    "task": "single_read",
+    "prompt": "Read answer.txt. Return exactly one JSON object with the key code and its verification code. Do not modify files or run commands.",
+    "expected": {
+      "code": "b85d539d2b7d"
+    },
+    "inputHashes": {
+      "answer.txt": "2e084fa1296711288ea6f99cb9bf571ae9b22ebf31b4f0a4fdbe660784b0bca0"
+    }
+  },
+  {
+    "seed": 20261109,
+    "task": "four_file_join",
+    "prompt": "Read alpha.json, beta.json, gamma.json, and delta.json. Return exactly one JSON object with keys alpha, beta, gamma, delta containing each file value, plus total containing their sum. Do not modify files or run commands.",
+    "expected": {
+      "alpha": 64,
+      "beta": 29,
+      "gamma": 142,
+      "delta": 91,
+      "total": 326
+    },
+    "inputHashes": {
+      "delta.json": "67bcbaec00623c56715b19e2f94ba90b1cd78629e088db83bf0b85403e834c6d",
+      "gamma.json": "7068883198e9ea03bf7a0f4ca983653285e0ae9fe26da4e1d3ea1d6181ef4a6a",
+      "beta.json": "7e52579543b0406e355b8f385fbed61d44e6783951c206b9acf41fe033ddb4de",
+      "alpha.json": "9f6480b42ecd282430ba0d3e8fcddae7b4bd0b04d1da7073b85d2cc12082b1f0"
+    }
+  },
+  {
+    "seed": 20261110,
+    "task": "single_read",
+    "prompt": "Read answer.txt. Return exactly one JSON object with the key code and its verification code. Do not modify files or run commands.",
+    "expected": {
+      "code": "98f0728774aa"
+    },
+    "inputHashes": {
+      "answer.txt": "77be8e5a84b67c501fcf057408f936a179b0912573bfea28dc346bb8162f0bdd"
+    }
+  },
+  {
+    "seed": 20261110,
+    "task": "four_file_join",
+    "prompt": "Read alpha.json, beta.json, gamma.json, and delta.json. Return exactly one JSON object with keys alpha, beta, gamma, delta containing each file value, plus total containing their sum. Do not modify files or run commands.",
+    "expected": {
+      "alpha": 93,
+      "beta": 182,
+      "gamma": 61,
+      "delta": 161,
+      "total": 497
+    },
+    "inputHashes": {
+      "delta.json": "c5e386b85aa7ae713333594f38be776ee8289d2a930180dce8382ddf90a2445f",
+      "gamma.json": "7f8988b38d40f638aca876606ac3726b398d5ff196a56e732d3b7bac3066b901",
+      "beta.json": "c1866cd89c1c15fddb7daac4d44af40fb2b151fde1f6f3a9c2262aefdd0900e3",
+      "alpha.json": "db39dad2c0abd7eefbd950930139aac2350d7ec95555799500aa0bf8f9ef1b9f"
+    }
+  }
+]

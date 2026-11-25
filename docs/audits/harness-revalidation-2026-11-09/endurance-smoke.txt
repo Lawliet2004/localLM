@@ -1,0 +1,34 @@
+
+running 1 test
+test harness_endurance_tests::wall_clock_endurance ... SOAK_START {"provider":"scripted-loopback","reads":24,"residentBytes":71331840,"seconds":8}
+SOAK_PROGRESS {"elapsedSeconds":0.321496854,"request":1,"requests":25,"residentBytes":96694272,"settledPriorReads":0}
+SOAK_PROGRESS {"elapsedSeconds":0.641719614,"request":2,"requests":25,"residentBytes":100569088,"settledPriorReads":1}
+SOAK_PROGRESS {"elapsedSeconds":0.961826104,"request":3,"requests":25,"residentBytes":101154816,"settledPriorReads":2}
+SOAK_PROGRESS {"elapsedSeconds":1.281865407,"request":4,"requests":25,"residentBytes":101662720,"settledPriorReads":3}
+SOAK_PROGRESS {"elapsedSeconds":1.6020299869999999,"request":5,"requests":25,"residentBytes":102158336,"settledPriorReads":4}
+SOAK_PROGRESS {"elapsedSeconds":1.921654485,"request":6,"requests":25,"residentBytes":102674432,"settledPriorReads":5}
+SOAK_PROGRESS {"elapsedSeconds":2.241350257,"request":7,"requests":25,"residentBytes":103170048,"settledPriorReads":6}
+SOAK_PROGRESS {"elapsedSeconds":2.561414777,"request":8,"requests":25,"residentBytes":103690240,"settledPriorReads":7}
+SOAK_PROGRESS {"elapsedSeconds":2.881432039,"request":9,"requests":25,"residentBytes":104181760,"settledPriorReads":8}
+SOAK_PROGRESS {"elapsedSeconds":3.202009962,"request":10,"requests":25,"residentBytes":104738816,"settledPriorReads":9}
+SOAK_PROGRESS {"elapsedSeconds":3.521514532,"request":11,"requests":25,"residentBytes":105230336,"settledPriorReads":10}
+SOAK_PROGRESS {"elapsedSeconds":3.841422466,"request":12,"requests":25,"residentBytes":105742336,"settledPriorReads":11}
+SOAK_PROGRESS {"elapsedSeconds":4.161354606,"request":13,"requests":25,"residentBytes":106258432,"settledPriorReads":12}
+SOAK_PROGRESS {"elapsedSeconds":4.481707192,"request":14,"requests":25,"residentBytes":106754048,"settledPriorReads":13}
+SOAK_PROGRESS {"elapsedSeconds":4.801665762,"request":15,"requests":25,"residentBytes":107257856,"settledPriorReads":14}
+SOAK_PROGRESS {"elapsedSeconds":5.121724111,"request":16,"requests":25,"residentBytes":107757568,"settledPriorReads":15}
+SOAK_PROGRESS {"elapsedSeconds":5.441490366,"request":17,"requests":25,"residentBytes":108331008,"settledPriorReads":16}
+SOAK_PROGRESS {"elapsedSeconds":5.762029666,"request":18,"requests":25,"residentBytes":108838912,"settledPriorReads":17}
+SOAK_PROGRESS {"elapsedSeconds":6.081571246,"request":19,"requests":25,"residentBytes":109330432,"settledPriorReads":18}
+SOAK_PROGRESS {"elapsedSeconds":6.401815678,"request":20,"requests":25,"residentBytes":109838336,"settledPriorReads":19}
+SOAK_PROGRESS {"elapsedSeconds":6.721360915,"request":21,"requests":25,"residentBytes":110329856,"settledPriorReads":20}
+SOAK_PROGRESS {"elapsedSeconds":7.041632708,"request":22,"requests":25,"residentBytes":110764032,"settledPriorReads":21}
+SOAK_PROGRESS {"elapsedSeconds":7.362018938,"request":23,"requests":25,"residentBytes":111177728,"settledPriorReads":22}
+SOAK_PROGRESS {"elapsedSeconds":7.681522095,"request":24,"requests":25,"residentBytes":111595520,"settledPriorReads":23}
+SOAK_PROGRESS {"elapsedSeconds":8.001549105,"request":25,"requests":25,"residentBytes":112009216,"settledPriorReads":24}
+SOAK_CONTEXT {"firstMessageBytes":8188,"lastMessageBytes":12367,"maxCompactedInputTokens":13608}
+SOAK_RESULT {"compactions":24,"elapsedSeconds":8.025723638,"ledgerStatus":"completed","partial":false,"realFileReads":24,"reopenPreservedCompletion":true,"requests":25,"residentEndBytes":112205824,"residentStartBytes":71331840,"runStatus":"completed","scope":"One registered read-only turn with paced scripted inference.","turnStatus":"complete"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1143 filtered out; finished in 8.05s
+

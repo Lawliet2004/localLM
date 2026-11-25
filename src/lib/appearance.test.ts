@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { APPEARANCE_STORAGE_KEY, applyAppearance, defaultAppearance, loadAppearance, normalizeAppearance } from './appearance';
+import { APPEARANCE_STORAGE_KEY, applyAppearance, contrastRatio, defaultAppearance, loadAppearance, normalizeAppearance } from './appearance';
 import { useAppearance } from './useAppearance';
 
 beforeEach(() => { localStorage.clear(); });
@@ -26,6 +26,26 @@ describe('appearance preferences', () => {
     applyAppearance({ ...defaultAppearance });
     expect(document.documentElement.style.getPropertyValue('--accent')).toBe('');
     expect(document.documentElement).toHaveAttribute('data-theme', 'light');
+  });
+
+  it('tints app surfaces in both modes and retains readable text', () => {
+    const style = document.documentElement.style;
+    for (const theme of ['light', 'dark'] as const) {
+      applyAppearance({ ...defaultAppearance, accent: 'rose' }, theme);
+      const roseSurface = style.getPropertyValue('--surface');
+      const roseSidebar = style.getPropertyValue('--sidebar');
+      applyAppearance({ ...defaultAppearance, accent: 'blue' }, theme);
+      expect(style.getPropertyValue('--surface')).not.toBe(roseSurface);
+      expect(style.getPropertyValue('--sidebar')).not.toBe(roseSidebar);
+      expect(contrastRatio(style.getPropertyValue('--secondary'), style.getPropertyValue('--surface'))).toBeGreaterThan(4.5);
+    }
+    applyAppearance({ ...defaultAppearance });
+    expect(style.getPropertyValue('--surface')).toBe('');
+  });
+
+  it('discards custom wallpaper values that could inject a URL', () => {
+    expect(normalizeAppearance({ homeWallpaper: 'custom', customWallpaper: 'https://example.com/photo.jpg' }))
+      .toMatchObject({ homeWallpaper: 'none', customWallpaper: '' });
   });
 
   it('follows system appearance changes and keeps explicit theme choices fixed', () => {

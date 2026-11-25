@@ -16,8 +16,6 @@
 /* Expanded tools must stay beside the persistent navigation dock. */
 .desktop-app .workspace-panel.panel-expanded { left: 52px; }
 .desktop-app .sidebar { grid-column: 1; grid-row: 2; border: 1px solid var(--border); border-radius: 14px; background: var(--sidebar); padding: 20px 14px 14px; }
-.desktop-app .workspace-header { background: var(--surface); padding: 0 24px; min-height: 54px; border-bottom-color: var(--border); }
-.desktop-app .workspace-header-minimal { min-height: 54px; border-bottom-color: transparent; }
 .desktop-app .preview-banner { background: var(--surface); color: var(--secondary); font-size: 11px; border: 0; padding: 8px 20px; flex-shrink: 0; }
 .desktop-app .error-banner { flex-shrink: 0; }
 .desktop-app :is(input, textarea) { caret-color: var(--accent); }
@@ -51,7 +49,7 @@
 .desktop-app .new-chat { margin: 24px 0 27px; padding: 11px 13px; border: 0; border-radius: 8px; background: var(--button-bg); color: var(--button-text); font-size: 13px; font-weight: 500; }
 .desktop-app .new-chat:hover:not(:disabled) { background: var(--accent-strong); color: var(--button-text); }
 .desktop-app .new-chat svg { color: inherit; }
-.desktop-app .new-chat-plus { opacity: .65; }
+.desktop-app .new-chat-plus { opacity: 1; }
 .desktop-app .sidebar-section-header { margin: 0 0 7px; padding: 0 9px; text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 500; color: var(--secondary); }
 .desktop-app .codex-folder-icon { color: var(--folder); }
 .desktop-app .codex-chat-title { font-size: 12px; }
@@ -112,13 +110,14 @@
 .desktop-app .codex-project-list .codex-chat-item { min-height: 32px; }
 .desktop-app .codex-project-list .codex-chat-item.active-conversation, .desktop-app .codex-project-list .codex-chat-item.active-pill { background: var(--active); }
 .desktop-app .codex-project-list .codex-chat-item.active-conversation::before, .desktop-app .codex-project-list .codex-chat-item.active-pill::before { left: -7px; top: 8px; bottom: 8px; }
-/* Conversation: compact bubble, quiet actions that appear on hover or focus. */
-.desktop-app .message-user { background: var(--hover); border: 0; box-shadow: none; padding: 10px 16px; margin: 4px 0 22px auto; border-radius: 16px 16px 4px 16px; line-height: 1.55; }
+/* Conversation: compact bubble with a copy action below the prompt. */
+.desktop-app .message-user { background: var(--hover); border: 0; box-shadow: none; padding: 10px 16px; margin: 4px 0 max(22px, var(--prompt-copy-space, 0px)) auto; border-radius: 16px 16px 4px 16px; line-height: 1.55; }
 .desktop-app .message-user .markdown > :last-child { margin-bottom: 0; }
 .desktop-app .message-user .markdown > :first-child { margin-top: 0; }
 .desktop-app .message .copy-message { width: 26px; height: 26px; margin: 0; opacity: 0; color: var(--muted); }
 .desktop-app .message .copy-message:focus-visible, .desktop-app .message:hover .copy-message, .desktop-app .message:focus-within .copy-message { opacity: 1; }
-.desktop-app .message-user .copy-message { position: absolute; right: calc(100% + 6px); top: 50%; transform: translateY(-50%); }
+.desktop-app .message-user:has(> .copy-message) { --prompt-copy-space: 32px; }
+.desktop-app .message-user .copy-message { position: absolute; inset-inline-end: 16px; inset-block-start: calc(100% + 2px); opacity: 1; }
 .desktop-app .message-assistant .copy-message { margin: 2px 0 0 -6px; }
 .desktop-app .message-assistant { padding-bottom: 14px; }
 .desktop-app .work-summary { margin: 8px 0 6px; font-size: 12px; }
@@ -129,7 +128,6 @@
 .desktop-app .work-summary > summary:hover { background: var(--hover); color: var(--text); }
 .desktop-app .work-summary > p { margin: 4px 0 0 22px; font-size: 12px; color: var(--secondary); }
 @media (hover: none) { .desktop-app .message .copy-message { opacity: 1; } }
-@media (max-width: 760px) { .desktop-app .message-user .copy-message { right: 0; top: calc(100% + 2px); transform: none; } .desktop-app .message-user { margin-bottom: 30px; } }
 /* Settings navigation is the modal's left column; content scrolls beside it. */
 .settings-sidebar { display: flex; flex-direction: column; min-height: 0; overflow: hidden; padding: 26px 15px 16px; background: var(--sidebar); border-right: 1px solid var(--border); }
 .settings-sidebar-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 32px; flex-shrink: 0; padding: 0; margin-bottom: 12px; }
@@ -178,7 +176,7 @@
 .preference-copy { flex: 1; min-width: 0; }
 .preference-copy > label, .preference-copy > span { font-size: 13px; font-weight: 500; color: var(--text); }
 .preference-copy p { font-size: 12px; color: var(--secondary); line-height: 1.65; margin: 4px 0 0; max-width: 62ch; overflow-wrap: anywhere; }
-.preference-row select { flex-shrink: 0; width: auto; max-width: 190px; min-width: 135px; padding: 8px 30px 8px 12px; font-size: 12px; border-radius: 8px; background-color: var(--input); }
+.preference-row select { flex-shrink: 0; width: auto; max-width: 190px; min-width: 135px; min-height: 36px; padding: 8px 30px 8px 12px; font-size: 13px; font-weight: 500; border-radius: 8px; background-color: var(--input); }
 .preference-link { display: inline-flex; align-items: center; justify-content: center; gap: 7px; flex-shrink: 0; font-size: 11px; padding: 8px 10px; border-radius: 7px; background: var(--hover); color: var(--text); white-space: nowrap; }
 .preference-link:hover { background: var(--active); }
 .preference-link > svg:first-child:not(:last-child) { color: var(--secondary); }
@@ -387,9 +385,6 @@ input[type=checkbox].switch:disabled { opacity: .5; cursor: not-allowed; }
   .theme-preview-canvas { padding: 19px 8px 8px; }
   .general-about { margin-top: 28px; }
   .environment-badge { margin-left: 0; }
-  .desktop-app .workspace-header { padding: 0 12px; }
-  .desktop-app .workspace-header .workspace-lead > [aria-label=Back], .desktop-app .workspace-header .workspace-lead > [aria-label=Forward] { display: none; }
-  .desktop-app .workspace-title { max-width: 110px; }
   .desktop-app .catalog-toolbar { flex-direction: column; align-items: stretch; }
   .desktop-app .catalog-toolbar .search-field { width: 100%; }
   .desktop-app .field-pair { grid-template-columns: minmax(0, 1fr); }
@@ -502,12 +497,13 @@ input[type=checkbox].switch:disabled { opacity: .5; cursor: not-allowed; }
 .artifact-expanded pre { max-height: 70vh; }
 /* Consolidated conversation/diagnostics repair after the first visual batch. */
 .desktop-app .composer-region { position: relative; }
-.desktop-app .composer-region > .jump-to-latest { top: -42px; bottom: auto; right: 20px; backdrop-filter: none; }
+.desktop-app .composer-region > .jump-to-latest { top: -42px; bottom: auto; right: -8px; backdrop-filter: none; }
 .desktop-app .chat-scroll { padding-bottom: 48px; }
 .desktop-app .code-block-wrapper { background: var(--code-bg); border-radius: 12px; }
 .desktop-app .code-block-header { background: var(--code-header-bg); color: var(--code-fg); padding: 8px 12px; }
 .desktop-app .code-block-lang, .desktop-app .code-block-copy-btn { color: var(--text); font-size: 12px; }
 .desktop-app .markdown .code-block-pre { margin: 0; padding: 18px; border: 0; border-radius: 0; background: var(--code-bg); color: var(--code-fg); box-shadow: none; line-height: 1.65; font-size: var(--code-font-size, 13px); }
+.desktop-app .markdown .code-block-line-numbers { padding: 18px 8px; line-height: 1.65; }
 .desktop-app .markdown .code-block-pre code { background: transparent; color: inherit; padding: 0; }
 .desktop-app .tool-result-json { color: var(--text); background: var(--surface); overflow: auto; margin: 0; padding: 12px; }
 .desktop-app .model-capabilities { display: block; position: static; max-width: none; color: var(--secondary); font-size: 12px; }
@@ -538,7 +534,6 @@ input[type=checkbox].switch:disabled { opacity: .5; cursor: not-allowed; }
   .desktop-app .model-status { flex-wrap: wrap; gap: 12px; }
   .desktop-app .model-status > div:not(.model-icon) { flex-basis: calc(100% - 72px); }
   .desktop-app .model-status > button { margin-left: auto; }
-  .desktop-app .composer-region > .jump-to-latest { right: 12px; }
 }
 .execution-artifacts { border: 0; border-radius: 0; padding: 0; }
 .project-documents > p { max-width: 75ch; overflow-wrap: anywhere; }
@@ -571,13 +566,14 @@ input[type=checkbox].switch:disabled { opacity: .5; cursor: not-allowed; }
 }
 
 /* Settings open as one centered floating window over the chat surface. */
-.settings-modal { width: min(1140px, calc(100vw - 96px)); height: min(780px, calc(100dvh - 96px)); max-width: none; max-height: none; margin: auto; padding: 0; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); color: var(--text); box-shadow: var(--shadow-lg); overflow: hidden; }
+.settings-modal { width: min(1400px, calc(100vw - 64px)); height: min(780px, calc(100dvh - 96px)); max-width: none; max-height: none; margin: auto; padding: 0; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); color: var(--text); box-shadow: var(--shadow-lg); overflow: hidden; }
 .settings-modal::backdrop { background: rgba(31, 41, 34, .42); }
 .settings-modal-body { display: grid; grid-template-columns: 254px minmax(0, 1fr); height: 100%; min-height: 0; }
 .settings-modal .settings-sidebar { min-width: 0; }
 .settings-modal-content { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .settings-modal-content > .settings-page { flex: 1; min-height: 0; }
-.settings-modal .settings-page, .settings-modal .settings-page.models-page { padding: 40px max(30px, calc((100% - 780px) / 2)) 48px; }
+.settings-modal .settings-page { padding: 40px max(30px, calc((100% - 1000px) / 2)) 48px; }
+.settings-modal .settings-page.models-page { padding-inline: max(30px, calc((100% - 1100px) / 2)); }
 @media (max-width: 1100px) {
   .settings-modal-body { grid-template-columns: 224px minmax(0, 1fr); }
   .settings-modal .settings-page, .settings-modal .settings-page.models-page { padding-left: 26px; padding-right: 26px; }
@@ -626,134 +622,6 @@ input[type=checkbox].switch:disabled { opacity: .5; cursor: not-allowed; }
   .chat-shell { flex-direction: column; }
   .canvas-panel { width: 100% !important; max-height: 48%; flex: 0 0 auto; margin: 0; border: 0; border-top: 1px solid var(--border); border-radius: 0; }
   .canvas-resize { display: none; }
-}
-
-/* Workspace top bar */
-.desktop-app .workspace-header:not(.workspace-header-minimal) {
-  height: 52px;
-  min-height: 52px;
-  padding: 0 14px 0 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-.desktop-app .workspace-header .icon-button,
-.desktop-app .workspace-header .task-menu > summary {
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  display: grid;
-  place-items: center;
-  border-radius: 8px;
-  color: var(--secondary);
-  background: transparent;
-  transition: background .12s, color .12s;
-}
-.desktop-app .workspace-header .icon-button:hover:not(:disabled),
-.desktop-app .workspace-header .task-menu > summary:hover,
-.desktop-app .workspace-header .task-menu[open] > summary {
-  background: var(--hover);
-  color: var(--text);
-}
-.desktop-app .workspace-header .icon-button:disabled {
-  opacity: .35;
-}
-.desktop-app .workspace-header .icon-button:disabled:hover {
-  background: transparent;
-}
-.desktop-app .workspace-header .icon-button:focus-visible,
-.desktop-app .workspace-header .task-menu > summary:focus-visible,
-.desktop-app .workspace-header .header-actions > select:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-.desktop-app .workspace-header .icon-button svg,
-.desktop-app .workspace-header .task-menu > summary svg {
-  stroke-width: 1.75;
-}
-.desktop-app .workspace-header .panel-toggles .icon-button[aria-pressed=true],
-.desktop-app .workspace-header .panel-toggles .icon-button[aria-expanded=true] {
-  background: var(--surface);
-  color: var(--text);
-  box-shadow: inset 0 0 0 1px var(--border-strong);
-}
-.desktop-app .workspace-header:not(.workspace-header-minimal) .workspace-lead > [aria-label="Forward"] {
-  position: relative;
-  margin-right: 19px;
-}
-.desktop-app .workspace-header:not(.workspace-header-minimal) .workspace-lead > [aria-label="Forward"]::after {
-  content: '';
-  position: absolute;
-  left: calc(100% + 10px);
-  top: 50%;
-  transform: translateY(-50%);
-  width: 1px;
-  height: 18px;
-  background: var(--border-strong);
-  pointer-events: none;
-}
-.desktop-app .workspace-header .task-folder-icon {
-  width: 16px;
-  height: 16px;
-  color: var(--muted);
-  margin-right: 8px;
-  flex-shrink: 0;
-}
-.desktop-app .workspace-header .workspace-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-  letter-spacing: -.01em;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.desktop-app .workspace-header .header-actions {
-  gap: 4px;
-}
-.desktop-app .workspace-header .header-actions > select {
-  appearance: none;
-  -webkit-appearance: none;
-  height: 30px;
-  padding: 0 28px 0 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239a9f98' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 9px center / 12px;
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--text);
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  cursor: pointer;
-}
-.desktop-app .workspace-header .header-actions > select:hover {
-  background-color: var(--hover);
-  border-color: var(--border-strong);
-}
-.desktop-app .workspace-header .header-actions > select option {
-  background: var(--elevated);
-  color: var(--text);
-}
-.desktop-app .workspace-header:not(.workspace-header-minimal) .panel-toggles {
-  gap: 4px;
-}
-.desktop-app .workspace-header:not(.workspace-header-minimal) .panel-toggles::before {
-  content: '';
-  width: 1px;
-  height: 18px;
-  margin: 0 6px;
-  background: var(--border-strong);
-  align-self: center;
-  flex-shrink: 0;
-}
-.desktop-app .workspace-header .task-menu > div > .icon-button {
-  width: 100%;
-  height: 34px;
-  padding: 8px 10px;
-  display: flex;
-  justify-content: flex-start;
 }
 
 /* Composer chrome must work before the lazy visual renderer loads. */

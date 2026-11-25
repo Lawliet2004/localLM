@@ -1,0 +1,12 @@
+{
+  "run": "1-four_file_join-Claude-Code-warm",
+  "timedOut": true,
+  "error": "Run exceeded 240 seconds",
+  "modelRequests": 62,
+  "modelIssuedToolCalls": 248,
+  "recognizedToolCalls": 247,
+  "underlyingToolOperations": 244,
+  "successfulToolOperations": 120,
+  "permissionDenials": null,
+  "toolOperationCountsPartial": true
+}

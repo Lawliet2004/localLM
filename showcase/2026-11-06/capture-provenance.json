@@ -1,0 +1,43 @@
+{
+  "recordedApplication": "Native Tauri desktop app; embedded frontend, no browser preview",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "provider": "River",
+  "inference": "Hosted API inference using the existing configured encrypted credential",
+  "localInference": "Local model/runtime settings are demonstrated; no local GGUF inference was run.",
+  "demoWorkspace": "demo-workspace",
+  "status": "complete",
+  "assistantResponse": "I'll read both input files first.\n\n**Created `launch-summary.md`** with a compact per-channel table (signups, paid conversions, conversion rate), a total row, and one conclusion. `README.md` and `stats.csv` were read only, not modified.\n\n| Channel | Signups | Paid | Rate |\n| --- | ---: | ---: | ---: |\n| YouTube | 320 | 48 | 15.0% |\n| GitHub | 245 | 42 | 17.1% |\n| Community | 180 | 20 | 11.1% |\n| **Total** | **745** | **110** | **14.8%** |\n\n**Conclusion:** GitHub converts best (17.1%), YouTube drives the most volume (320 signups, 48 paid), and Community trails on both \u2014 so effort is best spent on YouTube reach plus GitHub-style conversion.\n\nRates computed from the CSV (paid \u00f7 signups); total is 110/745 = 14.8%. File was written and read back to confirm contents.",
+  "toolActions": [
+    {
+      "tool": "file_read",
+      "decision": "allowed",
+      "path": "README.md"
+    },
+    {
+      "tool": "file_read",
+      "decision": "allowed",
+      "path": "stats.csv"
+    },
+    {
+      "tool": "file_write",
+      "decision": "allowed",
+      "path": "launch-summary.md"
+    },
+    {
+      "tool": "file_read",
+      "decision": "allowed",
+      "path": "launch-summary.md"
+    }
+  ],
+  "gitStatus": "A  launch-summary.md\n",
+  "inputSha256": {
+    "README.md": "980d14cbe1660cdcf95eef81d59a4adc64f8a84bf9ccfff2d1dc168e12cbf76e",
+    "stats.csv": "ad309b76e5c8ef2b068aa32fa47e018fa2100742bd8b04aa04b540c201d5c8ec"
+  },
+  "privacy": "Saved API key field was left blank and unrevealed. No plaintext key was exported.",
+  "editing": "Real footage with waiting time removed, close-ups and editorial overlays.",
+  "narration": "Synthetic English narration, Microsoft Edge neural voice",
+  "music": "Original procedural composition synthesized for this video",
+  "browserUsed": false,
+  "sourceFilesModifiedForRecording": false
+}

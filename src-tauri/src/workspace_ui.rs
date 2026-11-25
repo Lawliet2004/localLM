@@ -148,6 +148,15 @@ pub fn task_workspace(store: &crate::store::Store, id: &str) -> Result<Option<St
         .map(|p| p.path.clone()))
 }
 
+pub(crate) fn project_workspace(store: &crate::store::Store, id: Option<&str>) -> Result<Option<String>, String> {
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    Ok(index(store)?.projects.into_iter()
+        .find(|project| project.id == id)
+        .map(|project| project.path))
+}
+
 /// Do not remove a worktree while another conversation is filed in it, even
 /// when that conversation selected a subdirectory as its workspace.
 pub(crate) fn reserve_worktree_removal(

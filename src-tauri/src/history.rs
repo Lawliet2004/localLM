@@ -20,10 +20,20 @@ pub fn reserve_native_read_round(
     Ok(Some(row))
 }
 pub fn saved_native_message(message: &Value) -> Option<Value> {
+    let has_call_extra = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|call| call.get("extra_content").is_some_and(|v| !v.is_null()))
+        });
     if message.get("locallm_responses_output").is_some()
         || message.get("locallm_claude_content").is_some()
         || message.get("reasoning_content").is_some()
         || message.get("reasoning").is_some()
+        || message.get("extra_content").is_some_and(|v| !v.is_null())
+        || has_call_extra
     {
         Some(json!({"kind":NATIVE_MESSAGE,"message":message}))
     } else {
@@ -261,7 +271,7 @@ fn flush_tools(messages: &mut Vec<Value>, pending: &mut Vec<PendingCall>) -> Res
                     .iter()
                     .filter_map(|call| call["id"].as_str())
                     .collect();
-                native_calls.len() <= 8
+                native_calls.len() <= crate::tool_calls::MAX_CALLS_PER_ROUND
                     && ids.len() == native_calls.len()
                     && group.iter().all(|call| ids.contains(call.call_id.as_str()))
             });

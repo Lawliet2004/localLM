@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "locallm.database-acceptance/1",
+  "recordedAt": "2026-11-09T05:27:27.588138+00:00",
+  "results": [
+    {
+      "engine": "postgres",
+      "imageTag": "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+      "container": "locallm-acceptance-39f4bea5f63b447d88acb1dd11679e1c",
+      "status": "passed",
+      "cleaned": true,
+      "imageDigests": [
+        "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+      ],
+      "hostPort": 32787,
+      "exitCode": 0,
+      "elapsedSeconds": 8.173892200982664
+    },
+    {
+      "engine": "mysql",
+      "imageTag": "mirror.gcr.io/library/mysql@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902",
+      "container": "locallm-acceptance-12181472d09c449b838ae0cd834f480c",
+      "status": "passed",
+      "cleaned": true,
+      "imageDigests": [
+        "mirror.gcr.io/library/mysql@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902"
+      ],
+      "hostPort": 32788,
+      "isolatedClientOptionsControl": true,
+      "exitCode": 0,
+      "elapsedSeconds": 10.158207291009603
+    }
+  ]
+}

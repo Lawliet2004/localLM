@@ -1,0 +1,40 @@
+    Finished `test` profile [unoptimized] target(s) in 0.35s
+     Running unittests src/lib.rs (target/debug/deps/tauri_app_lib-1f9b5e0a6b72a6ac)
+
+running 20 tests
+test api_tools::transport_tests::actual_http_redirect_forms_references_and_uncertain_writes ... ok
+test api_tools::transport_tests::actual_http_response_validation_redaction_and_evidence ... ok
+test chat::output_recovery_tests::approval_items_match_live_and_replay_for_allow_deny_and_stop ... ok
+test chat::output_recovery_tests::buffered_reasoning_flushes_while_the_provider_is_silent ... ok
+test chat::output_recovery_tests::disconnected_view_can_recover_and_resolve_a_real_pending_approval ... ok
+test chat::output_recovery_tests::dropped_registered_turn_is_reconciled_after_its_lock_is_released ... ok
+test chat::output_recovery_tests::explicit_ask_rule_prevents_grouped_read_before_user_decision ... ok
+test chat::output_recovery_tests::failed_model_round_resumes_from_durable_tools_without_redispatch ... ok
+test chat::output_recovery_tests::glm_reasoning_items_match_live_delivery_and_journal_replay ... ok
+test chat::output_recovery_tests::grouped_reads_run_pre_hooks_once_and_preserve_both_results ... ok
+test chat::output_recovery_tests::model_multi_path_edits_respect_rule_on_later_target ... ok
+test chat::output_recovery_tests::partial_tool_request_is_visible_before_completion_and_stop_never_dispatches_it ... ok
+test chat::output_recovery_tests::permission_change_after_group_dispatch_preserves_both_real_results ... FAILED
+test chat::output_recovery_tests::permission_change_during_group_hooks_blocks_dispatch_and_preserves_audit ... ok
+test chat::output_recovery_tests::real_turn_recovers_empty_or_truncated_tool_output_and_actually_saves_the_file ... ok
+test chat::output_recovery_tests::registered_turns_queue_and_cancel_independently_against_scripted_provider ... ok
+test chat::output_recovery_tests::repeated_output_exhaustion_is_bounded_and_reported_as_failure ... ok
+test chat::output_recovery_tests::sequential_read_authorization_rechecks_before_dispatch_and_reports_truthfully ... ok
+test subagents::tests::child_permission_rules_block_or_allow_actual_workspace_reads ... ok
+test subagents::tests::foreground_child_approval_does_not_override_a_new_deny_rule ... ok
+
+failures:
+
+---- chat::output_recovery_tests::permission_change_after_group_dispatch_preserves_both_real_results stdout ----
+
+thread 'chat::output_recovery_tests::permission_change_after_group_dispatch_preserves_both_real_results' (606690) panicked at src/chat.rs:7905:17:
+called `Result::unwrap()` on an `Err` value: "Could not reach provider. Check the HTTPS base URL and network connection."
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    chat::output_recovery_tests::permission_change_after_group_dispatch_preserves_both_real_results
+
+test result: FAILED. 19 passed; 1 failed; 0 ignored; 0 measured; 1081 filtered out; finished in 10.19s
+
+error: test failed, to rerun pass `--lib`

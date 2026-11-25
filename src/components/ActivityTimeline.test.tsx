@@ -34,6 +34,7 @@ it('respects the reasoning disclosure while streaming and after completion', () 
   const view = render(<ActivityTimeline {...props} messages={[message]} events={[]} generating />);
   const disclosure = screen.getByTestId('turn-reasoning');
   expect(disclosure).not.toHaveAttribute('open');
+  expect(screen.getByText('First thought')).toHaveClass('reasoning-excerpt');
   fireEvent.click(screen.getByLabelText('Reasoning in progress'));
   expect(disclosure).toHaveAttribute('open');
   view.rerender(<ActivityTimeline {...props} messages={[{ ...message, reasoning: 'First thought and more' }]} events={[]} generating />);
@@ -231,14 +232,12 @@ it('keeps envelope failures visible outside the collapsed group', () => {
   expect(screen.getByText('execute_command').closest('details')).toBeNull();
 });
 
-it('folds only adjacent successful exploration and preserves errors and edits in place', () => {
+it('keeps consecutive exploration individually visible alongside errors and edits', () => {
   const tool = (id: string, name: string, status: Message['status'] = 'complete', decision = 'allowed'): Message => ({ ...assistant(status), id, role: 'tool', content: JSON.stringify({ request: { name, arguments: { path: `${id}.ts` }, decision }, result: {} }) });
   const tools = [tool('r1', 'read_file'), tool('r2', 'read_file'), tool('bad', 'search', 'error'), tool('r3', 'read_file'), tool('edit', 'edit_file'), tool('pending', 'execute_command', 'streaming', 'pending'), tool('r4', 'read_file'), tool('r5', 'read_file')];
   const { container } = render(<ActivityTimeline events={[]} messages={tools} {...props} renderTool={m => <p data-tool={m.id}>{m.id}</p>} />);
   expect([...container.querySelectorAll('[data-tool]')].map(row => row.getAttribute('data-tool'))).toEqual(tools.map(tool => tool.id));
-  expect(container.querySelectorAll('.activity-summary')).toHaveLength(2);
-  for (const id of ['bad', 'edit', 'pending']) expect(container.querySelector(`[data-tool="${id}"]`)?.closest('.activity-summary')).toBeNull();
-  expect(screen.getAllByText('Read 2 files')).toHaveLength(2);
+  for (const tool of tools) expect(screen.getByText(tool.id)).toBeVisible();
 });
 
 it('deduplicates journal deliveries and orders calls by sequence', () => {

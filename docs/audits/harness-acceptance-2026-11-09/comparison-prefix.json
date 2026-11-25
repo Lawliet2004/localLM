@@ -1,0 +1,122 @@
+[
+  {
+    "run": "0-single_read-LocalLM-cold",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "0-single_read-LocalLM-warm",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "0-four_file_join-LocalLM-cold",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "0-four_file_join-LocalLM-warm",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "1-single_read-LocalLM-cold",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "1-single_read-LocalLM-warm",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "1-four_file_join-LocalLM-cold",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "1-four_file_join-LocalLM-warm",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "2-single_read-LocalLM-cold",
+    "requests": 2,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "2-single_read-LocalLM-warm",
+    "requests": 2,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "2-four_file_join-LocalLM-cold",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  },
+  {
+    "run": "2-four_file_join-LocalLM-warm",
+    "requests": 3,
+    "stableLeadingSystem": true,
+    "stableToolSchemas": true,
+    "sortedToolAliases": true,
+    "toolCount": 36,
+    "toolSchemaBytes": 23948,
+    "firstToolSchemaSha256": "cc0500234709ef4d09bfea3e52bf37bbe1641947d69daec9090f8f3c694f05f8"
+  }
+]

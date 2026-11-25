@@ -75,6 +75,7 @@ pub struct ModelStream {
     claude_tools: std::collections::BTreeMap<u64, ClaudeToolBlock>,
     native_content: crate::claude_adapter::StreamContent,
     compatible_reasoning: std::collections::BTreeMap<String, String>,
+    compatible_extra_content: Option<serde_json::Value>,
 }
 
 struct ClaudeToolBlock {
@@ -94,6 +95,7 @@ impl ModelStream {
             claude_tools: Default::default(),
             native_content: Default::default(),
             compatible_reasoning: Default::default(),
+            compatible_extra_content: None,
         }
     }
 
@@ -146,7 +148,7 @@ impl ModelStream {
                 let block = value["index"]
                     .as_u64()
                     .ok_or("Claude tool block has no index.")?;
-                if self.claude_tools.len() >= 8 {
+                if self.claude_tools.len() >= crate::tool_calls::MAX_CALLS_PER_ROUND {
                     return Err("Claude returned too many tool blocks.".into());
                 }
                 let index = self.claude_tools.len() as u64;
@@ -225,6 +227,12 @@ impl ModelStream {
                     received.push_str(chunk);
                 }
             }
+            if let Some(extra) = value["choices"][0]["delta"]
+                .get("extra_content")
+                .filter(|v| !v.is_null())
+            {
+                crate::tool_calls::merge_extra_content(&mut self.compatible_extra_content, extra)?;
+            }
             Some(value)
         };
         if let Some(value) = &normalized {
@@ -283,6 +291,9 @@ impl ModelStream {
             "tool_calls":calls.iter().map(|call| call.model_value()).collect::<Vec<_>>()});
         for (key, reasoning) in &self.compatible_reasoning {
             message[key] = serde_json::json!(reasoning);
+        }
+        if let Some(extra) = &self.compatible_extra_content {
+            message["extra_content"] = extra.clone();
         }
         if let Some(content) = self
             .responses
@@ -662,6 +673,44 @@ mod responses_tests {
             .get("error")
             .is_some());
         assert!(!stream.done);
+    }
+
+    #[test]
+    fn gemini_thought_signature_extra_content_survives_stream_and_native_replay() {
+        let mut protocol = ModelStream::new(false);
+        let mut calls = crate::tool_calls::ToolCalls::default();
+        let events = [
+            json!({"choices":[{"delta":{
+                "extra_content":{"google":{"thought_signature":"msg-sig"}},
+                "tool_calls":[{"index":0,"id":"call_g1","type":"function","extra_content":{"google":{"thought_signature":"tool-sig"}},"function":{"name":"workspace_read_file","arguments":"{\"path\":\"a.rs\"}"}}]
+            },"finish_reason":"tool_calls"}]}),
+        ];
+        for event in events {
+            let normalized = protocol.push(&event.to_string()).unwrap().unwrap();
+            calls.push(&normalized["choices"][0]["delta"]).unwrap();
+        }
+        protocol.push("[DONE]").unwrap();
+        let finished = calls.finish().unwrap();
+        let assistant = protocol.assistant_message("", &finished);
+        assert_eq!(assistant["extra_content"]["google"]["thought_signature"], "msg-sig");
+        assert_eq!(assistant["tool_calls"][0]["extra_content"]["google"]["thought_signature"], "tool-sig");
+        assert!(crate::history::saved_native_message(&assistant).is_some());
+    }
+
+    #[test]
+    fn claude_stream_supports_sixteen_parallel_tool_blocks() {
+        let mut protocol = ModelStream::new(true);
+        let mut calls = crate::tool_calls::ToolCalls::default();
+        for offset in 0..16 {
+            let index = offset * 2;
+            let start = json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":format!("c_{offset}"),"name":"workspace_read_file","input":{"path":format!("f{offset}.rs")}}});
+            let normalized = protocol.push(&start.to_string()).unwrap().unwrap();
+            calls.push(&normalized["choices"][0]["delta"]).unwrap();
+            protocol.push(&json!({"type":"content_block_stop","index":index}).to_string()).unwrap();
+        }
+        protocol.push(r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#).unwrap();
+        protocol.push(r#"{"type":"message_stop"}"#).unwrap();
+        assert_eq!(calls.finish().unwrap().len(), 16);
     }
 }
 

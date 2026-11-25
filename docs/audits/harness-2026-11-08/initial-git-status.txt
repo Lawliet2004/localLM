@@ -1,0 +1,60 @@
+ M docs/RENDERING.md
+ M scripts/native-embedded-conversation-review.py
+ M src-tauri/src/artifacts.rs
+ M src-tauri/src/chat.rs
+ M src-tauri/src/compaction.rs
+ M src-tauri/src/connectors.rs
+ M src-tauri/src/harness.rs
+ M src-tauri/src/history.rs
+ M src-tauri/src/hooks.rs
+ M src-tauri/src/inference.rs
+ M src-tauri/src/lib.rs
+ M src-tauri/src/process_tools.rs
+ M src-tauri/src/sse.rs
+ M src-tauri/src/subagents.rs
+ M src-tauri/src/tool_calls.rs
+ M src-tauri/src/tool_discovery.rs
+ M src-tauri/src/tool_spec.rs
+ M src-tauri/src/verification_progress.rs
+ M src-tauri/src/workspace.rs
+ M src/App.test.tsx
+ M src/App.tsx
+ M src/components/ActivityTimeline.test.tsx
+ M src/components/ActivityTimeline.tsx
+ M src/components/AnswerSources.tsx
+ M src/components/Chat.test.tsx
+ M src/components/Chat.tsx
+ M src/components/CommandRunCard.test.tsx
+ M src/components/CommandRunCard.tsx
+ M src/components/MixedConversation.test.tsx
+ M src/components/ReasoningDisclosure.tsx
+ M src/components/TraceIcon.tsx
+ M src/components/WorkSummary.test.tsx
+ M src/components/WorkSummary.tsx
+ M src/lib/api.ts
+ M src/lib/types.ts
+ M src/responses.css
+?? .agents/
+?? GOAL.md
+?? docs/BACKEND_REVIEW_2026-11-06.md
+?? docs/CHAT_CODING_UX_PLAN_2026-11-05.md
+?? docs/FULL_CODEBASE_AUDIT_2026-11-08.md
+?? docs/GENERATION_QUALITY_2026-11-04.md
+?? docs/HARNESS_OUTPUT_QUALITY_PLAN_2026-11-05.md
+?? docs/HARNESS_WORKSPACE_2026-11-04.md
+?? docs/INFERENCE_AND_RESPONSE_FIX_PLAN_2026-11-08.md
+?? docs/INFERENCE_AND_RESPONSE_FIX_RESULTS_2026-11-08.md
+?? docs/INFERENCE_FAILURE_AUDIT_2026-11-06.md
+?? docs/PLAN_CONVERSATION_SESSIONS_HARNESS_2026-11-05.md
+?? docs/SESSION_HARNESS_PLAN_2026-11-04.md
+?? docs/audits/2026-11-08/
+?? docs/backend-review-2026-11-06/
+?? docs/ui-review/
+?? hackathon-submission/
+?? scripts/native-response-review.mjs
+?? showcase/
+?? src-tauri/src/audit_fixes_tests.rs
+?? src/components/ProcessTranscript.test.tsx
+?? src/components/ResponseAudit.test.tsx
+?? src/lib/ownedProcess.ts
+?? src/lib/toolActivity.ts

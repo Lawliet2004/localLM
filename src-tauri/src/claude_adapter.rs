@@ -194,9 +194,20 @@ pub fn to_messages_request(
                 .unwrap_or("unknown")
                 .to_string();
             let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+            let is_error = serde_json::from_str::<Value>(content)
+                .ok()
+                .is_some_and(|parsed| crate::tool_envelope::failed(&parsed));
+            let mut block = json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+            });
+            if is_error {
+                block["is_error"] = json!(true);
+            }
             messages.push(json!({
                 "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": content}],
+                "content": [block],
             }));
             continue;
         }
@@ -243,6 +254,10 @@ pub fn to_messages_request(
         let content = message.get("content").cloned().unwrap_or(Value::Null);
         let content = if let Some(parts) = content.as_array() {
             Value::Array(parts.iter().filter_map(|part| {
+                if part["type"] == "file" {
+                    let data = part["file"]["file_data"].as_str()?.strip_prefix("data:application/pdf;base64,")?;
+                    return Some(json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":data}}));
+                }
                 if part["type"] != "image_url" { return Some(part.clone()); }
                 let url = part["image_url"]["url"].as_str()?;
                 let (media, data) = url.strip_prefix("data:")?.split_once(";base64,")?;
@@ -317,24 +332,39 @@ pub fn to_messages_request(
         "claude-opus-4-6",
         "claude-opus-4-7",
         "claude-sonnet-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-4-8",
     ]
     .iter()
     .any(|prefix| model_id == *prefix || model_id.starts_with(&format!("{prefix}-20")));
     if adaptive {
-        match internal["locallm_reasoning_mode"].as_str() {
-            Some("quick") | Some("think") => {
-                request["thinking"] = json!({"type":"adaptive"});
-                request["output_config"] = json!({"effort": if internal["locallm_reasoning_mode"] == "quick" { "low" } else { "high" }});
-                if let Some(object) = request.as_object_mut() {
-                    object.remove("temperature");
-                    object.remove("top_p");
-                }
+        let effort = match internal["locallm_reasoning_mode"].as_str() {
+            Some("quick") => Some("low"),
+            Some("auto") => Some("medium"),
+            Some("think") => Some("high"),
+            _ => None,
+        };
+        if let Some(effort) = effort {
+            request["thinking"] = json!({"type":"adaptive"});
+            request["output_config"] = json!({"effort": effort});
+            if let Some(object) = request.as_object_mut() {
+                object.remove("temperature");
+                object.remove("top_p");
             }
-            _ => {}
         }
     }
     if internal["cache_prompt"] == true {
         request["cache_control"] = json!({"type":"ephemeral"});
+        // Also place an explicit breakpoint on the trailing tool definition so
+        // Anthropic-compatible proxies cache the entire tool catalog prefix.
+        if let Some(last_tool) = request
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .and_then(|tools| tools.last_mut())
+            .and_then(Value::as_object_mut)
+        {
+            last_tool.insert("cache_control".into(), json!({"type":"ephemeral"}));
+        }
     }
     // Parallel tool results must arrive together in the next user message.
     let mut merged: Vec<Value> = Vec::new();
@@ -630,5 +660,47 @@ mod reasoning_tests {
                 .get("thinking")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn claude_auto_adaptive_thinking_tool_cache_breakpoint_and_is_error_flag() {
+        let failed = crate::tool_envelope::failure_notice(
+            "edit-mismatch",
+            "Target text not found.",
+            true,
+            crate::tool_envelope::SIDE_NONE,
+            &json!({}),
+        );
+        let ok = crate::tool_envelope::success(json!({"content": "hi"}));
+        let payload = json!({
+            "messages": [
+                {"role": "user", "content": "Fix it"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "workspace_edit_file", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "workspace_read_file", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": failed.to_string()},
+                {"role": "tool", "tool_call_id": "c2", "content": ok.to_string()}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "workspace_read_file", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "workspace_edit_file", "parameters": {"type": "object"}}}
+            ],
+            "cache_prompt": true,
+            "temperature": 0.4,
+            "locallm_reasoning_mode": "auto"
+        });
+        let req = to_messages_request(&payload, "claude-opus-4-7", Some(8192));
+        assert_eq!(req["thinking"]["type"], "adaptive");
+        assert_eq!(req["output_config"]["effort"], "medium");
+        assert!(req.get("temperature").is_none());
+        assert_eq!(req["cache_control"], json!({"type": "ephemeral"}));
+        assert!(req["tools"][0].get("cache_control").is_none());
+        assert_eq!(req["tools"][1]["cache_control"], json!({"type": "ephemeral"}));
+        let results = req["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(results[0]["tool_use_id"], "c1");
+        assert_eq!(results[0]["is_error"], true);
+        assert_eq!(results[1]["tool_use_id"], "c2");
+        assert!(results[1].get("is_error").is_none());
     }
 }

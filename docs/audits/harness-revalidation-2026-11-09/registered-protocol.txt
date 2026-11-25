@@ -1,0 +1,10 @@
+
+running 5 tests
+test chat::reliability_regressions::registered_turn_rejects_fragments_from_a_second_compatible_choice ... ok
+test chat::reliability_regressions::registered_turn_rejects_native_claude_write_with_unclosed_thinking ... ok
+test chat::reliability_regressions::registered_turn_rejects_native_claude_write_without_a_closed_tool_block ... ok
+test chat::reliability_regressions::registered_turn_rejects_responses_arguments_extended_after_done ... ok
+test chat::reliability_regressions::registered_turn_rejects_responses_refusal_relabelled_as_output_text ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1139 filtered out; finished in 0.53s
+

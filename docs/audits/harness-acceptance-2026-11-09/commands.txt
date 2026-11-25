@@ -1,0 +1,81 @@
+Repository
+
+cd /home/papan/Desktop/Projects/localLM
+qa_root=$(realpath .local/qa/harness-acceptance-2026-11-08)
+qa_run="$qa_root/continuation-2026-11-09"
+test_bin="$qa_run/verified-lib"
+
+The stored binary was copied from the executable emitted by cargo test --lib --no-run --message-format=json. Evidence logs use the absolute paths above.
+
+Default gates
+
+(cd src-tauri && cargo test --lib)
+(cd src-tauri && cargo check --lib)
+npx vitest run
+npm run typecheck
+npm run build
+npm audit --json
+(cd src-tauri && "$qa_root/tools/cargo-audit" audit --json)
+python3 scripts/verify-glib-backport.py
+CARGO_TARGET_DIR="$qa_run/glib-release-target" cargo test --manifest-path src-tauri/vendor/glib/Cargo.toml --locked --offline --release --test variant_iter_backport
+node --import ./scripts/register-test-loader.mjs --test scripts/web-transport.test.mjs scripts/web-render.test.mjs scripts/web-storage.test.mjs scripts/searxng-worker.test.mjs scripts/weather-worker.test.mjs
+python3 scripts/benchmark-response-latency.test.py
+python3 scripts/run-harness-comparison.py --self-test
+python3 -m py_compile scripts/run-harness-comparison.py scripts/run-database-acceptance.py scripts/verify-glib-backport.py
+git diff --check
+graphify update .
+
+Ignored inventory and loopback fixtures
+
+(cd src-tauri && "$test_bin" --ignored --list)
+(cd src-tauri && "$test_bin" --ignored --test-threads=2 --nocapture \
+  --skip automation::tests::real_browser --skip computer_use::tests::isolated_x11 \
+  --skip debug_tools::acceptance --skip harness_comparison_tests:: --skip harness_endurance_tests:: \
+  --skip lsp_tools::acceptance --skip model_library::tests::live_hub --skip profile_tools::tests::real_native \
+  --skip remote_database::acceptance --skip runtime::tests::recognizes_current_runtime_flags \
+  --skip runtime_archive::tests::extracts_cached_pinned_cuda --skip semantic_impact::acceptance)
+
+Development, model catalog, runtime and profiler
+
+export LOCALLM_RUST_ANALYZER="$(command -v rust-analyzer)"
+export LOCALLM_TYPESCRIPT_LANGUAGE_SERVER="$(command -v node)"
+export LOCALLM_TYPESCRIPT_LANGUAGE_SERVER_SCRIPT="$qa_root/tools/lsp/node_modules/typescript-language-server/lib/cli.mjs"
+export LOCALLM_DEBUGPY_PYTHON="$qa_root/tools/python/bin/python"
+export LOCALLM_CODELLDB="$qa_root/tools/codelldb/extension/adapter/codelldb"
+export LOCALLM_CC="$(command -v cc)"
+(cd src-tauri && "$test_bin" lsp_tools::acceptance --ignored --nocapture --test-threads=1)
+(cd src-tauri && "$test_bin" semantic_impact::acceptance --ignored --nocapture --test-threads=1)
+(cd src-tauri && "$test_bin" debug_tools::acceptance --ignored --nocapture --test-threads=1)
+(cd src-tauri && "$test_bin" model_library::tests::live_hub_search_catalog_and_verified_download --exact --ignored --nocapture)
+(cd src-tauri && LOCALLM_ACCEPTANCE_RUNTIME="$qa_root/tools/llama/llama-b10855/llama-server" "$test_bin" runtime::tests::recognizes_current_runtime_flags --exact --ignored --nocapture)
+perf record -o "$qa_run/perf-probe.data" -- sleep .05
+
+Disposable databases
+
+Choose a fresh output directory for each attempt.
+
+python3 scripts/run-database-acceptance.py --test-binary "$test_bin" --engine all \
+  --output "$qa_run/databases-confirmed" --skip-pull \
+  --postgres-image postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 \
+  --mysql-image mirror.gcr.io/library/mysql@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+
+Endurance
+
+The starting runs used baseline-lib. The detailed elapsed runs used finished-lib. The final smoke used verified-lib. The latter two test executables differ only in later changes to the explicit stop, Responses cutoff and pause-before-dispatch paths and their regressions.
+
+(cd src-tauri && LOCALLM_SOAK_SECONDS=8 "$test_bin" --exact harness_endurance_tests::wall_clock_endurance --ignored --nocapture --test-threads=1)
+(cd src-tauri && LOCALLM_SOAK_SECONDS=3600 "$qa_run/finished-lib" --exact harness_endurance_tests::wall_clock_endurance --ignored --nocapture --test-threads=1)
+(cd src-tauri && LOCALLM_SOAK_SECONDS=7200 "$qa_run/finished-lib" --exact harness_endurance_tests::wall_clock_endurance --ignored --nocapture --test-threads=1)
+
+The elapsed runner sets TMPDIR to a fresh /tmp/locallm-finished-soak.* directory for each invocation and checks that rmdir succeeds after the test.
+
+Same-model comparison and live fixtures
+
+comparison-runtime.json contains the exact model-server and comparison runner argument arrays. Run a single owned runtime on loopback, with a fresh slot directory and the recorded flags, then run the comparison runner with a fresh output directory. The runner performs its own model and generation-limit checks and stores every effective harness command.
+
+The opt-in frontend fixture requires port 8107 to be free and starts its own model server. Run it after the comparison and direct cancellation probe have stopped. The recorded run used a new scratch directory under /tmp and copied only its selected logs to the report.
+
+LOCALLM_LIVE_MINICPM=1 LOCALLM_LIVE_DEVICE=Vulkan1 LOCALLM_LIVE_SCRATCH="$qa_fixture" \
+  LOCALLM_LLAMA_SERVER="$qa_root/tools/llama/llama-b10855/llama-server" \
+  LOCALLM_MODEL="$qa_root/models/MiniCPM5-2B-Q4_K_M.gguf" \
+  npx vitest run src/web/extraction/minicpm-live-fixtures.test.ts

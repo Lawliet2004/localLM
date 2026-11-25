@@ -3,8 +3,8 @@
 //! not participate in our root lock: hashes provide optimistic conflict checks,
 //! not an operating-system compare-and-swap or cross-file isolation guarantee.
 use super::{
-    is_generated_dir, open_file_no_links, parent_no_links, parse_hash, unified_diff, valid_path,
-    Workspace,
+    ensure_parent_dirs_no_links, is_generated_dir, open_file_no_links, parent_no_links, parse_hash,
+    remove_created_dirs_no_links, unified_diff, valid_path, Workspace,
 };
 use cap_fs_ext::DirExt;
 use cap_std::fs::{Dir, OpenOptions, Permissions};
@@ -184,7 +184,8 @@ pub(crate) fn ensure_clear(dir: &Dir) -> Result<(), String> {
 enum Change {
     Edit {
         path: String,
-        expected_sha256: String,
+        #[serde(default)]
+        expected_sha256: Option<String>,
         replacements: Vec<Replacement>,
     },
     Create {
@@ -244,20 +245,23 @@ struct WriteBase64 {
 struct Append {
     path: String,
     content: String,
-    expected_sha256: String,
+    #[serde(default)]
+    expected_sha256: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MultiEdit {
     path: String,
-    expected_sha256: String,
+    #[serde(default)]
+    expected_sha256: Option<String>,
     edits: Vec<Replacement>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditLines {
     path: String,
-    expected_sha256: String,
+    #[serde(default)]
+    expected_sha256: Option<String>,
     start_line: usize,
     end_line: usize,
     new_text: String,
@@ -429,66 +433,81 @@ fn preflight(
     let mut entries = Vec::new();
     let mut total = 0;
     let mut identities = HashSet::new();
-    for item in desired {
-        let (parent, leaf) = parent_no_links(root, &item.path).map_err(io)?;
-        let before = bytes(&parent, &leaf, MAX_FILE)?;
-        match (&item.expected, &before) {
-            (Some(expected), Some(before)) => require_hash(expected, before)?,
-            (None, None) => (),
-            (None, Some(_)) => {
+    let mut created_dirs = Vec::new();
+    let result: Result<(), String> = (|| {
+        for item in desired {
+            let (parent, leaf) = if item.expected.is_none() && item.after.is_some() {
+                let (parent, leaf, dirs) =
+                    ensure_parent_dirs_no_links(root, &item.path).map_err(io)?;
+                created_dirs.extend(dirs);
+                (parent, leaf)
+            } else {
+                parent_no_links(root, &item.path).map_err(io)?
+            };
+            let before = bytes(&parent, &leaf, MAX_FILE)?;
+            match (&item.expected, &before) {
+                (Some(expected), Some(before)) => require_hash(expected, before)?,
+                (None, None) => (),
+                (None, Some(_)) => {
+                    return Err(format!(
+                        "Destination '{}' already exists; it was preserved.",
+                        item.path
+                    ))
+                }
+                _ => return Err(format!("Expected file '{}' is missing.", item.path)),
+            }
+            let permissions = if before.is_some() {
+                let file =
+                    open_file_no_links(&parent, &leaf, OpenOptions::new().read(true)).map_err(io)?;
+                let meta = file.metadata().map_err(io)?;
+                if !identities.insert(file_identity::single_link_identity(&file)?) {
+                    return Err("Two patch paths resolve to the same file.".into());
+                }
+                if meta.permissions().readonly() {
+                    return Err(format!("'{}' is read-only.", item.path));
+                }
+                Some(meta.permissions())
+            } else {
+                item.permissions
+            };
+            total += before.as_ref().map_or(0, Vec::len) + item.after.as_ref().map_or(0, Vec::len);
+            if total > max_batch || item.after.as_ref().is_some_and(|b| b.len() > MAX_FILE) {
                 return Err(format!(
-                    "Destination '{}' already exists; it was preserved.",
-                    item.path
-                ))
+                    "Patch exceeds the 1 MiB per-file or {max_batch} byte aggregate bound."
+                ));
             }
-            _ => return Err(format!("Expected file '{}' is missing.", item.path)),
-        }
-        let permissions = if before.is_some() {
-            let file =
-                open_file_no_links(&parent, &leaf, OpenOptions::new().read(true)).map_err(io)?;
-            let meta = file.metadata().map_err(io)?;
-            if !identities.insert(file_identity::single_link_identity(&file)?) {
-                return Err("Two patch paths resolve to the same file.".into());
+            let rename_to = renames.remove(&item.path);
+            if before == item.after && rename_to.is_none() {
+                return Err(format!("'{}' has no change.", item.path));
             }
-            if meta.permissions().readonly() {
-                return Err(format!("'{}' is read-only.", item.path));
-            }
-            Some(meta.permissions())
-        } else {
-            item.permissions
-        };
-        total += before.as_ref().map_or(0, Vec::len) + item.after.as_ref().map_or(0, Vec::len);
-        if total > max_batch || item.after.as_ref().is_some_and(|b| b.len() > MAX_FILE) {
-            return Err(format!(
-                "Patch exceeds the 1 MiB per-file or {max_batch} byte aggregate bound."
-            ));
+            entries.push(Entry {
+                rename_to: rename_to.clone(),
+                path: item.path,
+                before: before.as_ref().map(|b| hash(b)),
+                after: item.after.as_ref().map(|b| hash(b)),
+            });
+            let identity = if before.is_some() {
+                Some(file_identity::single_link_identity(
+                    &open_file_no_links(&parent, &leaf, OpenOptions::new().read(true)).map_err(io)?,
+                )?)
+            } else {
+                None
+            };
+            targets.push(Target {
+                rename_to,
+                identity,
+                parent,
+                leaf,
+                before,
+                after: item.after,
+                permissions,
+            });
         }
-        let rename_to = renames.remove(&item.path);
-        if before == item.after && rename_to.is_none() {
-            return Err(format!("'{}' has no change.", item.path));
-        }
-        entries.push(Entry {
-            rename_to: rename_to.clone(),
-            path: item.path,
-            before: before.as_ref().map(|b| hash(b)),
-            after: item.after.as_ref().map(|b| hash(b)),
-        });
-        let identity = if before.is_some() {
-            Some(file_identity::single_link_identity(
-                &open_file_no_links(&parent, &leaf, OpenOptions::new().read(true)).map_err(io)?,
-            )?)
-        } else {
-            None
-        };
-        targets.push(Target {
-            rename_to,
-            identity,
-            parent,
-            leaf,
-            before,
-            after: item.after,
-            permissions,
-        });
+        Ok(())
+    })();
+    if let Err(error) = result {
+        remove_created_dirs_no_links(root, &created_dirs);
+        return Err(error);
     }
     Ok((targets, entries))
 }
@@ -943,7 +962,12 @@ impl Workspace {
                     path,
                     expected_sha256,
                     replacements,
-                } => desired.push(self.edit_desired(&path, &expected_sha256, replacements, 64)?),
+                } => {
+                    let expected = expected_sha256.as_deref().ok_or_else(|| {
+                        format!("Read '{path}' first (or supply expected_sha256 from a fresh read) before editing.")
+                    })?;
+                    desired.push(self.edit_desired(&path, expected, replacements, 64)?);
+                }
             }
         }
         Ok(desired)
@@ -953,10 +977,10 @@ impl Workspace {
     /// shared by apply_patch edits and multi_edit.
     ///
     /// The shared matcher locates every region, so a smart quote, a dash
-    /// variant, an exotic space, trailing whitespace or CRLF no longer fails
-    /// an otherwise exact edit. Every `old_text` must still resolve to
-    /// exactly one region of the original file, and the regions must not
-    /// overlap.
+    /// variant, an exotic space, trailing whitespace, base indentation shifts
+    /// or CRLF no longer fails an otherwise exact edit. Every `old_text` must
+    /// still resolve to exactly one region of the original file, and the
+    /// regions must not overlap.
     fn edit_desired(
         &self,
         path: &str,
@@ -985,8 +1009,10 @@ impl Workspace {
             let report = crate::edit_match::find_matches(&text, &replacement.old_text);
             if report.count() != 1 {
                 if !report.found() {
+                    let hint = crate::edit_match::nearest_line_hint(&text, &replacement.old_text)
+                        .unwrap_or_default();
                     return Err(format!(
-                        "The text to replace was not found ({}). Read the current file and retry.",
+                        "The text to replace was not found ({}).{hint} Read the current file and retry.",
                         report.describe()
                     ));
                 }
@@ -1001,7 +1027,7 @@ impl Workspace {
             if next < text.len() && text[next..].contains(&replacement.old_text) {
                 return Err("Each old_text must occur exactly once in the original file.".into());
             }
-            ranges.push((located, replacement.new_text));
+            ranges.push((located, replacement.old_text, replacement.new_text, report.kind));
         }
         ranges.sort_by_key(|range| range.0.start);
         if ranges.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
@@ -1012,8 +1038,15 @@ impl Workspace {
         // original file, not from the partially rewritten text.
         let dominant = crate::edit_match::dominant_terminator(&text);
         let mut updated = text.clone();
-        for (located, replacement) in ranges.into_iter().rev() {
-            updated = crate::edit_match::replace_at(&updated, &located, &replacement, dominant);
+        for (located, old_text, replacement, kind) in ranges.into_iter().rev() {
+            updated = crate::edit_match::replace_at_kind(
+                &updated,
+                &located,
+                &old_text,
+                &replacement,
+                kind,
+                dominant,
+            );
         }
         Ok(Desired {
             path: path.into(),
@@ -1034,9 +1067,12 @@ impl Workspace {
         if request.new_text.len() > MAX_FILE {
             return Err("Replacement text exceeds 1 MiB.".into());
         }
+        let expected = request.expected_sha256.as_deref().ok_or_else(|| {
+            format!("Read '{}' first (or supply expected_sha256 from a fresh read) before editing.", request.path)
+        })?;
         let data =
             bytes(&self.directory, &request.path, MAX_FILE)?.ok_or("Edit target is missing.")?;
-        require_hash(&request.expected_sha256, &data)?;
+        require_hash(expected, &data)?;
         let text = String::from_utf8(data).map_err(|_| "Line edits require UTF-8 text.")?;
         let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
         let trailing = text.ends_with('\n');
@@ -1083,7 +1119,7 @@ impl Workspace {
         }
         Ok(Desired {
             path: request.path.clone(),
-            expected: Some(request.expected_sha256.clone()),
+            expected: Some(expected.to_string()),
             after: Some(after.into_bytes()),
             permissions: None,
         })
@@ -1672,9 +1708,12 @@ impl Workspace {
                 if request.content.len() > MAX_FILE {
                     return Err("Append content exceeds 1 MiB.".into());
                 }
+                let expected = request.expected_sha256.as_deref().ok_or_else(|| {
+                    format!("Read '{}' first (or supply expected_sha256 from a fresh read) before appending.", request.path)
+                })?;
                 let mut data = bytes(&self.directory, &request.path, MAX_FILE)?
                     .ok_or("Append target is missing.")?;
-                require_hash(&request.expected_sha256, &data)?;
+                require_hash(expected, &data)?;
                 data.extend_from_slice(request.content.as_bytes());
                 if data.len() > MAX_FILE {
                     return Err("Appended file would exceed 1 MiB.".into());
@@ -1682,7 +1721,7 @@ impl Workspace {
                 self.transact(
                     vec![Desired {
                         path: request.path,
-                        expected: Some(request.expected_sha256),
+                        expected: Some(expected.to_string()),
                         after: Some(data),
                         permissions: None,
                     }],
@@ -1692,10 +1731,13 @@ impl Workspace {
             "multi_edit" => {
                 let request: MultiEdit =
                     serde_json::from_value(arguments).map_err(|e| e.to_string())?;
+                let expected = request.expected_sha256.as_deref().ok_or_else(|| {
+                    format!("Read '{}' first (or supply expected_sha256 from a fresh read) before editing.", request.path)
+                })?;
                 self.transact(
                     vec![self.edit_desired(
                         &request.path,
-                        &request.expected_sha256,
+                        expected,
                         request.edits,
                         32,
                     )?],
@@ -1825,21 +1867,21 @@ pub(super) fn definitions() -> Vec<(&'static str, &'static str, Value, Vec<&'sta
     let path = json!({"type":"string","minLength":1,"maxLength":4096});
     let hash = json!({"type":"string","pattern":"^[a-fA-F0-9]{64}$"});
     let replacement = json!({"type":"object","properties":{"old_text":{"type":"string","minLength":1,"maxLength":65536},"new_text":{"type":"string","maxLength":65536}},"required":["old_text","new_text"],"additionalProperties":false});
-    let edit = json!({"type":"object","properties":{"kind":{"const":"edit"},"path":path,"expected_sha256":hash,"replacements":{"type":"array","minItems":1,"maxItems":64,"items":replacement}},"required":["kind","path","expected_sha256","replacements"],"additionalProperties":false});
+    let edit = json!({"type":"object","properties":{"kind":{"const":"edit"},"path":path,"expected_sha256":hash,"replacements":{"type":"array","minItems":1,"maxItems":64,"items":replacement}},"required":["kind","path","replacements"],"additionalProperties":false});
     let create = json!({"type":"object","properties":{"kind":{"const":"create"},"path":path,"content":{"type":"string","maxLength":1048576}},"required":["kind","path","content"],"additionalProperties":false});
     let delete = json!({"type":"object","properties":{"kind":{"const":"delete"},"path":path,"expected_sha256":hash},"required":["kind","path","expected_sha256"],"additionalProperties":false});
     vec![
-        ("apply_patch", "Apply 1–16 hash-pinned file edits/creates/deletes after all-file preflight. Edits use unique, nonoverlapping replacements against original text; smart quotes, dash variants, exotic spaces, trailing whitespace and CRLF are tolerated when matching and the line endings of every replaced region are preserved. Atomic per-file replacement with durable rollback journal; external applications do not share cross-file isolation. Returns diffs and explicit committed/rolled_back/unknown status. Parents must exist; 1 MiB/file, 8 MiB total. Serialized arguments are limited to 8 MiB. For large batches, split the changes across calls. Recover an interrupted transaction with recover_patch.", json!({"changes":{"type":"array","minItems":1,"maxItems":16,"items":{"oneOf":[edit,create,delete]}}}), vec!["changes"]),
-        ("copy_file", "Copy a regular workspace file to a new destination without overwriting. Requires source SHA-256 from file_info/read_file. Parents must exist. Maximum 1 MiB; returns journaled transaction status.", json!({"path":path,"destination":path,"expected_sha256":hash}), vec!["path","destination","expected_sha256"]),
-        ("move_file", "Move a hash-pinned regular workspace file to a new destination using a recoverable copy/delete transaction. Never overwrites a destination. Parents must exist. Maximum 1 MiB.", json!({"path":path,"destination":path,"expected_sha256":hash}), vec!["path","destination","expected_sha256"]),
+        ("apply_patch", "Apply 1–16 hash-pinned file edits/creates/deletes after all-file preflight. Missing parent directories for creates are created automatically. Edits use unique, nonoverlapping replacements against original text; smart quotes, dash variants, exotic spaces, trailing whitespace, base indentation shifts and CRLF are tolerated when matching and the line endings of every replaced region are preserved. Atomic per-file replacement with durable rollback journal; 1 MiB/file, 8 MiB total. Recover an interrupted transaction with recover_patch.", json!({"changes":{"type":"array","minItems":1,"maxItems":16,"items":{"oneOf":[edit,create,delete]}}}), vec!["changes"]),
+        ("copy_file", "Copy a regular workspace file to a new destination without overwriting. Requires source SHA-256 from file_info/read_file. Missing parent directories are created automatically. Maximum 1 MiB; returns journaled transaction status.", json!({"path":path,"destination":path,"expected_sha256":hash}), vec!["path","destination","expected_sha256"]),
+        ("move_file", "Move a hash-pinned regular workspace file to a new destination using a recoverable copy/delete transaction. Never overwrites a destination. Missing parent directories are created automatically. Maximum 1 MiB.", json!({"path":path,"destination":path,"expected_sha256":hash}), vec!["path","destination","expected_sha256"]),
         ("delete_file", "Delete one regular workspace file after verifying expected_sha256. Uses durable rollback backup until commit. Does not delete directories. Maximum 1 MiB.", json!({"path":path,"expected_sha256":hash}), vec!["path","expected_sha256"]),
         ("recover_patch", "Inspect or recover pending workspace patch transactions. Omit transaction_id to list. Supply the ID to roll back a prepared transaction or clean a committed one. Divergent external edits are preserved and unresolved recovery is reported. This is a write operation subject to normal approval.", json!({"transaction_id":{"type":"string","pattern":"^[a-f0-9]{32}$"}}), vec![]),
         ("file_info", "Read bounded metadata and SHA-256 for a regular workspace text or binary file up to 1 MiB. Use the hash for copy/move/delete or patches. Does not return file contents.", json!({"path":path}), vec!["path"]),
-        ("write_file", "Create or overwrite one whole UTF-8 workspace file up to 1 MiB. For incremental text writes, create the file and use append_file with the updated hash after each append. Overwriting requires expected_sha256 from a fresh read_file/file_info; creating requires omitting it and never overwrites. Journaled transaction returning status and a diff when overwriting.", json!({"path":path,"content":{"type":"string","maxLength":1048576},"expected_sha256":hash}), vec!["path","content"]),
-        ("write_file_base64", "Create or overwrite one workspace file with base64-decoded binary content, up to 1 MiB decoded. Same existence and expected_sha256 rules as write_file. Journaled transaction returning status.", json!({"path":path,"content_base64":{"type":"string","maxLength":1400000},"expected_sha256":hash}), vec!["path","content_base64"]),
-        ("append_file", "Append UTF-8 text to an existing workspace file after verifying expected_sha256. The resulting file must stay under 1 MiB. Journaled transaction returning status and a diff.", json!({"path":path,"content":{"type":"string","maxLength":1048576},"expected_sha256":hash}), vec!["path","content","expected_sha256"]),
-        ("multi_edit", "Apply 1–32 unique nonoverlapping text replacements to one existing UTF-8 workspace file pinned by expected_sha256. Each old_text must occur exactly once in the original file. Serialized arguments are limited to 8 MiB. Smart quotes, dash variants, exotic spaces, trailing whitespace and CRLF are tolerated when matching, and the line endings of every replaced region are preserved. Journaled transaction returning status and a diff.", json!({"path":path,"expected_sha256":hash,"edits":{"type":"array","minItems":1,"maxItems":32,"items":replacement}}), vec!["path","expected_sha256","edits"]),
-        ("edit_lines", "Replace an inclusive 1-based line range in an existing UTF-8 workspace file pinned by expected_sha256. Use end_line = start_line - 1 to insert before start_line; start_line may be totalLines + 1 to append. The file's line ending style is preserved. Maximum file size 1 MiB.", json!({"path":path,"expected_sha256":hash,"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":0},"new_text":{"type":"string","maxLength":1048576}}), vec!["path","expected_sha256","start_line","end_line","new_text"]),
+        ("write_file", "Create or overwrite one whole UTF-8 workspace file up to 1 MiB. Missing parent directories inside the workspace are created automatically. For incremental text writes, create the file and use append_file after each append. Overwriting an existing file requires reading it first (or supplying expected_sha256); unread existing files are never overwritten. Journaled transaction returning status and a diff when overwriting.", json!({"path":path,"content":{"type":"string","maxLength":1048576},"expected_sha256":hash}), vec!["path","content"]),
+        ("write_file_base64", "Create or overwrite one workspace file with base64-decoded binary content, up to 1 MiB decoded. Missing parent directories inside the workspace are created automatically. Same existence and expected_sha256 rules as write_file. Journaled transaction returning status.", json!({"path":path,"content_base64":{"type":"string","maxLength":1400000},"expected_sha256":hash}), vec!["path","content_base64"]),
+        ("append_file", "Append UTF-8 text to an existing workspace file (optional expected_sha256 when already read or written in this session). The resulting file must stay under 1 MiB. Journaled transaction returning status and a diff.", json!({"path":path,"content":{"type":"string","maxLength":1048576},"expected_sha256":hash}), vec!["path","content"]),
+        ("multi_edit", "Apply 1–32 unique nonoverlapping text replacements to one existing UTF-8 workspace file (optional expected_sha256 when already read or written in this session). Each old_text must occur exactly once in the original file. Smart quotes, dash variants, exotic spaces, trailing whitespace, base indentation shifts and CRLF are tolerated when matching, and the line endings of every replaced region are preserved. Journaled transaction returning status and a diff.", json!({"path":path,"expected_sha256":hash,"edits":{"type":"array","minItems":1,"maxItems":32,"items":replacement}}), vec!["path","edits"]),
+        ("edit_lines", "Replace an inclusive 1-based line range in an existing UTF-8 workspace file (optional expected_sha256 when already read or written in this session). Use end_line = start_line - 1 to insert before start_line; start_line may be totalLines + 1 to append. The file's line ending style is preserved. Maximum file size 1 MiB.", json!({"path":path,"expected_sha256":hash,"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":0},"new_text":{"type":"string","maxLength":1048576}}), vec!["path","start_line","end_line","new_text"]),
         ("list_tree", "List a workspace directory recursively down to max_depth (1–10, default 3), skipping generated directories unless include_generated. Returns up to 2000 entries with path, kind, size and file SHA-256 plus treeSha256 over the full tree, the pin delete/move/copy_directory require.", json!({"path":path,"max_depth":{"type":"integer","minimum":1,"maximum":10,"default":3},"include_generated":{"type":"boolean","default":false}}), vec!["path"]),
         ("delete_directory", "Delete a workspace directory. Non-recursive removes only an empty directory. Recursive requires expected_tree_sha256 from list_tree for that path, refuses linked or special entries, and is capped at 2000 entries / 8 MiB. File contents are journaled for rollback before emptied directories are removed bottom-up.", json!({"path":path,"recursive":{"type":"boolean"},"expected_tree_sha256":hash}), vec!["path","recursive"]),
         ("move_directory", "Move a workspace directory to a new destination whose parent exists. Never overwrites; requires expected_tree_sha256 from list_tree; refuses linked or special entries; capped at 2000 entries / 8 MiB. Journaled file moves, then emptied source directories are removed.", json!({"path":path,"destination":path,"expected_tree_sha256":hash}), vec!["path","destination","expected_tree_sha256"]),
@@ -2478,7 +2520,6 @@ mod tests {
             "nested/.ssh/key",
             ".locallm-transactions/forged.json",
             ".locallm-txn-forged-old",
-            "missing/child.txt",
         ] {
             assert!(
                 w.call(
@@ -2489,6 +2530,19 @@ mod tests {
                 "{path}"
             );
         }
+        // Safe nested workspace parents are created automatically without following links.
+        assert_eq!(
+            w.call(
+                "apply_patch",
+                json!({"changes":[{"kind":"create","path":"missing/child.txt","content":"nested"}]})
+            )
+            .unwrap()["status"],
+            "committed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("missing/child.txt")).unwrap(),
+            "nested"
+        );
         assert!(w.call("apply_patch", json!({"changes":[]})).is_err());
         assert!(w.call("apply_patch",json!({"changes":[{"kind":"create","path":"large.txt","content":"x".repeat(MAX_FILE+1)}]})).is_err());
         assert!(!root.path().join("large.txt").exists());

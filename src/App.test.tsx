@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   getPendingTurn: vi.fn(), discardPendingTurn: vi.fn(),
   listActiveRuns: vi.fn(),
   getSessionEvents: vi.fn(),
+  contextPreflight: vi.fn(),
 }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: mocks.save, open: vi.fn(), confirm: mocks.confirm }));
 vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) => e instanceof Error ? e.message : String(e), api: {
@@ -34,7 +35,7 @@ vi.mock('./lib/api', () => ({ nativeAvailable: true, errorMessage: (e: unknown) 
   listConnectors: async () => [{ id: 'example', description: 'Example service', url: '', authType: 'apiKey', connected: true, hasCredential: true, tools: [{ name: 'kept_tool', description: 'Kept for new chats', inputSchema: {} }] }],
   listSkills: async () => [], getWorkspace: async () => ({ path: 'C:/workspace' }), hasDaytonaKey: async () => false,
   messages: mocks.messages, sendMessage: mocks.sendMessage,
-  contextPreflight: async () => ({ available: false }),
+  contextPreflight: mocks.contextPreflight,
 } }));
 const baseBootstrap = { conversations: [{ id: 'chat', title: 'Saved chat', updatedAt: 0 }], config: defaultRuntimeConfig,
   preferences: { runtimePath: '', modelPath: '', projectorPath: '', temperature: 1, topP: 0.95, maxTokens: 100, systemPrompt: '' }, runtime: { phase: 'stopped', message: '', modelPath: null },
@@ -49,6 +50,8 @@ beforeEach(() => {
   mocks.getPendingTurn.mockResolvedValue(null);
   mocks.listActiveRuns.mockResolvedValue([]);
   mocks.getSessionEvents.mockResolvedValue([]);
+  mocks.contextPreflight.mockReset();
+  mocks.contextPreflight.mockResolvedValue({ available: false });
   mocks.discardPendingTurn.mockResolvedValue(undefined);
   mocks.confirm.mockResolvedValue(true);
   mocks.workspaceIndex.mockResolvedValue({ projects: [], tasks: {} });
@@ -161,8 +164,10 @@ describe('workspace panel chrome', () => {
     await openChat();
     const message = screen.getByRole('textbox', { name: 'Message' });
     const conversation = message.closest('.workspace-conversation')!;
-    const header = conversation.querySelector('.workspace-header')!;
-    expect(header).not.toBeNull();
+    expect(conversation.querySelector('.workspace-header')).toBeNull();
+    const toggle = screen.getByRole('button', { name: 'Toggle workspace panel' });
+    expect(conversation).toContainElement(toggle);
+    expect(screen.getByLabelText('Application toolbar')).not.toContainElement(toggle);
     await userEvent.type(message, 'Keep my draft');
     await userEvent.click(screen.getByRole('button', { name: 'Toggle workspace panel' }));
     const panel = screen.getByRole('complementary', { name: 'Workspace inspector' });
@@ -183,7 +188,8 @@ describe('desktop conversation export', () => {
   it('saves to the chosen native path and reports completion', async () => {
     mocks.save.mockResolvedValue('C:/exports/chat.json');
     await openChat();
-    await userEvent.click(screen.getByRole('button', { name: 'Export conversation' }));
+    await userEvent.click(screen.getByText('File', { selector: 'summary' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save a copy…' }));
     expect(mocks.save).toHaveBeenCalledWith(expect.objectContaining({ filters: expect.arrayContaining([expect.objectContaining({ extensions: ['json'] })]) }));
     expect(mocks.exportConversation).toHaveBeenCalledWith('chat', 'C:/exports/chat.json');
     expect(await screen.findByRole('status')).toHaveTextContent('Saved conversation to C:/exports/chat.json');
@@ -191,7 +197,8 @@ describe('desktop conversation export', () => {
   it('does not write a file when the save dialog is cancelled', async () => {
     mocks.save.mockResolvedValue(null);
     await openChat();
-    await userEvent.click(screen.getByRole('button', { name: 'Export conversation' }));
+    await userEvent.click(screen.getByText('File', { selector: 'summary' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save a copy…' }));
     expect(mocks.exportConversation).not.toHaveBeenCalled();
     expect(screen.queryByText(/Saved conversation to/)).not.toBeInTheDocument();
   });
@@ -199,7 +206,8 @@ describe('desktop conversation export', () => {
     mocks.save.mockResolvedValue('C:/exports/chat.md');
     mocks.exportConversation.mockRejectedValue(new Error('The disk is full.'));
     await openChat();
-    await userEvent.click(screen.getByRole('button', { name: 'Export conversation' }));
+    await userEvent.click(screen.getByText('File', { selector: 'summary' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save a copy…' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('The disk is full.');
     expect(screen.queryByText(/Saved conversation to/)).not.toBeInTheDocument();
   });
@@ -367,6 +375,40 @@ describe('tools navigation', () => {
 });
 
 describe('project folders and scoping', () => {
+  it('clears the unsent draft and its context preview when opening another new chat', async () => {
+    saveDraft(null, 'Unsent question from the first new chat');
+    const projects = [
+      { id: 'first', name: 'First project', path: 'C:/first' },
+      { id: 'second', name: 'Second project', path: 'C:/second' },
+    ];
+    mocks.workspaceIndex.mockResolvedValue({ projects, tasks: {} });
+    mocks.bootstrap.mockResolvedValue({ ...baseBootstrap, runtime: { phase: 'ready', message: '', modelPath: 'fixture.gguf' } });
+    let finishOldPreview!: (result: unknown) => void;
+    mocks.contextPreflight.mockImplementationOnce(() => new Promise(resolve => { finishOldPreview = resolve; }));
+    render(<App />);
+    const newChat = await screen.findByRole('button', { name: 'New chat in Second project' });
+    expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('Unsent question from the first new chat');
+    await waitFor(() => expect(finishOldPreview).toBeTypeOf('function'));
+    await userEvent.click(newChat);
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue(''));
+    await act(async () => finishOldPreview({ available: true, breakdown: { overflow: 'The previous draft is too long' } }));
+    expect(screen.queryByText('The previous draft is too long')).not.toBeInTheDocument();
+
+    mocks.contextPreflight.mockResolvedValue({ available: true, breakdown: {
+      total: 100, instructions: 40, tools: 50, history: 0, draft: 10,
+      responseReserve: 512, contextLength: 8192, exact: true, fits: true,
+    } });
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'A fresh question' } });
+    await screen.findByRole('button', { name: 'Draft context details' });
+    expect(mocks.contextPreflight.mock.lastCall?.[0]).toBeNull();
+    expect(mocks.contextPreflight.mock.lastCall?.[1]).toBe('A fresh question');
+    expect(mocks.contextPreflight.mock.lastCall?.[8]).toBe('second');
+    const breakdown = screen.getByLabelText('Draft token breakdown');
+    expect(breakdown).toHaveTextContent(/Chat history0/);
+    expect(breakdown).toHaveTextContent(/Tool definitions50/);
+    saveDraft(null, '');
+  });
+
   it('starts a new chat scoped to a chosen project folder', async () => {
     mocks.workspaceIndex.mockResolvedValue({
       projects: [{ id: 'proj-1', name: 'Web Engine', path: 'C:/web-engine' }],
@@ -377,6 +419,7 @@ describe('project folders and scoping', () => {
     await userEvent.click(newChatInFolder);
 
     expect(mocks.setWorkspace).toHaveBeenCalledWith('C:/web-engine');
+    await userEvent.click(screen.getByText('Edit', { selector: 'summary' }));
     const projectSelect = screen.getByRole('combobox', { name: 'Task project' });
     expect(projectSelect).toHaveValue('proj-1');
   });
@@ -492,7 +535,7 @@ describe('reference-style settings', () => {
     expect(screen.queryByRole('combobox', { name: 'Theme' })).not.toBeInTheDocument();
     await userEvent.type(screen.getByRole('searchbox', { name: 'Search settings' }), 'font');
     await userEvent.click(screen.getByRole('button', { name: 'Settings: Appearance' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Ocean accent' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Ocean app color' }));
     await userEvent.selectOptions(screen.getByLabelText('Conversation font'), 'serif');
     await userEvent.selectOptions(screen.getByLabelText('Code size'), '16');
     await userEvent.selectOptions(screen.getByLabelText('Interface density'), 'compact');
@@ -591,7 +634,10 @@ it('streams tool-local channels and reconciles completion to persisted history',
     emit({ type: 'outputChunk', toolCallId: 'fixture', stream: 'stdout', chunk: 'test passed' });
     emit({ type: 'outputChunk', toolCallId: 'fixture', stream: 'stderr', chunk: 'warning only' });
   });
-  await waitFor(() => expect(screen.getByTestId('terminal-viewport')).toHaveTextContent('test passed'));
+  expect(await screen.findByLabelText('Recent command output')).toHaveTextContent('test passed');
+  expect(screen.getByLabelText('Recent stderr')).toHaveTextContent('warning only');
+  fireEvent.click(screen.getByTestId('command-run-card').querySelector('summary')!);
+  expect(screen.getByTestId('terminal-viewport')).toHaveTextContent('test passed');
   expect(screen.getByTestId('terminal-viewport')).toHaveTextContent('warning only');
   await act(async () => { emit({ type: 'finished', toolCallId: 'fixture', exitCode: 0, durationMs: 123 }); });
   expect(screen.getByTestId('status-exit-0')).toBeInTheDocument();
@@ -657,6 +703,24 @@ describe('independent running conversations', () => {
     expect(screen.queryByText('Background work')).not.toBeInTheDocument();
     await act(async () => f.finish.get('created')!());
     await act(async () => f.finish.get('one')!());
+  });
+
+  it('keeps a late creation failure with the old composer when New Chat is opened', async () => {
+    fixture();
+    saveDraft(null, '');
+    mocks.workspaceIndex.mockResolvedValue({ projects: [{ id: 'project', name: 'Workspace', path: 'C:/workspace' }], tasks: {} });
+    let failCreate!: (reason: Error) => void;
+    mocks.createConversation.mockImplementationOnce(() => new Promise((_resolve, reject) => { failCreate = reject; }));
+    render(<App />);
+    const newChat = await screen.findByRole('button', { name: 'New conversation' });
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'Earlier request' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    await waitFor(() => expect(failCreate).toBeTypeOf('function'));
+    await userEvent.click(newChat);
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop response' })).not.toBeInTheDocument());
+    await act(async () => failCreate(new Error('Creation failed for the earlier request')));
+    expect(screen.getByRole('textbox', { name: 'Message' })).toHaveValue('');
+    expect(screen.queryByText('Creation failed for the earlier request')).not.toBeInTheDocument();
   });
 
   it('keeps streams, drafts, completion and Stop attached to their conversation', async () => {
@@ -918,6 +982,7 @@ it('serializes workspace navigation and ignores a superseded project selection',
   expect(mocks.setWorkspace).toHaveBeenCalledTimes(1);
   await act(async () => releaseFirst());
   expect(await screen.findByText('Content for two')).toBeInTheDocument();
+  await userEvent.click(screen.getByText('Edit', { selector: 'summary' }));
   expect(screen.getByRole('combobox', { name: 'Task project' })).toHaveValue('p-two');
   expect(mocks.setWorkspace).toHaveBeenLastCalledWith('C:/second');
   expect(mocks.messages).not.toHaveBeenCalledWith('one');
@@ -951,6 +1016,7 @@ it('keeps reused call ids in distinct rounds and separates their output', async 
   expect(cards[0]).toHaveTextContent('printf first-command');
   expect(cards[1]).toHaveTextContent('printf second-command');
   if (!cards[0].hasAttribute('open')) fireEvent.click(cards[0].querySelector('summary')!);
+  if (!cards[1].hasAttribute('open')) fireEvent.click(cards[1].querySelector('summary')!);
   expect(cards[0]).toHaveTextContent('first-result');
   expect(cards[0]).not.toHaveTextContent('second-result');
   expect(cards[1]).toHaveTextContent('second-result');

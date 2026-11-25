@@ -14,7 +14,12 @@ pub const RESPONSE_STYLE: &str = "For completed work, lead with the concrete res
 
 pub const CONTINUE_INSTRUCTION: &str = "Continue the interrupted response without repeating earlier text. The user request is unchanged and any offered tools remain available. If the task requires saved files, create or update them with workspace tools rather than pasting the program in chat. Keep writes small and build incrementally. Finish naturally when the task is complete; do not ask the user to say go again.";
 
-pub const WORKSPACE_GUIDANCE: &str = "When asked to create or update a file, perform the workspace tool calls in this turn. A promise or code pasted in chat does not save a file. Prefer small complete writes followed by patches; read back the result and perform relevant checks before claiming success. Use tool_search for deferred editing tools. If workspace_open_preview is offered, it can open a saved HTML project in a visible browser using Workspace and Local execution; Browser/Computer automation is separate. Do not ask for another go or confirmation when the user already requested the work and tool policy permits it.";
+pub const WORKSPACE_GUIDANCE: &str = "When asked to create or update a file, perform the workspace tool calls in this turn. A promise or code pasted in chat does not save a file. Prefer small complete writes followed by patches; read back the result and perform relevant checks before claiming success. If workspace_open_preview is offered, it can open a saved HTML project in a visible browser using Workspace and Local execution; Browser/Computer automation is separate. Do not ask for another go or confirmation when the user already requested the work and tool policy permits it.";
+
+/// Frozen into the cache-stable system prefix whenever workspace editing tools
+/// are offered. Concise engineering discipline for deep software engineering,
+/// web/UI craft, 3D modeling, and multi-hour autonomous runs.
+pub const ENGINEERING_GUIDANCE: &str = "Engineering workflow: inspect structure cheaply first (workspace_outline, workspace_glob_files, workspace_search_content), then batch related reads in one call (workspace_read_files). Prefer surgical edits (workspace_edit_file, workspace_multi_edit, workspace_apply_patch) over whole-file rewrites; create nested files directly (missing parent directories are created automatically) and omit expected_sha256 for files already read or written in this session. Diagnose root causes and preserve existing interfaces, invariants, and security boundaries before changing code. For websites and UIs, deliver cohesive typography, hierarchy, color contrast, responsive layout, clean state handling, and real working interactions with zero placeholder stubs, and inspect rendered output visually when preview/image tools are offered. For 3D modeling, CAD, shaders, and Three.js/WebGL scenes, use explicit physical units, consistent coordinate axes and winding order, clean manifold topology, accurate normals/UVs/PBR materials, balanced lighting and camera framing, and verify exported geometry (bounds, triangle counts, watertightness, renders) before finishing. For long multi-hour tasks, track milestones (todo_add/todo_update or goal_update), delegate independent subtasks via subagent when available, run build/typecheck/tests on the final source, and report only verified results.";
 
 const VERIFICATION_GUIDANCE: &str = "For multi-step work, identify the acceptance checks early, batch independent reads, then make and verify the change. Run each required check separately and collect its terminal result on the current source. An active process, a clipped result, and an uncertain write need different follow-up. Use the returned handle or artifact cursor to inspect the result. Review uncertain writes before attempting them again. When a prerequisite is blocked, finish independent work and report the pending gate and recorded evidence.";
 
@@ -64,6 +69,12 @@ pub fn frozen_system_for_project(
     let mut guidance = Vec::new();
     if aliases.contains(&"workspace_create_file") || aliases.contains(&"file_write") {
         guidance.push(WORKSPACE_GUIDANCE);
+    }
+    if aliases.contains(&"workspace_create_file")
+        || aliases.contains(&"workspace_edit_file")
+        || aliases.contains(&"file_write")
+    {
+        guidance.push(ENGINEERING_GUIDANCE);
     }
     if aliases.contains(&"verification_run") {
         guidance.push(VERIFICATION_GUIDANCE);
@@ -261,8 +272,8 @@ pub fn selection_hash(
     hasher.update(active_skills.join("\0").as_bytes());
     hasher.update([u8::from(system_time), u8::from(tool_schemas_suppressed)]);
     // Bump when model-visible tool schemas/descriptions change so existing
-    // conversations pick up the new run_code notebook contract.
-    hasher.update(b"code-repl-v1-arex-research-v1");
+    // conversations pick up the new contracts and batch workspace tools.
+    hasher.update(b"code-repl-v2-harness-upgrade-v1");
     format!("{:x}", hasher.finalize())
 }
 
@@ -547,5 +558,29 @@ mod tests {
             .unwrap()
             .ends_with("build it"));
         assert!(strict_template_ok(&with).is_ok());
+    }
+
+    #[test]
+    fn engineering_guidance_freezes_only_with_workspace_tools_and_keeps_prefix_stable() {
+        let plain = frozen_system_for_tools("base", "", None, &["web_search"], false);
+        assert!(!plain.contains(ENGINEERING_GUIDANCE));
+        let workspace = frozen_system_for_tools(
+            "base",
+            "",
+            None,
+            &["workspace_read_files", "workspace_outline", "workspace_edit_file"],
+            false,
+        );
+        assert!(workspace.contains(ENGINEERING_GUIDANCE));
+        assert!(workspace.contains("workspace_read_files"));
+        assert!(workspace.contains("3D modeling"));
+        let turn1 = build_turn_messages(&workspace, &[], None, &draft("build scene"));
+        let turn2 = build_turn_messages(
+            &workspace,
+            &[],
+            volatile_scratchpad(&[("system_time".into(), "now".into())]).as_deref(),
+            &draft("build scene"),
+        );
+        assert_eq!(cache_prefix(&turn1), cache_prefix(&turn2));
     }
 }
